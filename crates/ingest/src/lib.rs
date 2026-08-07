@@ -40,6 +40,11 @@ pub enum RejectReason {
     InvalidMetricName,
     /// A sample timestamp outside any plausible range.
     InvalidTimestamp,
+    /// Storing it would create a new series past the configured cardinality cap.
+    ///
+    /// Unlike the others this is decided by the *store*, after decoding, because the
+    /// series is not known until then.
+    SeriesLimit,
 }
 
 impl RejectReason {
@@ -55,6 +60,7 @@ impl RejectReason {
             Self::MissingMetricName => "missing_metric_name",
             Self::InvalidMetricName => "invalid_metric_name",
             Self::InvalidTimestamp => "invalid_timestamp",
+            Self::SeriesLimit => "series_limit",
         }
     }
 }
@@ -106,6 +112,25 @@ impl<T> Decoded<T> {
 
     pub fn rejected(&self) -> usize {
         self.rejections.len()
+    }
+
+    /// Fold in records the *store* refused, after decoding succeeded.
+    ///
+    /// Cardinality is only knowable once the series is known, which is after decode,
+    /// so these arrive separately. They belong in the same `partialSuccess` all the
+    /// same: from the producer's side "you sent 500 and I kept 50" is one fact, not
+    /// two, and splitting it across a response and a log file is how it gets missed.
+    pub fn note_series_rejections(&mut self, rejected: usize, limit: Option<&str>) {
+        let Some(limit) = limit else { return };
+        for _ in 0..rejected {
+            self.rejections.push(Rejection {
+                reason: RejectReason::SeriesLimit,
+                detail: format!(
+                    "would create a new series past {limit}; raise the limit or send \
+                     fewer distinct label combinations"
+                ),
+            });
+        }
     }
 
     /// One-line summary for OTLP `partialSuccess.errorMessage`.

@@ -6,6 +6,7 @@
 //! thing everywhere.
 
 pub mod bloom;
+pub mod cardinality;
 pub mod datadir;
 pub mod logs;
 pub mod metrics;
@@ -24,8 +25,11 @@ use std::time::Duration;
 use telemetryd_core::MetricSample;
 use telemetryd_core::config::{Config, RetentionConfig};
 use telemetryd_core::span::SpanRecord;
-use telemetryd_core::{LogRecord, Result, Signal};
 
+use crate::schema::RecordSchema;
+use telemetryd_core::{Labels, LogRecord, Result, Signal};
+
+pub use cardinality::{Admission, Admitted, Cardinality};
 pub use datadir::{DataDir, DiskUsage};
 pub use logs::LogSchema;
 pub use metrics::MetricSchema;
@@ -55,6 +59,8 @@ pub struct Store {
     /// without a restart. Read only by the reaper, which is a cold path, so the lock
     /// costs nothing on ingest or query.
     policy: RwLock<RetentionPolicy>,
+    /// The ceiling on distinct series, enforced at ingest.
+    cardinality: Cardinality,
     reaper: Mutex<ReaperReport>,
     /// Kept for the process lifetime rather than only logged at startup — a crash
     /// that cost records should stay visible in `/status`.
@@ -102,6 +108,10 @@ impl Store {
             logs,
             traces,
             metrics,
+            cardinality: Cardinality::new(
+                config.limits.max_series,
+                config.limits.max_series_per_app,
+            ),
             policy: RwLock::new(RetentionPolicy {
                 disk_budget: config.storage.disk_budget.as_u64(),
                 retention: config.retention.clone(),
@@ -120,8 +130,10 @@ impl Store {
     }
 
     /// Append trace spans. Durable before this returns.
-    pub fn append_spans(&self, records: &[SpanRecord]) -> Result<()> {
-        self.traces.append(records)
+    pub fn append_spans(&self, records: &[SpanRecord]) -> Result<Admitted> {
+        self.append_within_limits(records, SpanSchema::index_labels, |kept| {
+            self.traces.append(kept)
+        })
     }
 
     pub fn metrics(&self) -> &RecordStore<MetricSchema> {
@@ -129,8 +141,10 @@ impl Store {
     }
 
     /// Append metric samples. Durable before this returns.
-    pub fn append_samples(&self, records: &[MetricSample]) -> Result<()> {
-        self.metrics.append(records)
+    pub fn append_samples(&self, records: &[MetricSample]) -> Result<Admitted> {
+        self.append_within_limits(records, MetricSchema::index_labels, |kept| {
+            self.metrics.append(kept)
+        })
     }
 
     pub fn data_dir(&self) -> &DataDir {
@@ -138,8 +152,67 @@ impl Store {
     }
 
     /// Append log records. Durable before this returns.
-    pub fn append_logs(&self, records: &[LogRecord]) -> Result<()> {
-        self.logs.append(records)
+    pub fn append_logs(&self, records: &[LogRecord]) -> Result<Admitted> {
+        self.append_within_limits(records, LogSchema::index_labels, |kept| {
+            self.logs.append(kept)
+        })
+    }
+
+    /// Store the records whose series fit inside the cardinality caps, and report the
+    /// rest.
+    ///
+    /// Only *new* series are ever refused. An app already at its limit keeps working;
+    /// what stops is its ability to invent more series. Turning a labelling mistake
+    /// into an outage of the telemetry you still have would be the wrong trade.
+    ///
+    /// The accepted records are passed through untouched when nothing was rejected,
+    /// which is the overwhelmingly common case and worth not copying a batch for.
+    fn append_within_limits<T: Clone>(
+        &self,
+        records: &[T],
+        labels: impl Fn(&T) -> &Labels,
+        store: impl FnOnce(&[T]) -> Result<()>,
+    ) -> Result<Admitted> {
+        let mut kept: Option<Vec<T>> = None;
+        let mut admitted = Admitted {
+            stored: records.len(),
+            rejected: 0,
+            reason: None,
+        };
+
+        for (index, record) in records.iter().enumerate() {
+            let series = labels(record);
+            let app = series.get(telemetryd_core::APP_LABEL).unwrap_or("unknown");
+            let verdict = self.cardinality.admit(app, series);
+            if verdict.is_accepted() {
+                if let Some(kept) = &mut kept {
+                    kept.push(record.clone());
+                }
+            } else {
+                let kept = kept.get_or_insert_with(|| records[..index].to_vec());
+                let _ = kept;
+                admitted.rejected += 1;
+                admitted.reason.get_or_insert(verdict.reason());
+            }
+        }
+
+        let to_store = kept.as_deref().unwrap_or(records);
+        admitted.stored = to_store.len();
+        store(to_store)?;
+
+        if let Some(reason) = admitted.reason {
+            // Loud, every time: a cap that silently drops data is indistinguishable
+            // from a bug in the producer, and someone will spend a day on it.
+            tracing::warn!(
+                rejected = admitted.rejected,
+                stored = admitted.stored,
+                limit = reason,
+                active_series = self.cardinality.active_series(),
+                "refused records that would have created new series past the \
+                 cardinality limit; raise the limit or reduce the labels being sent"
+            );
+        }
+        Ok(admitted)
     }
 
     /// Flush and fsync every log. Called on graceful shutdown so a clean stop never
@@ -255,6 +328,11 @@ impl Store {
         }
 
         let after = self.data_dir.usage()?.total();
+        // Retention just deleted series along with their segments. Recount from what
+        // survived, or the limiter would keep refusing new series against a budget
+        // held by data that no longer exists.
+        self.refresh_cardinality();
+
         report.still_over_budget = after > self.disk_budget();
         if report.still_over_budget {
             tracing::error!(
@@ -344,6 +422,39 @@ impl Store {
         policy.retention = config.retention.clone();
 
         changes
+    }
+
+    /// Recount active series from the segments that still exist plus what is buffered.
+    fn refresh_cardinality(&self) {
+        let logs = self.logs.segments();
+        let traces = self.traces.segments();
+        let metrics = self.metrics.segments();
+        let streams = logs
+            .iter()
+            .chain(traces.iter())
+            .chain(metrics.iter())
+            .flat_map(|segment| segment.manifest.streams.iter())
+            .map(|labels| {
+                (
+                    labels
+                        .get(telemetryd_core::APP_LABEL)
+                        .unwrap_or(telemetryd_core::UNKNOWN_APP),
+                    labels,
+                )
+            });
+        self.cardinality.refresh(streams);
+    }
+
+    /// Series counted right now, and the caps they are counted against.
+    #[must_use]
+    pub fn cardinality_status(&self) -> (u64, u64, u64, u64) {
+        let (max_series, max_per_app) = self.cardinality.limits();
+        (
+            self.cardinality.active_series(),
+            self.cardinality.rejected_records(),
+            max_series,
+            max_per_app,
+        )
     }
 
     #[must_use]

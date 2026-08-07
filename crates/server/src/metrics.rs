@@ -114,6 +114,21 @@ pub const DESCRIPTORS: &[Descriptor] = &[
         help: "Segments sealed since start, by signal",
     },
     Descriptor {
+        name: "telemetryd_series_active",
+        kind: Kind::Gauge,
+        help: "Distinct series counted against limits.max_series — the number that decides when ingest starts refusing new ones",
+    },
+    Descriptor {
+        name: "telemetryd_series_rejected_total",
+        kind: Kind::Counter,
+        help: "Records refused because their series would exceed a cardinality cap",
+    },
+    Descriptor {
+        name: "telemetryd_series_limit",
+        kind: Kind::Gauge,
+        help: "Configured limits.max_series, so the active count can be alerted on as a ratio",
+    },
+    Descriptor {
         name: "telemetryd_segments_unreadable_total",
         kind: Kind::Counter,
         help: "Query reads skipped because a segment file is damaged — non-zero means data was lost",

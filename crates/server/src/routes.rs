@@ -194,6 +194,15 @@ fn gauges(state: &AppState) -> Result<Vec<Sample>, Error> {
         }
     }
 
+    let (active_series, rejected_series, max_series, _) = state.store.cardinality_status();
+    for (name, value) in [
+        ("telemetryd_series_active", active_series as f64),
+        ("telemetryd_series_rejected_total", rejected_series as f64),
+        ("telemetryd_series_limit", max_series as f64),
+    ] {
+        samples.push(Sample::new(name, &[], value));
+    }
+
     // Retention outcomes belong in metrics, not just logs: deleting a user's data is
     // never something they should have to grep for.
     let reaper = &snapshot.retention;

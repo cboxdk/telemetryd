@@ -497,3 +497,116 @@ async fn a_body_past_the_configured_limit_is_refused() {
     let (status, _, _) = harness.request(request).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 }
+
+/// The cardinality cap has to be enforced, not merely configured.
+///
+/// `limits.max_series` was validated and documented long before it did anything: 400
+/// distinct series were stored against a configured cap of 50, with nothing rejected
+/// and nothing logged. Unbounded cardinality is how a log store dies, so this is the
+/// limit that most needs to be real.
+#[tokio::test]
+async fn a_new_series_past_the_cap_is_refused_and_reported() {
+    let harness = Harness::new(|config| {
+        config.limits.max_series = 5;
+        config.limits.max_series_per_app = 5;
+    });
+
+    let mut accepted = 0;
+    let mut refused = 0;
+    let mut last_message = String::new();
+
+    for i in 0..20 {
+        let payload = serde_json::json!({
+            "resourceLogs": [{
+                "resource": {"attributes": [
+                    {"key": "service.name", "value": {"stringValue": format!("svc-{i}")}}
+                ]},
+                "scopeLogs": [{"logRecords": [{
+                    "timeUnixNano": (1_786_000_000_000_000_000u64 + i).to_string(),
+                    "severityText": "INFO",
+                    "body": {"stringValue": "x"},
+                    "attributes": [],
+                }]}],
+            }]
+        })
+        .to_string();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        let (status, _, body) = harness.request(request).await;
+        assert_eq!(status, StatusCode::OK, "ingest must not fail outright");
+
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        if let Some(partial) = parsed.get("partialSuccess") {
+            refused += 1;
+            last_message = partial["errorMessage"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+        } else {
+            accepted += 1;
+        }
+    }
+
+    assert_eq!(accepted, 5, "exactly the cap should have been admitted");
+    assert_eq!(refused, 15);
+
+    // Refusals have to be actionable: the producer needs to know which limit and what
+    // to do, or a silent drop is indistinguishable from a bug on their side.
+    assert!(
+        last_message.contains("max_series"),
+        "the limit should be named: {last_message}"
+    );
+    assert!(
+        last_message.contains("raise the limit"),
+        "the message should say what to do: {last_message}"
+    );
+}
+
+/// A series already being stored keeps working once the cap is reached.
+#[tokio::test]
+async fn an_existing_series_still_ingests_at_the_cap() {
+    let harness = Harness::new(|config| {
+        config.limits.max_series = 1;
+        config.limits.max_series_per_app = 1;
+    });
+
+    let payload = |i: u64| {
+        serde_json::json!({
+            "resourceLogs": [{
+                "resource": {"attributes": [
+                    {"key": "service.name", "value": {"stringValue": "checkout"}}
+                ]},
+                "scopeLogs": [{"logRecords": [{
+                    "timeUnixNano": (1_786_000_000_000_000_000u64 + i).to_string(),
+                    "severityText": "INFO",
+                    "body": {"stringValue": "x"},
+                    "attributes": [],
+                }]}],
+            }]
+        })
+        .to_string()
+    };
+
+    // Ten batches on the same series, against a cap of one. Refusing these would turn
+    // a labelling mistake into an outage of the telemetry that still works.
+    for i in 0..10 {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload(i)))
+            .unwrap();
+        let (status, _, body) = harness.request(request).await;
+        assert_eq!(status, StatusCode::OK);
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            parsed.get("partialSuccess").is_none(),
+            "an existing series must keep ingesting: {body}"
+        );
+    }
+}

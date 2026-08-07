@@ -47,7 +47,7 @@ pub async fn otlp_logs(
 ) -> Result<Response, ApiError> {
     reject_protobuf(&headers)?;
 
-    let decoded = {
+    let mut decoded = {
         let limits = state.config.limits.clone();
         let ingest = state.config.ingest.clone();
         let now = telemetryd_store::now_nanos();
@@ -96,13 +96,14 @@ pub async fn otlp_logs(
 
         let store = std::sync::Arc::clone(&state.store);
         let records = decoded.records.clone();
-        let accepted = records.len() as u64;
 
         // The store is synchronous and fsyncs; running it on the async runtime would
         // stall every other connection on this worker.
-        tokio::task::spawn_blocking(move || store.append_logs(&records))
+        let admitted = tokio::task::spawn_blocking(move || store.append_logs(&records))
             .await
             .map_err(|e| Error::Config(format!("ingest task panicked: {e}")))??;
+        decoded.note_series_rejections(admitted.rejected, admitted.reason);
+        let accepted = admitted.stored as u64;
 
         state.metrics.add(
             "telemetryd_ingest_accepted_total",
@@ -131,7 +132,7 @@ pub async fn otlp_traces(
 ) -> Result<Response, ApiError> {
     reject_protobuf(&headers)?;
 
-    let decoded = {
+    let mut decoded = {
         let limits = state.config.limits.clone();
         let ingest = state.config.ingest.clone();
         let now = telemetryd_store::now_nanos();
@@ -161,11 +162,12 @@ pub async fn otlp_traces(
     if !decoded.records.is_empty() {
         let store = std::sync::Arc::clone(&state.store);
         let records = decoded.records.clone();
-        let accepted = records.len() as u64;
 
-        tokio::task::spawn_blocking(move || store.append_spans(&records))
+        let admitted = tokio::task::spawn_blocking(move || store.append_spans(&records))
             .await
             .map_err(|e| Error::Config(format!("ingest task panicked: {e}")))??;
+        decoded.note_series_rejections(admitted.rejected, admitted.reason);
+        let accepted = admitted.stored as u64;
 
         state.metrics.add(
             "telemetryd_ingest_accepted_total",
@@ -252,7 +254,7 @@ pub async fn remote_write(
 /// Shared tail of both metric ingest paths.
 async fn store_samples(
     state: &AppState,
-    decoded: telemetryd_ingest::Decoded<telemetryd_core::MetricSample>,
+    mut decoded: telemetryd_ingest::Decoded<telemetryd_core::MetricSample>,
 ) -> Result<Response, ApiError> {
     for rejection in &decoded.rejections {
         state.metrics.incr(
@@ -271,11 +273,12 @@ async fn store_samples(
     if !decoded.records.is_empty() {
         let store = std::sync::Arc::clone(&state.store);
         let records = decoded.records.clone();
-        let accepted = records.len() as u64;
 
-        tokio::task::spawn_blocking(move || store.append_samples(&records))
+        let admitted = tokio::task::spawn_blocking(move || store.append_samples(&records))
             .await
             .map_err(|e| Error::Config(format!("ingest task panicked: {e}")))??;
+        decoded.note_series_rejections(admitted.rejected, admitted.reason);
+        let accepted = admitted.stored as u64;
 
         state.metrics.add(
             "telemetryd_ingest_accepted_total",

@@ -23,6 +23,13 @@ Last updated at **M5**.
 with OTLP `partialSuccess`. Timestamps in the wrong unit are detected and corrected,
 and counted so the producer bug stays visible.
 
+**Cardinality is capped.** `limits.max_series` and `limits.max_series_per_app` refuse
+records that would create a *new* series past the limit, while series already being
+stored keep ingesting — a labelling mistake should not take out the telemetry that
+still works. Refusals reach the producer in `partialSuccess`, a log line naming the
+limit, and `telemetryd_series_rejected_total`. The count is rebuilt after each
+retention pass, so expired data gives its budget back.
+
 **Storage.** Write-ahead log with crash recovery, immutable Parquet segments, per-segment
 stream dictionary, Bloom filters for exact-key lookup, retention by age and by a global
 disk budget. One engine serves all three signals.
