@@ -343,6 +343,7 @@ def main() -> int:
 
     check_disk_budget(binary)
     check_reload(binary)
+    check_damaged_segment(binary)
 
     print("\n" + "=" * 52)
     if failures:
@@ -468,6 +469,85 @@ def check_reload(binary: str) -> None:
         status, after = request("/status")
         check("a malformed file does not disturb the running server",
               status == 200 and after["storage"]["disk_budget_bytes"] == 2 * 1024**3)
+    finally:
+        stop(proc)
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def check_damaged_segment(binary: str) -> None:
+    """One bad file must cost that file, not the store.
+
+    A truncated Parquet segment used to fail every query over its time range, so a
+    single bad sector denied access to every healthy segment beside it. The store-level
+    tests cover the logic; this covers the server, because "the process still starts and
+    still answers" is the property an operator actually cares about.
+    """
+    print("\n=== a damaged segment ===")
+    data_dir = tempfile.mkdtemp(prefix="telemetryd-damage-")
+    proc = start(binary, data_dir, {"TELEMETRYD_STORAGE_MAX_SEGMENT_BYTES": "1MiB"})
+    now = int(time.time() * 1_000_000_000)
+    try:
+        for batch in range(12):
+            request("/v1/logs", {"resourceLogs": [{
+                "resource": RESOURCE,
+                "scopeLogs": [{"logRecords": [
+                    {"timeUnixNano": str(now + (batch * 4000 + i) * 1000),
+                     "severityText": "INFO",
+                     "body": {"stringValue": f"payment attempt {i} for order {1000 + i}"},
+                     "attributes": []}
+                    for i in range(4000)]}]}]})
+        window = {"start": 0, "end": 9_223_372_036_854_775_807}
+        status, body = query("/loki/api/v1/query_range", query='{service_name="checkout"}',
+                             limit=5000, **window)
+        before = log_lines(body)
+    finally:
+        stop(proc)
+
+    segments = sorted(
+        root
+        for root, _dirs, files in os.walk(os.path.join(data_dir, "segments"))
+        if "data.parquet" in files and "manifest.json" in files
+    )
+    if len(segments) < 3:
+        check("the store produced enough segments to damage one", False,
+              f"only {len(segments)} segments")
+        shutil.rmtree(data_dir, ignore_errors=True)
+        return
+
+    victim = segments[len(segments) // 2]
+    with open(os.path.join(victim, "manifest.json"), encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    with open(os.path.join(victim, "data.parquet"), "r+b") as handle:
+        handle.truncate(64)
+
+    # The damaged segment's own window. Querying the whole store just fills the limit
+    # from the newest segments and never opens the damaged one at all — which is how an
+    # earlier version of this check passed while testing nothing.
+    damaged_window = {
+        "start": manifest["min_time_nanos"],
+        "end": manifest["max_time_nanos"],
+    }
+
+    proc = start(binary, data_dir)
+    try:
+        check("the server starts with a damaged segment", request("/healthz")[0] == 200)
+
+        # Over the damaged segment itself: this is the query that has to open it.
+        status, body = query("/loki/api/v1/query_range", query='{service_name="checkout"}',
+                             limit=5000, **damaged_window)
+        check("a query over the damaged window still answers", status == 200,
+              f"HTTP {status}, {log_lines(body)} lines")
+
+        # And the healthy segments are untouched.
+        status, body = query("/loki/api/v1/query_range", query='{service_name="checkout"}',
+                             limit=5000, **window)
+        check("the rest of the store is unaffected", status == 200 and log_lines(body) == before,
+              f"{log_lines(body)} of {before} lines")
+
+        status, health = request("/status")
+        unreadable = health["storage"]["logs"]["segments_unreadable"] if isinstance(health, dict) else 0
+        check("the loss is reported rather than silent", unreadable > 0,
+              f"segments_unreadable={unreadable}")
     finally:
         stop(proc)
         shutil.rmtree(data_dir, ignore_errors=True)

@@ -97,24 +97,39 @@ statically linked.
 
 ## Load, measured on the target platform
 
-All numbers below are the musl release build — the one that ships — driven over HTTP
-by four writers and one concurrent reader.
+All numbers are the musl release build — the one that ships — driven over HTTP.
 
 | | |
 |---|---|
 | Ingest, no queries running | 448,000 records/sec |
-| Ingest, one concurrent reader | 439,000 records/sec (2% lower) |
-| Query p50 / p95 under that load | 47 ms / 67 ms |
+| Ingest, one concurrent reader | 421,000 records/sec (4% lower) |
+| Query p50 / p95 under that load | 12 ms / 49 ms |
 | `kill -9` durability | 5,000 of 5,000 acknowledged records recovered |
 | Resident memory | ~`80 MB + 1.3 × storage.max_segment_bytes`, stable across seals |
 
-At the default 256 MiB buffer that is roughly 400 MB resident. Memory is a function of
-that setting and not of traffic, which is the property ADR-001 D4 promised and did not
-previously deliver.
+On a four-million-record store across 500 segments:
 
-Three things had to be true for those numbers, and none of them were a month ago: the
-allocator (ADR-009), the buffer no longer being scanned under the append lock, and
-`max_segment_bytes` meaning what it says. Each is guarded by a test that was checked
+| | |
+|---|---|
+| Cold start, empty | 59 ms |
+| **Restart, full store** | **55 ms** |
+| Newest 100 for one app | 8 ms |
+| Newest 100 with a line filter | 33 ms |
+| Label names, series list | under 1 ms (metadata only, no file I/O) |
+
+Restart time is an availability number — it is how long you are blind after a deploy —
+and it does not grow with the store, because sealed segments are read from their
+manifests rather than replayed.
+
+**Sealing costs the request that triggers it, and only that one.** A seal writes a
+Parquet file, which adds roughly 120 ms to one ingest request; with six concurrent
+writers no request exceeded three times the median, because the Parquet write happens
+outside the buffer lock. Smaller `max_segment_bytes` trades throughput for smoother
+latency: at 8 MiB every request seals.
+
+Three things had to be true for the throughput numbers, and none of them were a month
+ago: the allocator (ADR-009), the buffer no longer being scanned under the append lock,
+and `max_segment_bytes` meaning what it says. Each is guarded by a test that was checked
 against the broken version rather than assumed to work.
 
 ## Known gaps
