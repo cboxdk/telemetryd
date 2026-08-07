@@ -16,8 +16,14 @@ dependencies — no libc to match, no JVM, no Python, no shared libraries.
 | Operating system | Linux (any distribution, musl-static) or macOS 11+ |
 | Architecture | `x86_64` or `aarch64` |
 | Disk | The configured budget, default 10 GiB, plus headroom |
-| Memory | Tens of MB idle; the ceiling is `storage.max_segment_bytes` per signal |
+| Memory | ~80 MB idle, plus roughly 1.3x `storage.max_segment_bytes` under load — about 400 MB at the 256 MiB default. Measured on musl; see below |
 | Network | One TCP port, default 4319 |
+
+**On memory.** The figure above is measured rather than estimated, driving the musl
+release build at full ingest rate: resident size tracks `storage.max_segment_bytes`
+and is stable across many seal cycles, not a function of how much traffic arrives.
+Lower that setting on a small machine — it is the one knob that moves memory — at the
+cost of more, smaller segments.
 
 Prebuilt binaries are published for all four combinations:
 `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`,

@@ -173,6 +173,16 @@ impl Default for StorageConfig {
     }
 }
 
+/// Strip figment's internal profile name out of the key path it reports.
+///
+/// figment reports `key "default.retention.lgos"`, where `default` is its own profile
+/// concept and appears nowhere in the user's file. Someone reading the error goes
+/// looking for a `[default]` section, does not find one, and concludes the message is
+/// about something else. Everything after the profile is the real path.
+fn readable_figment_error(error: &figment::Error) -> String {
+    error.to_string().replace("key \"default.", "key \"")
+}
+
 /// Treats `""` and "absent" as the same value in both directions.
 mod optional_path {
     use std::path::PathBuf;
@@ -556,7 +566,7 @@ impl Config {
 
         let mut config: Config = figment
             .extract()
-            .map_err(|err| Error::Config(err.to_string()))?;
+            .map_err(|err| Error::Config(readable_figment_error(&err)))?;
 
         let mut flag_overrides = Vec::new();
         if let Some(listen) = overrides.listen {
@@ -1029,5 +1039,30 @@ mod tests {
         storage.data_dir = None;
         let resolved = storage.resolve_data_dir();
         assert!(resolved.is_absolute() || resolved == Path::new("./telemetryd-data"));
+    }
+
+    /// figment names its own profile in the key path, and the user's file has no such
+    /// section. Someone reading `key "default.retention.lgos"` goes looking for a
+    /// `[default]` table, does not find one, and stops trusting the message.
+    #[test]
+    fn a_bad_key_is_reported_by_the_path_the_user_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetryd.toml");
+        std::fs::write(&path, "[retention]\nlgos = \"7d\"\n").unwrap();
+
+        let error = Config::load(Some(&path), &Overrides::default())
+            .expect_err("a misspelt key must not load")
+            .to_string();
+
+        assert!(
+            error.contains("retention.lgos"),
+            "the real key should be named: {error}"
+        );
+        assert!(
+            !error.contains("default.retention"),
+            "figment's profile should not leak into the message: {error}"
+        );
+        // And it should still suggest what was expected.
+        assert!(error.contains("logs"), "{error}");
     }
 }
