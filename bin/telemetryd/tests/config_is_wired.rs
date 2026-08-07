@@ -19,8 +19,7 @@
 //! at all, which is the state all five were in.
 
 use std::collections::BTreeSet;
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 
 /// Fields whose only job is to be reported back, with the place that reports them.
 ///
@@ -77,35 +76,61 @@ fn declared_fields() -> Vec<(String, String)> {
     fields
 }
 
+/// Every `.rs` file under the workspace, except the one that declares the settings.
+///
+/// Read here rather than shelled out to `grep`: the first version of this test used
+/// `grep --include`, which BusyBox does not support, so it failed on Alpine — the
+/// distribution the release binary is actually built on. A test that depends on which
+/// grep the host happens to ship is not a test.
+fn source_files(root: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && !path.ends_with("core/src/config.rs")
+            {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    for sub in ["crates", "bin"] {
+        walk(&root.join(sub), &mut files);
+    }
+    assert!(
+        files.len() > 20,
+        "found only {} source files, so the walk is broken",
+        files.len()
+    );
+    files
+}
+
 #[test]
 fn every_configured_value_is_read_somewhere() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let exempt: BTreeSet<&str> = READ_INDIRECTLY.iter().map(|(field, _)| *field).collect();
+
+    let sources: Vec<String> = source_files(&root)
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .collect();
 
     let mut unread = Vec::new();
     for (struct_name, field) in declared_fields() {
         if exempt.contains(field.as_str()) {
             continue;
         }
-
-        // Anywhere outside config.rs that names the field on a value.
-        let output = Command::new("grep")
-            .args([
-                "-rn",
-                "--include=*.rs",
-                &format!(".{field}"),
-                "crates",
-                "bin",
-            ])
-            .current_dir(&root)
-            .output()
-            .expect("grep should run");
-        let hits = String::from_utf8_lossy(&output.stdout);
-        let read_somewhere = hits
-            .lines()
-            .any(|line| !line.contains("crates/core/src/config.rs"));
-
-        if !read_somewhere {
+        let needle = format!(".{field}");
+        if !sources.iter().any(|text| text.contains(&needle)) {
             unread.push(format!("{struct_name}.{field}"));
         }
     }
