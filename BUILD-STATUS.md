@@ -55,7 +55,16 @@ cargo doc --workspace --no-deps
 cargo deny check                      # advisories, licenses, bans, sources
 python3 scripts/generate-sbom.py --check
 python3 scripts/check-docs.py
+python3 scripts/soak.py target/debug/telemetryd   # the binary, over HTTP
 ```
+
+The soak is the one that runs the product rather than its parts: it starts the real
+binary, pushes all three signals at it, queries them back through the Loki, Tempo and
+Prometheus APIs, restarts the process and checks the data survived. It exists because
+two defects reached a tagged release with the whole unit suite green — a `.deb` whose
+systemd unit pointed at the build runner's filesystem, and a TraceQL endpoint that
+rejected its own documented `.attribute` syntax. It also runs in the release workflow,
+against the exact artifact being published, before anything is uploaded.
 
 Plus: all four release targets cross-compile, and the musl builds are asserted to be
 statically linked.

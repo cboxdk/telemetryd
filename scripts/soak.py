@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -337,6 +338,7 @@ def main() -> int:
         check("/status answers after restart", status == 200 and isinstance(body, dict))
     finally:
         stop(proc)
+        shutil.rmtree(data_dir, ignore_errors=True)
 
     print("\n" + "=" * 52)
     if failures:
