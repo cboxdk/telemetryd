@@ -859,6 +859,15 @@ impl<S: RecordSchema> RecordStore<S> {
             && extra(record)
     }
 
+    /// Segments sealed since the process started.
+    ///
+    /// One relaxed atomic load. Retention polls it to notice that there is new data on
+    /// disk without walking the filesystem to find out.
+    #[must_use]
+    pub fn sealed_count(&self) -> u64 {
+        self.stats.sealed_segments.load(Ordering::Relaxed)
+    }
+
     /// Distinct stream label names across the time range.
     ///
     /// Answered from segment metadata alone. The stream dictionary already lists every

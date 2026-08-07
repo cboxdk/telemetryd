@@ -17,9 +17,21 @@ use tokio::task::JoinHandle;
 /// a segment configured to seal every minute actually sealing every tick instead.
 const SEAL_TICK: Duration = Duration::from_secs(5);
 
-/// How often retention runs. Segment-granular deletion means running it more often
-/// than segments are produced achieves nothing.
-const RETENTION_TICK: Duration = Duration::from_secs(60);
+/// How often retention *looks*, which is not how often it works.
+///
+/// Segment bytes only grow when a segment is sealed, so the tick reads a counter and
+/// does nothing unless that changed. Ticking often is therefore nearly free, and it is
+/// what bounds how far usage can pass the disk budget: on a fixed 60-second tick a
+/// fast writer overshot the ceiling by 65% and the peak grew run over run, because a
+/// minute of writes at full rate is a great deal of data.
+const RETENTION_TICK: Duration = Duration::from_secs(1);
+
+/// Run retention at least this often even when nothing sealed.
+///
+/// Age-based expiry depends on the clock, not on writes: a store that stopped
+/// receiving data still has records that fall out of the retention window, and they
+/// should leave on schedule rather than when traffic happens to resume.
+const RETENTION_FLOOR: Duration = Duration::from_secs(60);
 
 /// Handles for the background tasks, so shutdown can stop them deterministically.
 #[derive(Debug)]
@@ -77,8 +89,23 @@ impl Maintenance {
             tasks.push(tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(RETENTION_TICK);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut seen_seals = store.sealed_count();
+                let mut last_run = tokio::time::Instant::now();
                 loop {
                     ticker.tick().await;
+
+                    // A full pass walks the data directory. Doing that every second
+                    // would be wasteful, and skipping it until a fixed minute has
+                    // passed is how the budget got overshot — so the trigger is the
+                    // thing that actually changes usage: a segment being sealed.
+                    let seals = store.sealed_count();
+                    let due = seals != seen_seals || last_run.elapsed() >= RETENTION_FLOOR;
+                    if !due {
+                        continue;
+                    }
+                    seen_seals = seals;
+                    last_run = tokio::time::Instant::now();
+
                     let store = Arc::clone(&store);
                     let result = tokio::task::spawn_blocking(move || store.run_retention()).await;
                     match result {

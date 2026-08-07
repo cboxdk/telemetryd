@@ -87,11 +87,12 @@ def series(body: object) -> list:
     return body.get("data", {}).get("result", []) if isinstance(body, dict) else []
 
 
-def start(binary: str, data_dir: str) -> subprocess.Popen:
+def start(binary: str, data_dir: str, env: dict | None = None) -> subprocess.Popen:
     proc = subprocess.Popen(
         [binary, "serve", "--listen", f"127.0.0.1:{PORT}", "--data-dir", data_dir],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        env={**os.environ, **(env or {})},
     )
     for _ in range(240):
         if proc.poll() is not None:
@@ -340,12 +341,83 @@ def main() -> int:
         stop(proc)
         shutil.rmtree(data_dir, ignore_errors=True)
 
+    check_disk_budget(binary)
+
     print("\n" + "=" * 52)
     if failures:
         print(f"SOAK FAILED: {', '.join(failures)}")
         return 1
     print("SOAK PASSED")
     return 0
+
+
+def check_disk_budget(binary: str) -> None:
+    """The disk budget has to hold while writes continue, not once they stop.
+
+    It used to be enforced on a fixed 60-second tick, so a fast writer passed the
+    ceiling by 65% and the peak grew run over run. Retention now runs when a segment
+    seals — the only thing that grows segment bytes — so the overshoot is bounded by
+    one segment rather than by a minute of traffic.
+    """
+    print("\n=== disk budget under sustained writes ===")
+    budget_mib = 4
+    data_dir = tempfile.mkdtemp(prefix="telemetryd-budget-")
+    proc = start(binary, data_dir, {
+        "TELEMETRYD_STORAGE_DISK_BUDGET": f"{budget_mib}MiB",
+        "TELEMETRYD_STORAGE_MAX_SEGMENT_BYTES": "1MiB",
+        # Long enough that only the budget can bind. With a short window the records
+        # expire by age instead and the budget path is never exercised at all.
+        "TELEMETRYD_RETENTION_LOGS": "30d",
+    })
+    try:
+        now = int(time.time() * 1_000_000_000)
+        peak = 0.0
+        errors = 0
+        for round_index in range(24):
+            for batch in range(10):
+                status, _ = request(
+                    "/v1/logs",
+                    {"resourceLogs": [{
+                        "resource": RESOURCE,
+                        "scopeLogs": [{"logRecords": [
+                            {"timeUnixNano": str(now + (round_index * 10 + batch) * 5000 * 1000 + i * 1000),
+                             "severityText": "INFO",
+                             "body": {"stringValue": f"payment attempt {i} for order {1000 + i}, padded"},
+                             "attributes": []}
+                            for i in range(5000)]}]}]},
+                )
+                if status != 200:
+                    errors += 1
+            peak = max(peak, directory_bytes(data_dir) / 1024 / 1024)
+
+        check("no ingest errors while over budget", errors == 0, f"{errors} failed posts")
+        # One segment of slack over the ceiling, not one reaper interval.
+        # If this never crossed the ceiling it proved nothing, so say so rather than
+        # reporting a pass for a code path that did not run.
+        check("the budget was actually exceeded", peak > budget_mib,
+              f"peak {peak:.1f} MB against a {budget_mib} MB budget — test too small")
+        check("disk stays near the budget", peak < budget_mib * 1.5,
+              f"peak {peak:.1f} MB against a {budget_mib} MB budget ({peak / budget_mib:.2f}x)")
+
+        status, body = query(
+            "/loki/api/v1/query_range", query='{service_name="checkout"}', limit=10,
+            start=0, end=9_223_372_036_854_775_807,
+        )
+        check("queries still answer after reaping", status == 200 and log_lines(body) > 0)
+    finally:
+        stop(proc)
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def directory_bytes(path: str) -> int:
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
 
 
 if __name__ == "__main__":

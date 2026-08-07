@@ -166,6 +166,16 @@ impl Store {
     /// Every deletion is reported — logged, counted, and reflected in `/status`.
     /// Silently discarding a user's telemetry to stay under a budget would be the
     /// single most damaging thing this process could do quietly.
+    /// Total segments sealed across all signals, for cheap change detection.
+    ///
+    /// Sealing is the only thing that grows segment bytes, so this changing is the
+    /// signal that the disk budget might now be exceeded. Three atomic loads, versus a
+    /// filesystem walk to answer the same question.
+    #[must_use]
+    pub fn sealed_count(&self) -> u64 {
+        self.logs.sealed_count() + self.traces.sealed_count() + self.metrics.sealed_count()
+    }
+
     pub fn run_retention(&self) -> Result<ReaperReport> {
         let usage = self.data_dir.usage()?;
 
