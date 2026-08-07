@@ -1,0 +1,22 @@
+[package]
+name = "telemetryd-store"
+description = "Storage engine for telemetryd: data directory, write-ahead log, segments, retention"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+telemetryd-core.workspace = true
+
+serde.workspace = true
+bytesize.workspace = true
+crc32fast.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --all-features
+
+      - name: cargo doc
+        run: cargo doc --workspace --no-deps --document-private-items
+
+  deny:
+    name: licenses and advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check --hide-inclusion-graph
+
+  msrv:
+    name: minimum supported rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: read rust-version from the workspace manifest
+        id: msrv
+        run: echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      # Build only: the MSRV claim is about compiling telemetryd, and dev-dependencies
+      # routinely require a newer toolchain than the crates themselves.
+      - run: cargo build --workspace
+
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: build
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} --bin telemetryd
+          else
+            cargo build --release --target ${{ matrix.target }} --bin telemetryd
+          fi
+
+      # "One static binary, no runtime deps, no glibc surprises" is a product
+      # constraint, not an aspiration. A musl build that quietly picked up a dynamic
+      # interpreter would still pass every test we have, so assert it here.
+      - name: verify the musl build is statically linked
+        if: contains(matrix.target, 'musl')
+        run: |
+          BIN=target/${{ matrix.target }}/release/telemetryd
+          file "$BIN"
+          if file "$BIN" | grep -q "dynamically linked"; then
+            echo "::error::${{ matrix.target }} produced a dynamically linked binary"
+            exit 1
+          fi
+
+      # Cross-compiled artifacts cannot run here; the two we can execute, we do.
+      - name: smoke test the native binary
+        if: matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          BIN=target/${{ matrix.target }}/release/telemetryd
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            docker run --rm -v "$PWD:/w" -w /w alpine:3 "$BIN" version
+          else
+            "$BIN" version
+            "$BIN" validate --data-dir "$RUNNER_TEMP/telemetryd-data"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: telemetryd-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/telemetryd
+          if-no-files-found: error
+          retention-days: 7
+
+  # A single required check, so branch protection does not need updating every time
+  # the matrix changes.
+  ci:
+    name: ci
+    if: always()
+    needs: [check, deny, msrv, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: verify every job succeeded
+        run: |
+          echo '${{ toJSON(needs) }}'
+          if echo '${{ toJSON(needs) }}' | grep -qv '"result": "success"'; then
+            echo '${{ toJSON(needs) }}' | grep '"result"' | grep -v success && exit 1
+          fi
+          echo "all jobs succeeded"

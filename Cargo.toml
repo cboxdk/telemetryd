@@ -1,0 +1,95 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/store",
+    "crates/ingest",
+    "crates/query",
+    "crates/server",
+    "bin/telemetryd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "Apache-2.0"
+repository = "https://github.com/cboxdk/telemetryd"
+homepage = "https://github.com/cboxdk/telemetryd"
+authors = ["Cbox"]
+
+[workspace.dependencies]
+# internal — versioned as well as pathed so the workspace stays publishable and
+# `cargo deny` can tell a deliberate internal edge from an unpinned third-party one
+telemetryd-core = { path = "crates/core", version = "0.1.0" }
+telemetryd-store = { path = "crates/store", version = "0.1.0" }
+telemetryd-ingest = { path = "crates/ingest", version = "0.1.0" }
+telemetryd-query = { path = "crates/query", version = "0.1.0" }
+telemetryd-server = { path = "crates/server", version = "0.1.0" }
+
+# runtime + http
+tokio = { version = "1.53", features = ["rt-multi-thread", "net", "signal", "fs", "sync", "time", "macros", "io-util"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "matched-path"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.7", features = ["trace", "limit", "timeout", "catch-panic"] }
+http-body-util = "0.1"
+
+# serde + config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+figment = { version = "0.10", features = ["toml", "env"] }
+humantime-serde = "1"
+humantime = "2"
+bytesize = { version = "2", features = ["serde"] }
+
+# cli + diagnostics
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+anyhow = "1"
+thiserror = "2"
+
+# storage + platform
+crc32fast = "1.5"
+directories = "6"
+time = { version = "0.3", features = ["formatting", "macros"] }
+
+# auth
+sha2 = "0.11"
+subtle = "2.6"
+
+# cli http client — plain HTTP only, no TLS stack (see ADR-004: v1 has no TLS)
+ureq = { version = "3", default-features = false }
+
+# dev
+tempfile = "3"
+toml = "0.8"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Noise for this codebase: we return Result from most public fns by design,
+# and module-name repetition reads fine with our short module names.
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+# Real bug classes we want to be hard errors.
+unwrap_used = "warn"
+expect_used = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dist]
+inherits = "release"
+lto = "fat"

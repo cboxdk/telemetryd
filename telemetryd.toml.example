@@ -1,0 +1,80 @@
+# telemetryd configuration — every value below is the default.
+#
+# You do not need this file. `telemetryd serve` with no configuration at all is a
+# complete, supported setup; this exists only to override parts of it. Copy it to
+# ./telemetryd.toml (or /etc/telemetryd/telemetryd.toml) and delete everything you
+# are not changing — partial files are the normal case.
+#
+# Every scalar is also settable as TELEMETRYD_<SECTION>_<KEY>, e.g.
+# TELEMETRYD_STORAGE_DATA_DIR. Precedence: defaults → this file → env → CLI flags.
+#
+# Check what actually takes effect with:  telemetryd validate
+
+[server]
+listen          = "127.0.0.1:4319"   # one port: ingest + query + UI APIs
+insecure        = false              # allow a non-loopback bind with no token — see [auth]
+max_body_bytes  = "16MiB"
+request_timeout = "30s"
+shutdown_grace  = "15s"
+
+[auth]
+# Both accept a string or a list. A list lets you rotate with no rejection window.
+# Indirection avoids putting a secret in a world-readable file:
+#   ingest_token = "file:/run/secrets/ingest"
+#   query_token  = "env:TELEMETRYD_QUERY_SECRET"
+#
+# Empty means that surface is unauthenticated. That is fine on loopback; binding a
+# non-loopback address with both empty is refused at startup (see ADR-004).
+ingest_token = []                    # /v1/*, /api/v1/write
+query_token  = []                    # Loki/Tempo/Prometheus reads, /status, /metrics
+
+[storage]
+# Empty = automatic: ./telemetryd-data if it already exists, else the platform data
+# directory. The resolved path is logged at startup and shown in /status.
+data_dir          = ""
+disk_budget       = "10GiB"          # hard cap across all signals; the reaper enforces it
+segment_duration  = "1h"
+max_segment_bytes = "256MiB"         # seal early on size, so memory is bounded under a burst
+
+# always   — fsync every batch; safest, and caps ingest at the device's sync rate
+# interval — fsync on a timer; you can lose up to wal_sync_interval on power loss
+# never    — test and benchmark use only
+wal_sync          = "interval"
+wal_sync_interval = "100ms"
+compression       = "zstd"           # zstd | snappy | none
+
+[retention]
+# Metrics are kept longer because they are ~100x cheaper per unit time, and
+# week-over-week comparison is most of what dashboards are for. disk_budget is still
+# the hard cap over all signals.
+logs    = "7d"
+traces  = "7d"
+events  = "7d"
+metrics = "30d"
+
+[limits]
+# Exceeding any of these rejects the record loudly: a labelled counter on
+# telemetryd_ingest_rejected_total, a structured error, and a count in /status.
+# Nothing here causes a silent drop.
+max_series            = 100000
+max_series_per_app    = 20000
+max_labels_per_series = 60
+max_label_name_bytes  = 128
+max_label_value_bytes = 2048
+max_log_line_bytes    = "256KiB"
+max_attrs_per_record  = 128
+max_spans_per_trace   = 10000
+ingest_queue_depth    = 8192         # full queue → 429 with Retry-After, not unbounded buffering
+
+[log]
+level  = "info"                      # RUST_LOG overrides this when set
+format = "text"                      # text | json
+
+# Optional Prometheus scrape targets (M3). File-only — not settable via env.
+# [[scrape]]
+# job      = "checkout"
+# targets  = ["127.0.0.1:9000"]
+# interval = "15s"
+# timeout  = "10s"
+# path     = "/metrics"
+# labels   = { app = "checkout" }

@@ -1,0 +1,220 @@
+//! telemetryd's HTTP surface — one port for ingest, query and the UI-facing APIs.
+//!
+//! The router is the composition root, and it is built independently of any listening
+//! socket so contract tests can drive it in-process with `tower::ServiceExt::oneshot`
+//! (ADR-002).
+
+pub mod auth;
+pub mod error;
+pub mod metrics;
+pub mod routes;
+pub mod state;
+
+use std::sync::Arc;
+
+use axum::Router;
+use axum::extract::{MatchedPath, Request, State};
+use axum::middleware::Next;
+use axum::response::Response;
+use axum::routing::get;
+use telemetryd_core::{Config, Result};
+use telemetryd_store::Store;
+use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
+use tower_http::trace::TraceLayer;
+
+pub use state::AppState;
+
+/// The milestone this build implements, reported by `/status`. Keeping it in the
+/// binary means a user can always tell which slice of the contract they have.
+pub const MILESTONE: &str = "M0";
+
+/// Build the complete router.
+pub fn router(state: AppState) -> Router {
+    let max_body =
+        usize::try_from(state.config.server.max_body_bytes.as_u64()).unwrap_or(usize::MAX);
+    let request_timeout = state.config.server.request_timeout;
+
+    // Unauthenticated: liveness only. It carries no telemetry and load balancers need
+    // it to work before anyone has configured a token.
+    let public = Router::new().route("/healthz", get(routes::healthz));
+
+    // `/status` and `/metrics` sit behind the *query* token: both disclose app names,
+    // volumes and cardinality, which is more than an unauthenticated caller should get.
+    let query = Router::new()
+        .route("/status", get(routes::status))
+        .route("/metrics", get(routes::metrics))
+        .merge(planned_query_routes())
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_query_token,
+        ));
+
+    let ingest = planned_ingest_routes().route_layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        auth::require_ingest_token,
+    ));
+
+    Router::new()
+        .merge(public)
+        .merge(query)
+        .merge(ingest)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            record_request,
+        ))
+        .layer(TraceLayer::new_for_http())
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            request_timeout,
+        ))
+        .layer(RequestBodyLimitLayer::new(max_body))
+        // A panic in one handler must not take the process down and lose the WAL's
+        // unsynced window along with it.
+        .layer(CatchPanicLayer::new())
+        .with_state(state)
+}
+
+/// Ingest endpoints from the contract. OTLP/HTTP JSON is the first-class format —
+/// `laravel-telemetry` sends JSON, so protobuf is never on the client's critical path.
+fn planned_ingest_routes() -> Router<AppState> {
+    Router::new()
+        .route("/v1/logs", routes::planned("/v1/logs", "M1"))
+        .route("/v1/traces", routes::planned("/v1/traces", "M2"))
+        .route("/v1/metrics", routes::planned("/v1/metrics", "M3"))
+        .route("/api/v1/write", routes::planned("/api/v1/write", "M3"))
+}
+
+/// Query endpoints from the contract, frozen as `COMPATIBILITY.md` in M4.
+fn planned_query_routes() -> Router<AppState> {
+    Router::new()
+        // Loki — M1
+        .route(
+            "/loki/api/v1/query_range",
+            routes::planned("/loki/api/v1/query_range", "M1"),
+        )
+        .route(
+            "/loki/api/v1/labels",
+            routes::planned("/loki/api/v1/labels", "M1"),
+        )
+        .route(
+            "/loki/api/v1/label/{name}/values",
+            routes::planned("/loki/api/v1/label/{name}/values", "M1"),
+        )
+        .route(
+            "/loki/api/v1/tail",
+            routes::planned("/loki/api/v1/tail", "M1"),
+        )
+        // Tempo — M2
+        .route(
+            "/api/traces/{trace_id}",
+            routes::planned("/api/traces/{trace_id}", "M2"),
+        )
+        .route("/api/search", routes::planned("/api/search", "M2"))
+        .route(
+            "/api/search/tags",
+            routes::planned("/api/search/tags", "M2"),
+        )
+        .route(
+            "/api/search/tag/{name}/values",
+            routes::planned("/api/search/tag/{name}/values", "M2"),
+        )
+        // Prometheus — M3
+        .route("/api/v1/query", routes::planned("/api/v1/query", "M3"))
+        .route(
+            "/api/v1/query_range",
+            routes::planned("/api/v1/query_range", "M3"),
+        )
+        .route("/api/v1/labels", routes::planned("/api/v1/labels", "M3"))
+        .route(
+            "/api/v1/label/{name}/values",
+            routes::planned("/api/v1/label/{name}/values", "M3"),
+        )
+        .route("/api/v1/series", routes::planned("/api/v1/series", "M3"))
+}
+
+/// Count every request by *matched route*, never by raw path.
+///
+/// Using the URI would let any caller mint unbounded label cardinality in our own
+/// metrics — the exact failure mode telemetryd exists to cap for its users.
+async fn record_request(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or_else(|| "<unmatched>".to_owned(), |m| m.as_str().to_owned());
+    let method = request.method().clone();
+
+    let response = next.run(request).await;
+
+    state.metrics.incr(
+        "telemetryd_http_requests_total",
+        &[
+            ("route", &route),
+            ("method", method.as_str()),
+            ("status", response.status().as_str()),
+        ],
+    );
+    response
+}
+
+/// Bind the listener and serve until shutdown is signalled.
+pub async fn serve(config: Arc<Config>, store: Arc<Store>) -> Result<()> {
+    let state = AppState::new(Arc::clone(&config), Arc::clone(&store))?;
+    let listener = tokio::net::TcpListener::bind(config.server.listen)
+        .await
+        .map_err(|e| telemetryd_core::Error::io(format!("binding {}", config.server.listen), e))?;
+
+    let local = listener.local_addr().unwrap_or(config.server.listen);
+    tracing::info!(
+        listen = %local,
+        data_dir = %store.data_dir().root().display(),
+        version = telemetryd_core::VERSION,
+        milestone = MILESTONE,
+        "telemetryd is serving"
+    );
+    if config.server.insecure {
+        tracing::warn!(
+            listen = %local,
+            "running with --insecure: this instance accepts unauthenticated requests \
+             from the network (see ADR-004)"
+        );
+    }
+
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .map_err(|e| telemetryd_core::Error::io("serving HTTP", e))?;
+
+    // In-flight requests are drained by then; this is the last chance to make the
+    // interval-sync window durable, so a clean stop never loses records.
+    tracing::info!("draining complete, flushing write-ahead log");
+    store.sync_all()?;
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "could not install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => tracing::info!("received interrupt, shutting down"),
+        () = terminate => tracing::info!("received SIGTERM, shutting down"),
+    }
+}

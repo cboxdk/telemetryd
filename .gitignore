@@ -1,0 +1,4 @@
+/target
+/telemetryd-data
+*.profraw
+.DS_Store

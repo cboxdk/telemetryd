@@ -1,0 +1,29 @@
+[package]
+name = "telemetryd-core"
+description = "Shared configuration, error taxonomy and signal types for telemetryd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+figment.workspace = true
+humantime-serde.workspace = true
+humantime.workspace = true
+bytesize.workspace = true
+thiserror.workspace = true
+directories.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+toml.workspace = true
+figment = { workspace = true, features = ["test"] }

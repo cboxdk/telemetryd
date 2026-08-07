@@ -1,0 +1,43 @@
+[graph]
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Permissive only. telemetryd ships as a static binary our users redistribute;
+# anything copyleft here becomes their problem, so it does not get in.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Our own crates are path dependencies with no version: telemetryd ships as a binary,
+# not as libraries on crates.io, so pinning versions between workspace members would
+# be bookkeeping with no consumer. Third-party wildcards stay denied.
+allow-wildcard-paths = true
+# Keep the dependency budget honest — these are the "you probably did not mean
+# to pull this into a single static binary" tripwires.
+deny = [
+    { name = "openssl-sys", reason = "no C TLS stack; v1 terminates TLS at a reverse proxy (ADR-004)" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

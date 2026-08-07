@@ -1,0 +1,204 @@
+//! Request handlers.
+//!
+//! M0 implements the self-observability endpoints. The ingest and query routes are
+//! registered but answer `501` — pointing `laravel-telemetry` at an early build should
+//! produce "not yet, planned for M1", not a `404` that reads as a wrong URL.
+
+use std::collections::BTreeMap;
+
+use axum::Json;
+use axum::extract::State;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use serde::Serialize;
+use telemetryd_core::{Error, VERSION};
+use telemetryd_store::StoreStatus;
+
+use crate::error::ApiError;
+use crate::metrics::Sample;
+use crate::state::AppState;
+
+/// Liveness. Never authenticated, never touches the store — a health check that fails
+/// because the disk is busy tells a load balancer the wrong thing.
+pub async fn healthz() -> Response {
+    (StatusCode::OK, "ok\n").into_response()
+}
+
+#[derive(Debug, Serialize)]
+pub struct StatusResponse {
+    pub version: &'static str,
+    pub milestone: &'static str,
+    pub storage_format_version: u32,
+    pub started_at: String,
+    pub uptime_seconds: f64,
+    pub listen: String,
+    /// True when the operator bypassed the ADR-004 bind check. Surfaced here so
+    /// "is this instance exposed without auth?" is answerable from a dashboard.
+    pub insecure: bool,
+    pub auth: AuthStatus,
+    pub storage: StoreStatus,
+    pub retention: BTreeMap<&'static str, String>,
+    pub limits: LimitsStatus,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthStatus {
+    pub ingest: &'static str,
+    pub query: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LimitsStatus {
+    pub max_series: u64,
+    pub max_series_per_app: u64,
+    pub max_log_line_bytes: u64,
+    pub ingest_queue_depth: u32,
+}
+
+pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>, ApiError> {
+    let config = &state.config;
+    let storage = state.store.snapshot()?;
+
+    let started_at = state
+        .started_at
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_owned());
+
+    let retention = BTreeMap::from([
+        (
+            "logs",
+            humantime::format_duration(config.retention.logs.get()).to_string(),
+        ),
+        (
+            "traces",
+            humantime::format_duration(config.retention.traces.get()).to_string(),
+        ),
+        (
+            "events",
+            humantime::format_duration(config.retention.events.get()).to_string(),
+        ),
+        (
+            "metrics",
+            humantime::format_duration(config.retention.metrics.get()).to_string(),
+        ),
+    ]);
+
+    Ok(Json(StatusResponse {
+        version: VERSION,
+        milestone: crate::MILESTONE,
+        storage_format_version: telemetryd_core::STORAGE_FORMAT_VERSION,
+        started_at,
+        uptime_seconds: state.uptime_seconds(),
+        listen: config.server.listen.to_string(),
+        insecure: config.server.insecure,
+        auth: AuthStatus {
+            ingest: enabled(state.ingest_tokens.is_empty()),
+            query: enabled(state.query_tokens.is_empty()),
+        },
+        storage,
+        retention,
+        limits: LimitsStatus {
+            max_series: config.limits.max_series,
+            max_series_per_app: config.limits.max_series_per_app,
+            max_log_line_bytes: config.limits.max_log_line_bytes.as_u64(),
+            ingest_queue_depth: config.limits.ingest_queue_depth,
+        },
+    }))
+}
+
+fn enabled(is_empty: bool) -> &'static str {
+    if is_empty { "disabled" } else { "enabled" }
+}
+
+pub async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let body = state.metrics.render(&gauges(&state)?);
+    Ok((
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response())
+}
+
+/// Read live gauge values at scrape time. See [`crate::metrics::Metrics::render`] for
+/// why these are not cached.
+///
+/// Every sample is `f64` because that is what the Prometheus exposition format is; the
+/// counts and byte totals here are far below the 2^53 boundary where that matters.
+#[allow(clippy::cast_precision_loss)]
+fn gauges(state: &AppState) -> Result<Vec<Sample>, Error> {
+    let snapshot = state.store.snapshot()?;
+    let mut samples = vec![
+        Sample::new("telemetryd_build_info", &[("version", VERSION)], 1.0),
+        Sample::new("telemetryd_uptime_seconds", &[], state.uptime_seconds()),
+        Sample::new(
+            "telemetryd_disk_budget_bytes",
+            &[],
+            snapshot.disk_budget_bytes as f64,
+        ),
+        Sample::new(
+            "telemetryd_storage_over_budget",
+            &[],
+            f64::from(u8::from(snapshot.over_budget)),
+        ),
+        Sample::new(
+            "telemetryd_wal_truncations_total",
+            &[],
+            snapshot.wal_truncations.len() as f64,
+        ),
+    ];
+
+    for (kind, bytes) in [
+        ("wal", snapshot.usage.wal_bytes),
+        ("segments", snapshot.usage.segment_bytes),
+        ("metrics", snapshot.usage.metric_bytes),
+        ("tmp", snapshot.usage.tmp_bytes),
+    ] {
+        samples.push(Sample::new(
+            "telemetryd_disk_used_bytes",
+            &[("kind", kind)],
+            bytes as f64,
+        ));
+    }
+
+    for (signal, wal) in &snapshot.wal {
+        let signal = signal.as_str();
+        samples.push(Sample::new(
+            "telemetryd_wal_segments",
+            &[("signal", signal)],
+            wal.segments as f64,
+        ));
+        samples.push(Sample::new(
+            "telemetryd_wal_records_total",
+            &[("signal", signal)],
+            wal.appended_records as f64,
+        ));
+        samples.push(Sample::new(
+            "telemetryd_wal_unsynced_records",
+            &[("signal", signal)],
+            wal.unsynced_records as f64,
+        ));
+    }
+
+    Ok(samples)
+}
+
+/// A route that is part of the compatibility contract but not built yet.
+///
+/// Answering every method keeps the diagnosis honest: a `GET` to an ingest endpoint
+/// should say "not implemented until M1", not "method not allowed", which would send
+/// someone hunting for the wrong problem.
+pub(crate) fn planned(
+    endpoint: &'static str,
+    milestone: &'static str,
+) -> axum::routing::MethodRouter<AppState> {
+    axum::routing::any(move || async move {
+        ApiError(Error::NotImplemented {
+            endpoint,
+            milestone,
+        })
+    })
+}
