@@ -1,3 +1,16 @@
+# The toolchain is pinned, not tracked to `stable`.
+#
+# This exists because of a real failure: local development ran 1.95 while CI
+# resolved `stable` to 1.97.1, so lints introduced in between fired only in CI. The
+# local gate reported green on code that could not pass. A verification gate whose
+# result depends on which machine ran it is not a gate.
+#
+# Pinning also means the release binaries are built by a compiler we chose rather
+# than whichever one happened to be current on release day.
+#
+# Bumping is a deliberate, reviewed change: raise the version here and in the
+# RUST_VERSION env in .github/workflows/{ci,release}.yml — CI asserts the two agree —
+# then fix whatever new lints surface in the same commit.
 [toolchain]
-channel = "stable"
+channel = "1.97.1"
 components = ["rustfmt", "clippy"]

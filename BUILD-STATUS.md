@@ -39,6 +39,12 @@ Homebrew formula, `.deb`, deterministic CycloneDX SBOM with a CI drift check.
 
 ## Gates
 
+**The toolchain is pinned** in `rust-toolchain.toml` (currently 1.97.1), so the gate
+gives the same answer on a laptop as in CI. This was a real defect, not a precaution:
+development ran 1.95 while CI resolved `stable` to 1.97.1, and a lint added in between
+failed CI on code the local gate had called clean. Bumping the pin is a deliberate
+commit that also fixes whatever new lints surface.
+
 Every one of these is green, and CI enforces all of them:
 
 ```

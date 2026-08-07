@@ -11,6 +11,11 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: -D warnings
+  # Must equal the channel in rust-toolchain.toml; the check job asserts it. CI
+  # cannot simply track `stable`: cargo would obey the pin while the action installed
+  # target std for a different compiler, and the MSRV job would silently test the
+  # pinned version instead of the minimum.
+  RUST_VERSION: "1.97.1"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -22,10 +27,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+
+      # The pin is only worth having if both halves move together. If they drift,
+      # cargo obeys the file and every other job's assumption is wrong.
+      - name: the pinned toolchain matches rust-toolchain.toml
+        run: |
+          PINNED=$(grep -m1 '^channel' rust-toolchain.toml | cut -d'"' -f2)
+          if [ "$PINNED" != "${RUST_VERSION}" ]; then
+            echo "::error::rust-toolchain.toml pins $PINNED but RUST_VERSION is ${RUST_VERSION}"
+            exit 1
+          fi
+          echo "both pinned to $PINNED"
 
       - name: cargo fmt
         run: cargo fmt --all --check
@@ -44,7 +61,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
 
       # The SBOM is committed, so this is a real drift check: it fails exactly when a
@@ -87,9 +106,13 @@ jobs:
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2
+      # `+${{ ... }}` is load-bearing: rust-toolchain.toml would otherwise redirect
+      # cargo to the pinned compiler and this job would pass without ever exercising
+      # the minimum version it exists to check.
+      #
       # Build only: the MSRV claim is about compiling telemetryd, and dev-dependencies
       # routinely require a newer toolchain than the crates themselves.
-      - run: cargo build --workspace
+      - run: cargo +${{ steps.msrv.outputs.version }} build --workspace
 
   build:
     name: ${{ matrix.target }}
@@ -112,8 +135,9 @@ jobs:
             cross: false
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:

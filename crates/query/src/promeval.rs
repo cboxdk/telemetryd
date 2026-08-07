@@ -580,7 +580,7 @@ mod tests {
     fn a_sample_older_than_the_lookback_is_stale() {
         let snapshot = Snapshot::from_samples(vec![sample("up", "checkout", T0, 1.0)]);
         // Default lookback is 5 minutes.
-        assert!(eval(&snapshot, "up", T0 + 299 * SECOND).samples.len() == 1);
+        assert_eq!(eval(&snapshot, "up", T0 + 299 * SECOND).samples.len(), 1);
         assert!(eval(&snapshot, "up", T0 + 400 * SECOND).samples.is_empty());
     }
 

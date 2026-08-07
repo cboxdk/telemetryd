@@ -14,6 +14,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Keep in step with rust-toolchain.toml and ci.yml. Release artifacts are built by
+  # a compiler we chose, not whichever one was current on the day of the tag.
+  RUST_VERSION: "1.97.1"
 
 jobs:
   build:
@@ -40,8 +43,9 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
