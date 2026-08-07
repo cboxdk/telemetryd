@@ -50,12 +50,22 @@ pub struct Store {
     logs: RecordStore<LogSchema>,
     traces: RecordStore<SpanSchema>,
     metrics: RecordStore<MetricSchema>,
-    disk_budget: u64,
-    retention: RetentionConfig,
+    /// The two settings an operator most often needs to change *now* — usually
+    /// because a disk is filling — so they live behind a lock and can be replaced
+    /// without a restart. Read only by the reaper, which is a cold path, so the lock
+    /// costs nothing on ingest or query.
+    policy: RwLock<RetentionPolicy>,
     reaper: Mutex<ReaperReport>,
     /// Kept for the process lifetime rather than only logged at startup — a crash
     /// that cost records should stay visible in `/status`.
     wal_truncations: RwLock<Vec<Truncation>>,
+}
+
+/// The reloadable half of the storage configuration.
+#[derive(Debug, Clone)]
+struct RetentionPolicy {
+    disk_budget: u64,
+    retention: RetentionConfig,
 }
 
 impl Store {
@@ -92,8 +102,10 @@ impl Store {
             logs,
             traces,
             metrics,
-            disk_budget: config.storage.disk_budget.as_u64(),
-            retention: config.retention.clone(),
+            policy: RwLock::new(RetentionPolicy {
+                disk_budget: config.storage.disk_budget.as_u64(),
+                retention: config.retention.clone(),
+            }),
             reaper: Mutex::new(ReaperReport::default()),
             wal_truncations: RwLock::new(Vec::new()),
         })
@@ -202,7 +214,7 @@ impl Store {
             &candidates,
             now_nanos(),
             &self.retention_windows(),
-            self.disk_budget,
+            self.disk_budget(),
             non_segment_bytes,
         );
 
@@ -236,18 +248,18 @@ impl Store {
             // budget and the retention window are in conflict and one of them is wrong.
             tracing::warn!(
                 segments = report.deleted_by_budget,
-                budget_bytes = self.disk_budget,
+                budget_bytes = self.disk_budget(),
                 "deleted segments that were still inside their retention window to \
                  stay under storage.disk_budget — raise the budget or shorten retention"
             );
         }
 
         let after = self.data_dir.usage()?.total();
-        report.still_over_budget = after > self.disk_budget;
+        report.still_over_budget = after > self.disk_budget();
         if report.still_over_budget {
             tracing::error!(
                 used_bytes = after,
-                budget_bytes = self.disk_budget,
+                budget_bytes = self.disk_budget(),
                 "still over the disk budget after deleting everything eligible"
             );
         }
@@ -271,12 +283,72 @@ impl Store {
     }
 
     fn retention_windows(&self) -> BTreeMap<Signal, Duration> {
+        let policy = lock_read(&self.policy);
         BTreeMap::from([
-            (Signal::Logs, self.retention.logs.get()),
-            (Signal::Traces, self.retention.traces.get()),
-            (Signal::Events, self.retention.events.get()),
-            (Signal::Metrics, self.retention.metrics.get()),
+            (Signal::Logs, policy.retention.logs.get()),
+            (Signal::Traces, policy.retention.traces.get()),
+            (Signal::Events, policy.retention.events.get()),
+            (Signal::Metrics, policy.retention.metrics.get()),
         ])
+    }
+
+    /// Replace the retention windows and disk budget without restarting.
+    ///
+    /// Returns a description of what changed, for the operator to see in the log. An
+    /// empty result means the reloaded configuration asked for nothing new, which is
+    /// worth saying out loud — "reloaded" and "changed something" are different facts.
+    pub fn apply_retention_policy(&self, config: &Config) -> Vec<String> {
+        let mut policy = lock_write(&self.policy);
+        let mut changes = Vec::new();
+
+        let budget = config.storage.disk_budget.as_u64();
+        if budget != policy.disk_budget {
+            changes.push(format!(
+                "storage.disk_budget {} -> {}",
+                bytesize::ByteSize::b(policy.disk_budget),
+                bytesize::ByteSize::b(budget)
+            ));
+            policy.disk_budget = budget;
+        }
+
+        for (name, old, new) in [
+            (
+                "logs",
+                policy.retention.logs.get(),
+                config.retention.logs.get(),
+            ),
+            (
+                "traces",
+                policy.retention.traces.get(),
+                config.retention.traces.get(),
+            ),
+            (
+                "metrics",
+                policy.retention.metrics.get(),
+                config.retention.metrics.get(),
+            ),
+            (
+                "events",
+                policy.retention.events.get(),
+                config.retention.events.get(),
+            ),
+        ] {
+            if old != new {
+                changes.push(format!(
+                    "retention.{name} {}s -> {}s",
+                    old.as_secs(),
+                    new.as_secs()
+                ));
+            }
+        }
+        policy.retention = config.retention.clone();
+
+        changes
+    }
+
+    #[must_use]
+    pub fn disk_budget(&self) -> u64 {
+        lock_read(&self.policy).disk_budget
     }
 
     pub fn record_wal_truncation(&self, truncation: Truncation) {
@@ -290,17 +362,17 @@ impl Store {
 
         Ok(StoreStatus {
             data_dir: self.data_dir.root().display().to_string(),
-            disk_budget_bytes: self.disk_budget,
+            disk_budget_bytes: self.disk_budget(),
             disk_used_bytes: used,
             // Reported, not clamped: a ratio above 1.0 is exactly the signal an
             // operator needs to see, and hiding it would defeat the point.
             #[allow(clippy::cast_precision_loss)]
-            disk_used_ratio: if self.disk_budget == 0 {
+            disk_used_ratio: if self.disk_budget() == 0 {
                 0.0
             } else {
-                used as f64 / self.disk_budget as f64
+                used as f64 / self.disk_budget() as f64
             },
-            over_budget: used > self.disk_budget,
+            over_budget: used > self.disk_budget(),
             usage,
             logs: self.logs.status(),
             traces: self.traces.status(),

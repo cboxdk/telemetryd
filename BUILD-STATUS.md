@@ -32,7 +32,8 @@ unsupported construct reports itself by name. Live tail over WebSocket. Label an
 queries answered from metadata with no file I/O.
 
 **Operations.** `/healthz`, `/status`, `/metrics`. `telemetryd validate` prints every
-resolved value with its origin. `telemetryd service install` writes a hardened unit.
+resolved value with its origin. `SIGHUP` reloads retention, the disk budget and the log
+level; anything else that changed in the file is refused by name rather than ignored. `telemetryd service install` writes a hardened unit.
 
 **Packaging.** Four cross-compiled targets, install script with checksum verification
 (and signature verification, once a signed release exists), Homebrew formula, `.deb`, deterministic CycloneDX SBOM with a
@@ -128,9 +129,6 @@ opt-in via `storage.query_parallelism` and worth about 7% on an unbounded scan; 
 not worth three cores by default on a box that is also ingesting. Limited queries never
 use it at all — their speed comes from a cutoff that tightens as it goes, which is a
 sequential dependency, and splitting it measured 60% slower.
-
-**No config reload.** Restart to apply. Startup is fast and the WAL is durable, so
-SIGHUP reload would be ongoing tax on every future option for little gain (ADR-003).
 
 **`telemetryd bench` is not built.** `cargo bench -p telemetryd-store` covers the same
 ground for now; the hidden subcommand exits with a message saying so rather than

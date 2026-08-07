@@ -76,7 +76,32 @@ enforced at load time (not at first use):
 
 ## Reloading
 
-**Not supported in v1.** Restart to apply. A single-binary, fast-starting process with
-a durable WAL makes SIGHUP reload a feature with a poor cost/benefit ratio — every
-config field would need to be either reload-safe or explicitly not, which is ongoing
-tax on every future option. Revisit if operators ask.
+**Superseded — `SIGHUP` reloads a deliberately narrow set.** This section originally
+declined reload, arguing that a fast-starting process with a durable log makes
+restarting cheap. That holds for most settings and fails for the ones people need to
+change in a hurry: a disk filling at three in the morning is fixed by shortening
+retention, and restarting the observability backend during an incident throws away the
+live tail of the incident you were watching.
+
+Reloadable:
+
+- `retention.*` — the window per signal
+- `storage.disk_budget` — the ceiling the reaper enforces
+- `log.level` — turning up logging should not require restarting the process whose
+  behaviour you are trying to observe
+
+**Everything else is refused by name, in a log line, naming both values.** That is the
+part that makes this safe. The original objection — that every field would have to be
+classified as reload-safe or not — was correct, and it is answered by classifying them
+explicitly rather than by declining the feature: an unlisted field is refused, so
+adding one forces a decision instead of defaulting to silence.
+
+A reload that quietly ignored half the file would be worse than no reload, because the
+operator would believe a setting had taken effect and go looking for the problem
+somewhere else.
+
+A malformed or invalid file leaves the running configuration untouched and logs the
+error. The worst outcome of a `SIGHUP` is a log line saying nothing changed.
+
+`SIGHUP` is Unix only. Windows has no equivalent and inventing one — a control socket,
+a file watcher — is a larger surface than the feature is worth for a Linux service.

@@ -12,6 +12,7 @@
 
 mod commands;
 mod logging;
+mod reload;
 
 /// telemetryd does not use the platform allocator.
 ///

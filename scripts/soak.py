@@ -342,6 +342,7 @@ def main() -> int:
         shutil.rmtree(data_dir, ignore_errors=True)
 
     check_disk_budget(binary)
+    check_reload(binary)
 
     print("\n" + "=" * 52)
     if failures:
@@ -404,6 +405,69 @@ def check_disk_budget(binary: str) -> None:
             start=0, end=9_223_372_036_854_775_807,
         )
         check("queries still answer after reaping", status == 200 and log_lines(body) > 0)
+    finally:
+        stop(proc)
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def check_reload(binary: str) -> None:
+    """SIGHUP must change the running configuration, and refuse what it cannot."""
+    if os.name != "posix":
+        return
+    print("\n=== configuration reload ===")
+    data_dir = tempfile.mkdtemp(prefix="telemetryd-reload-")
+    config_path = os.path.join(data_dir, "telemetryd.toml")
+
+    def write_config(budget: str, extra: str = "") -> None:
+        with open(config_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                f'[server]\nlisten = "127.0.0.1:{PORT}"\n'
+                f'[storage]\ndata_dir = "{data_dir}/data"\ndisk_budget = "{budget}"\n{extra}'
+            )
+
+    write_config("10GiB")
+    proc = subprocess.Popen(
+        [binary, "serve", "--config", config_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        for _ in range(240):
+            try:
+                if request("/healthz")[0] == 200:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.25)
+
+        _, before = request("/status")
+        write_config("2GiB", 'max_segment_bytes = "64MiB"\n')
+        proc.send_signal(signal.SIGHUP)
+
+        # The reload is asynchronous; poll rather than sleeping a guessed interval.
+        applied = False
+        for _ in range(80):
+            time.sleep(0.25)
+            _, after = request("/status")
+            if isinstance(after, dict) and after["storage"]["disk_budget_bytes"] == 2 * 1024**3:
+                applied = True
+                break
+        check("SIGHUP applies the new disk budget", applied,
+              f"{before['storage']['disk_budget_bytes']} -> {after['storage']['disk_budget_bytes']}"
+              if isinstance(after, dict) else "no status")
+
+        # max_segment_bytes cannot change under a running store; the server must keep
+        # serving rather than exiting or reopening anything.
+        check("the server survives an unreloadable change", request("/healthz")[0] == 200)
+
+        # A broken file must leave the running configuration alone.
+        with open(config_path, "w", encoding="utf-8") as handle:
+            handle.write("this is not valid toml {{{")
+        proc.send_signal(signal.SIGHUP)
+        time.sleep(1)
+        status, after = request("/status")
+        check("a malformed file does not disturb the running server",
+              status == 200 and after["storage"]["disk_budget_bytes"] == 2 * 1024**3)
     finally:
         stop(proc)
         shutil.rmtree(data_dir, ignore_errors=True)
