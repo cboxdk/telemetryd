@@ -167,6 +167,20 @@ fn unit_for_this_platform() -> anyhow::Result<String> {
     })
 }
 
+/// Where the `.deb` installs the binary, and therefore the `ExecStart` in the unit
+/// that ships inside it.
+///
+/// The packaged unit is a checked-in file rather than something the release job
+/// produces by running the binary it just built. That approach shipped a broken
+/// package: `service print` embeds `current_exe()`, so the unit generated on a build
+/// runner pointed at the runner's `target/` directory — a path that does not exist on
+/// the machine installing the `.deb`. It also only worked at all for the architecture
+/// that happened to match the runner, leaving the other one to a different code path.
+/// Test-only: the packaging path is a fact about the `.deb`, and the only thing that
+/// needs it at compile time is the check that the shipped unit still matches.
+#[cfg(test)]
+const DEB_EXEC_PATH: &str = "/usr/bin/telemetryd";
+
 /// A deliberately locked-down unit. telemetryd needs one directory and one socket, so
 /// everything else is denied — a telemetry backend is an attractive target precisely
 /// because everything sends it data.
@@ -261,6 +275,21 @@ fn manual_steps() -> &'static str {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// The `.deb` ships `packaging/telemetryd.service` verbatim. Nothing at release
+    /// time regenerates it, so without this test the packaged unit could drift from
+    /// the hardening the code applies and nobody would find out until a deployed
+    /// service was running with fewer restrictions than we document.
+    #[test]
+    fn the_packaged_unit_matches_what_the_code_generates() {
+        let packaged = include_str!("../../../../packaging/telemetryd.service");
+        assert_eq!(
+            packaged,
+            systemd_unit(DEB_EXEC_PATH),
+            "packaging/telemetryd.service is stale — regenerate it with \
+             `telemetryd service print` and set ExecStart to {DEB_EXEC_PATH}"
+        );
+    }
 
     #[test]
     fn the_generated_unit_is_for_this_platform_and_is_hardened() {

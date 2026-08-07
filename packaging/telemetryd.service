@@ -1,0 +1,39 @@
+[Unit]
+Description=telemetryd — observability backend
+Documentation=https://github.com/cboxdk/telemetryd
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/telemetryd serve --config /etc/telemetryd/telemetryd.toml
+Restart=on-failure
+RestartSec=5s
+
+User=telemetryd
+Group=telemetryd
+StateDirectory=telemetryd
+Environment=TELEMETRYD_STORAGE_DATA_DIR=/var/lib/telemetryd
+
+# SIGTERM triggers a graceful drain, then a final WAL flush. Give it room to
+# finish: killing it early costs the unsynced window.
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
