@@ -426,3 +426,74 @@ async fn auth_failures_are_counted() {
     assert!(line.contains(r#"surface="query""#), "{line}");
     assert!(line.ends_with(" 2"), "{line}");
 }
+
+/// `server.max_body_bytes` has to be the limit that applies.
+///
+/// axum's extractors carry their own 2 MB default, and it silently won: a 16 MiB
+/// setting rejected anything past 2 MiB, and raising the setting changed nothing. An
+/// app batching its logs would hit 413 and the operator would tune a value with no
+/// effect — the same class of bug as a memory bound that does not bound memory.
+#[tokio::test]
+async fn the_configured_body_limit_is_the_one_that_applies() {
+    let harness = Harness::new(|config| {
+        config.server.max_body_bytes = bytesize::ByteSize::mib(8);
+    });
+
+    // Comfortably past axum's 2 MB default, comfortably inside the configured 8 MiB.
+    let records: Vec<Value> = (0..30_000)
+        .map(|i| {
+            serde_json::json!({
+                "timeUnixNano": (1_760_000_000_000_000_000u64 + i).to_string(),
+                "severityText": "INFO",
+                "body": {"stringValue": "x".repeat(80)},
+                "attributes": [],
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "resourceLogs": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "checkout"}}
+            ]},
+            "scopeLogs": [{"logRecords": records}],
+        }]
+    })
+    .to_string();
+
+    assert!(
+        payload.len() > 4 * 1024 * 1024,
+        "the payload has to exceed axum's default to test anything, got {} bytes",
+        payload.len()
+    );
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/logs")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(payload))
+        .unwrap();
+    let (status, _, body) = harness.request(request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body: {}",
+        &body[..body.len().min(200)]
+    );
+}
+
+/// And a body past the configured limit is still refused, with a status a client can act on.
+#[tokio::test]
+async fn a_body_past_the_configured_limit_is_refused() {
+    let harness = Harness::new(|config| {
+        config.server.max_body_bytes = bytesize::ByteSize::mib(1);
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/logs")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("x".repeat(2 * 1024 * 1024)))
+        .unwrap();
+    let (status, _, _) = harness.request(request).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}

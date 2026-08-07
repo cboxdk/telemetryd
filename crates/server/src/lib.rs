@@ -110,6 +110,11 @@ pub fn router(state: AppState) -> Router {
             request_timeout,
         ))
         .layer(RequestBodyLimitLayer::new(max_body))
+        // axum's extractors carry their own 2 MB default, which silently won whatever
+        // `server.max_body_bytes` said: a 16 MiB setting rejected anything past 2 MiB,
+        // and raising it changed nothing. Disable it so the configured value is the
+        // only limit, enforced by the layer above.
+        .layer(axum::extract::DefaultBodyLimit::disable())
         // A panic in one handler must not take the process down and lose the WAL's
         // unsynced window along with it.
         .layer(CatchPanicLayer::new())
