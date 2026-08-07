@@ -16,6 +16,7 @@ pub mod schema;
 pub mod segment;
 pub mod spans;
 pub mod topk;
+pub mod trigram;
 pub mod wal;
 
 use std::collections::BTreeMap;

@@ -121,6 +121,7 @@ pub fn run(args: &BenchArgs) -> anyhow::Result<()> {
                         order: Order::Descending,
                         exact_key: None,
                         columns: None,
+                        required_text: None,
                     },
                     &matchers,
                     &|_| true,

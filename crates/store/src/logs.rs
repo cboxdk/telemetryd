@@ -197,6 +197,10 @@ impl RecordSchema for LogSchema {
     fn size_estimate(record: &Self::Record) -> usize {
         record.size_estimate()
     }
+
+    fn searchable_text(record: &Self::Record) -> Option<&str> {
+        Some(&record.body)
+    }
 }
 
 /// The app a record belongs to, for retention and quota accounting.

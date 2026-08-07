@@ -27,6 +27,7 @@ use telemetryd_core::{Error, LabelMatcher, Labels, Result, Signal};
 
 use crate::bloom::Bloom;
 use crate::schema::RecordSchema;
+use crate::trigram::TrigramIndex;
 
 /// Bumped when a sealed segment written by an older build can no longer be read.
 pub const SEGMENT_FORMAT_VERSION: u32 = 2;
@@ -253,6 +254,8 @@ pub struct Segment {
     pub dir: PathBuf,
     /// Exact-match filter over the schema's key column, when it declares one.
     pub(crate) bloom: Option<Bloom>,
+    /// Trigram index over the searchable text, when the signal has any.
+    pub(crate) text: Option<TrigramIndex>,
     /// Set once a read of this segment has failed.
     ///
     /// A damaged Parquet file used to abort the whole query, so one bad sector denied
@@ -327,6 +330,7 @@ impl Segment {
 
         Ok(Some(Self {
             bloom: Bloom::read(dir),
+            text: TrigramIndex::read(dir),
             manifest,
             dir: dir.to_path_buf(),
             unreadable: Arc::new(AtomicBool::new(false)),
@@ -446,6 +450,18 @@ impl Segment {
     ///
     /// False positives are possible, false negatives are not — so a `false` here is
     /// always safe to act on.
+    /// Whether any record here might contain `pattern` as a substring.
+    ///
+    /// `false` is a hard no and the segment can be skipped unread. Without an index —
+    /// an older segment, a signal with no text, a damaged file — the answer is `true`,
+    /// which is exactly the behaviour that existed before the index did.
+    #[must_use]
+    pub fn may_contain_text(&self, pattern: &str) -> bool {
+        self.text
+            .as_ref()
+            .is_none_or(|index| index.may_contain(pattern))
+    }
+
     pub fn may_contain_key(&self, key: &str) -> bool {
         self.bloom
             .as_ref()
@@ -534,6 +550,30 @@ pub struct SealOptions<'a> {
 ///
 /// Staged in `tmp/` and moved with `rename(2)`, so a reader never sees a half-written
 /// segment and a crash mid-seal leaves only a `tmp/` directory the janitor removes.
+/// The label index and the two filters, built in one pass over the records.
+///
+/// A schema opts into each by returning `Some` from `exact_key` or `searchable_text`;
+/// a signal that returns `None` pays nothing and gets no sidecar file.
+fn build_sidecars<S: RecordSchema>(
+    records: &[S::Record],
+) -> (LabelIndexBuilder, Option<Bloom>, Option<TrigramIndex>) {
+    let mut index = LabelIndexBuilder::default();
+    let mut bloom = S::exact_key(&records[0]).map(|_| Bloom::with_capacity(records.len()));
+    let mut text =
+        S::searchable_text(&records[0]).map(|_| TrigramIndex::with_capacity(records.len()));
+
+    for record in records {
+        index.observe(S::index_labels(record));
+        if let (Some(text), Some(body)) = (text.as_mut(), S::searchable_text(record)) {
+            text.insert(body);
+        }
+        if let (Some(bloom), Some(key)) = (bloom.as_mut(), S::exact_key(record)) {
+            bloom.insert(key);
+        }
+    }
+    (index, bloom, text)
+}
+
 pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) -> Result<Segment> {
     if records.is_empty() {
         return Err(Error::Config(
@@ -563,15 +603,7 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
         &sorted_storage[..]
     };
 
-    let mut index = LabelIndexBuilder::default();
-    let mut bloom = S::exact_key(&records[0]).map(|_| Bloom::with_capacity(records.len()));
-
-    for record in records {
-        index.observe(S::index_labels(record));
-        if let (Some(bloom), Some(key)) = (bloom.as_mut(), S::exact_key(record)) {
-            bloom.insert(key);
-        }
-    }
+    let (index, bloom, text) = build_sidecars::<S>(records);
     // Sorted, so the bounds are simply the endpoints.
     let min_time = S::timestamp(&records[0]);
     let max_time = S::timestamp(&records[records.len() - 1]);
@@ -608,6 +640,9 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
     write_manifest(&staging.join(MANIFEST_FILE), &manifest)?;
     if let Some(bloom) = &bloom {
         bloom.write(&staging)?;
+    }
+    if let Some(text) = &text {
+        text.write(&staging)?;
     }
 
     // Sync the staging directory so the rename cannot be reordered ahead of the file
@@ -647,6 +682,7 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
         manifest,
         dir: final_dir,
         bloom,
+        text,
         unreadable: Arc::new(AtomicBool::new(false)),
         metadata: Arc::new(OnceLock::new()),
     })

@@ -423,6 +423,12 @@ pub fn query_range(
     if let Some(prefilter) = prefilter.as_ref() {
         scan = scan.columns(prefilter);
     }
+    // Lets a segment be skipped without reading it at all, rather than read and
+    // filtered. This is what stops a search for a term that appears nowhere from
+    // costing the whole retention window.
+    if let Some(required) = request.query.required_substring() {
+        scan = scan.required_text(required);
+    }
 
     let records = store.scan(scan, &request.query.matchers, &filter)?;
 

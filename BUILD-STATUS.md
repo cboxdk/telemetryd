@@ -31,7 +31,8 @@ limit, and `telemetryd_series_rejected_total`. The count is rebuilt after each
 retention pass, so expired data gives its budget back.
 
 **Storage.** Write-ahead log with crash recovery, immutable Parquet segments, per-segment
-stream dictionary, Bloom filters for exact-key lookup, retention by age and by a global
+stream dictionary, Bloom filters for exact-key lookup, trigram indexes for substring
+search, retention by age and by a global
 disk budget. One engine serves all three signals.
 
 **Damage is survivable.** A truncated, zero-length, garbled or deleted segment file
@@ -103,9 +104,9 @@ All numbers are the musl release build — the one that ships — driven over HT
 
 | | |
 |---|---|
-| Ingest, no queries running | 448,000 records/sec |
-| Ingest, one concurrent reader | 421,000 records/sec (4% lower) |
-| Query p50 / p95 under that load | 12 ms / 49 ms |
+| Ingest, no queries running | 389,000 records/sec |
+| Ingest, one concurrent reader | 357,000 records/sec (8% lower) |
+| Query p50 / p95 under that load | 8 ms / 31 ms |
 | `kill -9` durability | 5,000 of 5,000 acknowledged records recovered |
 | Resident memory | ~`80 MB + 1.3 × storage.max_segment_bytes`, stable across seals |
 
@@ -129,6 +130,10 @@ writers no request exceeded three times the median, because the Parquet write ha
 outside the buffer lock. Smaller `max_segment_bytes` trades throughput for smoother
 latency: at 8 MiB every request seals.
 
+Ingest gave up 13% when the trigram index landed (ADR-010): it is paid on every write
+whether or not anyone searches, and it buys a substring query going from 98 seconds to
+0.2 over a full store.
+
 Three things had to be true for the throughput numbers, and none of them were a month
 ago: the allocator (ADR-009), the buffer no longer being scanned under the append lock,
 and `max_segment_bytes` meaning what it says. Each is guarded by a test that was checked
@@ -146,30 +151,13 @@ instead.
 interning does not obviously apply. Only paid for rows that survive filtering, so it no
 longer dominates a query (ADR-006).
 
-**No text index — and ADR-001 D1's trigger has now fired.** The condition it set was
-"a single-term query over a full 10 GiB dataset exceeding one second". Measured on the
-musl build over 63 million records (405 MB, 877 segments):
-
-| Line filter over the whole store | |
-|---|---|
-| a term that matches often | 5 ms |
-| a term matching a handful | 4.4 s |
-| **a term matching nothing** | **3.9 s** |
-| the same miss over the newest 10% | 397 ms |
-| the same miss over the newest 1% | 45 ms |
-
-That is roughly 10 seconds per gigabyte scanned, so a full 10 GiB store extrapolates to
-about 98 seconds — a hundred times the trigger.
-
-The cost is linear in the time range scanned, not in the store, so bounding the range
-is an effective mitigation and it is what a UI does by default. The unbounded case —
-"search all of the last seven days for a term that does not appear" — is the one that
-is genuinely slow.
-
-Fixing it properly means a substring-capable index (trigrams, not tokens: `|=` is a
-substring match, so a token index would give wrong answers), built at seal time. That
-trades ingest throughput for query latency and changes the segment format, so it wants
-its own decision rather than being slipped in.
+**Substring search prunes, but not equally well for every pattern.** A per-segment
+trigram index (ADR-010) skips segments that cannot contain a `|=` filter's text. A term
+present nowhere went from 3.9 s to 6 ms over 405 MB — 98 s to 0.2 s extrapolated to a
+full 10 GiB store. A pattern built entirely from *common* trigrams still prunes poorly:
+searching one specific order number costs about 3 s over the same store, because its
+digit trigrams appear in most segments. Bounding the time range remains the answer
+there.
 
 **Queries are single-threaded by default** (ADR-008, ADR-009). Parallel scanning is
 opt-in via `storage.query_parallelism` and worth about 7% on an unbounded scan; it is

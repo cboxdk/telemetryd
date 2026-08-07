@@ -78,6 +78,7 @@ fn everything() -> Scan<'static> {
         order: Order::Ascending,
         exact_key: None,
         columns: None,
+        required_text: None,
     }
 }
 

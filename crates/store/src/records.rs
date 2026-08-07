@@ -282,6 +282,12 @@ pub struct Scan<'a> {
     /// what turns a line filter from "decode every row, then test" into "test the
     /// Arrow string buffer, then decode the few that matched".
     pub columns: Option<crate::schema::ColumnFilter<'a>>,
+    /// A substring every matching record must contain.
+    ///
+    /// Only set from a filter that *requires* the text — a positive `|=`, never a
+    /// negated one — because it is used to skip segments unread via the trigram index.
+    /// A wrong value here silently drops results, so the rule is: if in doubt, `None`.
+    pub required_text: Option<&'a str>,
 }
 
 impl std::fmt::Debug for Scan<'_> {
@@ -308,7 +314,15 @@ impl<'a> Scan<'a> {
             order: Order::Ascending,
             exact_key: None,
             columns: None,
+            required_text: None,
         }
+    }
+
+    /// Declare a substring every match must contain, for trigram pruning.
+    #[must_use]
+    pub fn required_text(mut self, text: &'a str) -> Self {
+        self.required_text = Some(text);
+        self
     }
 
     #[must_use]
@@ -600,6 +614,7 @@ impl<S: RecordSchema> RecordStore<S> {
                 order: Order::Ascending,
                 exact_key: None,
                 columns: None,
+                required_text: None,
             },
             matchers,
             extra,
@@ -800,6 +815,10 @@ impl<S: RecordSchema> RecordStore<S> {
             || request
                 .exact_key
                 .is_some_and(|key| !segment.may_contain_key(key))
+            // As can a line filter whose trigrams are not all present.
+            || request
+                .required_text
+                .is_some_and(|text| !segment.may_contain_text(text))
             || collector.can_skip_range(min_nanos, max_nanos);
 
         if prunable {

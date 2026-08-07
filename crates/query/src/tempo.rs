@@ -396,6 +396,7 @@ pub fn trace(store: &RecordStore<SpanSchema>, trace_id: &str) -> Result<TraceRes
             order: telemetryd_store::Order::Ascending,
             exact_key: Some(&wanted),
             columns: None,
+            required_text: None,
         },
         &[],
         &|span: &SpanRecord| span.trace_id == wanted,

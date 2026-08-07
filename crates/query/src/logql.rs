@@ -68,6 +68,28 @@ pub enum LineOp {
     NotMatches,
 }
 
+impl LogQuery {
+    /// A substring that every matching line must contain, if the pipeline states one.
+    ///
+    /// Used to skip whole segments via their trigram index, so being wrong here drops
+    /// results silently. Only a positive `|=` qualifies:
+    ///
+    /// - `!=` and `!~` are satisfied by lines that lack the pattern, so they say
+    ///   nothing about what a segment must hold
+    /// - `|~` is a regular expression; its literal text is not necessarily a substring
+    ///   of the lines it matches
+    ///
+    /// The first qualifying filter is enough — one necessary condition prunes as
+    /// soundly as several, and stopping there keeps the rule easy to check.
+    #[must_use]
+    pub fn required_substring(&self) -> Option<&str> {
+        self.stages.iter().find_map(|stage| match stage {
+            Stage::Line(filter) if filter.op == LineOp::Contains => Some(filter.pattern.as_str()),
+            _ => None,
+        })
+    }
+}
+
 impl LineFilter {
     fn new(op: LineOp, pattern: String) -> Result<Self> {
         let regex = match op {

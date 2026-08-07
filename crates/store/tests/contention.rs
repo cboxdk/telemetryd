@@ -81,6 +81,7 @@ fn newest_hundred() -> Scan<'static> {
         order: Order::Descending,
         exact_key: None,
         columns: None,
+        required_text: None,
     }
 }
 
@@ -205,6 +206,7 @@ fn a_query_sees_records_appended_a_moment_ago() {
                     order: Order::Ascending,
                     exact_key: None,
                     columns: None,
+                    required_text: None,
                 },
                 &matchers,
                 &|_| true,

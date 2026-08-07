@@ -148,6 +148,7 @@ fn a_limited_query_does_not_open_every_segment() {
                 order: Order::Descending,
                 exact_key: None,
                 columns: None,
+                required_text: None,
             },
             &[],
             &|_| true,
@@ -178,6 +179,7 @@ fn a_limited_query_still_returns_the_correct_records() {
                 order: Order::Descending,
                 exact_key: None,
                 columns: None,
+                required_text: None,
             },
             &[],
             &|_| true,
@@ -211,6 +213,7 @@ fn an_ascending_limited_query_takes_the_oldest_and_prunes_from_the_other_end() {
                 order: Order::Ascending,
                 exact_key: None,
                 columns: None,
+                required_text: None,
             },
             &[],
             &|_| true,
@@ -325,6 +328,7 @@ fn a_trace_lookup_does_not_read_the_whole_retention_window() {
                 order: Order::Ascending,
                 exact_key: Some("4bf92f3577b34da6a3ce929d0e0e4736"),
                 columns: None,
+                required_text: None,
             },
             &[],
             &|s: &SpanRecord| s.trace_id == "4bf92f3577b34da6a3ce929d0e0e4736",
@@ -367,6 +371,7 @@ fn the_bloom_filter_never_hides_a_trace_that_exists() {
                     order: Order::Ascending,
                     exact_key: Some(id),
                     columns: None,
+                    required_text: None,
                 },
                 &[],
                 &|s: &SpanRecord| &s.trace_id == id,
@@ -399,6 +404,7 @@ fn a_limited_query_over_a_large_store_stays_bounded() {
                 order: Order::Descending,
                 exact_key: None,
                 columns: None,
+                required_text: None,
             },
             &[],
             &|_| true,
@@ -468,6 +474,7 @@ fn parallel_scanning_returns_exactly_the_sequential_answer() {
             order,
             exact_key: None,
             columns: None,
+            required_text: None,
         };
         let expected = sequential.scan(request(), &matchers, &|_| true).unwrap();
         let actual = parallel.scan(request(), &matchers, &|_| true).unwrap();
@@ -519,6 +526,7 @@ fn a_parallel_query_is_deterministic_across_runs() {
         order: Order::Descending,
         exact_key: None,
         columns: None,
+        required_text: None,
     };
 
     let first: Vec<_> = store
@@ -587,6 +595,7 @@ fn a_stream_is_pruned_on_its_own_time_range_not_the_segments() {
                     order: Order::Descending,
                     exact_key: None,
                     columns: None,
+                    required_text: None,
                 },
                 &[LabelMatcher::equal("app", app)],
                 &|_| true,
@@ -609,5 +618,148 @@ fn a_stream_is_pruned_on_its_own_time_range_not_the_segments() {
     assert!(
         oldest < segments as u64,
         "opening {oldest} of {segments} segments means nothing was pruned"
+    );
+}
+
+/// The trigram index may change how much is read. It must never change what is found.
+///
+/// A false positive costs one wasted segment read. A false negative silently drops
+/// matching lines, and nothing downstream would notice — so this compares an indexed
+/// scan against the same scan with pruning switched off, line for line, across
+/// patterns chosen to probe the awkward cases.
+#[test]
+fn trigram_pruning_never_changes_the_answer() {
+    let harness = Harness::new();
+    {
+        let store = harness.logs();
+        for segment in 0..8u64 {
+            let records: Vec<LogRecord> = (0..2_000)
+                .map(|i| {
+                    let n = segment * 2_000 + i;
+                    log(
+                        BASE + n * 1_000,
+                        "checkout",
+                        // Deliberately overlapping vocabulary, so most patterns appear
+                        // in some segments and not others.
+                        &match n % 4 {
+                            0 => format!("payment attempt {n} for order {} took 42ms", n + 7),
+                            1 => format!("MyTimeoutError while charging card {n}"),
+                            2 => format!("connection refused talking to stripe, retry {n}"),
+                            _ => format!("order {n} processed in 42ms via gateway"),
+                        },
+                    )
+                })
+                .collect();
+            store.append(&records).unwrap();
+            store.seal_now().unwrap();
+        }
+    }
+
+    let store = harness.logs();
+    let matchers = [LabelMatcher::equal("app", "checkout")];
+
+    let patterns = [
+        "payment attempt",
+        // A substring that is not a token — the case a token index would answer wrongly.
+        "TimeoutError",
+        "refused talking",
+        "42ms",
+        "order 15",
+        // Present nowhere: the shape that used to read every segment.
+        "zzzzz-no-such-term",
+        "qqqq",
+        // Too short to have a trigram: must not prune anything.
+        "ms",
+        "4",
+    ];
+
+    for pattern in patterns {
+        let scan = |with_index: bool| {
+            let mut request = Scan {
+                start_nanos: 0,
+                end_nanos: u64::MAX,
+                limit: 0,
+                order: Order::Ascending,
+                exact_key: None,
+                columns: None,
+                required_text: None,
+            };
+            if with_index {
+                request.required_text = Some(pattern);
+            }
+            store
+                .scan(request, &matchers, &|record: &LogRecord| {
+                    record.body.contains(pattern)
+                })
+                .unwrap()
+        };
+
+        let unindexed = scan(false);
+        let indexed = scan(true);
+
+        assert_eq!(
+            unindexed.len(),
+            indexed.len(),
+            "{pattern:?}: pruning changed the number of results ({} without, {} with)",
+            unindexed.len(),
+            indexed.len()
+        );
+        for (want, got) in unindexed.iter().zip(&indexed) {
+            assert_eq!(
+                (want.timestamp_nanos, &want.body),
+                (got.timestamp_nanos, &got.body),
+                "{pattern:?}: pruning changed which records came back"
+            );
+        }
+    }
+}
+
+/// And it has to actually prune, or it is only overhead.
+#[test]
+fn a_pattern_that_appears_nowhere_reads_no_segments() {
+    let harness = Harness::new();
+    {
+        let store = harness.logs();
+        for segment in 0..8u64 {
+            let records: Vec<LogRecord> = (0..2_000)
+                .map(|i| {
+                    let n = segment * 2_000 + i;
+                    log(
+                        BASE + n * 1_000,
+                        "checkout",
+                        &format!("order {n} processed in 42ms"),
+                    )
+                })
+                .collect();
+            store.append(&records).unwrap();
+            store.seal_now().unwrap();
+        }
+    }
+
+    let store = harness.logs();
+    let segments = store.segments().len() as u64;
+    let before = store.status().segments_scanned;
+
+    let found = store
+        .scan(
+            Scan {
+                start_nanos: 0,
+                end_nanos: u64::MAX,
+                limit: 0,
+                order: Order::Ascending,
+                exact_key: None,
+                columns: None,
+                required_text: Some("zzzzz-no-such-term"),
+            },
+            &[LabelMatcher::equal("app", "checkout")],
+            &|record: &LogRecord| record.body.contains("zzzzz-no-such-term"),
+        )
+        .unwrap();
+
+    assert!(found.is_empty());
+    let scanned = store.status().segments_scanned - before;
+    assert!(
+        scanned == 0,
+        "a term present in no segment should read none of the {segments}, but read {scanned}"
     );
 }

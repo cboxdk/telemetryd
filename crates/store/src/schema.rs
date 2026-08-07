@@ -108,6 +108,16 @@ pub trait RecordSchema: Send + Sync + 'static {
         let _ = record;
         None
     }
+
+    /// The text a substring filter searches, if this signal has one.
+    ///
+    /// `Some` builds a per-segment trigram index over it, which is what lets
+    /// `|= "..."` skip a segment without decompressing its body column. Logs return
+    /// the message; signals with no free text return `None` and get no index.
+    fn searchable_text(record: &Self::Record) -> Option<&str> {
+        let _ = record;
+        None
+    }
 }
 
 /// Shared Arrow helpers so each schema does not reimplement them.
