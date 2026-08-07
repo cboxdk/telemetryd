@@ -1,15 +1,15 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
-  "serialNumber": "urn:uuid:a2afa5ce-bf4a-5ff6-b88b-eb55b1d29c85",
+  "serialNumber": "urn:uuid:013f8f5d-7b39-5384-ae2f-3067c850edd9",
   "version": 1,
   "metadata": {
     "component": {
       "type": "application",
-      "bom-ref": "pkg:cargo/telemetryd@0.6.0",
+      "bom-ref": "pkg:cargo/telemetryd@0.7.0",
       "name": "telemetryd",
-      "version": "0.6.0",
-      "purl": "pkg:cargo/telemetryd@0.6.0",
+      "version": "0.7.0",
+      "purl": "pkg:cargo/telemetryd@0.7.0",
       "description": "Single-binary, zero-config observability backend",
       "licenses": [
         {
@@ -2893,6 +2893,27 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/libmimalloc-sys@0.1.49",
+      "name": "libmimalloc-sys",
+      "version": "0.1.49",
+      "purl": "pkg:cargo/libmimalloc-sys@0.1.49",
+      "description": "Sys crate wrapping the mimalloc allocator",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/purpleprotocol/mimalloc_rust/tree/master/libmimalloc-sys"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/libredox@0.1.19",
       "name": "libredox",
       "version": "0.1.19",
@@ -3065,6 +3086,27 @@
         {
           "type": "vcs",
           "url": "https://github.com/BurntSushi/memchr"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/mimalloc@0.1.52",
+      "name": "mimalloc",
+      "version": "0.1.52",
+      "purl": "pkg:cargo/mimalloc@0.1.52",
+      "description": "Performance and security oriented drop-in allocator",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/purpleprotocol/mimalloc_rust"
         }
       ]
     },

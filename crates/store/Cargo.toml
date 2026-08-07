@@ -23,6 +23,7 @@ parquet.workspace = true
 postcard.workspace = true
 
 [dev-dependencies]
+mimalloc = { workspace = true }
 tempfile.workspace = true
 criterion.workspace = true
 

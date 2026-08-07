@@ -81,6 +81,28 @@ against the exact artifact being published, before anything is uploaded.
 Plus: all four release targets cross-compile, and the musl builds are asserted to be
 statically linked.
 
+## Load, measured on the target platform
+
+All numbers below are the musl release build — the one that ships — driven over HTTP
+by four writers and one concurrent reader.
+
+| | |
+|---|---|
+| Ingest, no queries running | 448,000 records/sec |
+| Ingest, one concurrent reader | 439,000 records/sec (2% lower) |
+| Query p50 / p95 under that load | 47 ms / 67 ms |
+| `kill -9` durability | 5,000 of 5,000 acknowledged records recovered |
+| Resident memory | ~`80 MB + 1.3 × storage.max_segment_bytes`, stable across seals |
+
+At the default 256 MiB buffer that is roughly 400 MB resident. Memory is a function of
+that setting and not of traffic, which is the property ADR-001 D4 promised and did not
+previously deliver.
+
+Three things had to be true for those numbers, and none of them were a month ago: the
+allocator (ADR-009), the buffer no longer being scanned under the append lock, and
+`max_segment_bytes` meaning what it says. Each is guarded by a test that was checked
+against the broken version rather than assumed to work.
+
 ## Known gaps
 
 Named rather than left to be discovered.
@@ -101,11 +123,11 @@ longer dominates a query (ADR-006).
 slot and sets the falsifiable trigger for adding tantivy: a 7-day single-term query over
 a full 10 GiB dataset exceeding one second.
 
-**Limited queries are single-threaded, deliberately** (ADR-008). Unbounded scans use
-several workers and gain about 1.27×; queries *with* a limit stay on one thread because
-parallelising them measured 60% **slower** — their speed comes from a cutoff that
-tightens as it goes, which is a sequential dependency. Eight workers are no faster than
-four, so the remaining cost is serial, not a knob set too low.
+**Queries are single-threaded by default** (ADR-008, ADR-009). Parallel scanning is
+opt-in via `storage.query_parallelism` and worth about 7% on an unbounded scan; it is
+not worth three cores by default on a box that is also ingesting. Limited queries never
+use it at all — their speed comes from a cutoff that tightens as it goes, which is a
+sequential dependency, and splitting it measured 60% slower.
 
 **No config reload.** Restart to apply. Startup is fast and the WAL is durable, so
 SIGHUP reload would be ongoing tax on every future option for little gain (ADR-003).

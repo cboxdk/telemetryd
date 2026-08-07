@@ -134,10 +134,12 @@ pub struct StorageConfig {
     pub compression: Compression,
     /// Threads a single query may use to scan sealed segments.
     ///
-    /// Deliberately not "all of them". This process is serving ingest at the same
-    /// time, and giving every core to one query is a good way to make the system
-    /// stutter under exactly the load an operator is trying to look at. `0` picks a
-    /// conservative fraction of the machine; `1` disables parallel scanning.
+    /// **Defaults to 1 — off.** It was worth 1.27x when the allocator was the
+    /// bottleneck; with mimalloc the sequential path got fast enough that four
+    /// workers buy about 7% on an unbounded scan and nothing at all on a limited one.
+    /// That is not enough to spend three extra cores by default on a machine that is
+    /// also accepting writes. Raise it if you run wide analytical queries and have
+    /// cores to spare. `0` picks a conservative fraction of the machine.
     pub query_parallelism: usize,
 }
 
@@ -166,7 +168,7 @@ impl Default for StorageConfig {
             wal_sync: WalSync::Interval,
             wal_sync_interval: Duration::from_millis(100),
             compression: Compression::Zstd,
-            query_parallelism: 0,
+            query_parallelism: 1,
         }
     }
 }

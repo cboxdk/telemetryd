@@ -17,6 +17,7 @@ name = "telemetryd"
 path = "src/main.rs"
 
 [dependencies]
+mimalloc = { workspace = true }
 telemetryd-core.workspace = true
 telemetryd-store.workspace = true
 telemetryd-server.workspace = true

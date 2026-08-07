@@ -43,13 +43,14 @@ wal_sync          = "interval"
 wal_sync_interval = "100ms"
 compression       = "zstd"           # zstd | snappy | none
 
-# Threads one query may use to scan sealed segments. 0 picks a conservative
-# fraction of the machine; 1 disables parallel scanning entirely.
+# Threads one query may use to scan sealed segments. Off by default: once the
+# allocator stopped being the bottleneck, four workers were worth about 7% on an
+# unbounded scan and nothing on a limited one. 0 picks a fraction of the machine.
 #
-# Only unbounded queries use more than one thread. A query with a limit is fast
+# Only unbounded queries ever use more than one thread. A query with a limit is fast
 # because the collector's cutoff lets it skip whole segments unopened, and workers
-# racing ahead just do work that would have been skipped — measured 60% slower.
-query_parallelism = 0
+# racing ahead just redo work that would have been skipped — measured 60% slower.
+query_parallelism = 1
 
 [retention]
 # Metrics are kept longer because they are ~100x cheaper per unit time, and

@@ -10,6 +10,11 @@
 
 use std::time::Duration;
 
+// The shipped binary sets mimalloc as its global allocator; a benchmark on the
+// platform allocator would be measuring a program we do not ship.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use telemetryd_core::config::{Compression, WalSync};
 use telemetryd_core::{LabelMatcher, Labels, LogRecord, Severity};

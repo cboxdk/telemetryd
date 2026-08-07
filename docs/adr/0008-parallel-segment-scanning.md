@@ -6,7 +6,9 @@ description: "Why only unbounded queries use more than one thread, and what the 
 
 # ADR-008: Parallel segment scanning, for unbounded queries only
 
-- **Status:** Accepted
+- **Status:** Accepted, then **largely superseded by [ADR-009](0009-allocator.md)** —
+  see "What changed" at the end. Kept because the reasoning about *why* limited
+  queries must stay sequential is still load-bearing.
 - **Date:** 2026-08-07
 - **Supersedes:** the "single-threaded per query" gap in `BUILD-STATUS.md`
 
@@ -104,6 +106,32 @@ Two tests, both in `crates/store/tests/scale.rs`:
 - `a_parallel_query_is_deterministic_across_runs` repeats one parallel query a dozen
   times and requires an identical result each time, so a race that happened to resolve
   consistently twice does not pass.
+
+## What changed
+
+Everything above was measured on macOS, and that turned out to be the wrong machine.
+
+On the musl build — the one that actually ships — parallel scanning was not a 1.27×
+gain but a **3.3× loss**: 130 ms sequential against 432 ms with four workers. musl's
+allocator serialises on one global lock, and this workload allocates constantly, so
+the extra threads spent their time queueing for `malloc`.
+
+Fixing that properly (ADR-009 — mimalloc as the global allocator) made the sequential
+path roughly twice as fast on musl, and shrank what parallelism is worth to about 7%:
+
+| unbounded scan, musl | one thread | four threads |
+|---|---|---|
+| musl allocator | 130 ms | 432 ms |
+| mimalloc | 65 ms | 61 ms |
+
+So `storage.query_parallelism` now **defaults to 1 — off**. Seven percent does not
+justify handing three extra cores to a single query on a machine that is also
+accepting writes, and the code path stays available for anyone running wide
+analytical queries with cores to spare.
+
+The lesson worth keeping: the parallelism was partly compensating for the allocator.
+Measuring on the target platform first would have found the real bottleneck and made
+most of this unnecessary.
 
 ## Revisit if
 

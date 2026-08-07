@@ -20,6 +20,7 @@ than quietly corrected, because the reasoning is the useful part.
 | [ADR-006](0006-query-performance-architecture.md) | Query performance, measured |
 | [ADR-007](0007-metrics-reuse-the-record-store.md) | Why metrics reuse the record store |
 | [ADR-008](0008-parallel-segment-scanning.md) | Parallel scanning, and why only for unbounded queries |
+| [ADR-009](0009-allocator.md) | Why the binary ships mimalloc, and the musl numbers that forced it |
 
 ## Two worth reading first
 

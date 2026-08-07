@@ -13,6 +13,30 @@
 mod commands;
 mod logging;
 
+/// telemetryd does not use the platform allocator.
+///
+/// This is not a micro-optimisation, it is a correctness-of-shipping decision. The
+/// primary target is `*-unknown-linux-musl`, and musl's allocator serialises on a
+/// single global lock. Our workload is allocation-heavy by nature — every record is a
+/// handful of small `String`s — so under concurrency that lock, not the disk and not
+/// our own mutexes, becomes the limit. Measured on musl, over the same 100k-record
+/// store:
+///
+/// | | musl allocator | mimalloc |
+/// |---|---|---|
+/// | unbounded scan, one thread | 130 ms | 65 ms |
+/// | unbounded scan, four threads | 432 ms | 61 ms |
+///
+/// Four threads being **3.3x slower than one** is the tell: that is not our code
+/// scaling badly, it is threads queueing for `malloc`. With mimalloc the same scan
+/// gets faster with more threads, as it should.
+///
+/// It helps on macOS too (72 ms to 57 ms), so this is set for every target rather
+/// than only for musl — one allocator everywhere means the benchmarks, the tests and
+/// the shipped binary are all measuring the same program.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
