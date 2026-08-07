@@ -1,3 +1,9 @@
+---
+title: "ADR-007: Metrics reuse the record store instead of a bespoke chunk store"
+weight: 7
+description: "Why metrics reuse the record store instead of the bespoke chunk store ADR-001 planned."
+---
+
 # ADR-007: Metrics reuse the record store instead of a bespoke chunk store
 
 - **Status:** Accepted

@@ -1,3 +1,9 @@
+---
+title: "ADR-002: Workspace layout"
+weight: 2
+description: "Six crates, a strict dependency DAG, and why two of them are not in the original list."
+---
+
 # ADR-002: Workspace layout
 
 - **Status:** Accepted

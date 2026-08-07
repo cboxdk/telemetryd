@@ -1,3 +1,9 @@
+---
+title: "ADR-003: Configuration model"
+weight: 3
+description: "Defaults, then file, then environment, then flags — and why the empty configuration is valid."
+---
+
 # ADR-003: Configuration model
 
 - **Status:** Accepted

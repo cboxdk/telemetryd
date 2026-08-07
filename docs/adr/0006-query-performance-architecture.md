@@ -1,3 +1,9 @@
+---
+title: "ADR-006: Query performance comes from knowing the queries"
+weight: 6
+description: "What knowing the queries in advance buys, measured — and where a general engine stays ahead."
+---
+
 # ADR-006: Query performance comes from knowing the queries
 
 - **Status:** Accepted

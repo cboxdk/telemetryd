@@ -1,11 +1,17 @@
 //! `telemetryd service`
 //!
-//! Installing a unit means writing outside the data directory and invoking
-//! `systemctl`/`launchctl`, which lands with the packaging work in M5. Generating the
-//! unit needs neither, so `print` works now — an operator can pipe it wherever they
-//! like today, and `install` will just automate the same text.
+//! Generates and installs a service unit for this machine.
+//!
+//! `install` writes outside the data directory and invokes `systemctl`/`launchctl`, so
+//! it says exactly what it is about to do and refuses rather than guessing when it
+//! cannot. It never invokes `sudo` on the operator's behalf: a tool that silently
+//! escalates is a tool you cannot reason about, so when a path is not writable it
+//! prints the command to run instead.
 
-use anyhow::bail;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{Context, bail};
 use clap::Subcommand;
 
 #[derive(Debug, Subcommand)]
@@ -24,15 +30,126 @@ pub fn run(action: &ServiceAction) -> anyhow::Result<()> {
             print!("{}", unit_for_this_platform()?);
             Ok(())
         }
-        ServiceAction::Install | ServiceAction::Uninstall => bail!(
-            "`telemetryd service install` lands with the packaging work in M5.\n\
-             \n\
-             Until then, `telemetryd service print` emits the same unit:\n\
-             \n\
-             {}",
-            manual_steps()
-        ),
+        ServiceAction::Install => install(),
+        ServiceAction::Uninstall => uninstall(),
     }
+}
+
+/// Where the unit belongs on this platform, and what manages it.
+fn unit_path() -> anyhow::Result<PathBuf> {
+    if cfg!(target_os = "macos") {
+        let home = std::env::var("HOME").context("HOME is not set")?;
+        // A LaunchAgent rather than a LaunchDaemon: it runs as the user, needs no root,
+        // and a developer laptop is the case this actually serves.
+        Ok(PathBuf::from(home).join("Library/LaunchAgents/dk.cbox.telemetryd.plist"))
+    } else if cfg!(target_os = "linux") {
+        Ok(PathBuf::from("/etc/systemd/system/telemetryd.service"))
+    } else {
+        bail!("no service manager is supported on this platform")
+    }
+}
+
+fn install() -> anyhow::Result<()> {
+    let unit = unit_for_this_platform()?;
+    let path = unit_path()?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "creating {}\n\nIf this needs root, run:\n{}",
+                parent.display(),
+                manual_steps()
+            )
+        })?;
+    }
+
+    if path.exists() {
+        println!("replacing the existing unit at {}", path.display());
+    }
+
+    std::fs::write(&path, &unit).with_context(|| {
+        format!(
+            "writing {}\n\n\
+             telemetryd does not invoke sudo on your behalf. If this needs root, run:\n{}",
+            path.display(),
+            manual_steps()
+        )
+    })?;
+    println!("wrote {}", path.display());
+
+    enable(&path)?;
+
+    println!();
+    println!("telemetryd will start on boot and is starting now.");
+    println!("Check it with: telemetryd status");
+    Ok(())
+}
+
+fn enable(path: &Path) -> anyhow::Result<()> {
+    if cfg!(target_os = "macos") {
+        // `bootstrap` is the modern spelling; `load` is kept for older systems, and
+        // either failing is reported rather than swallowed.
+        exec("launchctl", &["unload", &path.display().to_string()]).ok();
+        exec("launchctl", &["load", "-w", &path.display().to_string()])
+            .context("launchctl load failed")?;
+        println!("loaded the LaunchAgent");
+    } else {
+        exec("systemctl", &["daemon-reload"]).context("systemctl daemon-reload failed")?;
+        exec("systemctl", &["enable", "--now", "telemetryd"])
+            .context("systemctl enable --now telemetryd failed")?;
+        println!("enabled and started the systemd unit");
+    }
+    Ok(())
+}
+
+fn uninstall() -> anyhow::Result<()> {
+    let path = unit_path()?;
+
+    if cfg!(target_os = "macos") {
+        exec("launchctl", &["unload", &path.display().to_string()]).ok();
+    } else {
+        exec("systemctl", &["disable", "--now", "telemetryd"]).ok();
+    }
+
+    match std::fs::remove_file(&path) {
+        Ok(()) => println!("removed {}", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("no unit installed at {}", path.display());
+        }
+        Err(e) => {
+            bail!(
+                "could not remove {}: {e}\n\n\
+                 telemetryd does not invoke sudo on your behalf; run:\n  sudo rm {}",
+                path.display(),
+                path.display()
+            );
+        }
+    }
+
+    if cfg!(target_os = "linux") {
+        exec("systemctl", &["daemon-reload"]).ok();
+    }
+
+    // The data directory is never touched. Removing a service should not delete the
+    // telemetry it collected, and a flag that did would be one keystroke from a very
+    // bad afternoon.
+    println!();
+    println!("The data directory was left alone. Remove it yourself if you want it gone.");
+    Ok(())
+}
+
+/// Run a service-manager command, surfacing its stderr rather than swallowing it.
+fn exec(program: &str, args: &[&str]) -> anyhow::Result<()> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("running {program}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!("{program} {}: {}", args.join(" "), stderr.trim())
 }
 
 fn unit_for_this_platform() -> anyhow::Result<String> {
@@ -163,10 +280,31 @@ mod tests {
     }
 
     #[test]
-    fn install_is_honest_about_not_being_built_yet() {
-        let err = run(&ServiceAction::Install).unwrap_err().to_string();
-        assert!(err.contains("M5"), "{err}");
-        // …and still tells the operator how to do it by hand.
-        assert!(err.contains("telemetryd service print"), "{err}");
+    fn the_unit_path_is_the_platform_convention() {
+        // Deliberately does not call `install()`. An earlier version of this test did,
+        // and installing a real LaunchAgent on whoever ran `cargo test` is not a test
+        // result, it is a side effect.
+        let path = unit_path().unwrap();
+
+        if cfg!(target_os = "macos") {
+            assert!(path.ends_with("Library/LaunchAgents/dk.cbox.telemetryd.plist"));
+            assert!(path.is_absolute());
+        } else {
+            assert_eq!(
+                path,
+                std::path::Path::new("/etc/systemd/system/telemetryd.service")
+            );
+        }
+    }
+
+    #[test]
+    fn the_manual_steps_match_the_platform() {
+        let steps = manual_steps();
+        assert!(steps.contains("telemetryd service print"));
+        if cfg!(target_os = "macos") {
+            assert!(steps.contains("launchctl"), "{steps}");
+        } else {
+            assert!(steps.contains("systemctl"), "{steps}");
+        }
     }
 }

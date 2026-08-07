@@ -1,0 +1,218 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (must already exist)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: build
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --profile dist --target ${{ matrix.target }} --bin telemetryd
+          else
+            cargo build --profile dist --target ${{ matrix.target }} --bin telemetryd
+          fi
+
+      # "One static binary, no runtime deps, no glibc surprises" is a promise on the
+      # README. A dynamically linked musl build would break it silently, so a release
+      # that produced one must not ship.
+      - name: verify the musl build is statically linked
+        if: contains(matrix.target, 'musl')
+        run: |
+          BIN=target/${{ matrix.target }}/dist/telemetryd
+          file "$BIN"
+          if file "$BIN" | grep -q "dynamically linked"; then
+            echo "::error::${{ matrix.target }} produced a dynamically linked binary"
+            exit 1
+          fi
+
+      - name: package
+        id: package
+        shell: bash
+        run: |
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          NAME="telemetryd-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/$NAME"
+
+          cp "target/${{ matrix.target }}/dist/telemetryd" "dist/$NAME/"
+          cp README.md LICENSE COMPATIBILITY.md SECURITY.md telemetryd.toml.example "dist/$NAME/"
+
+          tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
+          echo "archive=dist/$NAME.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      # A .deb built by hand rather than with cargo-deb: the package is one binary, one
+      # config file and one unit, and a control file is a dozen lines. Not worth a tool
+      # that has to run on the build host.
+      - name: build .deb
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'
+        shell: bash
+        run: |
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          case "${{ matrix.target }}" in
+            x86_64-*)  ARCH=amd64 ;;
+            aarch64-*) ARCH=arm64 ;;
+          esac
+
+          ROOT="deb/telemetryd_${VERSION}_${ARCH}"
+          mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/bin" "$ROOT/etc/telemetryd" \
+                   "$ROOT/lib/systemd/system" "$ROOT/usr/share/doc/telemetryd"
+
+          install -m 0755 "target/${{ matrix.target }}/dist/telemetryd" "$ROOT/usr/bin/telemetryd"
+          install -m 0644 telemetryd.toml.example "$ROOT/etc/telemetryd/telemetryd.toml.example"
+          install -m 0644 README.md LICENSE "$ROOT/usr/share/doc/telemetryd/"
+          "target/${{ matrix.target }}/dist/telemetryd" service print > "$ROOT/lib/systemd/system/telemetryd.service" 2>/dev/null \
+            || cp packaging/telemetryd.service "$ROOT/lib/systemd/system/telemetryd.service"
+
+          cat > "$ROOT/DEBIAN/control" <<EOF
+          Package: telemetryd
+          Version: ${VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: ${ARCH}
+          Maintainer: Cbox <https://github.com/cboxdk/telemetryd>
+          Description: Single-binary, zero-config observability backend
+           OTLP and Prometheus in, Loki/Tempo/Prometheus query APIs out.
+           One binary, one port, one data directory, no sidecars.
+          Homepage: https://github.com/cboxdk/telemetryd
+          EOF
+
+          cat > "$ROOT/DEBIAN/postinst" <<'EOF'
+          #!/bin/sh
+          set -e
+          # A dedicated unprivileged user; the unit refuses to run as root.
+          if ! getent passwd telemetryd >/dev/null; then
+              adduser --system --group --no-create-home --home /var/lib/telemetryd telemetryd
+          fi
+          mkdir -p /var/lib/telemetryd
+          chown telemetryd:telemetryd /var/lib/telemetryd
+          if [ -d /run/systemd/system ]; then
+              systemctl daemon-reload || true
+          fi
+          echo "telemetryd installed. Start it with: systemctl enable --now telemetryd"
+          EOF
+          chmod 0755 "$ROOT/DEBIAN/postinst"
+
+          dpkg-deb --build --root-owner-group "$ROOT" "dist/telemetryd_${VERSION}_${ARCH}.deb"
+
+      - name: checksums
+        shell: bash
+        run: |
+          cd dist
+          for f in *.tar.gz *.deb; do
+            [ -e "$f" ] || continue
+            shasum -a 256 "$f" > "$f.sha256"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # One combined checksum file is what an installer actually wants to fetch.
+      - name: combine checksums
+        run: |
+          cd artifacts
+          cat *.sha256 | sort -k2 > SHA256SUMS
+          rm -f *.sha256
+          ls -la
+
+      - name: publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.deb
+            artifacts/SHA256SUMS
+            sbom.json
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/cboxdk/telemetryd/main/install.sh | sh
+            ```
+
+            Or with Homebrew:
+
+            ```bash
+            brew install cboxdk/tap/telemetryd
+            ```
+
+            Debian and Ubuntu: download the `.deb` for your architecture and
+            `sudo dpkg -i telemetryd_*.deb`. There is no hosted apt repository —
+            see the README for why.
+
+            ## Verifying
+
+            `SHA256SUMS` covers every archive. Signing is not yet in place; the
+            approach is tracked in the README's packaging section rather than
+            implied by an unsigned checksum file.
+
+            `sbom.json` is a CycloneDX 1.5 manifest of everything linked into the
+            binary.

@@ -117,7 +117,7 @@ async fn status_reports_the_shape_operators_and_the_cli_depend_on() {
 
     let json: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(json["milestone"], "M3");
+    assert_eq!(json["milestone"], "M5");
     assert_eq!(json["storage_format_version"], 1);
     assert_eq!(json["insecure"], false);
     assert_eq!(json["auth"]["ingest"], "disabled");

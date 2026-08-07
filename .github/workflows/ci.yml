@@ -39,6 +39,33 @@ jobs:
       - name: cargo doc
         run: cargo doc --workspace --no-deps --document-private-items
 
+  supply-chain:
+    name: SBOM and docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The SBOM is committed, so this is a real drift check: it fails exactly when a
+      # dependency changed and the manifest was not regenerated.
+      - name: SBOM is not stale
+        run: python3 scripts/generate-sbom.py --check
+
+      # Structure, frontmatter and dangling links. A moved doc that leaves a dead link
+      # is the most common way documentation rots.
+      - name: docs meet the standard
+        run: python3 scripts/check-docs.py
+
+      - name: install script is valid POSIX sh
+        run: sh -n install.sh
+
+      - name: shellcheck the installer
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: "."
+          additional_files: "install.sh"
+
   deny:
     name: licenses and advisories
     runs-on: ubuntu-latest
@@ -143,7 +170,7 @@ jobs:
   ci:
     name: ci
     if: always()
-    needs: [check, deny, msrv, build]
+    needs: [check, deny, msrv, supply-chain, build]
     runs-on: ubuntu-latest
     steps:
       - name: verify every job succeeded

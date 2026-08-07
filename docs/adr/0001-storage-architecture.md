@@ -1,3 +1,9 @@
+---
+title: "ADR-001: Storage architecture"
+weight: 1
+description: "WAL, immutable Parquet segments, and four deviations from the original storage plan."
+---
+
 # ADR-001: Storage architecture
 
 - **Status:** Accepted

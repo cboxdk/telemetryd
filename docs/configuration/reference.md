@@ -1,3 +1,9 @@
+---
+title: "Configuration reference"
+weight: 41
+description: "Every configuration option, with its default and the reasoning behind it."
+---
+
 # Configuration
 
 telemetryd starts with no configuration at all. Everything below has a default;
@@ -8,7 +14,7 @@ telemetryd starts with no configuration at all. Everything below has a default;
 `TELEMETRYD_STORAGE_DATA_DIR`.
 
 Durations are humantime strings (`500ms`, `30s`, `7d`). Sizes are byte strings
-(`64MiB`, `10GiB`). Unknown keys are a startup error. See [ADR-003](adr/0003-configuration-model.md).
+(`64MiB`, `10GiB`). Unknown keys are a startup error. See [ADR-003](../adr/0003-configuration-model.md).
 
 ## Full schema with defaults
 
@@ -76,7 +82,7 @@ labels   = { app = "checkout" }
 3. `$XDG_DATA_HOME/telemetryd` — on macOS `~/Library/Application Support/telemetryd`
 
 The resolved path is logged at startup and reported by `/status`. Rationale in
-[ADR-003](adr/0003-configuration-model.md).
+[ADR-003](../adr/0003-configuration-model.md).
 
 ## Config file discovery
 

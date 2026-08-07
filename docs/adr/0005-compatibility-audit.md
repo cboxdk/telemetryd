@@ -1,3 +1,9 @@
+---
+title: "ADR-005: The compatibility subset comes from the client, not the upstream spec"
+weight: 5
+description: "Why the compatibility subset is read out of the client's source rather than the upstream spec."
+---
+
 # ADR-005: The compatibility subset comes from the client, not the upstream spec
 
 - **Status:** Accepted

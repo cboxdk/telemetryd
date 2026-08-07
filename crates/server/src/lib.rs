@@ -32,8 +32,9 @@ use tower_http::trace::TraceLayer;
 pub use state::AppState;
 
 /// The milestone this build implements, reported by `/status`. Keeping it in the
-/// binary means a user can always tell which slice of the contract they have.
-pub const MILESTONE: &str = "M3";
+/// binary means a user can always tell which slice of the contract they have — and
+/// from M5 that is all of it: nothing in `COMPATIBILITY.md` answers `501`.
+pub const MILESTONE: &str = "M5";
 
 /// Build the complete router.
 pub fn router(state: AppState) -> Router {

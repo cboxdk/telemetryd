@@ -1,3 +1,9 @@
+---
+title: "ADR-004: Auth and network binding"
+weight: 4
+description: "Failing closed on an exposed bind, two independent tokens, and what is deliberately absent."
+---
+
 # ADR-004: Auth and network binding
 
 - **Status:** Accepted

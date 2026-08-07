@@ -16,11 +16,13 @@ ship one 2.6 MB binary instead of a stack of services to operate. If you outgrow
 node, you have outgrown telemetryd, and we would rather say so than pretend
 otherwise.
 
-> **Status: M3.** All three signals work end to end. Logs, traces and metrics go in as
-> OTLP/HTTP JSON (plus Prometheus `remote_write`), land in Parquet segments, and come
-> back out through the Loki, Tempo and Prometheus query APIs — with live tail, and
-> retention enforcing both time and a disk budget. Nothing in the contract answers
-> `501` any more. See [Milestones](#milestones).
+> **Status: M5 — feature complete.** All three signals go in as OTLP/HTTP JSON (plus
+> Prometheus `remote_write`), land in Parquet segments, and come back out through the
+> Loki, Tempo and Prometheus query APIs — with live tail, and retention enforcing both
+> time and a disk budget. Nothing in the contract answers `501`.
+>
+> [BUILD-STATUS.md](BUILD-STATUS.md) is the honest, current list of what works, what
+> the known gaps are, and what is deliberately absent.
 
 ## Quickstart
 
@@ -54,9 +56,24 @@ curl http://127.0.0.1:4319/api/traces/4bf92f3577b34da6a3ce929d0e0e4736
 Point all three of `laravel-telemetry-ui`'s connectors — Loki, Tempo and
 Prometheus — at that one base URL.
 
+## Documentation
+
+Full documentation is in [docs/](docs/index.md) — start with the
+[quickstart](docs/quickstart.md).
+
+| | |
+|---|---|
+| [Getting started](docs/getting-started/_index.md) | Installing, sending data, testing |
+| [Core concepts](docs/core-concepts/_index.md) | Architecture, signals, storage, performance |
+| [Cookbook](docs/cookbook/_index.md) | Running as a service, exposing it safely, sizing the budget |
+| [Configuration](docs/configuration/reference.md) | Every option, with defaults |
+| [Extension points](docs/extension-points/_index.md) | What is adjustable, and what is not |
+| [Security](docs/security/_index.md) | Threat model and honest scope |
+
 ## Design
 
-Four documents cover the decisions and the reasoning behind them:
+Seven decision records cover the reasoning, including where the original plan was
+wrong:
 
 | ADR | Subject |
 |-----|---------|
@@ -68,7 +85,6 @@ Four documents cover the decisions and the reasoning behind them:
 | [ADR-006](docs/adr/0006-query-performance-architecture.md) | Query performance: what knowing the queries in advance buys, and where a general engine stays ahead |
 | [ADR-007](docs/adr/0007-metrics-reuse-the-record-store.md) | Why metrics reuse the record store instead of the bespoke chunk store ADR-001 planned |
 
-Configuration reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 API contract: [COMPATIBILITY.md](COMPATIBILITY.md) — derived from `laravel-telemetry-ui`'s
 actual connector source, not from the upstream API references.
 
@@ -132,16 +148,20 @@ error, rather than dropping data quietly.
 | **M1** | OTLP JSON logs → Parquet segments → Loki `query_range`, labels, series, live tail; retention reaper | **done** |
 | **M2** | OTLP traces → Tempo trace-by-id, TraceQL search, tags; query performance architecture | **done** |
 | **M3** | Prometheus `remote_write` + OTLP metrics → PromQL subset, Prometheus query APIs | **done** |
-| M4 | Freeze `COMPATIBILITY.md` and contract-test every row (audit already done — [ADR-005](docs/adr/0005-compatibility-audit.md)) | next |
-| M5 | cargo-dist, install script, brew tap, `.deb`, `service install` | |
+| **M4** | `COMPATIBILITY.md` frozen and contract-tested, derived from the client's source ([ADR-005](docs/adr/0005-compatibility-audit.md)) | **done** |
+| **M5** | Install script, brew tap, `.deb`, `service install`, SBOM, docs | **done** |
 
 ## Development
 
 ```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo deny check
-cargo bench -p telemetryd-store          # measures the constants
+cargo deny check                          # advisories, licenses, bans, sources
+python3 scripts/generate-sbom.py --check  # SBOM is not stale
+python3 scripts/check-docs.py             # docs structure, frontmatter, links
+
+cargo bench -p telemetryd-store                         # measures the constants
 cargo test -p telemetryd-store --test scale --release   # asserts the asymptotics
 ```
 
