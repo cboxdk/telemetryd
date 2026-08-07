@@ -27,6 +27,7 @@ impl IntoResponse for ApiError {
             // which is where our "unsupported in telemetryd" message needs to end up.
             Error::Unsupported { .. } | Error::BadRequest(_) => StatusCode::BAD_REQUEST,
 
+            Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::LimitExceeded { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Error::Overloaded => StatusCode::TOO_MANY_REQUESTS,
             Error::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,

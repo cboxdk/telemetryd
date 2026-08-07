@@ -11,8 +11,8 @@ use telemetryd_core::record::{APP_LABEL, LEVEL_LABEL, UNKNOWN_APP, sanitize_labe
 use telemetryd_core::{Labels, LogRecord, Severity};
 
 use crate::otlp::{
-    AnyValue, FlexEnum, FlexU64, InstrumentationScope, KeyValue, Resource, extend_labels,
-    normalize_id,
+    AnyValue, FlexEnum, FlexU64, InstrumentationScope, KeyValue, Resource, extend_attributes,
+    extend_labels, normalize_id,
 };
 use crate::{Decoded, RejectReason, Rejection};
 
@@ -231,9 +231,10 @@ fn convert(
         tracing::debug!(original_bytes = original, "truncated an oversized log body");
     }
 
-    // Record attributes: per-record, deliberately not part of stream identity.
+    // Record attributes: per-record, deliberately not part of stream identity, and
+    // kept under the producer's own key spelling.
     let mut attributes = Labels::new();
-    extend_labels(&mut attributes, &raw.attributes);
+    extend_attributes(&mut attributes, &raw.attributes);
     if attributes.len() > ctx.limits.max_attrs_per_record as usize {
         return Err(Rejection::new(
             RejectReason::TooManyAttributes,
@@ -390,8 +391,13 @@ mod tests {
         );
         assert_eq!(record.span_id.as_deref(), Some("00f067aa0ba902b7"));
 
-        // Record attributes are queryable but must not be part of stream identity.
-        assert_eq!(record.attributes.get("order_id"), Some("9912"));
+        // Record attributes keep the producer's key spelling — a UI that shows
+        // attributes should show what was sent, not a rewritten form.
+        assert_eq!(record.attributes.get("order.id"), Some("9912"));
+        // …and are reachable by the label-safe form too.
+        assert_eq!(record.attributes.get_relaxed("order_id"), Some("9912"));
+        // But they are never part of stream identity.
+        assert!(!record.stream.contains_key("order.id"));
         assert!(!record.stream.contains_key("order_id"));
     }
 

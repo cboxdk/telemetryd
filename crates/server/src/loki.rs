@@ -230,6 +230,10 @@ fn matches_tail(query: &logql::LogQuery, record: &LogRecord) -> bool {
     let mut base = record.stream.clone();
     for (name, value) in record.attributes.iter() {
         base.insert(name, value);
+        let sanitized = telemetryd_core::record::sanitize_label_name(name);
+        if sanitized != name {
+            base.insert(sanitized, value);
+        }
     }
     query.evaluate(&record.body, &base)
 }

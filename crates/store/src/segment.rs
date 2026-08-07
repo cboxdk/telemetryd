@@ -9,20 +9,26 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ProjectionMask;
+use parquet::arrow::arrow_reader::{
+    ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+    RowFilter,
+};
 use parquet::basic::{Compression as ParquetCompression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use serde::{Deserialize, Serialize};
 use telemetryd_core::config::Compression;
 use telemetryd_core::{Error, LabelMatcher, Labels, Result, Signal};
 
+use crate::bloom::Bloom;
 use crate::schema::RecordSchema;
 
 /// Bumped when a sealed segment written by an older build can no longer be read.
-pub const SEGMENT_FORMAT_VERSION: u32 = 1;
+pub const SEGMENT_FORMAT_VERSION: u32 = 2;
 
 /// Above this many distinct values, a label stops being tracked individually.
 ///
@@ -55,6 +61,14 @@ pub struct SegmentManifest {
     pub wal_sequence: u64,
     /// Per-label value sets, for pruning.
     pub labels: BTreeMap<String, LabelValues>,
+    /// The distinct stream label sets in this segment, indexed by the `stream_id`
+    /// column.
+    ///
+    /// Interning them here is what makes label matching cost one evaluation per
+    /// *stream* instead of one per *row*. A segment holding a million rows across
+    /// fifty streams evaluates the matchers fifty times.
+    #[serde(default)]
+    pub streams: Vec<Labels>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,11 +168,56 @@ impl SegmentManifest {
     }
 }
 
+/// How many rows to decode at a time when scanning.
+///
+/// Small enough that a highly selective query does not decode a whole row group to
+/// find one row; large enough that per-batch overhead stays amortised.
+const SCAN_BATCH_ROWS: usize = 8192;
+
+/// Evaluates a selection over a projected batch.
+pub type SelectionMask =
+    std::sync::Arc<dyn Fn(&RecordBatch) -> Result<arrow::array::BooleanArray> + Send + Sync>;
+
+/// A predicate pushed into the Parquet reader.
+///
+/// Owned rather than borrowed: arrow-rs boxes the predicate into the reader and may
+/// evaluate it from its own threads, so it has to outlive this call.
+#[derive(Clone)]
+pub struct Selection {
+    /// Column names the predicate reads. Only these are decompressed to evaluate it.
+    pub columns: Vec<&'static str>,
+    /// Given a batch projected to `columns`, which rows are wanted.
+    pub mask: SelectionMask,
+}
+
+impl std::fmt::Debug for Selection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Selection")
+            .field("columns", &self.columns)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Whether a scan should keep going.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flow {
+    Continue,
+    Stop,
+}
+
 /// A sealed segment on disk.
 #[derive(Debug, Clone)]
 pub struct Segment {
     pub manifest: SegmentManifest,
     pub dir: PathBuf,
+    /// Exact-match filter over the schema's key column, when it declares one.
+    pub(crate) bloom: Option<Bloom>,
+    /// Parquet footer, parsed once and reused.
+    ///
+    /// Segments are immutable, so their metadata can never go stale. Re-reading and
+    /// re-parsing the footer on every query is pure fixed cost, and it dominates a
+    /// selective query that only touches a few hundred rows.
+    metadata: Arc<OnceLock<ArrowReaderMetadata>>,
 }
 
 impl Segment {
@@ -207,30 +266,129 @@ impl Segment {
         }
 
         Ok(Some(Self {
+            bloom: Bloom::read(dir),
             manifest,
             dir: dir.to_path_buf(),
+            metadata: Arc::new(OnceLock::new()),
         }))
     }
 
-    /// Read every record back.
-    pub fn read<S: RecordSchema>(&self) -> Result<Vec<S::Record>> {
+    /// Stream the segment one Arrow batch at a time.
+    ///
+    /// This is the read path that matters for scale. Materialising a whole segment
+    /// before filtering means a query that matches three rows still allocates every
+    /// row in the file; at a 256 MiB segment that is the difference between a few
+    /// microseconds and a few hundred milliseconds, plus the memory to hold it.
+    ///
+    /// `visit` returns [`Flow::Stop`] to end the scan early — which is what lets a
+    /// `limit`-bounded query stop as soon as it can prove nothing better remains.
+    pub fn scan<S, F>(&self, mut visit: F) -> Result<()>
+    where
+        S: RecordSchema,
+        F: FnMut(Vec<S::Record>) -> Result<Flow>,
+    {
         let path = self.data_path();
         let file = File::open(&path)
             .map_err(|e| Error::io(format!("opening segment {}", path.display()), e))?;
 
         let reader = ParquetRecordBatchReaderBuilder::try_new(file)
             .map_err(|e| segment_corrupt(&path, &e))?
+            .with_batch_size(SCAN_BATCH_ROWS)
             .build()
             .map_err(|e| segment_corrupt(&path, &e))?;
 
-        // Row counts come from our own manifest and are bounded by max_segment_bytes,
-        // so this cannot overflow a usize on any target we ship.
-        let mut records = Vec::with_capacity(usize::try_from(self.manifest.rows).unwrap_or(0));
         for batch in reader {
             let batch = batch.map_err(|e| segment_corrupt(&path, &e))?;
-            records.extend(S::from_batch(&batch)?);
+            if visit(S::from_batch(&batch)?)? == Flow::Stop {
+                return Ok(());
+            }
         }
+        Ok(())
+    }
+
+    /// Stream raw Arrow batches, without decoding anything.
+    pub fn scan_batches<F>(&self, visit: F) -> Result<()>
+    where
+        F: FnMut(&RecordBatch) -> Result<Flow>,
+    {
+        self.scan_batches_where(None, visit)
+    }
+
+    /// Stream batches with a selection predicate pushed **into** the Parquet reader.
+    ///
+    /// The predicate is evaluated over a projection of just the filter columns, so a
+    /// selective query never decompresses the wide columns — bodies, attribute maps,
+    /// events — for rows it is going to discard. Rows that survive come back fully
+    /// decoded; rows that do not are never touched.
+    pub fn scan_batches_where<F>(&self, selection: Option<Selection>, mut visit: F) -> Result<()>
+    where
+        F: FnMut(&RecordBatch) -> Result<Flow>,
+    {
+        let path = self.data_path();
+        let file = File::open(&path)
+            .map_err(|e| Error::io(format!("opening segment {}", path.display()), e))?;
+
+        // Parse the footer once per segment, then reuse it for every later query.
+        let metadata = if let Some(metadata) = self.metadata.get() {
+            metadata.clone()
+        } else {
+            let loaded = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())
+                .map_err(|e| segment_corrupt(&path, &e))?;
+            let _ = self.metadata.set(loaded.clone());
+            loaded
+        };
+
+        let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata)
+            .with_batch_size(SCAN_BATCH_ROWS);
+
+        if let Some(selection) = selection {
+            let mask = ProjectionMask::columns(
+                builder.parquet_schema(),
+                selection.columns.iter().copied(),
+            );
+            let evaluate = selection.mask;
+            let predicate = ArrowPredicateFn::new(mask, move |batch| {
+                evaluate(&batch).map_err(|e| {
+                    arrow::error::ArrowError::ComputeError(format!("selection failed: {e}"))
+                })
+            });
+            builder = builder.with_row_filter(RowFilter::new(vec![Box::new(predicate)]));
+        }
+
+        let reader = builder.build().map_err(|e| segment_corrupt(&path, &e))?;
+
+        for batch in reader {
+            let batch = batch.map_err(|e| segment_corrupt(&path, &e))?;
+            if visit(&batch)? == Flow::Stop {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Read every record back, resolving stream ids through the manifest dictionary.
+    ///
+    /// Convenience over [`Self::scan_batches`] for callers that genuinely want the
+    /// whole segment; the query path does not.
+    pub fn read<S: RecordSchema>(&self) -> Result<Vec<S::Record>> {
+        let mut records = Vec::with_capacity(usize::try_from(self.manifest.rows).unwrap_or(0));
+        self.scan_batches(|batch| {
+            let rows: crate::schema::Rows =
+                (0..u32::try_from(batch.num_rows()).unwrap_or(u32::MAX)).collect();
+            records.extend(S::materialize(batch, &rows, &self.manifest.streams)?);
+            Ok(Flow::Continue)
+        })?;
         Ok(records)
+    }
+
+    /// Whether this segment might contain `key`, per its exact-match filter.
+    ///
+    /// False positives are possible, false negatives are not — so a `false` here is
+    /// always safe to act on.
+    pub fn may_contain_key(&self, key: &str) -> bool {
+        self.bloom
+            .as_ref()
+            .is_none_or(|bloom| bloom.may_contain(key))
     }
 
     /// Remove the segment directory. Retention is exactly this.
@@ -247,6 +405,29 @@ fn segment_corrupt(path: &Path, error: &dyn std::fmt::Display) -> Error {
     Error::WalCorrupt {
         path: path.to_path_buf(),
         detail: format!("unreadable Parquet: {error}"),
+    }
+}
+
+/// Assigns a dense id to each distinct stream label set.
+#[derive(Debug, Default)]
+pub struct StreamInterner {
+    ids: std::collections::HashMap<Labels, u32>,
+    streams: Vec<Labels>,
+}
+
+impl StreamInterner {
+    pub fn intern(&mut self, labels: &Labels) -> u32 {
+        if let Some(id) = self.ids.get(labels) {
+            return *id;
+        }
+        let id = u32::try_from(self.streams.len()).unwrap_or(u32::MAX);
+        self.ids.insert(labels.clone(), id);
+        self.streams.push(labels.clone());
+        id
+    }
+
+    pub fn into_streams(self) -> Vec<Labels> {
+        self.streams
     }
 }
 
@@ -274,15 +455,40 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
         ));
     }
 
-    let mut min_time = u64::MAX;
-    let mut max_time = 0;
+    // Sort by time before writing. Records arrive out of order — batching clients,
+    // retries, clock skew — and an unsorted timestamp column gives Parquet's row-group
+    // statistics nothing to prune with, because every group's min/max ends up spanning
+    // the whole segment.
+    //
+    // Checked first rather than sorted unconditionally: records normally arrive in
+    // order, and `to_vec()` on a full buffer is a real cost (it measured at ~20% of
+    // seal). Paying it only when the data is actually out of order keeps the common
+    // case free.
+    let sorted_storage: Vec<S::Record>;
+    let records = if records
+        .windows(2)
+        .all(|w| S::timestamp(&w[0]) <= S::timestamp(&w[1]))
+    {
+        records
+    } else {
+        let mut owned = records.to_vec();
+        owned.sort_by_key(|record| S::timestamp(record));
+        sorted_storage = owned;
+        &sorted_storage[..]
+    };
+
     let mut index = LabelIndexBuilder::default();
+    let mut bloom = S::exact_key(&records[0]).map(|_| Bloom::with_capacity(records.len()));
+
     for record in records {
-        let ts = S::timestamp(record);
-        min_time = min_time.min(ts);
-        max_time = max_time.max(ts);
         index.observe(S::index_labels(record));
+        if let (Some(bloom), Some(key)) = (bloom.as_mut(), S::exact_key(record)) {
+            bloom.insert(key);
+        }
     }
+    // Sorted, so the bounds are simply the endpoints.
+    let min_time = S::timestamp(&records[0]);
+    let max_time = S::timestamp(&records[records.len() - 1]);
 
     let id = format!("{min_time:020}-{:08}", options.sequence);
     let staging = options.tmp_dir.join(format!("{}-{id}", S::SIGNAL.as_str()));
@@ -294,7 +500,7 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
     fs::create_dir_all(&staging)
         .map_err(|e| Error::io(format!("creating {}", staging.display()), e))?;
 
-    let batch = S::to_batch(records)?;
+    let (batch, streams) = S::to_batch(records)?;
     let data_path = staging.join(DATA_FILE);
     let bytes = write_parquet(&data_path, &batch, options.compression)?;
 
@@ -309,8 +515,12 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
         created_at_nanos: options.now_nanos,
         wal_sequence: options.wal_sequence,
         labels: index.build(),
+        streams,
     };
     write_manifest(&staging.join(MANIFEST_FILE), &manifest)?;
+    if let Some(bloom) = &bloom {
+        bloom.write(&staging)?;
+    }
 
     // Sync the staging directory so the rename cannot be reordered ahead of the file
     // contents on a crash.
@@ -348,6 +558,8 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
     Ok(Segment {
         manifest,
         dir: final_dir,
+        bloom,
+        metadata: Arc::new(OnceLock::new()),
     })
 }
 
@@ -457,6 +669,7 @@ mod tests {
             created_at_nanos: 0,
             wal_sequence: 0,
             labels: labels_map,
+            streams: Vec::new(),
         }
     }
 

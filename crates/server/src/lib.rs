@@ -12,6 +12,7 @@ pub mod maintenance;
 pub mod metrics;
 pub mod routes;
 pub mod state;
+pub mod tempo;
 
 use std::sync::Arc;
 
@@ -31,7 +32,7 @@ pub use state::AppState;
 
 /// The milestone this build implements, reported by `/status`. Keeping it in the
 /// binary means a user can always tell which slice of the contract they have.
-pub const MILESTONE: &str = "M1";
+pub const MILESTONE: &str = "M2";
 
 /// Build the complete router.
 pub fn router(state: AppState) -> Router {
@@ -54,6 +55,14 @@ pub fn router(state: AppState) -> Router {
         .route("/loki/api/v1/label/{name}/values", get(loki::label_values))
         .route("/loki/api/v1/series", get(loki::series))
         .route("/loki/api/v1/tail", get(loki::tail))
+        // Tempo-compatible read APIs (M2).
+        .route("/api/traces/{trace_id}", get(tempo::trace))
+        .route("/api/search", get(tempo::search))
+        .route("/api/search/tags", get(tempo::tags))
+        .route("/api/v2/search/tags", get(tempo::tags))
+        // The UI calls the v2 path; v1 is kept for older clients (ADR-005).
+        .route("/api/v2/search/tag/{name}/values", get(tempo::tag_values))
+        .route("/api/search/tag/{name}/values", get(tempo::tag_values))
         .merge(planned_query_routes())
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -63,6 +72,7 @@ pub fn router(state: AppState) -> Router {
     let ingest = Router::new()
         // OTLP/HTTP JSON logs — the first-class ingest path (M1).
         .route("/v1/logs", axum::routing::post(ingest::otlp_logs))
+        .route("/v1/traces", axum::routing::post(ingest::otlp_traces))
         .merge(planned_ingest_routes())
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -92,7 +102,6 @@ pub fn router(state: AppState) -> Router {
 /// Ingest endpoints still to come.
 fn planned_ingest_routes() -> Router<AppState> {
     Router::new()
-        .route("/v1/traces", routes::planned("/v1/traces", "M2"))
         .route("/v1/metrics", routes::planned("/v1/metrics", "M3"))
         .route("/api/v1/write", routes::planned("/api/v1/write", "M3"))
 }

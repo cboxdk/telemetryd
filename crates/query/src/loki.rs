@@ -13,6 +13,8 @@ use telemetryd_core::{Error, Labels, LogRecord, Result};
 use telemetryd_store::RecordStore;
 use telemetryd_store::logs::LogSchema;
 
+use arrow::array::Array as _;
+
 use crate::logql::{self, LogQuery};
 
 /// Default entry limit, matching Loki.
@@ -390,29 +392,39 @@ pub fn query_range(
         scanned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Label filters see stream labels *and* record attributes; see
         // `LogQuery::evaluate`.
+        // Attributes keep the producer's key spelling, so both it and the
+        // label-safe form are exposed — `| exception_type="x"` and
+        // `| exception.type="x"` should reach the same attribute.
         let mut base = record.stream.clone();
         for (name, value) in record.attributes.iter() {
             base.insert(name, value);
+            let sanitized = telemetryd_core::record::sanitize_label_name(name);
+            if sanitized != name {
+                base.insert(sanitized, value);
+            }
         }
         request.query.evaluate(&record.body, &base)
     };
 
-    let mut records = store.query(
-        request.start_nanos,
-        request.end_nanos,
-        &request.query.matchers,
-        &filter,
-    )?;
-
-    // Sort before limiting: a `backward` query must return the newest N entries in the
-    // range, not the first N the storage layer happened to hand back.
-    match request.direction {
-        Direction::Backward => {
-            records.sort_by_key(|r| std::cmp::Reverse(r.timestamp_nanos));
-        }
-        Direction::Forward => records.sort_by_key(|r| r.timestamp_nanos),
+    // The limit and the direction go all the way down to storage. Collecting every
+    // match and sorting afterwards would make peak memory a function of how much data
+    // matched rather than of how much was asked for — and `limit=100` over a week on a
+    // busy app is a very large difference.
+    // Line filters run over the Arrow string buffer before any row is decoded. A
+    // `|= "text"` that rejects 99% of rows now costs a substring scan over a
+    // contiguous buffer instead of ~500ns of allocation per row.
+    let prefilter = build_line_prefilter(&request.query);
+    let mut scan = telemetryd_store::Scan::range(request.start_nanos, request.end_nanos)
+        .limit(request.limit)
+        .order(match request.direction {
+            Direction::Backward => telemetryd_store::Order::Descending,
+            Direction::Forward => telemetryd_store::Order::Ascending,
+        });
+    if let Some(prefilter) = prefilter.as_ref() {
+        scan = scan.columns(prefilter);
     }
-    records.truncate(request.limit);
+
+    let records = store.scan(scan, &request.query.matchers, &filter)?;
 
     let returned = records.len() as u64;
     let result = group_into_streams(records, request.direction);
@@ -427,6 +439,53 @@ pub fn query_range(
                 exec_time: started.elapsed().as_secs_f64(),
             },
         },
+    }))
+}
+
+/// Build a columnar pre-filter from the query's line filters, if it has any.
+///
+/// Only the cheap, unambiguous stages are lifted here — `|=` and `!=` on the body
+/// column. Regex stages stay in the record predicate: the point is to reject most rows
+/// for almost nothing, not to reimplement evaluation twice. Over-selecting is safe by
+/// contract, so anything not handled here simply falls through.
+type Prefilter =
+    Box<dyn Fn(&arrow::record_batch::RecordBatch, &mut Vec<u32>) -> Result<()> + Send + Sync>;
+
+fn build_line_prefilter(query: &LogQuery) -> Option<Prefilter> {
+    let contains: Vec<(bool, String)> = query
+        .stages
+        .iter()
+        .filter_map(|stage| match stage {
+            logql::Stage::Line(filter) => match filter.op {
+                logql::LineOp::Contains => Some((true, filter.pattern.clone())),
+                logql::LineOp::NotContains => Some((false, filter.pattern.clone())),
+                _ => None,
+            },
+            _ => None,
+        })
+        .filter(|(_, pattern)| !pattern.is_empty())
+        .collect();
+
+    if contains.is_empty() {
+        return None;
+    }
+
+    Some(Box::new(move |batch, rows| {
+        let column = batch
+            .column_by_name("body")
+            .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>());
+        let Some(bodies) = column else {
+            // Unknown layout: keep every candidate and let the record predicate decide.
+            return Ok(());
+        };
+
+        rows.retain(|&row| {
+            let line = bodies.value(row as usize);
+            contains
+                .iter()
+                .all(|(wanted, pattern)| line.contains(pattern.as_str()) == *wanted)
+        });
+        Ok(())
     }))
 }
 

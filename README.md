@@ -16,10 +16,10 @@ ship one 2.6 MB binary instead of a stack of services to operate. If you outgrow
 node, you have outgrown telemetryd, and we would rather say so than pretend
 otherwise.
 
-> **Status: M1.** Logs work end to end: OTLP/HTTP JSON in, Parquet segments on disk,
-> the Loki query APIs and live tail out, with retention enforcing both time and a disk
-> budget. Traces and metrics endpoints are registered and answer `501` naming the
-> milestone they land in. See [Milestones](#milestones).
+> **Status: M2.** Logs and traces work end to end: OTLP/HTTP JSON in, Parquet segments
+> on disk, the Loki and Tempo query APIs out, with live tail and retention enforcing
+> both time and a disk budget. Metrics endpoints are registered and answer `501` naming
+> the milestone they land in. See [Milestones](#milestones).
 
 ## Quickstart
 
@@ -53,6 +53,7 @@ Four documents cover the decisions and the reasoning behind them:
 | [ADR-003](docs/adr/0003-configuration-model.md) | Configuration model and layering |
 | [ADR-004](docs/adr/0004-auth-and-network-binding.md) | Auth, network binding, and what is deliberately out of scope |
 | [ADR-005](docs/adr/0005-compatibility-audit.md) | Why the compatibility subset is derived from the client, not the upstream spec |
+| [ADR-006](docs/adr/0006-query-performance-architecture.md) | Query performance: what knowing the queries in advance buys, and where a general engine stays ahead |
 
 Configuration reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 API contract: [COMPATIBILITY.md](COMPATIBILITY.md) — derived from `laravel-telemetry-ui`'s
@@ -116,8 +117,8 @@ error, rather than dropping data quietly.
 |---|---|---|
 | **M0** | Workspace, config, data dir, WAL, HTTP surface, self-observability, CI | **done** |
 | **M1** | OTLP JSON logs → Parquet segments → Loki `query_range`, labels, series, live tail; retention reaper | **done** |
-| M2 | OTLP traces, trace-by-id, Tempo search | next |
-| M3 | `remote_write`, OTLP metrics, PromQL subset, cardinality caps | |
+| **M2** | OTLP traces → Tempo trace-by-id, TraceQL search, tags; query performance architecture | **done** |
+| M3 | `remote_write`, OTLP metrics, PromQL subset, cardinality caps | next |
 | M4 | Freeze `COMPATIBILITY.md` and contract-test every row (audit already done — [ADR-005](docs/adr/0005-compatibility-audit.md)) | |
 | M5 | cargo-dist, install script, brew tap, `.deb`, `service install` | |
 
@@ -127,7 +128,14 @@ error, rather than dropping data quietly.
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo deny check
+cargo bench -p telemetryd-store          # measures the constants
+cargo test -p telemetryd-store --test scale --release   # asserts the asymptotics
 ```
+
+Performance is held in place from two directions: benchmarks measure the constants,
+and `tests/scale.rs` asserts the asymptotics as *segment-open counts* rather than
+wall-clock times — so they mean something on a shared CI runner. See
+[ADR-006](docs/adr/0006-query-performance-architecture.md).
 
 CI additionally cross-compiles all four release targets
 (`{x86_64,aarch64}-unknown-linux-musl`, `{x86_64,aarch64}-apple-darwin`) and asserts

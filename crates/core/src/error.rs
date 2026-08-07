@@ -45,6 +45,9 @@ pub enum Error {
     #[error("{0}")]
     BadRequest(String),
 
+    #[error("{0}")]
+    NotFound(String),
+
     #[error("{feature} is not supported by telemetryd")]
     Unsupported {
         feature: String,
@@ -126,6 +129,7 @@ impl Error {
             }
             Self::Unauthorized => "unauthorized",
             Self::BadRequest(_) => "bad_request",
+            Self::NotFound(_) => "not_found",
             Self::Unsupported { .. } => "unsupported_feature",
             Self::NotImplemented { .. } => "not_implemented",
             Self::LimitExceeded { .. } => "limit_exceeded",

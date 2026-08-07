@@ -12,6 +12,24 @@ use telemetryd_core::{Error, Labels};
 use telemetryd_query::lexer;
 use telemetryd_query::logql;
 
+/// Words that are LogQL pipeline stages rather than label names.
+const RESERVED_STAGE_NAMES: &[&str] = &[
+    "json",
+    "logfmt",
+    "line_format",
+    "label_format",
+    "unwrap",
+    "pattern",
+    "regexp",
+    "drop",
+    "keep",
+    "decolorize",
+    "distinct",
+    "ip",
+    "and",
+    "or",
+];
+
 /// Anything a caller could send.
 fn arbitrary_input() -> impl Strategy<Value = String> {
     prop_oneof![
@@ -176,9 +194,15 @@ proptest! {
     }
 
     /// Whatever `| json` extracts, a matching label filter must then accept.
+    ///
+    /// The key is filtered against the reserved stage names — `| ip` is a parser, not
+    /// a label filter, so generating it here would be testing the wrong thing.
     #[test]
     fn json_extraction_and_label_filters_agree(
-        key in "[a-z][a-z0-9_]{0,8}",
+        key in "[a-z][a-z0-9_]{0,8}".prop_filter(
+            "reserved LogQL stage name",
+            |k| !RESERVED_STAGE_NAMES.contains(&k.as_str()),
+        ),
         value in "[a-zA-Z0-9 ]{0,15}",
     ) {
         let line = serde_json::json!({ key.clone(): value.clone() }).to_string();

@@ -518,27 +518,53 @@ fn a_full_buffer_seals_itself() {
 }
 
 #[test]
-fn time_based_sealing_fires_only_once_the_window_elapses() {
+fn a_window_that_has_not_elapsed_does_not_seal() {
     let harness = Harness::new();
+    // Deliberately long: this asserts a *negative*, so the window must not be able to
+    // elapse accidentally on a loaded test runner.
     let store = harness.open_with(StoreSettings {
-        segment_duration: Duration::from_millis(50),
+        segment_duration: Duration::from_secs(3600),
         ..settings()
     });
 
     store
         .append(&[record(0, "a", Severity::Info, "x")])
         .unwrap();
-    assert!(
-        store.maybe_seal().unwrap().is_none(),
-        "window has not elapsed"
+    assert!(store.maybe_seal().unwrap().is_none());
+    assert_eq!(store.status().segments, 0);
+}
+
+#[test]
+fn time_based_sealing_fires_once_the_window_elapses() {
+    let harness = Harness::new();
+    let store = harness.open_with(StoreSettings {
+        segment_duration: Duration::from_millis(20),
+        ..settings()
+    });
+
+    store
+        .append(&[record(0, "a", Severity::Info, "x")])
+        .unwrap();
+
+    // Poll rather than sleeping exactly once. The claim is "the window causes a seal",
+    // not "a seal happens within one scheduler quantum"; asserting the latter is how a
+    // test becomes flaky under parallel load, and a flaky test trains people to
+    // re-run rather than to read.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if store.maybe_seal().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        store.status().segments,
+        1,
+        "the window never triggered a seal"
     );
 
-    std::thread::sleep(Duration::from_millis(60));
-    assert!(store.maybe_seal().unwrap().is_some());
-    assert_eq!(store.status().segments, 1);
-
-    // An empty buffer must not produce an empty segment on every tick.
-    std::thread::sleep(Duration::from_millis(60));
+    // An empty buffer must not produce an empty segment on every subsequent tick.
+    std::thread::sleep(Duration::from_millis(40));
     assert!(store.maybe_seal().unwrap().is_none());
     assert_eq!(store.status().segments, 1);
 }

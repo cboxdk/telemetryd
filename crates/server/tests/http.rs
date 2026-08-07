@@ -117,7 +117,7 @@ async fn status_reports_the_shape_operators_and_the_cli_depend_on() {
 
     let json: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(json["milestone"], "M1");
+    assert_eq!(json["milestone"], "M2");
     assert_eq!(json["storage_format_version"], 1);
     assert_eq!(json["insecure"], false);
     assert_eq!(json["auth"]["ingest"], "disabled");
@@ -271,11 +271,8 @@ async fn contract_endpoints_answer_501_naming_their_milestone() {
     let harness = Harness::new(|_| {});
 
     let expected = [
-        ("/v1/traces", "M2"),
         ("/v1/metrics", "M3"),
         ("/api/v1/write", "M3"),
-        ("/api/traces/abc123", "M2"),
-        ("/api/search", "M2"),
         ("/api/v1/query", "M3"),
         ("/api/v1/label/app/values", "M3"),
     ];
@@ -314,14 +311,14 @@ async fn a_genuinely_unknown_route_is_still_a_404() {
 #[tokio::test]
 async fn contract_endpoints_answer_every_method_not_just_get() {
     let harness = Harness::new(|_| {});
-    // A GET to an unbuilt ingest endpoint says "not implemented until M2", not
+    // A GET to an unbuilt ingest endpoint says "not implemented until M3", not
     // "method not allowed", which would send someone hunting for the wrong problem.
     let (status, _, _) = harness
-        .request(Request::get("/v1/traces").body(Body::empty()).unwrap())
+        .request(Request::get("/v1/metrics").body(Body::empty()).unwrap())
         .await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     let (status, _, _) = harness
-        .request(Request::post("/v1/traces").body(Body::from("{}")).unwrap())
+        .request(Request::post("/v1/metrics").body(Body::from("{}")).unwrap())
         .await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
 }

@@ -25,7 +25,8 @@ use telemetryd_core::config::{Compression, StorageConfig, WalSync};
 use telemetryd_core::{Error, LabelMatcher, Labels, Result, matches_all};
 
 use crate::schema::RecordSchema;
-use crate::segment::{SealOptions, Segment, seal};
+use crate::segment::{Flow, SealOptions, Segment, seal};
+use crate::topk::{Order, TopK};
 use crate::wal::{self, Wal};
 
 /// Sizing and durability knobs, lifted out of [`StorageConfig`].
@@ -55,11 +56,24 @@ pub struct RecordStore<S: RecordSchema> {
     segments_dir: PathBuf,
     tmp_dir: PathBuf,
     settings: StoreSettings,
-    wal: Mutex<Wal>,
-    buffer: Mutex<Buffer<S>>,
+    /// The write-ahead log **and** the in-memory buffer, under one lock.
+    ///
+    /// They were separate locks once, and that was a data-loss bug: a seal landing
+    /// between "appended to the WAL" and "pushed to the buffer" took a buffer that did
+    /// not contain the record, then truncated the WAL segment that did. The record
+    /// existed only in memory and vanished on restart. Nothing errored — it is exactly
+    /// the failure a concurrency test exists to find. A record must become durable and
+    /// queryable atomically.
+    writer: Mutex<Writer<S>>,
     catalogue: RwLock<Vec<Arc<Segment>>>,
     seal_sequence: AtomicU64,
     stats: Stats,
+}
+
+/// The write side: log and buffer, kept consistent with each other.
+struct Writer<S: RecordSchema> {
+    wal: Wal,
+    buffer: Buffer<S>,
 }
 
 impl<S: RecordSchema> std::fmt::Debug for RecordStore<S> {
@@ -93,6 +107,84 @@ struct Stats {
     sealed_segments: AtomicU64,
     sealed_records: AtomicU64,
     recovered: AtomicU64,
+    /// Segments actually opened and decoded. The counterpart to `segments_pruned`:
+    /// together they say how much of the store a query had to touch, which is the
+    /// number to watch when queries get slow.
+    segments_scanned: AtomicU64,
+    /// Segments a query skipped without any I/O — by time range, label index, Bloom
+    /// filter, or the limit cutoff.
+    segments_pruned: AtomicU64,
+}
+
+/// A bounded query request.
+#[derive(Clone, Copy)]
+pub struct Scan<'a> {
+    pub start_nanos: u64,
+    pub end_nanos: u64,
+    /// `0` means unbounded.
+    pub limit: usize,
+    pub order: Order,
+    /// An exact value for the schema's key column, when the query is a point lookup.
+    /// Lets the per-segment Bloom filter rule segments out before any I/O.
+    pub exact_key: Option<&'a str>,
+    /// Optional columnar narrowing, applied before any row is decoded.
+    ///
+    /// May over-select; the record predicate remains the authority. Supplying one is
+    /// what turns a line filter from "decode every row, then test" into "test the
+    /// Arrow string buffer, then decode the few that matched".
+    pub columns: Option<crate::schema::ColumnFilter<'a>>,
+}
+
+impl std::fmt::Debug for Scan<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Scan")
+            .field("start_nanos", &self.start_nanos)
+            .field("end_nanos", &self.end_nanos)
+            .field("limit", &self.limit)
+            .field("order", &self.order)
+            .field("exact_key", &self.exact_key)
+            .field("columns", &self.columns.is_some())
+            .finish()
+    }
+}
+
+impl<'a> Scan<'a> {
+    /// An unbounded scan over a time range.
+    #[must_use]
+    pub fn range(start_nanos: u64, end_nanos: u64) -> Self {
+        Self {
+            start_nanos,
+            end_nanos,
+            limit: 0,
+            order: Order::Ascending,
+            exact_key: None,
+            columns: None,
+        }
+    }
+
+    #[must_use]
+    pub fn limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    #[must_use]
+    pub fn order(mut self, order: Order) -> Self {
+        self.order = order;
+        self
+    }
+
+    #[must_use]
+    pub fn exact_key(mut self, key: &'a str) -> Self {
+        self.exact_key = Some(key);
+        self
+    }
+
+    #[must_use]
+    pub fn columns(mut self, filter: crate::schema::ColumnFilter<'a>) -> Self {
+        self.columns = Some(filter);
+        self
+    }
 }
 
 /// A point-in-time view of one signal's storage.
@@ -108,6 +200,8 @@ pub struct RecordStoreStatus {
     pub recovered_records: u64,
     pub oldest_record_nanos: Option<u64>,
     pub newest_record_nanos: Option<u64>,
+    pub segments_scanned: u64,
+    pub segments_pruned: u64,
 }
 
 impl<S: RecordSchema> RecordStore<S> {
@@ -183,8 +277,7 @@ impl<S: RecordSchema> RecordStore<S> {
             segments_dir,
             tmp_dir,
             settings,
-            wal: Mutex::new(wal),
-            buffer: Mutex::new(buffer),
+            writer: Mutex::new(Writer { wal, buffer }),
             catalogue: RwLock::new(segments.into_iter().map(Arc::new).collect()),
             seal_sequence: AtomicU64::new(seal_sequence),
             stats,
@@ -200,22 +293,16 @@ impl<S: RecordSchema> RecordStore<S> {
             return Ok(());
         }
 
-        {
-            let mut wal = lock(&self.wal);
+        let should_seal = {
+            let mut writer = lock(&self.writer);
             for record in records {
                 let payload = postcard::to_stdvec(record)
                     .map_err(|e| Error::Config(format!("encoding a {} record: {e}", S::SIGNAL)))?;
-                wal.append(&payload)?;
+                writer.wal.append(&payload)?;
+                writer.buffer.bytes += S::size_estimate(record);
+                writer.buffer.records.push(record.clone());
             }
-        }
-
-        let should_seal = {
-            let mut buffer = lock(&self.buffer);
-            for record in records {
-                buffer.bytes += S::size_estimate(record);
-                buffer.records.push(record.clone());
-            }
-            buffer.bytes as u64 >= self.settings.max_segment_bytes
+            writer.buffer.bytes as u64 >= self.settings.max_segment_bytes
         };
 
         self.stats
@@ -234,9 +321,9 @@ impl<S: RecordSchema> RecordStore<S> {
     /// force a seal (shutdown, tests) without waiting for the window.
     pub fn maybe_seal(&self) -> Result<Option<Arc<Segment>>> {
         let due = {
-            let buffer = lock(&self.buffer);
-            !buffer.records.is_empty()
-                && buffer.opened_at.elapsed() >= self.settings.segment_duration
+            let writer = lock(&self.writer);
+            !writer.buffer.records.is_empty()
+                && writer.buffer.opened_at.elapsed() >= self.settings.segment_duration
         };
         if due { self.seal_now() } else { Ok(None) }
     }
@@ -249,16 +336,16 @@ impl<S: RecordSchema> RecordStore<S> {
     /// published, so a crash anywhere in between recovers rather than loses.
     pub fn seal_now(&self) -> Result<Option<Arc<Segment>>> {
         let (records, wal_sequence) = {
-            let mut buffer = lock(&self.buffer);
-            if buffer.records.is_empty() {
+            let mut writer = lock(&self.writer);
+            if writer.buffer.records.is_empty() {
                 return Ok(None);
             }
-            // Rotate under the buffer lock so the boundary between "in this segment"
-            // and "still in the log" is unambiguous.
-            let wal_sequence = lock(&self.wal).rotate()?;
-            let records = std::mem::take(&mut buffer.records);
-            buffer.bytes = 0;
-            buffer.opened_at = Instant::now();
+            // Rotate and drain under the same lock that appends hold, so the boundary
+            // between "in this segment" and "still in the log" is exact.
+            let wal_sequence = writer.wal.rotate()?;
+            let records = std::mem::take(&mut writer.buffer.records);
+            writer.buffer.bytes = 0;
+            writer.buffer.opened_at = Instant::now();
             (records, wal_sequence)
         };
 
@@ -281,12 +368,12 @@ impl<S: RecordSchema> RecordStore<S> {
                 // Put the records back rather than dropping them on the floor. They
                 // are still in the WAL, so they would survive a restart either way,
                 // but a running process must not silently lose queryable data.
-                let mut buffer = lock(&self.buffer);
+                let mut writer = lock(&self.writer);
                 let bytes: usize = records.iter().map(S::size_estimate).sum();
                 let mut restored = records;
-                restored.append(&mut buffer.records);
-                buffer.records = restored;
-                buffer.bytes += bytes;
+                restored.append(&mut writer.buffer.records);
+                writer.buffer.records = restored;
+                writer.buffer.bytes += bytes;
                 tracing::error!(
                     signal = %S::SIGNAL,
                     error = %error,
@@ -304,7 +391,7 @@ impl<S: RecordSchema> RecordStore<S> {
         lock_write(&self.catalogue).push(Arc::clone(&segment));
 
         // Only now is the log redundant.
-        if let Err(e) = lock(&self.wal).remove_up_to(wal_sequence) {
+        if let Err(e) = lock(&self.writer).wal.remove_up_to(wal_sequence) {
             tracing::warn!(
                 signal = %S::SIGNAL,
                 error = %e,
@@ -318,12 +405,12 @@ impl<S: RecordSchema> RecordStore<S> {
 
     /// Flush and fsync the write-ahead log without sealing.
     pub fn sync(&self) -> Result<()> {
-        lock(&self.wal).sync()
+        lock(&self.writer).wal.sync()
     }
 
     /// Apply the configured sync policy; called from the background ticker.
     pub fn maybe_sync(&self) -> Result<()> {
-        lock(&self.wal).maybe_sync()
+        lock(&self.writer).wal.maybe_sync()
     }
 
     /// Every sealed segment, oldest first.
@@ -349,11 +436,10 @@ impl<S: RecordSchema> RecordStore<S> {
         }
     }
 
-    /// Query records in `[start_nanos, end_nanos]` matching `matchers`.
+    /// Query records in `[start_nanos, end_nanos]` matching `matchers`, unbounded.
     ///
-    /// `extra` runs after label matching and is where line filters live. Applied here
-    /// rather than by the caller so a highly selective filter does not first
-    /// materialise every row in the range.
+    /// Prefer [`Self::scan`] with a limit wherever the caller has one: this variant
+    /// materialises every match.
     pub fn query(
         &self,
         start_nanos: u64,
@@ -361,58 +447,161 @@ impl<S: RecordSchema> RecordStore<S> {
         matchers: &[LabelMatcher],
         extra: &dyn Fn(&S::Record) -> bool,
     ) -> Result<Vec<S::Record>> {
-        let mut out = Vec::new();
+        self.scan(
+            Scan {
+                start_nanos,
+                end_nanos,
+                limit: 0,
+                order: Order::Ascending,
+                exact_key: None,
+                columns: None,
+            },
+            matchers,
+            extra,
+        )
+    }
 
-        // Sealed segments, skipping any the manifest rules out without opening it.
-        for segment in self.segments() {
-            if !segment.manifest.overlaps(start_nanos, end_nanos)
-                || !segment.manifest.might_match(matchers)
-            {
+    /// Query with a bound, in a chosen order.
+    ///
+    /// Three things keep this from scaling with the size of the store rather than the
+    /// size of the answer:
+    ///
+    /// 1. **Manifest pruning** skips segments that cannot match, without opening them.
+    /// 2. **Streaming decode** processes one Arrow batch at a time, so a query that
+    ///    matches three rows never allocates a whole segment.
+    /// 3. **A bounded collector** holds `limit` records rather than every match, and
+    ///    tells us when a remaining segment is entirely worse than what we already
+    ///    have — at which point the scan stops.
+    pub fn scan(
+        &self,
+        request: Scan,
+        matchers: &[LabelMatcher],
+        extra: &dyn Fn(&S::Record) -> bool,
+    ) -> Result<Vec<S::Record>> {
+        let mut collector = TopK::new(request.limit, request.order);
+
+        // The live buffer first: it holds the newest data, so filling the collector
+        // from it maximises how many sealed segments the cutoff can then skip.
+        {
+            let writer = lock(&self.writer);
+            for record in &writer.buffer.records {
+                if Self::selects(record, &request, matchers, extra) {
+                    collector.push(S::timestamp(record), record.clone());
+                }
+            }
+        }
+
+        // Walk segments from the end the caller cares about, so the cutoff tightens as
+        // fast as possible.
+        let mut segments = self.segments();
+        match request.order {
+            Order::Descending => {
+                segments.sort_by_key(|s| std::cmp::Reverse(s.manifest.max_time_nanos));
+            }
+            Order::Ascending => segments.sort_by_key(|s| s.manifest.min_time_nanos),
+        }
+
+        for segment in segments {
+            let manifest = &segment.manifest;
+            // Evaluate the matchers once per distinct stream, not once per row. A
+            // segment with a million rows across fifty streams does fifty
+            // evaluations; before interning it did a million.
+            let allowed: Vec<bool> = manifest
+                .streams
+                .iter()
+                .map(|labels| matches_all(matchers, labels))
+                .collect();
+            let no_stream_matches = !manifest.streams.is_empty() && !allowed.iter().any(|ok| *ok);
+
+            let prunable = no_stream_matches
+                || !manifest.overlaps(request.start_nanos, request.end_nanos)
+                || !manifest.might_match(matchers)
+                // An exact-key lookup (a trace id) can rule out a segment outright.
+                || request
+                    .exact_key
+                    .is_some_and(|key| !segment.may_contain_key(key))
+                || collector.can_skip_range(manifest.min_time_nanos, manifest.max_time_nanos);
+
+            if prunable {
+                self.stats.segments_pruned.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            for record in segment.read::<S>()? {
-                if Self::selects(&record, start_nanos, end_nanos, matchers, extra) {
-                    out.push(record);
+            self.stats.segments_scanned.fetch_add(1, Ordering::Relaxed);
+
+            // Push the time-and-stream predicate into the Parquet reader so the wide
+            // columns are never decompressed for rows we are going to discard.
+            let selection = {
+                let allowed = allowed.clone();
+                let (start, end) = (request.start_nanos, request.end_nanos);
+                crate::segment::Selection {
+                    columns: S::filter_columns().to_vec(),
+                    mask: std::sync::Arc::new(move |batch: &arrow::record_batch::RecordBatch| {
+                        S::selection_mask(batch, start, end, &allowed)
+                    }),
                 }
-            }
+            };
+
+            segment.scan_batches_where(Some(selection), |batch| {
+                // Rows here already passed the pushed-down predicate; `select_rows`
+                // re-checks because a batch may still carry rows the reader kept for
+                // its own alignment reasons, and correctness must not depend on that.
+                let mut rows =
+                    S::select_rows(batch, request.start_nanos, request.end_nanos, &allowed)?;
+                if let Some(refine) = request.columns {
+                    refine(batch, &mut rows)?;
+                }
+                if rows.is_empty() {
+                    return Ok(Flow::Continue);
+                }
+
+                for record in S::materialize(batch, &rows, &manifest.streams)? {
+                    // The record predicate stays the authority; the columnar filter
+                    // above is only allowed to over-select.
+                    if extra(&record) {
+                        collector.push(S::timestamp(&record), record);
+                    }
+                }
+                Ok(Flow::Continue)
+            })?;
         }
 
-        // …and the live buffer, so just-ingested data is visible immediately.
-        {
-            let buffer = lock(&self.buffer);
-            for record in &buffer.records {
-                if Self::selects(record, start_nanos, end_nanos, matchers, extra) {
-                    out.push(record.clone());
-                }
-            }
-        }
-
-        Ok(out)
+        Ok(collector.into_sorted())
     }
 
     fn selects(
         record: &S::Record,
-        start_nanos: u64,
-        end_nanos: u64,
+        request: &Scan,
         matchers: &[LabelMatcher],
         extra: &dyn Fn(&S::Record) -> bool,
     ) -> bool {
         let ts = S::timestamp(record);
-        ts >= start_nanos
-            && ts <= end_nanos
+        ts >= request.start_nanos
+            && ts <= request.end_nanos
             && matches_all(matchers, S::index_labels(record))
             && extra(record)
     }
 
     /// Distinct stream label names across the time range.
+    ///
+    /// Answered from segment metadata alone. The stream dictionary already lists every
+    /// distinct label set in the segment, so this never opens a Parquet file — which
+    /// is the whole reason label discovery in a UI feels instant instead of scanning.
     pub fn label_names(&self, start_nanos: u64, end_nanos: u64) -> Vec<String> {
         let mut names = std::collections::BTreeSet::new();
         for segment in self.segments() {
-            if segment.manifest.overlaps(start_nanos, end_nanos) {
+            if !segment.manifest.overlaps(start_nanos, end_nanos) {
+                continue;
+            }
+            for stream in &segment.manifest.streams {
+                names.extend(stream.names().map(str::to_owned));
+            }
+            // Segments written before stream interning have no dictionary; their label
+            // index still lists the names.
+            if segment.manifest.streams.is_empty() {
                 names.extend(segment.manifest.labels.keys().cloned());
             }
         }
-        for record in &lock(&self.buffer).records {
+        for record in &lock(&self.writer).buffer.records {
             let ts = S::timestamp(record);
             if ts >= start_nanos && ts <= end_nanos {
                 names.extend(S::index_labels(record).names().map(str::to_owned));
@@ -423,8 +612,8 @@ impl<S: RecordSchema> RecordStore<S> {
 
     /// Distinct values for one stream label across the time range.
     ///
-    /// A label that went unbounded in a segment has no recorded values, so this reads
-    /// that segment rather than under-reporting. Silently returning a short list would
+    /// Also metadata-only, and *exact* — the dictionary holds every distinct stream,
+    /// so there is no cardinality cutoff to fall off and no under-reporting that would
     /// make a UI dropdown quietly wrong.
     pub fn label_values(
         &self,
@@ -438,22 +627,39 @@ impl<S: RecordSchema> RecordStore<S> {
             if !segment.manifest.overlaps(start_nanos, end_nanos) {
                 continue;
             }
-            match segment.manifest.labels.get(name) {
-                Some(crate::segment::LabelValues::Values(set)) => {
-                    values.extend(set.iter().cloned());
-                }
-                Some(crate::segment::LabelValues::Unbounded { .. }) => {
-                    for record in segment.read::<S>()? {
-                        if let Some(value) = S::index_labels(&record).get(name) {
-                            values.insert(value.to_owned());
-                        }
+
+            if segment.manifest.streams.is_empty() {
+                // Pre-dictionary segment: fall back to the label index, and read the
+                // data only when that index gave up on this label.
+                match segment.manifest.labels.get(name) {
+                    Some(crate::segment::LabelValues::Values(set)) => {
+                        values.extend(set.iter().cloned());
                     }
+                    Some(crate::segment::LabelValues::Unbounded { .. }) => {
+                        segment.scan_batches(|batch| {
+                            let rows: crate::schema::Rows =
+                                (0..u32::try_from(batch.num_rows()).unwrap_or(u32::MAX)).collect();
+                            for record in S::materialize(batch, &rows, &segment.manifest.streams)? {
+                                if let Some(value) = S::index_labels(&record).get(name) {
+                                    values.insert(value.to_owned());
+                                }
+                            }
+                            Ok(Flow::Continue)
+                        })?;
+                    }
+                    None => {}
                 }
-                None => {}
+                continue;
+            }
+
+            for stream in &segment.manifest.streams {
+                if let Some(value) = stream.get(name) {
+                    values.insert(value.to_owned());
+                }
             }
         }
 
-        for record in &lock(&self.buffer).records {
+        for record in &lock(&self.writer).buffer.records {
             let ts = S::timestamp(record);
             if ts >= start_nanos
                 && ts <= end_nanos
@@ -467,23 +673,61 @@ impl<S: RecordSchema> RecordStore<S> {
     }
 
     /// Distinct stream label sets in the range, for `/loki/api/v1/series`.
+    ///
+    /// Metadata-only when there are no matchers to apply beyond the label set itself —
+    /// which is every call the UI makes.
     pub fn streams(
         &self,
         start_nanos: u64,
         end_nanos: u64,
         matchers: &[LabelMatcher],
     ) -> Result<Vec<Labels>> {
-        let mut seen = std::collections::BTreeSet::new();
-        let records = self.query(start_nanos, end_nanos, matchers, &|_| true)?;
-        for record in &records {
-            seen.insert(S::index_labels(record).clone());
+        let mut seen: std::collections::BTreeSet<Labels> = std::collections::BTreeSet::new();
+
+        for segment in self.segments() {
+            if !segment.manifest.overlaps(start_nanos, end_nanos) {
+                continue;
+            }
+            if segment.manifest.streams.is_empty() {
+                // Pre-dictionary segment: the only way to know is to read it.
+                for record in segment.read::<S>()? {
+                    let ts = S::timestamp(&record);
+                    if ts >= start_nanos
+                        && ts <= end_nanos
+                        && matches_all(matchers, S::index_labels(&record))
+                    {
+                        seen.insert(S::index_labels(&record).clone());
+                    }
+                }
+                continue;
+            }
+            seen.extend(
+                segment
+                    .manifest
+                    .streams
+                    .iter()
+                    .filter(|labels| matches_all(matchers, labels))
+                    .cloned(),
+            );
         }
+
+        for record in &lock(&self.writer).buffer.records {
+            let ts = S::timestamp(record);
+            if ts >= start_nanos
+                && ts <= end_nanos
+                && matches_all(matchers, S::index_labels(record))
+            {
+                seen.insert(S::index_labels(record).clone());
+            }
+        }
+
         Ok(seen.into_iter().collect())
     }
 
     pub fn status(&self) -> RecordStoreStatus {
         let segments = self.segments();
-        let buffer = lock(&self.buffer);
+        let writer = lock(&self.writer);
+        let buffer = &writer.buffer;
 
         let mut oldest = segments.iter().map(|s| s.manifest.min_time_nanos).min();
         let mut newest = segments.iter().map(|s| s.manifest.max_time_nanos).max();
@@ -504,6 +748,8 @@ impl<S: RecordSchema> RecordStore<S> {
             recovered_records: self.stats.recovered.load(Ordering::Relaxed),
             oldest_record_nanos: oldest,
             newest_record_nanos: newest,
+            segments_scanned: self.stats.segments_scanned.load(Ordering::Relaxed),
+            segments_pruned: self.stats.segments_pruned.load(Ordering::Relaxed),
         }
     }
 }

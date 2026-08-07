@@ -33,6 +33,29 @@ impl Labels {
         self.0.get(name).map(String::as_str)
     }
 
+    /// Look up a key, accepting either the original spelling or the sanitised one.
+    ///
+    /// Attribute keys are stored exactly as the producer sent them —
+    /// `exception.type` stays `exception.type` — because they are *data*, and
+    /// rewriting them means a trace view shows a key nobody sent. Stream labels are
+    /// different: they have to be valid Loki/Prometheus label names, so those are
+    /// sanitised at ingest.
+    ///
+    /// That leaves queries needing to reach an attribute by either spelling —
+    /// TraceQL's `span.exception.type` and LogQL's `| exception_type="x"` mean the
+    /// same attribute. The exact match is tried first and is the common case; the
+    /// scan only runs when it misses, over a set capped by `max_attrs_per_record`.
+    pub fn get_relaxed(&self, name: &str) -> Option<&str> {
+        if let Some(value) = self.get(name) {
+            return Some(value);
+        }
+        let wanted = sanitize_label_name(name);
+        self.0
+            .iter()
+            .find(|(key, _)| sanitize_label_name(key) == wanted)
+            .map(|(_, value)| value.as_str())
+    }
+
     pub fn contains_key(&self, name: &str) -> bool {
         self.0.contains_key(name)
     }

@@ -10,6 +10,7 @@ pub mod matcher;
 pub mod record;
 pub mod secret;
 pub mod signal;
+pub mod span;
 
 pub use config::Config;
 pub use error::{Error, Result};
@@ -17,6 +18,7 @@ pub use matcher::{LabelMatcher, MatchOp, matches_all};
 pub use record::{APP_LABEL, LEVEL_LABEL, Labels, LogRecord, Severity, UNKNOWN_APP};
 pub use secret::{Secret, TokenSet};
 pub use signal::Signal;
+pub use span::{SpanEvent, SpanKind, SpanRecord, SpanStatus};
 
 /// Crate version, surfaced by `/status`, `telemetryd version` and the `User-Agent`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

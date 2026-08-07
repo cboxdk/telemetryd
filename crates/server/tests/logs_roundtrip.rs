@@ -293,6 +293,8 @@ async fn label_filters_reach_record_attributes() {
         ]))
         .await;
 
+    // The label-safe spelling still reaches the attribute, which is what a LogQL
+    // label filter can express.
     let (status, response) = harness
         .get(&range(
             "/loki/api/v1/query_range",
@@ -803,7 +805,8 @@ async fn record_attributes_are_returned_as_structured_metadata() {
     let entry = &response["data"]["result"][0]["values"][0];
     let tuple = entry.as_array().unwrap();
     assert_eq!(tuple.len(), 3, "expected structured metadata, got {entry}");
-    assert_eq!(tuple[2]["order_id"], "1002");
+    // Attributes keep the producer's key spelling all the way to the wire.
+    assert_eq!(tuple[2]["order.id"], "1002");
 
     // Stream labels stay in `stream`, not duplicated into the metadata.
     assert!(tuple[2].get("app").is_none());

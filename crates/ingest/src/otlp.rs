@@ -212,9 +212,26 @@ fn format_double(value: f64) -> String {
 
 /// Fold OTLP attributes into a label set, sanitising names.
 ///
+/// Used for the resource and scope attributes that become *stream labels*, which must
+/// be valid Loki/Prometheus label names.
+///
 /// Later keys win, which is what lets scope attributes override resource attributes
 /// and record attributes override both — narrowest scope closest to the data.
 pub fn extend_labels(target: &mut Labels, attributes: &[KeyValue]) {
+    extend(target, attributes, true);
+}
+
+/// Fold OTLP attributes in **verbatim**, preserving the producer's key spelling.
+///
+/// Used for per-record and per-span attributes, which are data rather than label
+/// names. Rewriting `exception.type` to `exception_type` would mean a trace view shows
+/// a key nobody sent; queries reach either spelling through
+/// [`telemetryd_core::Labels::get_relaxed`].
+pub fn extend_attributes(target: &mut Labels, attributes: &[KeyValue]) {
+    extend(target, attributes, false);
+}
+
+fn extend(target: &mut Labels, attributes: &[KeyValue], sanitize: bool) {
     for kv in attributes {
         if kv.key.is_empty() {
             continue;
@@ -222,7 +239,11 @@ pub fn extend_labels(target: &mut Labels, attributes: &[KeyValue]) {
         let Some(text) = kv.value.as_ref().and_then(AnyValue::to_text) else {
             continue;
         };
-        target.insert(sanitize_label_name(&kv.key), text);
+        if sanitize {
+            target.insert(sanitize_label_name(&kv.key), text);
+        } else {
+            target.insert(kv.key.clone(), text);
+        }
     }
 }
 

@@ -23,6 +23,10 @@ pub enum Token {
     NotEqual,
     RegexMatch,
     RegexNotMatch,
+    /// `&&` — TraceQL condition conjunction.
+    AndAnd,
+    /// `||` — TraceQL disjunction. Tokenised so it can be *named* as unsupported.
+    OrOr,
     /// `|=` — line contains.
     LineContains,
     /// `|~` — line matches regex.
@@ -65,6 +69,8 @@ impl fmt::Display for Token {
             Self::NotEqual => f.write_str("!="),
             Self::RegexMatch => f.write_str("=~"),
             Self::RegexNotMatch => f.write_str("!~"),
+            Self::AndAnd => f.write_str("&&"),
+            Self::OrOr => f.write_str("||"),
             Self::LineContains => f.write_str("|="),
             Self::LineRegex => f.write_str("|~"),
             Self::Less => f.write_str("<"),
@@ -156,6 +162,8 @@ impl<'a> Lexer<'a> {
             (b'!', Some(b'~')) => Some(Token::RegexNotMatch),
             (b'=', Some(b'~')) => Some(Token::RegexMatch),
             (b'=', Some(b'=')) => Some(Token::Equal),
+            (b'&', Some(b'&')) => Some(Token::AndAnd),
+            (b'|', Some(b'|')) => Some(Token::OrOr),
             (b'|', Some(b'=')) => Some(Token::LineContains),
             (b'|', Some(b'~')) => Some(Token::LineRegex),
             (b'<', Some(b'=')) => Some(Token::LessEqual),
@@ -362,13 +370,26 @@ impl<'a> Lexer<'a> {
         Ok(Token::Duration(total))
     }
 
+    /// Identifiers, including dotted paths.
+    ///
+    /// TraceQL field paths are dotted (`resource.service.name`, `span.http.status_code`),
+    /// so `.` continues an identifier — but only when a name character follows it.
+    /// Requiring the lookahead keeps `1.5` a number and stops a trailing `.` from
+    /// swallowing the next token.
     fn lex_ident(&mut self) -> Token {
         let start = self.pos;
-        while self
-            .peek(0)
-            .is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b':')
-        {
-            self.pos += 1;
+        loop {
+            match self.peek(0) {
+                Some(c) if c.is_ascii_alphanumeric() || c == b'_' || c == b':' => self.pos += 1,
+                Some(b'.')
+                    if self
+                        .peek(1)
+                        .is_some_and(|next| next.is_ascii_alphanumeric() || next == b'_') =>
+                {
+                    self.pos += 1;
+                }
+                _ => break,
+            }
         }
         Token::Ident(self.input[start..self.pos].to_owned())
     }
@@ -503,6 +524,38 @@ mod tests {
         let err = tokenize("{app=$}").unwrap_err().to_string();
         assert!(err.contains("unexpected character"), "{err}");
         assert!(err.contains("position"), "{err}");
+    }
+
+    #[test]
+    fn dotted_identifiers_lex_as_one_token() {
+        // TraceQL field paths.
+        assert_eq!(
+            tokens("resource.service.name"),
+            vec![Token::Ident("resource.service.name".into())]
+        );
+        assert_eq!(
+            tokens("span.http.status_code"),
+            vec![Token::Ident("span.http.status_code".into())]
+        );
+    }
+
+    #[test]
+    fn a_dot_does_not_swallow_numbers_or_trailing_tokens() {
+        // The lookahead is what keeps these correct.
+        assert_eq!(tokens("1.5"), vec![Token::Number(1.5)]);
+        assert_eq!(tokens("1.5h"), vec![Token::Duration(5_400_000_000_000)]);
+        // A trailing dot is not part of the identifier, and `.` is not a token on its
+        // own — so this is a syntax error rather than a silently truncated name.
+        assert!(tokenize("foo.").is_err());
+    }
+
+    #[test]
+    fn traceql_conjunctions_lex_as_single_tokens() {
+        assert_eq!(tokens("&&"), vec![Token::AndAnd]);
+        // `||` must not be read as two pipes, or a TraceQL disjunction would look
+        // like an empty pipeline stage.
+        assert_eq!(tokens("||"), vec![Token::OrOr]);
+        assert_eq!(tokens("|"), vec![Token::Pipe]);
     }
 
     #[test]

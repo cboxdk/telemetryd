@@ -114,6 +114,16 @@ pub const DESCRIPTORS: &[Descriptor] = &[
         help: "Segments sealed since start, by signal",
     },
     Descriptor {
+        name: "telemetryd_query_segments_scanned_total",
+        kind: Kind::Counter,
+        help: "Segments opened and decoded to answer queries — the number to watch when queries slow down",
+    },
+    Descriptor {
+        name: "telemetryd_query_segments_pruned_total",
+        kind: Kind::Counter,
+        help: "Segments queries skipped with no I/O, via time range, label index, Bloom filter or limit cutoff",
+    },
+    Descriptor {
         name: "telemetryd_retention_deleted_total",
         kind: Kind::Counter,
         help: "Segments deleted by retention, by reason (age or disk_budget)",

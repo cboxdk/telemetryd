@@ -8,6 +8,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use telemetryd_core::Error;
 use telemetryd_ingest::logs::{self, DecodeContext};
+use telemetryd_ingest::traces;
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -26,8 +27,10 @@ pub struct OtlpResponse {
 
 #[derive(Debug, Serialize)]
 pub struct PartialSuccess {
-    #[serde(rename = "rejectedLogRecords")]
-    pub rejected_log_records: String,
+    #[serde(rename = "rejectedLogRecords", skip_serializing_if = "Option::is_none")]
+    pub rejected_log_records: Option<String>,
+    #[serde(rename = "rejectedSpans", skip_serializing_if = "Option::is_none")]
+    pub rejected_spans: Option<String>,
     #[serde(rename = "errorMessage")]
     pub error_message: String,
 }
@@ -106,7 +109,70 @@ pub async fn otlp_logs(
 
     let response = OtlpResponse {
         partial_success: decoded.rejection_summary().map(|message| PartialSuccess {
-            rejected_log_records: decoded.rejected().to_string(),
+            rejected_log_records: Some(decoded.rejected().to_string()),
+            rejected_spans: None,
+            error_message: message,
+        }),
+    };
+
+    Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+/// `POST /v1/traces`
+pub async fn otlp_traces(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    reject_protobuf(&headers)?;
+
+    let decoded = {
+        let limits = state.config.limits.clone();
+        let ingest = state.config.ingest.clone();
+        let now = telemetryd_store::now_nanos();
+        traces::decode(&body, traces::context(&limits, &ingest, now)).map_err(|e| {
+            state.metrics.incr(
+                "telemetryd_ingest_rejected_total",
+                &[("signal", "traces"), ("reason", "malformed_json")],
+            );
+            Error::BadRequest(format!("could not decode the OTLP traces payload: {e}"))
+        })?
+    };
+
+    for rejection in &decoded.rejections {
+        state.metrics.incr(
+            "telemetryd_ingest_rejected_total",
+            &[("signal", "traces"), ("reason", rejection.reason.as_str())],
+        );
+    }
+    if decoded.rescaled_timestamps > 0 {
+        state.metrics.add(
+            "telemetryd_ingest_timestamps_rescaled_total",
+            &[("signal", "traces")],
+            decoded.rescaled_timestamps,
+        );
+    }
+
+    if !decoded.records.is_empty() {
+        let store = std::sync::Arc::clone(&state.store);
+        let records = decoded.records.clone();
+        let accepted = records.len() as u64;
+
+        tokio::task::spawn_blocking(move || store.append_spans(&records))
+            .await
+            .map_err(|e| Error::Config(format!("ingest task panicked: {e}")))??;
+
+        state.metrics.add(
+            "telemetryd_ingest_accepted_total",
+            &[("signal", "traces")],
+            accepted,
+        );
+    }
+
+    let response = OtlpResponse {
+        partial_success: decoded.rejection_summary().map(|message| PartialSuccess {
+            rejected_log_records: None,
+            rejected_spans: Some(decoded.rejected().to_string()),
             error_message: message,
         }),
     };
@@ -181,13 +247,15 @@ mod tests {
     fn the_partial_success_envelope_matches_otlps_shape() {
         let response = OtlpResponse {
             partial_success: Some(PartialSuccess {
-                rejected_log_records: "3".to_owned(),
+                rejected_log_records: Some("3".to_owned()),
+                rejected_spans: None,
                 error_message: "3 record(s) rejected".to_owned(),
             }),
         };
         let json = serde_json::to_value(&response).unwrap();
 
         assert_eq!(json["partialSuccess"]["rejectedLogRecords"], "3");
+        assert!(json["partialSuccess"].get("rejectedSpans").is_none());
         assert!(
             json["partialSuccess"]["rejectedLogRecords"].is_string(),
             "OTLP encodes int64 as a string; a number breaks strict clients"

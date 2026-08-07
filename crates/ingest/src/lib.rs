@@ -15,6 +15,7 @@
 
 pub mod logs;
 pub mod otlp;
+pub mod traces;
 
 /// Why a record was refused. The string form is the metric label, so it is a closed
 /// set rather than free text — an operator can alert on it.
@@ -25,6 +26,10 @@ pub enum RejectReason {
     TooManyLabels,
     LabelNameTooLong,
     LabelValueTooLong,
+    /// A span with no usable trace id cannot be joined to anything.
+    MissingTraceId,
+    /// Likewise with no span id: nothing could ever reference it.
+    MissingSpanId,
 }
 
 impl RejectReason {
@@ -35,6 +40,8 @@ impl RejectReason {
             Self::TooManyLabels => "too_many_labels",
             Self::LabelNameTooLong => "label_name_too_long",
             Self::LabelValueTooLong => "label_value_too_long",
+            Self::MissingTraceId => "missing_trace_id",
+            Self::MissingSpanId => "missing_span_id",
         }
     }
 }
@@ -125,6 +132,8 @@ mod tests {
             RejectReason::TooManyLabels,
             RejectReason::LabelNameTooLong,
             RejectReason::LabelValueTooLong,
+            RejectReason::MissingTraceId,
+            RejectReason::MissingSpanId,
         ] {
             let label = reason.as_str();
             assert!(!label.is_empty());

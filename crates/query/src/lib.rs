@@ -21,5 +21,7 @@
 pub mod lexer;
 pub mod logql;
 pub mod loki;
+pub mod tempo;
+pub mod traceql;
 
 pub use logql::{LogQuery, Stage};

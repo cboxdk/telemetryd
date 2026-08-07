@@ -5,12 +5,15 @@
 //! store in M3. Both register in one retention pass, so the disk budget means the same
 //! thing everywhere.
 
+pub mod bloom;
 pub mod datadir;
 pub mod logs;
 pub mod records;
 pub mod retention;
 pub mod schema;
 pub mod segment;
+pub mod spans;
+pub mod topk;
 pub mod wal;
 
 use std::collections::BTreeMap;
@@ -18,13 +21,16 @@ use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
 use telemetryd_core::config::{Config, RetentionConfig};
+use telemetryd_core::span::SpanRecord;
 use telemetryd_core::{LogRecord, Result, Signal};
 
 pub use datadir::{DataDir, DiskUsage};
 pub use logs::LogSchema;
-pub use records::{RecordStore, RecordStoreStatus, StoreSettings};
+pub use records::{RecordStore, RecordStoreStatus, Scan, StoreSettings};
 pub use retention::{Candidate, Plan, ReaperReport};
 pub use segment::{Segment, SegmentManifest};
+pub use spans::SpanSchema;
+pub use topk::Order;
 pub use wal::{Truncation, TruncationReason, Wal, WalStats};
 
 /// Wall-clock now, in Unix nanoseconds.
@@ -39,6 +45,7 @@ pub fn now_nanos() -> u64 {
 pub struct Store {
     data_dir: DataDir,
     logs: RecordStore<LogSchema>,
+    traces: RecordStore<SpanSchema>,
     disk_budget: u64,
     retention: RetentionConfig,
     reaper: Mutex<ReaperReport>,
@@ -62,9 +69,17 @@ impl Store {
             settings,
         )?;
 
+        let traces = RecordStore::<SpanSchema>::open(
+            &data_dir.wal_dir(Signal::Traces),
+            data_dir.segments_dir(Signal::Traces),
+            data_dir.tmp_dir(),
+            settings,
+        )?;
+
         Ok(Self {
             data_dir,
             logs,
+            traces,
             disk_budget: config.storage.disk_budget.as_u64(),
             retention: config.retention.clone(),
             reaper: Mutex::new(ReaperReport::default()),
@@ -74,6 +89,15 @@ impl Store {
 
     pub fn logs(&self) -> &RecordStore<LogSchema> {
         &self.logs
+    }
+
+    pub fn traces(&self) -> &RecordStore<SpanSchema> {
+        &self.traces
+    }
+
+    /// Append trace spans. Durable before this returns.
+    pub fn append_spans(&self, records: &[SpanRecord]) -> Result<()> {
+        self.traces.append(records)
     }
 
     pub fn data_dir(&self) -> &DataDir {
@@ -88,23 +112,27 @@ impl Store {
     /// Flush and fsync every log. Called on graceful shutdown so a clean stop never
     /// loses the interval-sync window.
     pub fn sync_all(&self) -> Result<()> {
-        self.logs.sync()
+        self.logs.sync()?;
+        self.traces.sync()
     }
 
     /// Apply the configured sync policy without forcing a flush.
     pub fn maybe_sync(&self) -> Result<()> {
-        self.logs.maybe_sync()
+        self.logs.maybe_sync()?;
+        self.traces.maybe_sync()
     }
 
     /// Seal any buffer whose window has elapsed.
     pub fn maybe_seal(&self) -> Result<()> {
         self.logs.maybe_seal()?;
+        self.traces.maybe_seal()?;
         Ok(())
     }
 
     /// Seal everything, regardless of window. Used on shutdown and by tests.
     pub fn seal_all(&self) -> Result<()> {
         self.logs.seal_now()?;
+        self.traces.seal_now()?;
         Ok(())
     }
 
@@ -115,10 +143,14 @@ impl Store {
     /// single most damaging thing this process could do quietly.
     pub fn run_retention(&self) -> Result<ReaperReport> {
         let usage = self.data_dir.usage()?;
-        let segments = self.logs.segments();
 
-        let candidates: Vec<Candidate> = segments
+        // Every signal contributes candidates to one plan, because the disk budget is
+        // global — the oldest data anywhere is what goes.
+        let candidates: Vec<Candidate> = self
+            .logs
+            .segments()
             .iter()
+            .chain(self.traces.segments().iter())
             .map(|segment| Candidate {
                 signal: segment.manifest.signal,
                 id: segment.manifest.id.clone(),
@@ -191,8 +223,9 @@ impl Store {
     fn delete_segment(&self, candidate: &Candidate) -> Result<bool> {
         match candidate.signal {
             Signal::Logs => self.logs.remove_segment(&candidate.id),
-            // Traces and events land in M2, metrics in M3. Nothing else produces
-            // candidates yet, so this is a loud no-op rather than a silent skip.
+            Signal::Traces => self.traces.remove_segment(&candidate.id),
+            // Events and metrics land later. Nothing else produces candidates yet, so
+            // this is a loud no-op rather than a silent skip.
             other => {
                 tracing::warn!(signal = %other, "retention has no store for this signal yet");
                 Ok(false)
@@ -233,6 +266,7 @@ impl Store {
             over_budget: used > self.disk_budget,
             usage,
             logs: self.logs.status(),
+            traces: self.traces.status(),
             retention: lock(&self.reaper).clone(),
             wal_truncations: lock_read(&self.wal_truncations).clone(),
         })
@@ -248,6 +282,7 @@ pub struct StoreStatus {
     pub over_budget: bool,
     pub usage: DiskUsage,
     pub logs: RecordStoreStatus,
+    pub traces: RecordStoreStatus,
     pub retention: ReaperReport,
     /// Non-empty when a crash cost us records. "Degrade loudly."
     pub wal_truncations: Vec<Truncation>,
