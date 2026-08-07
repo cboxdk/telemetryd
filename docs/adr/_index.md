@@ -19,6 +19,7 @@ than quietly corrected, because the reasoning is the useful part.
 | [ADR-005](0005-compatibility-audit.md) | Why the API subset comes from the client, not the upstream spec |
 | [ADR-006](0006-query-performance-architecture.md) | Query performance, measured |
 | [ADR-007](0007-metrics-reuse-the-record-store.md) | Why metrics reuse the record store |
+| [ADR-008](0008-parallel-segment-scanning.md) | Parallel scanning, and why only for unbounded queries |
 
 ## Two worth reading first
 

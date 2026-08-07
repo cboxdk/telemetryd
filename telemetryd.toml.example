@@ -43,6 +43,14 @@ wal_sync          = "interval"
 wal_sync_interval = "100ms"
 compression       = "zstd"           # zstd | snappy | none
 
+# Threads one query may use to scan sealed segments. 0 picks a conservative
+# fraction of the machine; 1 disables parallel scanning entirely.
+#
+# Only unbounded queries use more than one thread. A query with a limit is fast
+# because the collector's cutoff lets it skip whole segments unopened, and workers
+# racing ahead just do work that would have been skipped — measured 60% slower.
+query_parallelism = 0
+
 [retention]
 # Metrics are kept longer because they are ~100x cheaper per unit time, and
 # week-over-week comparison is most of what dashboards are for. disk_budget is still

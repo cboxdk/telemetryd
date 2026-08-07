@@ -20,20 +20,29 @@ pub enum Order {
     Ascending,
 }
 
-/// Keyed by timestamp, with an insertion counter to break ties deterministically.
+/// Keyed by timestamp, with a scan position to break ties deterministically.
 ///
-/// Without the counter, two records sharing a timestamp would order arbitrarily and
-/// paging could show the same line twice or skip one.
+/// Without it, two records sharing a timestamp would order arbitrarily and paging
+/// could show the same line twice or skip one. Timestamps tie constantly in practice:
+/// plenty of producers emit millisecond precision into a nanosecond field.
+///
+/// The position is `(unit, row)` — which part of the scan the record came from, and
+/// where within it — rather than a running counter, because scan order is no longer
+/// the same thing as *arrival* order. Workers scan segments concurrently, so a counter
+/// incremented per push would tie-break on thread scheduling, and the same query over
+/// the same data could return a different hundred lines each time. `(unit, row)` is a
+/// property of where the record sits in the store, so the answer is identical whether
+/// one thread or eight produced it.
 #[derive(Debug)]
 struct Keyed<T> {
     timestamp: u64,
-    sequence: u64,
+    sequence: (u32, u64),
     value: T,
 }
 
 // Ordering is over the key alone, deliberately: the collector must work for record
 // types that are not themselves comparable, and `(timestamp, sequence)` is already a
-// total order because `sequence` is unique per push.
+// total order because no two records share a `(unit, row)` position.
 impl<T> Ord for Keyed<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.timestamp
@@ -61,7 +70,10 @@ impl<T> Eq for Keyed<T> {}
 pub struct TopK<T> {
     limit: usize,
     order: Order,
-    sequence: u64,
+    /// Which part of the scan is being read: 0 is the in-memory buffer, and sealed
+    /// segments follow in the order the scan visits them.
+    unit: u32,
+    row: u64,
     /// For [`Order::Descending`] the heap is min-first so the *worst* kept element is
     /// on top and is the one evicted; for ascending it is max-first. Both are
     /// expressed as a max-heap by flipping the key.
@@ -74,7 +86,8 @@ impl<T> TopK<T> {
         Self {
             limit,
             order,
-            sequence: 0,
+            unit: 0,
+            row: 0,
             heap: BinaryHeap::new(),
             ascending: BinaryHeap::new(),
         }
@@ -92,15 +105,49 @@ impl<T> TopK<T> {
         self.limit != 0 && self.len() >= self.limit
     }
 
+    /// Declare which part of the scan the following records come from.
+    ///
+    /// Ties are broken by this, so it has to reflect the order a sequential scan would
+    /// have visited things — otherwise a parallel scan would return a different (still
+    /// correct, but different) set of records at the limit boundary.
+    pub fn set_unit(&mut self, unit: u32) {
+        self.unit = unit;
+        self.row = 0;
+    }
+
     /// Offer a record. Kept only if it beats the current worst, once full.
     pub fn push(&mut self, timestamp: u64, value: T) {
         let entry = Keyed {
             timestamp,
-            sequence: self.sequence,
+            sequence: (self.unit, self.row),
             value,
         };
-        self.sequence += 1;
+        self.row += 1;
+        self.offer(entry);
+    }
 
+    /// Absorb another collector, preserving each record's original scan position.
+    ///
+    /// Merging is order-independent by construction: the keys travel with the records,
+    /// so the result does not depend on which worker finished first.
+    pub fn merge(&mut self, mut other: Self) {
+        // Unbounded: nothing can be evicted, so the heaps concatenate. Offering a
+        // hundred thousand records one at a time re-sifts the heap on every insert,
+        // and that serial tail was eating most of what parallel scanning had won.
+        if self.limit == 0 {
+            self.heap.append(&mut other.heap);
+            self.ascending.append(&mut other.ascending);
+            return;
+        }
+        for entry in other.heap.into_iter().map(|Reverse(entry)| entry) {
+            self.offer(entry);
+        }
+        for entry in other.ascending {
+            self.offer(entry);
+        }
+    }
+
+    fn offer(&mut self, entry: Keyed<T>) {
         match self.order {
             Order::Descending => {
                 if self.is_full() {
@@ -282,5 +329,62 @@ mod tests {
             top.push(i, i);
         }
         assert_eq!(top.into_sorted(), vec![9, 7, 5, 3, 1]);
+    }
+}
+
+/// A cutoff shared by parallel scan workers.
+///
+/// Each worker holds its own [`TopK`]; the merged answer is the top-k of their union.
+/// Because the union contains every worker's k entries, its cutoff is at least as tight
+/// as the best individual one — so publishing the extreme of what workers have found is
+/// always a *sound* bound for skipping, never an over-aggressive one.
+///
+/// Stored as a plain integer with a sentinel rather than an `Option`, so reading it
+/// costs one relaxed atomic load on the hot path.
+#[derive(Debug)]
+pub struct SharedCutoff {
+    order: Order,
+    /// `u64::MIN`/`u64::MAX` (per order) means "no worker has filled its collector yet",
+    /// which is the state in which nothing may be skipped.
+    value: std::sync::atomic::AtomicU64,
+}
+
+impl SharedCutoff {
+    #[must_use]
+    pub fn new(order: Order) -> Self {
+        let empty = match order {
+            // Descending skips when `max <= cutoff`, so start at a cutoff nothing beats.
+            Order::Descending => u64::MIN,
+            Order::Ascending => u64::MAX,
+        };
+        Self {
+            order,
+            value: std::sync::atomic::AtomicU64::new(empty),
+        }
+    }
+
+    /// Offer a worker's current cutoff. Keeps the tightest sound bound seen so far.
+    pub fn publish<T>(&self, local: &TopK<T>) {
+        let Some(cutoff) = local.cutoff() else { return };
+        match self.order {
+            Order::Descending => {
+                self.value
+                    .fetch_max(cutoff, std::sync::atomic::Ordering::Relaxed);
+            }
+            Order::Ascending => {
+                self.value
+                    .fetch_min(cutoff, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Whether a segment spanning `[min, max]` can be skipped by any worker.
+    #[must_use]
+    pub fn can_skip(&self, min_nanos: u64, max_nanos: u64) -> bool {
+        let cutoff = self.value.load(std::sync::atomic::Ordering::Relaxed);
+        match self.order {
+            Order::Descending => cutoff != u64::MIN && max_nanos <= cutoff,
+            Order::Ascending => cutoff != u64::MAX && min_nanos >= cutoff,
+        }
     }
 }

@@ -21,7 +21,7 @@ pub type Rows = Vec<u32>;
 /// **May over-select, must never under-select.** The record-level predicate stays the
 /// authority, so a columnar filter that is approximate is safe — it only decides how
 /// much work is skipped, never what the answer is. Same contract as the Bloom filter.
-pub type ColumnFilter<'a> = &'a dyn Fn(&RecordBatch, &mut Rows) -> Result<()>;
+pub type ColumnFilter<'a> = &'a (dyn Fn(&RecordBatch, &mut Rows) -> Result<()> + Sync);
 
 pub trait RecordSchema: Send + Sync + 'static {
     /// The decoded record type, as it exists in memory and in the WAL.

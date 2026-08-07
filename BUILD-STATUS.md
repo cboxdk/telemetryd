@@ -34,8 +34,15 @@ queries answered from metadata with no file I/O.
 **Operations.** `/healthz`, `/status`, `/metrics`. `telemetryd validate` prints every
 resolved value with its origin. `telemetryd service install` writes a hardened unit.
 
-**Packaging.** Four cross-compiled targets, install script with checksum verification,
-Homebrew formula, `.deb`, deterministic CycloneDX SBOM with a CI drift check.
+**Packaging.** Four cross-compiled targets, install script with checksum *and*
+signature verification, Homebrew formula, `.deb`, deterministic CycloneDX SBOM with a
+CI drift check.
+
+**Release signing.** `SHA256SUMS` carries a keyless Sigstore signature, made by the
+release workflow's own OIDC identity and recorded in the public transparency log.
+There is no private key to store or rotate. The release job verifies its own signature
+before publishing, and `install.sh` verifies it when `cosign` is present — pinning
+`--certificate-identity`, without which any valid Sigstore signature would pass.
 
 ## Gates
 
@@ -73,10 +80,6 @@ statically linked.
 
 Named rather than left to be discovered.
 
-**Release signing.** Releases carry SHA-256 checksums, which protect against a corrupted
-download but not a compromised release. Sigstore or minisign is the intended approach;
-not yet implemented, and not implied to be covered by the checksum file.
-
 **No hosted apt repository.** Deliberate — running one means running signing
 infrastructure and keeping it available. `dpkg -i` from a release asset is documented
 instead.
@@ -93,9 +96,11 @@ longer dominates a query (ADR-006).
 slot and sets the falsifiable trigger for adding tantivy: a 7-day single-term query over
 a full 10 GiB dataset exceeding one second.
 
-**Single-threaded per query.** Segments are independent and could be scanned in
-parallel. Deferred deliberately: on a machine also serving ingest, spending every core
-on one query is not obviously the right default.
+**Limited queries are single-threaded, deliberately** (ADR-008). Unbounded scans use
+several workers and gain about 1.27×; queries *with* a limit stay on one thread because
+parallelising them measured 60% **slower** — their speed comes from a cutoff that
+tightens as it goes, which is a sequential dependency. Eight workers are no faster than
+four, so the remaining cost is serial, not a knob set too low.
 
 **No config reload.** Restart to apply. Startup is fast and the WAL is durable, so
 SIGHUP reload would be ongoing tax on every future option for little gain (ADR-003).
@@ -118,7 +123,7 @@ Not gaps. These are decisions, each with an ADR:
 
 ## Where the reasoning lives
 
-`docs/adr/` holds seven decision records. Two are worth reading before changing
+`docs/adr/` holds eight decision records. Two are worth reading before changing
 anything:
 
 - **ADR-005** — the compatibility subset is derived from the client's source, not the

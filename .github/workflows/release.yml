@@ -10,7 +10,7 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -181,6 +181,12 @@ jobs:
     name: publish
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Only this job signs, so only this job can mint an OIDC identity token. The
+      # build matrix runs third-party build tooling and has no business holding a
+      # credential that vouches for "this is the telemetryd release workflow".
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -196,6 +202,31 @@ jobs:
           rm -f *.sha256
           ls -la
 
+      # Keyless: the signing identity is this workflow, attested by GitHub's OIDC
+      # provider, and the certificate lands in the public transparency log. There is
+      # no private key — nothing to store, rotate, or leak. Signing SHA256SUMS rather
+      # than each file keeps one signature authoritative over everything, since the
+      # checksums already cover the artifacts.
+      - uses: sigstore/cosign-installer@v3
+
+      - name: sign the checksum file
+        run: |
+          cd artifacts
+          cosign sign-blob --yes \
+            --bundle SHA256SUMS.cosign.bundle \
+            SHA256SUMS
+
+      # Verify here, with the same command the docs give users. A signature nobody
+      # checked is a file, not a guarantee.
+      - name: verify the signature we just made
+        run: |
+          cd artifacts
+          cosign verify-blob \
+            --bundle SHA256SUMS.cosign.bundle \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            SHA256SUMS
+
       - name: publish release
         uses: softprops/action-gh-release@v2
         with:
@@ -203,6 +234,7 @@ jobs:
             artifacts/*.tar.gz
             artifacts/*.deb
             artifacts/SHA256SUMS
+            artifacts/SHA256SUMS.cosign.bundle
             sbom.json
           generate_release_notes: true
           body: |
@@ -224,9 +256,21 @@ jobs:
 
             ## Verifying
 
-            `SHA256SUMS` covers every archive. Signing is not yet in place; the
-            approach is tracked in the README's packaging section rather than
-            implied by an unsigned checksum file.
+            `SHA256SUMS` covers every archive, and `SHA256SUMS.cosign.bundle` is a
+            keyless Sigstore signature over it. There is no public key to fetch: the
+            signing identity is this release workflow, attested by GitHub's OIDC
+            provider and recorded in the public transparency log.
+
+            ```bash
+            cosign verify-blob \
+              --bundle SHA256SUMS.cosign.bundle \
+              --certificate-identity "https://github.com/cboxdk/telemetryd/.github/workflows/release.yml@refs/tags/${{ github.event.inputs.tag || github.ref_name }}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              SHA256SUMS
+            ```
+
+            Pin `--certificate-identity` as shown. Without it any valid Sigstore
+            signature would pass, including one made by somebody else.
 
             `sbom.json` is a CycloneDX 1.5 manifest of everything linked into the
             binary.

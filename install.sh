@@ -95,6 +95,30 @@ main() {
     # warned about: an installer that continues past a bad checksum provides no
     # protection at all.
     if curl -fsSL "https://github.com/$REPO/releases/download/v$version/SHA256SUMS" -o "$tmp/SHA256SUMS" 2>/dev/null; then
+        # The checksum file arrives from the same server as the archive, so on its own
+        # it proves the download was not corrupted — not that we published it. The
+        # Sigstore signature over it is what establishes that, so verify it when
+        # cosign is available and say plainly when it is not.
+        if command -v cosign >/dev/null 2>&1; then
+            if curl -fsSL "https://github.com/$REPO/releases/download/v$version/SHA256SUMS.cosign.bundle" \
+                -o "$tmp/SHA256SUMS.cosign.bundle" 2>/dev/null; then
+                # --certificate-identity is not optional: without pinning it, any
+                # valid Sigstore signature by anyone at all would satisfy this.
+                cosign verify-blob \
+                    --bundle "$tmp/SHA256SUMS.cosign.bundle" \
+                    --certificate-identity "https://github.com/$REPO/.github/workflows/release.yml@refs/tags/v$version" \
+                    --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+                    "$tmp/SHA256SUMS" >/dev/null 2>&1 \
+                    || die "signature verification failed for v$version — refusing to install.
+  The checksum file is not signed by the telemetryd release workflow."
+                say "signature verified"
+            else
+                say "note: v$version predates release signing, falling back to checksums"
+            fi
+        else
+            say "note: cosign not installed — verifying the checksum only, not who published it"
+        fi
+
         expected="$(grep " $name.tar.gz\$" "$tmp/SHA256SUMS" | awk '{print $1}' | head -n 1)"
         if [ -n "$expected" ]; then
             if command -v sha256sum >/dev/null 2>&1; then

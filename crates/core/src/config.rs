@@ -132,6 +132,28 @@ pub struct StorageConfig {
     #[serde(with = "humantime_serde")]
     pub wal_sync_interval: Duration,
     pub compression: Compression,
+    /// Threads a single query may use to scan sealed segments.
+    ///
+    /// Deliberately not "all of them". This process is serving ingest at the same
+    /// time, and giving every core to one query is a good way to make the system
+    /// stutter under exactly the load an operator is trying to look at. `0` picks a
+    /// conservative fraction of the machine; `1` disables parallel scanning.
+    pub query_parallelism: usize,
+}
+
+impl StorageConfig {
+    /// Resolved worker ceiling: `0` means "choose for me".
+    #[must_use]
+    pub fn resolved_query_parallelism(&self) -> usize {
+        if self.query_parallelism != 0 {
+            return self.query_parallelism;
+        }
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        // Half the machine, capped. Past a handful of workers a single query is
+        // usually bound by disk rather than CPU anyway, and the rest of the cores
+        // still have writes to accept.
+        (cores / 2).clamp(1, 4)
+    }
 }
 
 impl Default for StorageConfig {
@@ -144,6 +166,7 @@ impl Default for StorageConfig {
             wal_sync: WalSync::Interval,
             wal_sync_interval: Duration::from_millis(100),
             compression: Compression::Zstd,
+            query_parallelism: 0,
         }
     }
 }
@@ -411,6 +434,10 @@ const ENV_KEYS: &[(&str, &str)] = &[
         "storage.wal_sync_interval",
     ),
     ("TELEMETRYD_STORAGE_COMPRESSION", "storage.compression"),
+    (
+        "TELEMETRYD_STORAGE_QUERY_PARALLELISM",
+        "storage.query_parallelism",
+    ),
     ("TELEMETRYD_RETENTION_LOGS", "retention.logs"),
     ("TELEMETRYD_RETENTION_TRACES", "retention.traces"),
     ("TELEMETRYD_RETENTION_EVENTS", "retention.events"),

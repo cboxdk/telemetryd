@@ -55,6 +55,7 @@ fn settings() -> StoreSettings {
         wal_sync: WalSync::Always,
         wal_sync_interval: Duration::ZERO,
         compression: Compression::Zstd,
+        query_parallelism: 1,
     }
 }
 

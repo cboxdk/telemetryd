@@ -39,11 +39,15 @@ impl Harness {
     }
 
     fn logs(&self) -> RecordStore<LogSchema> {
+        self.logs_with_parallelism(1)
+    }
+
+    fn logs_with_parallelism(&self, workers: usize) -> RecordStore<LogSchema> {
         RecordStore::<LogSchema>::open(
             &self.root.join("wal"),
             self.root.join("segments"),
             self.root.join("tmp"),
-            settings(),
+            settings_with_parallelism(workers),
         )
         .unwrap()
     }
@@ -60,12 +64,17 @@ impl Harness {
 }
 
 fn settings() -> StoreSettings {
+    settings_with_parallelism(1)
+}
+
+fn settings_with_parallelism(query_parallelism: usize) -> StoreSettings {
     StoreSettings {
         segment_duration: Duration::from_secs(3600),
         max_segment_bytes: 1 << 30,
         wal_sync: WalSync::Never,
         wal_sync_interval: Duration::ZERO,
         compression: Compression::Zstd,
+        query_parallelism,
     }
 }
 
@@ -407,4 +416,125 @@ fn a_limited_query_over_a_large_store_stays_bounded() {
         "opened {} segments for a limit=20 query",
         after.segments_scanned - before.segments_scanned
     );
+}
+
+/// Parallel scanning must return *the same* answer, not merely an equally good one.
+///
+/// The risk is at the limit boundary. Timestamps tie constantly — plenty of producers
+/// emit millisecond precision into a nanosecond field — and if ties broke on which
+/// thread got there first, the same query over unchanged data would return a different
+/// hundred lines each run, and a paging UI would show a line twice or skip it.
+///
+/// So this seeds heavy ties deliberately and compares element by element.
+#[test]
+fn parallel_scanning_returns_exactly_the_sequential_answer() {
+    let harness = Harness::new();
+
+    // 24 segments so the worker pool is actually used, with only 8 distinct
+    // timestamps per segment: ~40 records share every timestamp.
+    {
+        let store = harness.logs();
+        for segment in 0..24u64 {
+            let records: Vec<LogRecord> = (0..320)
+                .map(|i| {
+                    let ts = BASE + segment * 3600 * SECOND + (i % 8) * SECOND;
+                    log(
+                        ts,
+                        if i % 3 == 0 { "checkout" } else { "cart" },
+                        &format!("line {i}"),
+                    )
+                })
+                .collect();
+            store.append(&records).unwrap();
+            store.seal_now().unwrap();
+        }
+    }
+
+    let sequential = harness.logs();
+    let parallel = harness.logs_with_parallelism(8);
+
+    let matchers = vec![LabelMatcher::equal("app", "checkout")];
+    for (order, limit) in [
+        (Order::Descending, 100),
+        (Order::Ascending, 100),
+        (Order::Descending, 7),
+        // Unbounded: no cutoff to prune with, so every segment is read by both.
+        (Order::Descending, 0),
+    ] {
+        let request = || Scan {
+            start_nanos: 0,
+            end_nanos: u64::MAX,
+            limit,
+            order,
+            exact_key: None,
+            columns: None,
+        };
+        let expected = sequential.scan(request(), &matchers, &|_| true).unwrap();
+        let actual = parallel.scan(request(), &matchers, &|_| true).unwrap();
+
+        assert_eq!(
+            expected.len(),
+            actual.len(),
+            "{order:?} limit={limit}: length"
+        );
+        for (i, (want, got)) in expected.iter().zip(&actual).enumerate() {
+            assert_eq!(
+                (want.timestamp_nanos, &want.body),
+                (got.timestamp_nanos, &got.body),
+                "{order:?} limit={limit}: record {i} differs"
+            );
+        }
+    }
+}
+
+/// Repeat the same parallel query and require an identical answer every time.
+///
+/// The equivalence test above could pass by luck if a race resolved the same way twice.
+/// This one fails if the result depends on scheduling at all.
+#[test]
+fn a_parallel_query_is_deterministic_across_runs() {
+    let harness = Harness::new();
+    {
+        let store = harness.logs();
+        for segment in 0..16u64 {
+            let records: Vec<LogRecord> = (0..200)
+                .map(|i| {
+                    log(
+                        BASE + segment * 3600 * SECOND + (i % 4) * SECOND,
+                        "checkout",
+                        &format!("line {i}"),
+                    )
+                })
+                .collect();
+            store.append(&records).unwrap();
+            store.seal_now().unwrap();
+        }
+    }
+
+    let store = harness.logs_with_parallelism(8);
+    let request = || Scan {
+        start_nanos: 0,
+        end_nanos: u64::MAX,
+        limit: 50,
+        order: Order::Descending,
+        exact_key: None,
+        columns: None,
+    };
+
+    let first: Vec<_> = store
+        .scan(request(), &[], &|_| true)
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.timestamp_nanos, r.body))
+        .collect();
+
+    for run in 1..12 {
+        let again: Vec<_> = store
+            .scan(request(), &[], &|_| true)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.timestamp_nanos, r.body))
+            .collect();
+        assert_eq!(first, again, "run {run} disagreed with the first");
+    }
 }

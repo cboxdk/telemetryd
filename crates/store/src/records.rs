@@ -24,9 +24,15 @@ use std::time::{Duration, Instant};
 use telemetryd_core::config::{Compression, StorageConfig, WalSync};
 use telemetryd_core::{Error, LabelMatcher, Labels, Result, matches_all};
 
+/// Below this many segments a query stays on one thread.
+///
+/// Spawning costs more than the manifest check a pruned segment needs, and the queries
+/// that touch few segments are the ones already answered in about a millisecond.
+const MIN_SEGMENTS_PER_EXTRA_WORKER: usize = 4;
+
 use crate::schema::RecordSchema;
 use crate::segment::{Flow, SealOptions, Segment, seal};
-use crate::topk::{Order, TopK};
+use crate::topk::{Order, SharedCutoff, TopK};
 use crate::wal::{self, Wal};
 
 /// Sizing and durability knobs, lifted out of [`StorageConfig`].
@@ -37,6 +43,8 @@ pub struct StoreSettings {
     pub wal_sync: WalSync,
     pub wal_sync_interval: Duration,
     pub compression: Compression,
+    /// Upper bound on threads used to scan sealed segments for one query.
+    pub query_parallelism: usize,
 }
 
 impl From<&StorageConfig> for StoreSettings {
@@ -47,6 +55,7 @@ impl From<&StorageConfig> for StoreSettings {
             wal_sync: config.wal_sync,
             wal_sync_interval: config.wal_sync_interval,
             compression: config.compression,
+            query_parallelism: config.resolved_query_parallelism(),
         }
     }
 }
@@ -445,7 +454,7 @@ impl<S: RecordSchema> RecordStore<S> {
         start_nanos: u64,
         end_nanos: u64,
         matchers: &[LabelMatcher],
-        extra: &dyn Fn(&S::Record) -> bool,
+        extra: &(dyn Fn(&S::Record) -> bool + Sync),
     ) -> Result<Vec<S::Record>> {
         self.scan(
             Scan {
@@ -476,13 +485,14 @@ impl<S: RecordSchema> RecordStore<S> {
         &self,
         request: Scan,
         matchers: &[LabelMatcher],
-        extra: &dyn Fn(&S::Record) -> bool,
+        extra: &(dyn Fn(&S::Record) -> bool + Sync),
     ) -> Result<Vec<S::Record>> {
         let mut collector = TopK::new(request.limit, request.order);
 
         // The live buffer first: it holds the newest data, so filling the collector
         // from it maximises how many sealed segments the cutoff can then skip.
         {
+            collector.set_unit(0);
             let writer = lock(&self.writer);
             for record in &writer.buffer.records {
                 if Self::selects(record, &request, matchers, extra) {
@@ -501,78 +511,192 @@ impl<S: RecordSchema> RecordStore<S> {
             Order::Ascending => segments.sort_by_key(|s| s.manifest.min_time_nanos),
         }
 
-        for segment in segments {
-            let manifest = &segment.manifest;
-            // Evaluate the matchers once per distinct stream, not once per row. A
-            // segment with a million rows across fifty streams does fifty
-            // evaluations; before interning it did a million.
-            let allowed: Vec<bool> = manifest
-                .streams
-                .iter()
-                .map(|labels| matches_all(matchers, labels))
-                .collect();
-            let no_stream_matches = !manifest.streams.is_empty() && !allowed.iter().any(|ok| *ok);
-
-            let prunable = no_stream_matches
-                || !manifest.overlaps(request.start_nanos, request.end_nanos)
-                || !manifest.might_match(matchers)
-                // An exact-key lookup (a trace id) can rule out a segment outright.
-                || request
-                    .exact_key
-                    .is_some_and(|key| !segment.may_contain_key(key))
-                || collector.can_skip_range(manifest.min_time_nanos, manifest.max_time_nanos);
-
-            if prunable {
-                self.stats.segments_pruned.fetch_add(1, Ordering::Relaxed);
-                continue;
+        let workers = self.scan_workers(&request, segments.len());
+        if workers <= 1 {
+            for (ordinal, segment) in segments.iter().enumerate() {
+                self.scan_segment(segment, ordinal, &request, matchers, extra, &mut collector)?;
             }
-            self.stats.segments_scanned.fetch_add(1, Ordering::Relaxed);
+            return Ok(collector.into_sorted());
+        }
 
-            // Push the time-and-stream predicate into the Parquet reader so the wide
-            // columns are never decompressed for rows we are going to discard.
-            let selection = {
-                let allowed = allowed.clone();
-                let (start, end) = (request.start_nanos, request.end_nanos);
-                crate::segment::Selection {
-                    columns: S::filter_columns().to_vec(),
-                    mask: std::sync::Arc::new(move |batch: &arrow::record_batch::RecordBatch| {
-                        S::selection_mask(batch, start, end, &allowed)
-                    }),
-                }
-            };
+        // Parallel: each worker keeps its own collector and they are merged at the end.
+        //
+        // The sequential walk is not just a loop — the collector's cutoff tightens as it
+        // goes, and later segments get skipped because of what earlier ones found. Split
+        // that across threads naively and every worker starts from nothing, so the
+        // pruning that makes bounded queries fast disappears exactly when there is most
+        // work to divide.
+        //
+        // So the workers share a cutoff. For a descending query the merged top-k is the
+        // top-k of the union, and the union already contains every worker's k results —
+        // so the merged cutoff is at least the largest individual one. Publishing the
+        // maximum is therefore always safe: it can only ever be tighter than the truth
+        // in the direction that skips *less*, never more. Ascending is the mirror image.
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let shared = SharedCutoff::new(request.order);
+        let collected = std::sync::Mutex::new(Vec::with_capacity(workers));
+        let first_error = std::sync::Mutex::new(None::<Error>);
 
-            segment.scan_batches_where(Some(selection), |batch| {
-                // Rows here already passed the pushed-down predicate; `select_rows`
-                // re-checks because a batch may still carry rows the reader kept for
-                // its own alignment reasons, and correctness must not depend on that.
-                let mut rows =
-                    S::select_rows(batch, request.start_nanos, request.end_nanos, &allowed)?;
-                if let Some(refine) = request.columns {
-                    refine(batch, &mut rows)?;
-                }
-                if rows.is_empty() {
-                    return Ok(Flow::Continue);
-                }
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    let mut local = TopK::new(request.limit, request.order);
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(segment) = segments.get(index) else {
+                            break;
+                        };
 
-                for record in S::materialize(batch, &rows, &manifest.streams)? {
-                    // The record predicate stays the authority; the columnar filter
-                    // above is only allowed to over-select.
-                    if extra(&record) {
-                        collector.push(S::timestamp(&record), record);
+                        // Another worker may already have proved this segment cannot
+                        // contribute. Checking before opening it is the whole point.
+                        if shared.can_skip(
+                            segment.manifest.min_time_nanos,
+                            segment.manifest.max_time_nanos,
+                        ) {
+                            self.stats.segments_pruned.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+
+                        match self
+                            .scan_segment(segment, index, &request, matchers, extra, &mut local)
+                        {
+                            Ok(()) => shared.publish(&local),
+                            Err(err) => {
+                                let mut slot = lock(&first_error);
+                                if slot.is_none() {
+                                    *slot = Some(err);
+                                }
+                                break;
+                            }
+                        }
                     }
-                }
-                Ok(Flow::Continue)
-            })?;
+                    lock(&collected).push(local);
+                });
+            }
+        });
+
+        if let Some(err) = lock(&first_error).take() {
+            return Err(err);
+        }
+        for local in lock(&collected).drain(..) {
+            collector.merge(local);
         }
 
         Ok(collector.into_sorted())
+    }
+
+    /// How many threads to scan with.
+    ///
+    /// **Only unbounded queries are parallelised**, and that is the measured result
+    /// rather than a guess. A limited query is fast because the collector's cutoff
+    /// tightens on the first segment and the other nineteen are then skipped without
+    /// being opened; four workers instead race ahead and do real work on segments the
+    /// cutoff would have discarded. On the benchmark store that made `limit=100` go
+    /// from 1.45 ms to 2.33 ms — parallelism bought nothing and cost 60%.
+    ///
+    /// An unbounded scan has no cutoff to lose, so the work divides. It gains about
+    /// 1.3× at four workers — real, but nothing like linear, because materialising a
+    /// hundred thousand records is bound by allocation rather than by decode.
+    ///
+    /// Conservative on purpose besides: this process is accepting writes at the same
+    /// time, and handing every core to one query makes ingest stutter under exactly
+    /// the load an operator is trying to look at.
+    fn scan_workers(&self, request: &Scan, segments: usize) -> usize {
+        let configured = self.settings.query_parallelism;
+        if configured <= 1 || request.limit != 0 || segments < MIN_SEGMENTS_PER_EXTRA_WORKER {
+            return 1;
+        }
+        configured
+            .min(segments / MIN_SEGMENTS_PER_EXTRA_WORKER)
+            .max(1)
+    }
+
+    /// Scan one sealed segment into `collector`.
+    ///
+    /// Shared verbatim by the sequential and parallel drivers: the difference between
+    /// them is only which thread calls this and what the collector is, and a second
+    /// copy of this logic would be a correctness gap waiting to open.
+    fn scan_segment(
+        &self,
+        segment: &Segment,
+        ordinal: usize,
+        request: &Scan,
+        matchers: &[LabelMatcher],
+        extra: &(dyn Fn(&S::Record) -> bool + Sync),
+        collector: &mut TopK<S::Record>,
+    ) -> Result<()> {
+        // Position 0 is the live buffer, so sealed segments start at 1. Setting it here
+        // rather than in each driver is what makes the sequential and parallel paths
+        // produce the same answer instead of two defensible ones.
+        collector.set_unit(u32::try_from(ordinal + 1).unwrap_or(u32::MAX));
+
+        let manifest = &segment.manifest;
+        // Evaluate the matchers once per distinct stream, not once per row. A
+        // segment with a million rows across fifty streams does fifty
+        // evaluations; before interning it did a million.
+        let allowed: Vec<bool> = manifest
+            .streams
+            .iter()
+            .map(|labels| matches_all(matchers, labels))
+            .collect();
+        let no_stream_matches = !manifest.streams.is_empty() && !allowed.iter().any(|ok| *ok);
+
+        let prunable = no_stream_matches
+            || !manifest.overlaps(request.start_nanos, request.end_nanos)
+            || !manifest.might_match(matchers)
+            // An exact-key lookup (a trace id) can rule out a segment outright.
+            || request
+                .exact_key
+                .is_some_and(|key| !segment.may_contain_key(key))
+            || collector.can_skip_range(manifest.min_time_nanos, manifest.max_time_nanos);
+
+        if prunable {
+            self.stats.segments_pruned.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        self.stats.segments_scanned.fetch_add(1, Ordering::Relaxed);
+
+        // Push the time-and-stream predicate into the Parquet reader so the wide
+        // columns are never decompressed for rows we are going to discard.
+        let selection = {
+            let allowed = allowed.clone();
+            let (start, end) = (request.start_nanos, request.end_nanos);
+            crate::segment::Selection {
+                columns: S::filter_columns().to_vec(),
+                mask: std::sync::Arc::new(move |batch: &arrow::record_batch::RecordBatch| {
+                    S::selection_mask(batch, start, end, &allowed)
+                }),
+            }
+        };
+
+        segment.scan_batches_where(Some(selection), |batch| {
+            // Rows here already passed the pushed-down predicate; `select_rows`
+            // re-checks because a batch may still carry rows the reader kept for
+            // its own alignment reasons, and correctness must not depend on that.
+            let mut rows = S::select_rows(batch, request.start_nanos, request.end_nanos, &allowed)?;
+            if let Some(refine) = request.columns {
+                refine(batch, &mut rows)?;
+            }
+            if rows.is_empty() {
+                return Ok(Flow::Continue);
+            }
+
+            for record in S::materialize(batch, &rows, &manifest.streams)? {
+                // The record predicate stays the authority; the columnar filter
+                // above is only allowed to over-select.
+                if extra(&record) {
+                    collector.push(S::timestamp(&record), record);
+                }
+            }
+            Ok(Flow::Continue)
+        })
     }
 
     fn selects(
         record: &S::Record,
         request: &Scan,
         matchers: &[LabelMatcher],
-        extra: &dyn Fn(&S::Record) -> bool,
+        extra: &(dyn Fn(&S::Record) -> bool + Sync),
     ) -> bool {
         let ts = S::timestamp(record);
         ts >= request.start_nanos

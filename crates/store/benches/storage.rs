@@ -29,6 +29,7 @@ fn settings() -> StoreSettings {
         wal_sync: WalSync::Never,
         wal_sync_interval: Duration::ZERO,
         compression: Compression::Zstd,
+        query_parallelism: 1,
     }
 }
 
@@ -62,6 +63,10 @@ fn record(i: u64) -> LogRecord {
 }
 
 fn open(dir: &std::path::Path) -> RecordStore<LogSchema> {
+    open_with_parallelism(dir, 1)
+}
+
+fn open_with_parallelism(dir: &std::path::Path, workers: usize) -> RecordStore<LogSchema> {
     for sub in ["wal", "segments", "tmp"] {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
     }
@@ -69,7 +74,10 @@ fn open(dir: &std::path::Path) -> RecordStore<LogSchema> {
         &dir.join("wal"),
         dir.join("segments"),
         dir.join("tmp"),
-        settings(),
+        StoreSettings {
+            query_parallelism: workers,
+            ..settings()
+        },
     )
     .unwrap()
 }
@@ -250,6 +258,39 @@ fn bench_query(c: &mut Criterion) {
     // The pathological case, kept honest: no limit, whole store.
     group.bench_function("unbounded_full_scan", |b| {
         b.iter(|| store.query(0, u64::MAX, &[], &|_| true).unwrap());
+    });
+
+    // The same store read by several threads. Both numbers are reported because the
+    // win is not uniform: an unbounded scan divides cleanly, while a small limited
+    // query is already answered by the cutoff before there is anything to divide.
+    let parallel = open_with_parallelism(tmp.path(), 4);
+    group.bench_function("unbounded_full_scan_4_workers", |b| {
+        b.iter(|| parallel.query(0, u64::MAX, &[], &|_| true).unwrap());
+    });
+    // Eight workers on the same 20 segments. If this is no better than four, the
+    // remaining cost is serial — worth knowing before anyone raises the default.
+    let parallel8 = open_with_parallelism(tmp.path(), 8);
+    group.bench_function("unbounded_full_scan_8_workers", |b| {
+        b.iter(|| parallel8.query(0, u64::MAX, &[], &|_| true).unwrap());
+    });
+
+    group.bench_function("limit_100_backward_4_workers", |b| {
+        b.iter(|| {
+            parallel
+                .scan(
+                    Scan {
+                        start_nanos: 0,
+                        end_nanos: u64::MAX,
+                        limit: 100,
+                        order: Order::Descending,
+                        exact_key: None,
+                        columns: None,
+                    },
+                    &[LabelMatcher::equal("app", "checkout")],
+                    &|_| true,
+                )
+                .unwrap()
+        });
     });
 
     group.finish();

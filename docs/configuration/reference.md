@@ -41,6 +41,7 @@ max_segment_bytes = "256MiB"         # seal early if buffer exceeds this
 wal_sync          = "interval"       # always | interval | never
 wal_sync_interval = "100ms"          # worst-case loss window when "interval"
 compression       = "zstd"           # zstd | snappy | none  (Parquet page compression)
+query_parallelism = 0                # threads per query; 0 = auto, 1 = sequential
 
 [retention]
 logs    = "7d"

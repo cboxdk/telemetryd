@@ -25,7 +25,7 @@ command to run instead — a tool that silently escalates is one you cannot reas
 Overrides:
 
 ```bash
-TELEMETRYD_VERSION=0.5.2 sh install.sh
+TELEMETRYD_VERSION=0.6.0 sh install.sh
 TELEMETRYD_INSTALL_DIR="$HOME/.local/bin" sh install.sh
 ```
 
@@ -41,7 +41,7 @@ Download the `.deb` for your architecture from the
 [releases page](https://github.com/cboxdk/telemetryd/releases) and install it:
 
 ```bash
-sudo dpkg -i telemetryd_0.5.2_amd64.deb
+sudo dpkg -i telemetryd_0.6.0_amd64.deb
 sudo systemctl enable --now telemetryd
 ```
 
@@ -52,6 +52,38 @@ The package creates an unprivileged `telemetryd` user, a state directory at
 infrastructure and keeping it available; for a project at this scale a signed release
 asset carries the same guarantee with far less that can quietly break. Stated here
 rather than left as a gap you discover.
+
+## Verifying a release
+
+Every release publishes `SHA256SUMS` and `SHA256SUMS.cosign.bundle`, a keyless
+[Sigstore](https://www.sigstore.dev/) signature over it. There is no public key to
+fetch or trust on first use: the signing identity is the release workflow itself,
+attested by GitHub's OIDC provider and recorded in the public transparency log.
+
+`install.sh` does this automatically when `cosign` is on your `PATH`, and tells you
+when it is not. To check by hand:
+
+```bash
+cosign verify-blob \
+  --bundle SHA256SUMS.cosign.bundle \
+  --certificate-identity "https://github.com/cboxdk/telemetryd/.github/workflows/release.yml@refs/tags/v0.6.0" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  SHA256SUMS
+```
+
+Then check the archive against the verified checksums:
+
+```bash
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+**Pin `--certificate-identity`.** Without it, cosign accepts any valid Sigstore
+signature — including one made by someone else entirely. The identity is what ties
+the signature to this repository's release workflow at that tag.
+
+The checksum file alone proves your download was not corrupted in transit. It comes
+from the same server as the archive, so on its own it says nothing about who produced
+it; the signature is what does that.
 
 ## From source
 
