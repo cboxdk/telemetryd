@@ -70,6 +70,46 @@ pub struct SegmentManifest {
     /// fifty streams evaluates the matchers fifty times.
     #[serde(default)]
     pub streams: Vec<Labels>,
+    /// `(min, max)` event time per entry of `streams`, in the same order.
+    ///
+    /// A segment's overall time range spans every stream in it, which makes it useless
+    /// for pruning as soon as one producer's clock sits far from the others'. A backfill
+    /// job, or a host with a skewed clock, gives every segment a range wide enough that
+    /// no limited query can ever skip one — measured at seven seconds for a `limit=100`
+    /// query across 5,500 segments, degrading as the store grew.
+    ///
+    /// Per-stream bounds let the collector's cutoff apply to the streams the query
+    /// actually selected. Empty on segments written before this existed, which fall back
+    /// to the whole-segment range.
+    #[serde(default)]
+    pub stream_bounds: Vec<(u64, u64)>,
+}
+
+impl SegmentManifest {
+    /// The time range of just the streams a query selected.
+    ///
+    /// `allowed` is indexed by stream id. Falls back to the whole-segment range when
+    /// bounds are absent or nothing was selected, which is always sound: a wider range
+    /// can only cause the segment to be read when it need not have been.
+    #[must_use]
+    pub fn bounds_for(&self, allowed: &[bool]) -> (u64, u64) {
+        if self.stream_bounds.len() != self.streams.len() || allowed.len() != self.streams.len() {
+            return (self.min_time_nanos, self.max_time_nanos);
+        }
+        let mut min = u64::MAX;
+        let mut max = u64::MIN;
+        for (bounds, permitted) in self.stream_bounds.iter().zip(allowed) {
+            if *permitted {
+                min = min.min(bounds.0);
+                max = max.max(bounds.1);
+            }
+        }
+        if min > max {
+            (self.min_time_nanos, self.max_time_nanos)
+        } else {
+            (min, max)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -429,6 +469,31 @@ fn segment_corrupt(path: &Path, error: &dyn std::fmt::Display) -> Error {
     }
 }
 
+/// Event-time bounds for each interned stream, in stream-id order.
+///
+/// One pass over the records with a hash lookup each. Sealing already encodes every
+/// record into Arrow and compresses it, so this is not the expensive part.
+fn stream_time_bounds<S: RecordSchema>(
+    records: &[S::Record],
+    streams: &[Labels],
+) -> Vec<(u64, u64)> {
+    let index: std::collections::HashMap<u64, usize> = streams
+        .iter()
+        .enumerate()
+        .map(|(id, labels)| (labels.fingerprint(), id))
+        .collect();
+
+    let mut bounds = vec![(u64::MAX, u64::MIN); streams.len()];
+    for record in records {
+        if let Some(&id) = index.get(&S::index_labels(record).fingerprint()) {
+            let at = S::timestamp(record);
+            bounds[id].0 = bounds[id].0.min(at);
+            bounds[id].1 = bounds[id].1.max(at);
+        }
+    }
+    bounds
+}
+
 /// Assigns a dense id to each distinct stream label set.
 #[derive(Debug, Default)]
 pub struct StreamInterner {
@@ -522,6 +587,7 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
         .map_err(|e| Error::io(format!("creating {}", staging.display()), e))?;
 
     let (batch, streams) = S::to_batch(records)?;
+    let stream_bounds = stream_time_bounds::<S>(records, &streams);
     let data_path = staging.join(DATA_FILE);
     let bytes = write_parquet(&data_path, &batch, options.compression)?;
 
@@ -537,6 +603,7 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
         wal_sequence: options.wal_sequence,
         labels: index.build(),
         streams,
+        stream_bounds,
     };
     write_manifest(&staging.join(MANIFEST_FILE), &manifest)?;
     if let Some(bloom) = &bloom {
@@ -692,6 +759,7 @@ mod tests {
             wal_sequence: 0,
             labels: labels_map,
             streams: Vec::new(),
+            stream_bounds: Vec::new(),
         }
     }
 

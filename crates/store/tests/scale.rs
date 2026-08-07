@@ -538,3 +538,76 @@ fn a_parallel_query_is_deterministic_across_runs() {
         assert_eq!(first, again, "run {run} disagreed with the first");
     }
 }
+
+/// A segment's overall time range is useless for pruning once one producer's clock
+/// sits away from the others'.
+///
+/// Concurrent producers land in the same segments, so a segment holding a backfill job
+/// alongside live traffic spans both. A `limit=100` query for the older producer then
+/// finds its cutoff below every segment's `max_time_nanos`, so nothing is skippable and
+/// every segment is opened. Measured at 111 ms across 90 segments, and seven seconds
+/// across 5,500 — degrading as the store grew, which is the shape that matters.
+///
+/// Per-stream bounds let the cutoff apply to the streams the query actually selected.
+#[test]
+fn a_stream_is_pruned_on_its_own_time_range_not_the_segments() {
+    let harness = Harness::new();
+    {
+        let store = harness.logs();
+        // Three apps, interleaved into the same segments, an hour apart in event time.
+        for round in 0..12u64 {
+            for app in 0..3u64 {
+                let records: Vec<LogRecord> = (0..400)
+                    .map(|i| {
+                        log(
+                            BASE + app * 3600 * SECOND + (round * 400 + i) * 1000,
+                            &format!("svc-{app}"),
+                            &format!("line {i}"),
+                        )
+                    })
+                    .collect();
+                store.append(&records).unwrap();
+            }
+            store.seal_now().unwrap();
+        }
+    }
+
+    let store = harness.logs();
+    let segments = store.segments().len();
+    assert!(segments >= 10, "expected several segments, got {segments}");
+
+    let newest_hundred = |app: &str| {
+        let before = store.status().segments_scanned;
+        let found = store
+            .scan(
+                Scan {
+                    start_nanos: 0,
+                    end_nanos: u64::MAX,
+                    limit: 100,
+                    order: Order::Descending,
+                    exact_key: None,
+                    columns: None,
+                },
+                &[LabelMatcher::equal("app", app)],
+                &|_| true,
+            )
+            .unwrap();
+        assert_eq!(found.len(), 100, "{app} should still return its newest 100");
+        store.status().segments_scanned - before
+    };
+
+    // The newest app was always fine — its cutoff sits at the top of the range.
+    let newest = newest_hundred("svc-2");
+    // The oldest is the case that used to open every segment.
+    let oldest = newest_hundred("svc-0");
+
+    assert!(
+        oldest <= newest * 2 + 2,
+        "the oldest app opened {oldest} segments against the newest app's {newest}; \
+         pruning is falling back to the whole-segment range again"
+    );
+    assert!(
+        oldest < segments as u64,
+        "opening {oldest} of {segments} segments means nothing was pruned"
+    );
+}

@@ -146,9 +146,30 @@ instead.
 interning does not obviously apply. Only paid for rows that survive filtering, so it no
 longer dominates a query (ADR-006).
 
-**No text index.** Line filters scan the body column. ADR-001 D1 reserves the segment
-slot and sets the falsifiable trigger for adding tantivy: a 7-day single-term query over
-a full 10 GiB dataset exceeding one second.
+**No text index — and ADR-001 D1's trigger has now fired.** The condition it set was
+"a single-term query over a full 10 GiB dataset exceeding one second". Measured on the
+musl build over 63 million records (405 MB, 877 segments):
+
+| Line filter over the whole store | |
+|---|---|
+| a term that matches often | 5 ms |
+| a term matching a handful | 4.4 s |
+| **a term matching nothing** | **3.9 s** |
+| the same miss over the newest 10% | 397 ms |
+| the same miss over the newest 1% | 45 ms |
+
+That is roughly 10 seconds per gigabyte scanned, so a full 10 GiB store extrapolates to
+about 98 seconds — a hundred times the trigger.
+
+The cost is linear in the time range scanned, not in the store, so bounding the range
+is an effective mitigation and it is what a UI does by default. The unbounded case —
+"search all of the last seven days for a term that does not appear" — is the one that
+is genuinely slow.
+
+Fixing it properly means a substring-capable index (trigrams, not tokens: `|=` is a
+substring match, so a token index would give wrong answers), built at seal time. That
+trades ingest throughput for query latency and changes the segment format, so it wants
+its own decision rather than being slipped in.
 
 **Queries are single-threaded by default** (ADR-008, ADR-009). Parallel scanning is
 opt-in via `storage.query_parallelism` and worth about 7% on an unbounded scan; it is

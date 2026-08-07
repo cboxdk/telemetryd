@@ -105,6 +105,16 @@ reasoning. Each is reversible.
 
 ### D1 — tantivy becomes an optional sidecar; M1 ships without it
 
+> **Update: the trigger fired.** Measured over 63 million records (405 MB, 877
+> segments) on the musl build, a line filter matching *nothing* takes 3.9 s — about
+> 10 s per gigabyte scanned, extrapolating to ~98 s over a full 10 GiB store against a
+> stated threshold of 1 s. Bounding the time range still works (397 ms over the newest
+> 10%, 45 ms over the newest 1%), so the mitigation is real and is what a UI does by
+> default. The remaining decision is whether to pay trigram indexing at seal time —
+> tokens will not do, because `|=` is a substring match — and that trade is recorded in
+> `BUILD-STATUS.md` rather than settled here.
+
+
 **Brief:** full-text + term lookup via an embedded tantivy index per segment.
 
 **Proposed:** keep tantivy in the design and reserve the `index/` slot in the segment

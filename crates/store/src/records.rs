@@ -786,14 +786,21 @@ impl<S: RecordSchema> RecordStore<S> {
             .collect();
         let no_stream_matches = !manifest.streams.is_empty() && !allowed.iter().any(|ok| *ok);
 
+        // Prune on the time range of the streams this query selected, not the segment's
+        // overall span. They differ whenever one producer's clock sits away from the
+        // others', and then the overall span is wide enough that nothing is ever
+        // skippable.
+        let (min_nanos, max_nanos) = manifest.bounds_for(&allowed);
+
         let prunable = no_stream_matches
-            || !manifest.overlaps(request.start_nanos, request.end_nanos)
+            || min_nanos > request.end_nanos
+            || max_nanos < request.start_nanos
             || !manifest.might_match(matchers)
             // An exact-key lookup (a trace id) can rule out a segment outright.
             || request
                 .exact_key
                 .is_some_and(|key| !segment.may_contain_key(key))
-            || collector.can_skip_range(manifest.min_time_nanos, manifest.max_time_nanos);
+            || collector.can_skip_range(min_nanos, max_nanos);
 
         if prunable {
             self.stats.segments_pruned.fetch_add(1, Ordering::Relaxed);
