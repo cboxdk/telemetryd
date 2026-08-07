@@ -21,6 +21,9 @@
 pub mod lexer;
 pub mod logql;
 pub mod loki;
+pub mod prometheus;
+pub mod promeval;
+pub mod promql;
 pub mod tempo;
 pub mod traceql;
 

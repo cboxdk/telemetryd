@@ -65,6 +65,8 @@ ureq = { version = "3", default-features = false }
 arrow = { version = "59", default-features = false, features = ["ipc"] }
 parquet = { version = "59", default-features = false, features = ["arrow", "zstd", "snap"] }
 postcard = { version = "1", features = ["use-std"] }
+# Pure Rust; already in the tree via parquet's snappy support.
+snap = "1"
 regex = "1"
 
 # dev

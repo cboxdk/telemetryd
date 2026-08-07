@@ -117,7 +117,7 @@ async fn status_reports_the_shape_operators_and_the_cli_depend_on() {
 
     let json: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(json["milestone"], "M2");
+    assert_eq!(json["milestone"], "M3");
     assert_eq!(json["storage_format_version"], 1);
     assert_eq!(json["insecure"], false);
     assert_eq!(json["auth"]["ingest"], "disabled");
@@ -267,37 +267,42 @@ async fn token_rotation_accepts_both_old_and_new() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn contract_endpoints_answer_501_naming_their_milestone() {
+async fn every_contracted_endpoint_is_implemented() {
+    // Nothing in the contract answers 501 any more. If a future milestone registers a
+    // placeholder, this catches it rather than letting it ship silently.
     let harness = Harness::new(|_| {});
 
-    let expected = [
-        ("/v1/metrics", "M3"),
-        ("/api/v1/write", "M3"),
-        ("/api/v1/query", "M3"),
-        ("/api/v1/label/app/values", "M3"),
-    ];
-
-    for (path, milestone) in expected {
-        let (status, _, body) = harness.get(path).await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{path}");
-
-        let json: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(json["error"]["code"], "not_implemented", "{path}");
-        assert!(
-            json["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains(milestone),
-            "{path} should name milestone {milestone}: {body}"
+    for path in [
+        "/v1/logs",
+        "/v1/traces",
+        "/v1/metrics",
+        "/api/v1/write",
+        "/loki/api/v1/query_range?query=%7Bapp%3D%22x%22%7D",
+        "/loki/api/v1/labels",
+        "/loki/api/v1/label/app/values",
+        "/loki/api/v1/series",
+        "/api/traces/abc123",
+        "/api/search",
+        "/api/search/tags",
+        "/api/v2/search/tag/app/values",
+        "/api/v1/status/buildinfo",
+        "/api/v1/query?query=up",
+        "/api/v1/query_range?query=up",
+        "/api/v1/labels",
+        "/api/v1/label/app/values",
+        "/api/v1/series",
+    ] {
+        let (status, _, _) = harness.get(path).await;
+        assert_ne!(
+            status,
+            StatusCode::NOT_IMPLEMENTED,
+            "{path} still answers 501"
         );
-        // Every subset boundary links the compatibility doc.
-        assert!(
-            json["error"]["docs"]
-                .as_str()
-                .unwrap()
-                .ends_with("COMPATIBILITY.md"),
-            "{path}"
-        );
+        // A 404 from `/api/traces/{id}` means "no such trace", which is the correct
+        // answer on an empty store — it is a routed endpoint either way.
+        if !path.starts_with("/api/traces/") {
+            assert_ne!(status, StatusCode::NOT_FOUND, "{path} is not routed");
+        }
     }
 }
 
@@ -309,18 +314,19 @@ async fn a_genuinely_unknown_route_is_still_a_404() {
 }
 
 #[tokio::test]
-async fn contract_endpoints_answer_every_method_not_just_get() {
+async fn ingest_endpoints_accept_post() {
     let harness = Harness::new(|_| {});
-    // A GET to an unbuilt ingest endpoint says "not implemented until M3", not
-    // "method not allowed", which would send someone hunting for the wrong problem.
-    let (status, _, _) = harness
-        .request(Request::get("/v1/metrics").body(Body::empty()).unwrap())
-        .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    let (status, _, _) = harness
-        .request(Request::post("/v1/metrics").body(Body::from("{}")).unwrap())
-        .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    for path in ["/v1/logs", "/v1/traces", "/v1/metrics"] {
+        let (status, _, _) = harness
+            .request(
+                Request::post(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+    }
 }
 
 // ---------------------------------------------------------------------------

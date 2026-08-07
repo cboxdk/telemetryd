@@ -16,10 +16,11 @@ ship one 2.6 MB binary instead of a stack of services to operate. If you outgrow
 node, you have outgrown telemetryd, and we would rather say so than pretend
 otherwise.
 
-> **Status: M2.** Logs and traces work end to end: OTLP/HTTP JSON in, Parquet segments
-> on disk, the Loki and Tempo query APIs out, with live tail and retention enforcing
-> both time and a disk budget. Metrics endpoints are registered and answer `501` naming
-> the milestone they land in. See [Milestones](#milestones).
+> **Status: M3.** All three signals work end to end. Logs, traces and metrics go in as
+> OTLP/HTTP JSON (plus Prometheus `remote_write`), land in Parquet segments, and come
+> back out through the Loki, Tempo and Prometheus query APIs — with live tail, and
+> retention enforcing both time and a disk budget. Nothing in the contract answers
+> `501` any more. See [Milestones](#milestones).
 
 ## Quickstart
 
@@ -38,9 +39,20 @@ telemetryd status
 Point `cboxdk/laravel-telemetry` at `http://127.0.0.1:4319` and query it back:
 
 ```bash
+# logs
 curl -G http://127.0.0.1:4319/loki/api/v1/query_range \
-  --data-urlencode '{app="checkout", level="error"} |= "declined"'
+  --data-urlencode 'query={app="checkout", level="error"} |= "declined"'
+
+# metrics
+curl -G http://127.0.0.1:4319/api/v1/query \
+  --data-urlencode 'query=rate(http_requests_total[5m])'
+
+# a trace
+curl http://127.0.0.1:4319/api/traces/4bf92f3577b34da6a3ce929d0e0e4736
 ```
+
+Point all three of `laravel-telemetry-ui`'s connectors — Loki, Tempo and
+Prometheus — at that one base URL.
 
 ## Design
 
@@ -54,6 +66,7 @@ Four documents cover the decisions and the reasoning behind them:
 | [ADR-004](docs/adr/0004-auth-and-network-binding.md) | Auth, network binding, and what is deliberately out of scope |
 | [ADR-005](docs/adr/0005-compatibility-audit.md) | Why the compatibility subset is derived from the client, not the upstream spec |
 | [ADR-006](docs/adr/0006-query-performance-architecture.md) | Query performance: what knowing the queries in advance buys, and where a general engine stays ahead |
+| [ADR-007](docs/adr/0007-metrics-reuse-the-record-store.md) | Why metrics reuse the record store instead of the bespoke chunk store ADR-001 planned |
 
 Configuration reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 API contract: [COMPATIBILITY.md](COMPATIBILITY.md) — derived from `laravel-telemetry-ui`'s
@@ -118,8 +131,8 @@ error, rather than dropping data quietly.
 | **M0** | Workspace, config, data dir, WAL, HTTP surface, self-observability, CI | **done** |
 | **M1** | OTLP JSON logs → Parquet segments → Loki `query_range`, labels, series, live tail; retention reaper | **done** |
 | **M2** | OTLP traces → Tempo trace-by-id, TraceQL search, tags; query performance architecture | **done** |
-| M3 | `remote_write`, OTLP metrics, PromQL subset, cardinality caps | next |
-| M4 | Freeze `COMPATIBILITY.md` and contract-test every row (audit already done — [ADR-005](docs/adr/0005-compatibility-audit.md)) | |
+| **M3** | Prometheus `remote_write` + OTLP metrics → PromQL subset, Prometheus query APIs | **done** |
+| M4 | Freeze `COMPATIBILITY.md` and contract-test every row (audit already done — [ADR-005](docs/adr/0005-compatibility-audit.md)) | next |
 | M5 | cargo-dist, install script, brew tap, `.deb`, `service install` | |
 
 ## Development

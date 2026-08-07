@@ -202,20 +202,3 @@ fn gauges(state: &AppState) -> Result<Vec<Sample>, Error> {
 
     Ok(samples)
 }
-
-/// A route that is part of the compatibility contract but not built yet.
-///
-/// Answering every method keeps the diagnosis honest: a `GET` to an ingest endpoint
-/// should say "not implemented until M1", not "method not allowed", which would send
-/// someone hunting for the wrong problem.
-pub(crate) fn planned(
-    endpoint: &'static str,
-    milestone: &'static str,
-) -> axum::routing::MethodRouter<AppState> {
-    axum::routing::any(move || async move {
-        ApiError(Error::NotImplemented {
-            endpoint,
-            milestone,
-        })
-    })
-}

@@ -8,6 +8,7 @@
 pub mod bloom;
 pub mod datadir;
 pub mod logs;
+pub mod metrics;
 pub mod records;
 pub mod retention;
 pub mod schema;
@@ -20,12 +21,14 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
+use telemetryd_core::MetricSample;
 use telemetryd_core::config::{Config, RetentionConfig};
 use telemetryd_core::span::SpanRecord;
 use telemetryd_core::{LogRecord, Result, Signal};
 
 pub use datadir::{DataDir, DiskUsage};
 pub use logs::LogSchema;
+pub use metrics::MetricSchema;
 pub use records::{RecordStore, RecordStoreStatus, Scan, StoreSettings};
 pub use retention::{Candidate, Plan, ReaperReport};
 pub use segment::{Segment, SegmentManifest};
@@ -46,6 +49,7 @@ pub struct Store {
     data_dir: DataDir,
     logs: RecordStore<LogSchema>,
     traces: RecordStore<SpanSchema>,
+    metrics: RecordStore<MetricSchema>,
     disk_budget: u64,
     retention: RetentionConfig,
     reaper: Mutex<ReaperReport>,
@@ -76,10 +80,18 @@ impl Store {
             settings,
         )?;
 
+        let metrics = RecordStore::<MetricSchema>::open(
+            &data_dir.wal_dir(Signal::Metrics),
+            data_dir.segments_dir(Signal::Metrics),
+            data_dir.tmp_dir(),
+            settings,
+        )?;
+
         Ok(Self {
             data_dir,
             logs,
             traces,
+            metrics,
             disk_budget: config.storage.disk_budget.as_u64(),
             retention: config.retention.clone(),
             reaper: Mutex::new(ReaperReport::default()),
@@ -100,6 +112,15 @@ impl Store {
         self.traces.append(records)
     }
 
+    pub fn metrics(&self) -> &RecordStore<MetricSchema> {
+        &self.metrics
+    }
+
+    /// Append metric samples. Durable before this returns.
+    pub fn append_samples(&self, records: &[MetricSample]) -> Result<()> {
+        self.metrics.append(records)
+    }
+
     pub fn data_dir(&self) -> &DataDir {
         &self.data_dir
     }
@@ -113,19 +134,22 @@ impl Store {
     /// loses the interval-sync window.
     pub fn sync_all(&self) -> Result<()> {
         self.logs.sync()?;
-        self.traces.sync()
+        self.traces.sync()?;
+        self.metrics.sync()
     }
 
     /// Apply the configured sync policy without forcing a flush.
     pub fn maybe_sync(&self) -> Result<()> {
         self.logs.maybe_sync()?;
-        self.traces.maybe_sync()
+        self.traces.maybe_sync()?;
+        self.metrics.maybe_sync()
     }
 
     /// Seal any buffer whose window has elapsed.
     pub fn maybe_seal(&self) -> Result<()> {
         self.logs.maybe_seal()?;
         self.traces.maybe_seal()?;
+        self.metrics.maybe_seal()?;
         Ok(())
     }
 
@@ -133,6 +157,7 @@ impl Store {
     pub fn seal_all(&self) -> Result<()> {
         self.logs.seal_now()?;
         self.traces.seal_now()?;
+        self.metrics.seal_now()?;
         Ok(())
     }
 
@@ -151,6 +176,7 @@ impl Store {
             .segments()
             .iter()
             .chain(self.traces.segments().iter())
+            .chain(self.metrics.segments().iter())
             .map(|segment| Candidate {
                 signal: segment.manifest.signal,
                 id: segment.manifest.id.clone(),
@@ -224,10 +250,11 @@ impl Store {
         match candidate.signal {
             Signal::Logs => self.logs.remove_segment(&candidate.id),
             Signal::Traces => self.traces.remove_segment(&candidate.id),
-            // Events and metrics land later. Nothing else produces candidates yet, so
-            // this is a loud no-op rather than a silent skip.
-            other => {
-                tracing::warn!(signal = %other, "retention has no store for this signal yet");
+            Signal::Metrics => self.metrics.remove_segment(&candidate.id),
+            // Events land later. Nothing else produces candidates yet, so this is a
+            // loud no-op rather than a silent skip.
+            Signal::Events => {
+                tracing::warn!(signal = %Signal::Events, "retention has no store for events yet");
                 Ok(false)
             }
         }
@@ -267,6 +294,7 @@ impl Store {
             usage,
             logs: self.logs.status(),
             traces: self.traces.status(),
+            metrics: self.metrics.status(),
             retention: lock(&self.reaper).clone(),
             wal_truncations: lock_read(&self.wal_truncations).clone(),
         })
@@ -283,6 +311,7 @@ pub struct StoreStatus {
     pub usage: DiskUsage,
     pub logs: RecordStoreStatus,
     pub traces: RecordStoreStatus,
+    pub metrics: RecordStoreStatus,
     pub retention: ReaperReport,
     /// Non-empty when a crash cost us records. "Degrade loudly."
     pub wal_truncations: Vec<Truncation>,

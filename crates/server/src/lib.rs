@@ -10,6 +10,7 @@ pub mod ingest;
 pub mod loki;
 pub mod maintenance;
 pub mod metrics;
+pub mod prometheus;
 pub mod routes;
 pub mod state;
 pub mod tempo;
@@ -32,7 +33,7 @@ pub use state::AppState;
 
 /// The milestone this build implements, reported by `/status`. Keeping it in the
 /// binary means a user can always tell which slice of the contract they have.
-pub const MILESTONE: &str = "M2";
+pub const MILESTONE: &str = "M3";
 
 /// Build the complete router.
 pub fn router(state: AppState) -> Router {
@@ -63,17 +64,32 @@ pub fn router(state: AppState) -> Router {
         // The UI calls the v2 path; v1 is kept for older clients (ADR-005).
         .route("/api/v2/search/tag/{name}/values", get(tempo::tag_values))
         .route("/api/search/tag/{name}/values", get(tempo::tag_values))
-        .merge(planned_query_routes())
+        // Prometheus-compatible read APIs (M3). `buildinfo` is the UI's primary probe;
+        // without it every connection check shows a degraded backend (ADR-005).
+        .route("/api/v1/status/buildinfo", get(prometheus::build_info))
+        .route(
+            "/api/v1/query",
+            get(prometheus::instant).post(prometheus::instant),
+        )
+        .route(
+            "/api/v1/query_range",
+            get(prometheus::range).post(prometheus::range),
+        )
+        .route("/api/v1/labels", get(prometheus::labels))
+        .route("/api/v1/label/{name}/values", get(prometheus::label_values))
+        .route("/api/v1/series", get(prometheus::series))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_query_token,
         ));
 
     let ingest = Router::new()
-        // OTLP/HTTP JSON logs — the first-class ingest path (M1).
+        // OTLP/HTTP JSON is the first-class ingest path; laravel-telemetry sends JSON,
+        // so protobuf is never on the client's critical path.
         .route("/v1/logs", axum::routing::post(ingest::otlp_logs))
         .route("/v1/traces", axum::routing::post(ingest::otlp_traces))
-        .merge(planned_ingest_routes())
+        .route("/v1/metrics", axum::routing::post(ingest::otlp_metrics))
+        .route("/api/v1/write", axum::routing::post(ingest::remote_write))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_ingest_token,
@@ -97,61 +113,6 @@ pub fn router(state: AppState) -> Router {
         // unsynced window along with it.
         .layer(CatchPanicLayer::new())
         .with_state(state)
-}
-
-/// Ingest endpoints still to come.
-fn planned_ingest_routes() -> Router<AppState> {
-    Router::new()
-        .route("/v1/metrics", routes::planned("/v1/metrics", "M3"))
-        .route("/api/v1/write", routes::planned("/api/v1/write", "M3"))
-}
-
-/// Query endpoints from the contract, frozen as `COMPATIBILITY.md` in M4.
-fn planned_query_routes() -> Router<AppState> {
-    Router::new()
-        // Loki — M1
-        .route(
-            "/loki/api/v1/query_range",
-            routes::planned("/loki/api/v1/query_range", "M1"),
-        )
-        .route(
-            "/loki/api/v1/labels",
-            routes::planned("/loki/api/v1/labels", "M1"),
-        )
-        .route(
-            "/loki/api/v1/label/{name}/values",
-            routes::planned("/loki/api/v1/label/{name}/values", "M1"),
-        )
-        .route(
-            "/loki/api/v1/tail",
-            routes::planned("/loki/api/v1/tail", "M1"),
-        )
-        // Tempo — M2
-        .route(
-            "/api/traces/{trace_id}",
-            routes::planned("/api/traces/{trace_id}", "M2"),
-        )
-        .route("/api/search", routes::planned("/api/search", "M2"))
-        .route(
-            "/api/search/tags",
-            routes::planned("/api/search/tags", "M2"),
-        )
-        .route(
-            "/api/search/tag/{name}/values",
-            routes::planned("/api/search/tag/{name}/values", "M2"),
-        )
-        // Prometheus — M3
-        .route("/api/v1/query", routes::planned("/api/v1/query", "M3"))
-        .route(
-            "/api/v1/query_range",
-            routes::planned("/api/v1/query_range", "M3"),
-        )
-        .route("/api/v1/labels", routes::planned("/api/v1/labels", "M3"))
-        .route(
-            "/api/v1/label/{name}/values",
-            routes::planned("/api/v1/label/{name}/values", "M3"),
-        )
-        .route("/api/v1/series", routes::planned("/api/v1/series", "M3"))
 }
 
 /// Count every request by *matched route*, never by raw path.

@@ -15,6 +15,9 @@
 
 pub mod logs;
 pub mod otlp;
+pub mod otlp_metrics;
+pub mod protobuf;
+pub mod remote_write;
 pub mod traces;
 
 /// Why a record was refused. The string form is the metric label, so it is a closed
@@ -30,6 +33,13 @@ pub enum RejectReason {
     MissingTraceId,
     /// Likewise with no span id: nothing could ever reference it.
     MissingSpanId,
+    /// A time series with no `__name__`.
+    MissingMetricName,
+    /// A metric name that is not a valid Prometheus name. Refused rather than
+    /// rewritten — see `telemetryd_core::metric::is_valid_metric_name`.
+    InvalidMetricName,
+    /// A sample timestamp outside any plausible range.
+    InvalidTimestamp,
 }
 
 impl RejectReason {
@@ -42,6 +52,9 @@ impl RejectReason {
             Self::LabelValueTooLong => "label_value_too_long",
             Self::MissingTraceId => "missing_trace_id",
             Self::MissingSpanId => "missing_span_id",
+            Self::MissingMetricName => "missing_metric_name",
+            Self::InvalidMetricName => "invalid_metric_name",
+            Self::InvalidTimestamp => "invalid_timestamp",
         }
     }
 }
@@ -134,6 +147,9 @@ mod tests {
             RejectReason::LabelValueTooLong,
             RejectReason::MissingTraceId,
             RejectReason::MissingSpanId,
+            RejectReason::MissingMetricName,
+            RejectReason::InvalidMetricName,
+            RejectReason::InvalidTimestamp,
         ] {
             let label = reason.as_str();
             assert!(!label.is_empty());

@@ -8,6 +8,8 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use telemetryd_core::Error;
 use telemetryd_ingest::logs::{self, DecodeContext};
+use telemetryd_ingest::otlp_metrics;
+use telemetryd_ingest::remote_write;
 use telemetryd_ingest::traces;
 
 use crate::error::ApiError;
@@ -31,6 +33,8 @@ pub struct PartialSuccess {
     pub rejected_log_records: Option<String>,
     #[serde(rename = "rejectedSpans", skip_serializing_if = "Option::is_none")]
     pub rejected_spans: Option<String>,
+    #[serde(rename = "rejectedDataPoints", skip_serializing_if = "Option::is_none")]
+    pub rejected_data_points: Option<String>,
     #[serde(rename = "errorMessage")]
     pub error_message: String,
 }
@@ -111,6 +115,7 @@ pub async fn otlp_logs(
         partial_success: decoded.rejection_summary().map(|message| PartialSuccess {
             rejected_log_records: Some(decoded.rejected().to_string()),
             rejected_spans: None,
+            rejected_data_points: None,
             error_message: message,
         }),
     };
@@ -173,6 +178,117 @@ pub async fn otlp_traces(
         partial_success: decoded.rejection_summary().map(|message| PartialSuccess {
             rejected_log_records: None,
             rejected_spans: Some(decoded.rejected().to_string()),
+            rejected_data_points: None,
+            error_message: message,
+        }),
+    };
+
+    Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+/// `POST /v1/metrics`
+pub async fn otlp_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    reject_protobuf(&headers)?;
+
+    let decoded = {
+        let limits = state.config.limits.clone();
+        let ingest = state.config.ingest.clone();
+        let now = telemetryd_store::now_nanos();
+        otlp_metrics::decode(
+            &body,
+            otlp_metrics::MetricContext {
+                limits: &limits,
+                ingest: &ingest,
+                now_nanos: now,
+            },
+        )
+        .map_err(|e| {
+            state.metrics.incr(
+                "telemetryd_ingest_rejected_total",
+                &[("signal", "metrics"), ("reason", "malformed_json")],
+            );
+            Error::BadRequest(format!("could not decode the OTLP metrics payload: {e}"))
+        })?
+    };
+
+    store_samples(&state, decoded).await
+}
+
+/// `POST /api/v1/write` — Prometheus remote_write.
+pub async fn remote_write(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let decoded = {
+        let limits = state.config.limits.clone();
+        remote_write::decode(
+            &body,
+            remote_write::WriteContext {
+                limits: &limits,
+                default_app: telemetryd_core::record::UNKNOWN_APP,
+            },
+        )
+        .inspect_err(|_| {
+            state.metrics.incr(
+                "telemetryd_ingest_rejected_total",
+                &[("signal", "metrics"), ("reason", "malformed_protobuf")],
+            );
+        })?
+    };
+
+    // remote_write has no partial-success envelope; Prometheus expects 204 on success
+    // and treats anything else as a failure worth retrying.
+    let response = store_samples(&state, decoded).await?;
+    if response.status().is_success() {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    Ok(response)
+}
+
+/// Shared tail of both metric ingest paths.
+async fn store_samples(
+    state: &AppState,
+    decoded: telemetryd_ingest::Decoded<telemetryd_core::MetricSample>,
+) -> Result<Response, ApiError> {
+    for rejection in &decoded.rejections {
+        state.metrics.incr(
+            "telemetryd_ingest_rejected_total",
+            &[("signal", "metrics"), ("reason", rejection.reason.as_str())],
+        );
+    }
+    if decoded.rescaled_timestamps > 0 {
+        state.metrics.add(
+            "telemetryd_ingest_timestamps_rescaled_total",
+            &[("signal", "metrics")],
+            decoded.rescaled_timestamps,
+        );
+    }
+
+    if !decoded.records.is_empty() {
+        let store = std::sync::Arc::clone(&state.store);
+        let records = decoded.records.clone();
+        let accepted = records.len() as u64;
+
+        tokio::task::spawn_blocking(move || store.append_samples(&records))
+            .await
+            .map_err(|e| Error::Config(format!("ingest task panicked: {e}")))??;
+
+        state.metrics.add(
+            "telemetryd_ingest_accepted_total",
+            &[("signal", "metrics")],
+            accepted,
+        );
+    }
+
+    let response = OtlpResponse {
+        partial_success: decoded.rejection_summary().map(|message| PartialSuccess {
+            rejected_log_records: None,
+            rejected_spans: None,
+            rejected_data_points: Some(decoded.rejected().to_string()),
             error_message: message,
         }),
     };
@@ -249,6 +365,7 @@ mod tests {
             partial_success: Some(PartialSuccess {
                 rejected_log_records: Some("3".to_owned()),
                 rejected_spans: None,
+                rejected_data_points: None,
                 error_message: "3 record(s) rejected".to_owned(),
             }),
         };

@@ -28,6 +28,7 @@ humantime.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+snap.workspace = true
 bytesize.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true

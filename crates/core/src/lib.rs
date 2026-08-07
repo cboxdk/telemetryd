@@ -7,6 +7,7 @@
 pub mod config;
 pub mod error;
 pub mod matcher;
+pub mod metric;
 pub mod record;
 pub mod secret;
 pub mod signal;
@@ -15,6 +16,7 @@ pub mod span;
 pub use config::Config;
 pub use error::{Error, Result};
 pub use matcher::{LabelMatcher, MatchOp, matches_all};
+pub use metric::{METRIC_NAME_LABEL, MetricKind, MetricSample};
 pub use record::{APP_LABEL, LEVEL_LABEL, Labels, LogRecord, Severity, UNKNOWN_APP};
 pub use secret::{Secret, TokenSet};
 pub use signal::Signal;
