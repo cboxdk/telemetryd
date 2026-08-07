@@ -781,3 +781,114 @@ async fn ingested_logs_survive_a_restart() {
         "a record accepted over HTTP must survive a restart"
     );
 }
+
+// ---------------------------------------------------------------------------
+// UI compatibility, verified against what laravel-telemetry-ui actually sends
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn record_attributes_are_returned_as_structured_metadata() {
+    // The UI reads a third element from each `values` tuple and merges it over the
+    // stream labels. Without it, order.id / trace_id are invisible in the UI even
+    // though telemetryd stored them.
+    let harness = Harness::new();
+    harness
+        .post_logs(&otlp_logs(&[(0, "error", "payment declined", "1002")]))
+        .await;
+
+    let (_, response) = harness
+        .get(&range("/loki/api/v1/query_range", r#"{app="checkout"}"#))
+        .await;
+
+    let entry = &response["data"]["result"][0]["values"][0];
+    let tuple = entry.as_array().unwrap();
+    assert_eq!(tuple.len(), 3, "expected structured metadata, got {entry}");
+    assert_eq!(tuple[2]["order_id"], "1002");
+
+    // Stream labels stay in `stream`, not duplicated into the metadata.
+    assert!(tuple[2].get("app").is_none());
+}
+
+#[tokio::test]
+async fn an_entry_without_attributes_stays_a_two_element_tuple() {
+    // Loki omits the element entirely rather than sending {}, and a client that
+    // checks `count($value) < 2` should not see a surprise shape.
+    let harness = Harness::new();
+    let payload = json!({
+        "resourceLogs": [{
+            "resource": {"attributes": [{"key":"service.name","value":{"stringValue":"checkout"}}]},
+            "scopeLogs": [{"logRecords": [
+                {"timeUnixNano": NOW.to_string(), "body": {"stringValue": "no attributes"}}
+            ]}]
+        }]
+    });
+    harness.post_logs(&payload).await;
+
+    let (_, response) = harness
+        .get(&range("/loki/api/v1/query_range", r#"{app="checkout"}"#))
+        .await;
+    let tuple = response["data"]["result"][0]["values"][0]
+        .as_array()
+        .unwrap();
+    assert_eq!(tuple.len(), 2);
+}
+
+#[tokio::test]
+async fn the_uis_default_selector_returns_data() {
+    // LogqlCompiler emits {service_name=~".+"} when no stream matcher is given.
+    let harness = Harness::new();
+    harness
+        .post_logs(&otlp_logs(&[(0, "info", "hello", "1")]))
+        .await;
+
+    let (status, response) = harness
+        .get(&range(
+            "/loki/api/v1/query_range",
+            r#"{service_name=~".+"}"#,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["data"]["result"][0]["values"][0][1], "hello");
+}
+
+#[tokio::test]
+async fn label_filters_with_or_work_over_the_wire() {
+    let harness = Harness::new();
+    harness
+        .post_logs(&otlp_logs(&[
+            (0, "info", "a", "1001"),
+            (1, "info", "b", "1002"),
+            (2, "info", "c", "1003"),
+        ]))
+        .await;
+
+    let (status, response) = harness
+        .get(&range(
+            "/loki/api/v1/query_range",
+            r#"{app="checkout"} | order_id="1001" or order_id="1003""#,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut bodies: Vec<&str> = response["data"]["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|s| s["values"].as_array().unwrap())
+        .map(|v| v[1].as_str().unwrap())
+        .collect();
+    bodies.sort_unstable();
+    assert_eq!(bodies, vec!["a", "c"]);
+}
+
+#[tokio::test]
+async fn the_probe_the_ui_uses_to_recognise_a_log_backend_succeeds() {
+    // LokiSource::probe() GETs /loki/api/v1/labels with no parameters and requires
+    // {"status":"success"}. A bare 200 with some other JSON is treated as "not Loki".
+    let harness = Harness::new();
+    let (status, response) = harness.get("/loki/api/v1/labels").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["status"], "success");
+    assert!(response["data"].is_array());
+}

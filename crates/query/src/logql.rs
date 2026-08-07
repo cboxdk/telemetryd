@@ -28,7 +28,29 @@ pub enum Stage {
     Json,
     /// Parse the line as logfmt and merge its fields into the label set.
     Logfmt,
-    Label(LabelMatcher),
+    Label(LabelPredicate),
+}
+
+/// A label filter stage: one or more matchers combined with `and` / `or`.
+///
+/// LogQL allows `| status="500" or status="503"` in a single stage, and
+/// `laravel-telemetry-ui` generates exactly that. Supporting only a bare matcher would
+/// turn an ordinary UI query into a syntax error.
+#[derive(Debug, Clone)]
+pub enum LabelPredicate {
+    Match(LabelMatcher),
+    And(Box<LabelPredicate>, Box<LabelPredicate>),
+    Or(Box<LabelPredicate>, Box<LabelPredicate>),
+}
+
+impl LabelPredicate {
+    pub fn matches(&self, labels: &Labels) -> bool {
+        match self {
+            Self::Match(matcher) => matcher.matches(labels),
+            Self::And(left, right) => left.matches(labels) && right.matches(labels),
+            Self::Or(left, right) => left.matches(labels) || right.matches(labels),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -250,11 +272,44 @@ impl<'a> Parser<'a> {
 
             // Anything else in this position is a label filter.
             _ => {
-                let op = self.expect_match_op()?;
-                let value = self.expect_string("a quoted value in a label filter")?;
-                Ok(Stage::Label(LabelMatcher::new(name, op, value)?))
+                let first = self.label_matcher(name)?;
+                Ok(Stage::Label(self.label_predicate_tail(first)?))
             }
         }
+    }
+
+    /// Parse one `name op "value"` matcher, given the already-consumed name.
+    fn label_matcher(&mut self, name: String) -> Result<LabelPredicate> {
+        let op = self.expect_match_op()?;
+        let value = self.expect_string("a quoted value in a label filter")?;
+        Ok(LabelPredicate::Match(LabelMatcher::new(name, op, value)?))
+    }
+
+    /// Extend a matcher with any `and` / `or` continuation.
+    ///
+    /// `and` binds tighter than `or`, as in LogQL, so `a or b and c` is `a or (b and c)`.
+    fn label_predicate_tail(&mut self, first: LabelPredicate) -> Result<LabelPredicate> {
+        let mut left = self.label_predicate_and(first)?;
+
+        while matches!(self.peek(), Some(Token::Ident(word)) if word == "or") {
+            self.pos += 1;
+            let name = self.expect_ident("a label name after `or`")?;
+            let next = self.label_matcher(name)?;
+            let right = self.label_predicate_and(next)?;
+            left = LabelPredicate::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn label_predicate_and(&mut self, first: LabelPredicate) -> Result<LabelPredicate> {
+        let mut left = first;
+        while matches!(self.peek(), Some(Token::Ident(word)) if word == "and") {
+            self.pos += 1;
+            let name = self.expect_ident("a label name after `and`")?;
+            let right = self.label_matcher(name)?;
+            left = LabelPredicate::And(Box::new(left), Box::new(right));
+        }
+        Ok(left)
     }
 
     // -- token helpers -----------------------------------------------------
@@ -357,9 +412,9 @@ impl LogQuery {
                     let labels = extracted.get_or_insert_with(|| base.clone());
                     merge_logfmt(labels, line);
                 }
-                Stage::Label(matcher) => {
+                Stage::Label(predicate) => {
                     let labels = extracted.as_ref().unwrap_or(base);
-                    if !matcher.matches(labels) {
+                    if !predicate.matches(labels) {
                         return false;
                     }
                 }
@@ -717,5 +772,80 @@ mod tests {
     fn json_flattening_sanitises_and_joins_nested_names() {
         let query = parse(r#"{app="x"} | json | http_status_code="500""#).unwrap();
         assert!(query.evaluate(r#"{"http":{"status.code":500}}"#, &labels(&[])));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod compatibility_tests {
+    //! Cases taken from what `cboxdk/laravel-telemetry-ui`'s `LogqlCompiler` actually
+    //! emits. These are the contract, so they are pinned separately from the tests
+    //! that cover the language in general.
+
+    use super::*;
+
+    fn labels(pairs: &[(&str, &str)]) -> Labels {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn the_uis_default_selector_parses() {
+        // LogqlCompiler falls back to this when no stream matcher is given.
+        let query = parse(r#"{service_name=~".+"}"#).unwrap();
+        assert_eq!(query.matchers.len(), 1);
+        assert!(
+            query.matchers[0].is_selective(),
+            "`.+` requires a value, so it must not be treated as match-everything"
+        );
+    }
+
+    #[test]
+    fn label_filters_combine_with_and() {
+        let query = parse(r#"{app="x"} | status="500" and method="GET""#).unwrap();
+
+        assert!(query.evaluate("l", &labels(&[("status", "500"), ("method", "GET")])));
+        assert!(!query.evaluate("l", &labels(&[("status", "500"), ("method", "POST")])));
+        assert!(!query.evaluate("l", &labels(&[("status", "200"), ("method", "GET")])));
+    }
+
+    #[test]
+    fn label_filters_combine_with_or() {
+        let query = parse(r#"{app="x"} | status="500" or status="503""#).unwrap();
+
+        assert!(query.evaluate("l", &labels(&[("status", "500")])));
+        assert!(query.evaluate("l", &labels(&[("status", "503")])));
+        assert!(!query.evaluate("l", &labels(&[("status", "200")])));
+    }
+
+    #[test]
+    fn and_binds_tighter_than_or() {
+        // `a or b and c` is `a or (b and c)`, as in LogQL.
+        let query = parse(r#"{app="x"} | a="1" or b="2" and c="3""#).unwrap();
+
+        assert!(query.evaluate("l", &labels(&[("a", "1")])));
+        assert!(query.evaluate("l", &labels(&[("b", "2"), ("c", "3")])));
+        assert!(
+            !query.evaluate("l", &labels(&[("b", "2")])),
+            "b alone must not satisfy `b and c`"
+        );
+    }
+
+    #[test]
+    fn a_long_or_chain_parses() {
+        let query = parse(r#"{app="x"} | s="1" or s="2" or s="3" or s="4""#).unwrap();
+        for value in ["1", "2", "3", "4"] {
+            assert!(query.evaluate("l", &labels(&[("s", value)])), "{value}");
+        }
+        assert!(!query.evaluate("l", &labels(&[("s", "5")])));
+    }
+
+    #[test]
+    fn mixed_operators_in_a_filter_chain_work() {
+        let query = parse(r#"{app="x"} | route=~"/api/.*" and status!="200""#).unwrap();
+        assert!(query.evaluate("l", &labels(&[("route", "/api/orders"), ("status", "500")])));
+        assert!(!query.evaluate("l", &labels(&[("route", "/api/orders"), ("status", "200")])));
     }
 }

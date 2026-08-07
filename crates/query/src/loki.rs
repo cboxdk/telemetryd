@@ -324,9 +324,39 @@ pub struct StreamsData {
 #[derive(Debug, Serialize)]
 pub struct StreamResult {
     pub stream: BTreeMap<String, String>,
-    /// `[timestamp_nanos_as_string, line]`. The timestamp is a string because it does
-    /// not survive a JSON number in JavaScript.
-    pub values: Vec<[String; 2]>,
+    pub values: Vec<Entry>,
+}
+
+/// One log entry on the wire.
+///
+/// Loki entries are `[timestamp, line]` or `[timestamp, line, structuredMetadata]`.
+/// The third element is where per-record attributes belong: promoting them to stream
+/// labels would explode the index, and dropping them would make `order.id` and
+/// `trace_id` invisible in a client that reads them from there — which
+/// `laravel-telemetry-ui` does. The timestamp is a string because a JSON number loses
+/// nanosecond precision in JavaScript.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum Entry {
+    Plain([String; 2]),
+    WithMetadata(String, String, BTreeMap<String, String>),
+}
+
+impl Entry {
+    pub fn new(timestamp_nanos: u64, line: String, metadata: BTreeMap<String, String>) -> Self {
+        if metadata.is_empty() {
+            // Match Loki, which omits the element entirely rather than sending {}.
+            Self::Plain([timestamp_nanos.to_string(), line])
+        } else {
+            Self::WithMetadata(timestamp_nanos.to_string(), line, metadata)
+        }
+    }
+
+    pub fn timestamp(&self) -> &str {
+        match self {
+            Self::Plain([ts, _]) | Self::WithMetadata(ts, _, _) => ts,
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -402,12 +432,17 @@ pub fn query_range(
 
 /// Group records by their stream label set, preserving order within each stream.
 fn group_into_streams(records: Vec<LogRecord>, direction: Direction) -> Vec<StreamResult> {
-    let mut grouped: BTreeMap<Labels, Vec<[String; 2]>> = BTreeMap::new();
+    let mut grouped: BTreeMap<Labels, Vec<Entry>> = BTreeMap::new();
     for record in records {
+        let metadata: BTreeMap<String, String> = record
+            .attributes
+            .iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
         grouped
             .entry(record.stream.clone())
             .or_default()
-            .push([record.timestamp_nanos.to_string(), record.body]);
+            .push(Entry::new(record.timestamp_nanos, record.body, metadata));
     }
 
     grouped
@@ -416,8 +451,10 @@ fn group_into_streams(records: Vec<LogRecord>, direction: Direction) -> Vec<Stre
             // Entries within a stream follow the requested direction, which is what
             // clients rely on for paging.
             match direction {
-                Direction::Backward => values.sort_by(|a, b| b[0].cmp(&a[0])),
-                Direction::Forward => values.sort_by(|a, b| a[0].cmp(&b[0])),
+                Direction::Backward => {
+                    values.sort_by(|a, b| b.timestamp().cmp(a.timestamp()));
+                }
+                Direction::Forward => values.sort_by(|a, b| a.timestamp().cmp(b.timestamp())),
             }
             StreamResult {
                 stream: stream

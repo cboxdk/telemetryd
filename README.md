@@ -52,9 +52,11 @@ Four documents cover the decisions and the reasoning behind them:
 | [ADR-002](docs/adr/0002-workspace-layout.md) | Workspace layout |
 | [ADR-003](docs/adr/0003-configuration-model.md) | Configuration model and layering |
 | [ADR-004](docs/adr/0004-auth-and-network-binding.md) | Auth, network binding, and what is deliberately out of scope |
+| [ADR-005](docs/adr/0005-compatibility-audit.md) | Why the compatibility subset is derived from the client, not the upstream spec |
 
 Configuration reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
-API contract: [COMPATIBILITY.md](COMPATIBILITY.md) (frozen in M4).
+API contract: [COMPATIBILITY.md](COMPATIBILITY.md) — derived from `laravel-telemetry-ui`'s
+actual connector source, not from the upstream API references.
 
 ## Security
 
@@ -116,7 +118,7 @@ error, rather than dropping data quietly.
 | **M1** | OTLP JSON logs → Parquet segments → Loki `query_range`, labels, series, live tail; retention reaper | **done** |
 | M2 | OTLP traces, trace-by-id, Tempo search | next |
 | M3 | `remote_write`, OTLP metrics, PromQL subset, cardinality caps | |
-| M4 | Run `laravel-telemetry-ui` against telemetryd, freeze `COMPATIBILITY.md`, contract-test | |
+| M4 | Freeze `COMPATIBILITY.md` and contract-test every row (audit already done — [ADR-005](docs/adr/0005-compatibility-audit.md)) | |
 | M5 | cargo-dist, install script, brew tap, `.deb`, `service install` | |
 
 ## Development
