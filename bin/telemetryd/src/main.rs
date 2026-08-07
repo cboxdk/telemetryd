@@ -80,9 +80,12 @@ enum Command {
     /// Print version and build information.
     Version,
 
-    /// Ingest synthetic telemetry while querying, to catch performance regressions.
+    /// Measure what this machine can ingest and query, for sizing.
+    ///
+    /// Runs against a temporary directory that is deleted afterwards; it will never
+    /// touch a real data directory.
     #[command(hide = true)]
-    Bench,
+    Bench(commands::bench::BenchArgs),
 }
 
 #[derive(Debug, Args)]
@@ -163,9 +166,6 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             commands::version::run();
             Ok(())
         }
-        Command::Bench => anyhow::bail!(
-            "`telemetryd bench` arrives with M1, once there is an ingest path to \
-             drive. Until then, `cargo bench` runs the criterion benches."
-        ),
+        Command::Bench(args) => commands::bench::run(&args),
     }
 }

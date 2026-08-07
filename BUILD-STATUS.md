@@ -44,7 +44,9 @@ damaging a real data directory five different ways.
 unsupported construct reports itself by name. Live tail over WebSocket. Label and series
 queries answered from metadata with no file I/O.
 
-**Operations.** `/healthz`, `/status`, `/metrics`. `telemetryd validate` prints every
+**Operations.** `telemetryd bench` measures what the machine can ingest and query, on
+a throwaway directory, so sizing is a measurement rather than a guess.
+`/healthz`, `/status`, `/metrics`. `telemetryd validate` prints every
 resolved value with its origin. `SIGHUP` reloads retention, the disk budget and the log
 level; anything else that changed in the file is refused by name rather than ignored. `telemetryd service install` writes a hardened unit.
 
@@ -157,10 +159,6 @@ opt-in via `storage.query_parallelism` and worth about 7% on an unbounded scan; 
 not worth three cores by default on a box that is also ingesting. Limited queries never
 use it at all — their speed comes from a cutoff that tightens as it goes, which is a
 sequential dependency, and splitting it measured 60% slower.
-
-**`telemetryd bench` is not built.** `cargo bench -p telemetryd-store` covers the same
-ground for now; the hidden subcommand exits with a message saying so rather than
-pretending.
 
 ## Deliberately absent
 
