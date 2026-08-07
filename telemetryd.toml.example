@@ -58,7 +58,6 @@ query_parallelism = 1
 # the hard cap over all signals.
 logs    = "7d"
 traces  = "7d"
-events  = "7d"
 metrics = "30d"
 
 [limits]

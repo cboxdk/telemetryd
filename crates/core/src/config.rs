@@ -257,7 +257,6 @@ pub enum Compression {
 pub struct RetentionConfig {
     pub logs: DurationSetting,
     pub traces: DurationSetting,
-    pub events: DurationSetting,
     /// Longer than the rest by default: metrics cost ~1.3 bytes/sample, and
     /// week-over-week comparison is most of what dashboards are for. See ADR-001 D3.
     pub metrics: DurationSetting,
@@ -269,18 +268,16 @@ impl Default for RetentionConfig {
         Self {
             logs: DurationSetting(Duration::from_secs(7 * DAY)),
             traces: DurationSetting(Duration::from_secs(7 * DAY)),
-            events: DurationSetting(Duration::from_secs(7 * DAY)),
             metrics: DurationSetting(Duration::from_secs(30 * DAY)),
         }
     }
 }
 
 impl RetentionConfig {
-    fn each(&self) -> [(&'static str, Duration); 4] {
+    fn each(&self) -> [(&'static str, Duration); 3] {
         [
             ("retention.logs", self.logs.0),
             ("retention.traces", self.traces.0),
-            ("retention.events", self.events.0),
             ("retention.metrics", self.metrics.0),
         ]
     }
@@ -422,7 +419,6 @@ const ENV_KEYS: &[(&str, &str)] = &[
     ),
     ("TELEMETRYD_RETENTION_LOGS", "retention.logs"),
     ("TELEMETRYD_RETENTION_TRACES", "retention.traces"),
-    ("TELEMETRYD_RETENTION_EVENTS", "retention.events"),
     ("TELEMETRYD_RETENTION_METRICS", "retention.metrics"),
     ("TELEMETRYD_LIMITS_MAX_SERIES", "limits.max_series"),
     (

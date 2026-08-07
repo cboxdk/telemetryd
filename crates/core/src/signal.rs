@@ -14,12 +14,11 @@ use serde::{Deserialize, Serialize};
 pub enum Signal {
     Logs,
     Traces,
-    Events,
     Metrics,
 }
 
 impl Signal {
-    pub const ALL: [Self; 4] = [Self::Logs, Self::Traces, Self::Events, Self::Metrics];
+    pub const ALL: [Self; 3] = [Self::Logs, Self::Traces, Self::Metrics];
 
     /// Directory name under `wal/` and `segments/`. Stable on disk — changing one of
     /// these is a storage format break.
@@ -27,7 +26,6 @@ impl Signal {
         match self {
             Self::Logs => "logs",
             Self::Traces => "traces",
-            Self::Events => "events",
             Self::Metrics => "metrics",
         }
     }

@@ -46,7 +46,6 @@ query_parallelism = 1                # threads per query; 1 = off (default), 0 =
 [retention]
 logs    = "7d"
 traces  = "7d"
-events  = "7d"
 metrics = "30d"                      # cheaper per unit time — see ADR-001 D3
 
 [limits]

@@ -353,10 +353,6 @@ impl Store {
             Signal::Metrics => self.metrics.remove_segment(&candidate.id),
             // Events land later. Nothing else produces candidates yet, so this is a
             // loud no-op rather than a silent skip.
-            Signal::Events => {
-                tracing::warn!(signal = %Signal::Events, "retention has no store for events yet");
-                Ok(false)
-            }
         }
     }
 
@@ -365,7 +361,6 @@ impl Store {
         BTreeMap::from([
             (Signal::Logs, policy.retention.logs.get()),
             (Signal::Traces, policy.retention.traces.get()),
-            (Signal::Events, policy.retention.events.get()),
             (Signal::Metrics, policy.retention.metrics.get()),
         ])
     }
@@ -404,11 +399,6 @@ impl Store {
                 "metrics",
                 policy.retention.metrics.get(),
                 config.retention.metrics.get(),
-            ),
-            (
-                "events",
-                policy.retention.events.get(),
-                config.retention.events.get(),
             ),
         ] {
             if old != new {

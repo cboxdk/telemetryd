@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn a_signal_with_no_configured_window_never_expires_by_age() {
-        let candidates = vec![candidate("ancient", Signal::Events, 3650 * DAY, 100)];
+        let candidates = vec![candidate("ancient", Signal::Metrics, 3650 * DAY, 100)];
         let plan = plan(
             &candidates,
             NOW,

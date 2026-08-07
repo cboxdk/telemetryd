@@ -74,10 +74,6 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse
             humantime::format_duration(config.retention.traces.get()).to_string(),
         ),
         (
-            "events",
-            humantime::format_duration(config.retention.events.get()).to_string(),
-        ),
-        (
             "metrics",
             humantime::format_duration(config.retention.metrics.get()).to_string(),
         ),

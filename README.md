@@ -1,7 +1,7 @@
 # telemetryd
 
 Single-binary, zero-config observability backend for the [cboxdk](https://github.com/cboxdk)
-Laravel ecosystem. Logs, traces, events and metrics in one directory, served back
+Laravel ecosystem. Logs, traces and metrics in one directory, served back
 through the Loki, Tempo and Prometheus APIs that `laravel-telemetry-ui` already speaks.
 
 **Your telemetry never leaves your infrastructure: one binary, one port, one data

@@ -142,10 +142,6 @@ Named rather than left to be discovered.
 infrastructure and keeping it available. `dpkg -i` from a release asset is documented
 instead.
 
-**Events are a signal we do not store.** `Signal::Events` exists in the type system and
-the retention reaper handles it, but nothing ingests events yet. The record store would
-need only a schema.
-
 **Attribute maps are still per-row JSON.** They are genuinely high cardinality, so
 interning does not obviously apply. Only paid for rows that survive filtering, so it no
 longer dominates a query (ADR-006).
@@ -170,6 +166,10 @@ Not gaps. These are decisions, each with an ADR:
 - **Plugins, relabelling rules, write-path transformations** — shape data in the
   instrumentation
 - **OTLP/gRPC** — JSON is first-class because that is what the client emits
+- **A separate "events" signal** — OpenTelemetry has no such signal. An event is a log
+  record carrying `event.name`, so events already arrive on `/v1/logs` and are queryable
+  through the Loki API. telemetryd used to carry a fourth `Signal::Events` that nothing
+  could write to, along with a `retention.events` setting that governed nothing
 - **Scraping Prometheus targets** — telemetryd receives (`remote_write`, OTLP), it
   does not go and fetch. A `[[scrape]]` config section existed, complete with
   validation and documentation, and was read by nothing; it has been removed rather
