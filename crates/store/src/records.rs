@@ -252,6 +252,8 @@ impl<S: RecordSchema> Buffer<S> {
 struct Stats {
     appended: AtomicU64,
     sealed_segments: AtomicU64,
+    /// Reads that failed because a segment file is damaged.
+    segments_unreadable: AtomicU64,
     sealed_records: AtomicU64,
     recovered: AtomicU64,
     /// Segments actually opened and decoded. The counterpart to `segments_pruned`:
@@ -344,6 +346,9 @@ pub struct RecordStoreStatus {
     pub segment_bytes: u64,
     pub appended_records: u64,
     pub sealed_segments: u64,
+    /// Query-time reads skipped because the segment file is damaged. Non-zero means
+    /// data has been lost and the operator needs to know.
+    pub segments_unreadable: u64,
     pub recovered_records: u64,
     pub oldest_record_nanos: Option<u64>,
     pub newest_record_nanos: Option<u64>,
@@ -668,7 +673,7 @@ impl<S: RecordSchema> RecordStore<S> {
         let workers = self.scan_workers(&request, segments.len());
         if workers <= 1 {
             for (ordinal, segment) in segments.iter().enumerate() {
-                self.scan_segment(segment, ordinal, &request, matchers, extra, &mut collector)?;
+                self.scan_segment(segment, ordinal, &request, matchers, extra, &mut collector);
             }
             return Ok(collector.into_sorted());
         }
@@ -689,7 +694,6 @@ impl<S: RecordSchema> RecordStore<S> {
         let next = std::sync::atomic::AtomicUsize::new(0);
         let shared = SharedCutoff::new(request.order);
         let collected = std::sync::Mutex::new(Vec::with_capacity(workers));
-        let first_error = std::sync::Mutex::new(None::<Error>);
 
         std::thread::scope(|scope| {
             for _ in 0..workers {
@@ -711,27 +715,14 @@ impl<S: RecordSchema> RecordStore<S> {
                             continue;
                         }
 
-                        match self
-                            .scan_segment(segment, index, &request, matchers, extra, &mut local)
-                        {
-                            Ok(()) => shared.publish(&local),
-                            Err(err) => {
-                                let mut slot = lock(&first_error);
-                                if slot.is_none() {
-                                    *slot = Some(err);
-                                }
-                                break;
-                            }
-                        }
+                        self.scan_segment(segment, index, &request, matchers, extra, &mut local);
+                        shared.publish(&local);
                     }
                     lock(&collected).push(local);
                 });
             }
         });
 
-        if let Some(err) = lock(&first_error).take() {
-            return Err(err);
-        }
         for local in lock(&collected).drain(..) {
             collector.merge(local);
         }
@@ -778,7 +769,7 @@ impl<S: RecordSchema> RecordStore<S> {
         matchers: &[LabelMatcher],
         extra: &(dyn Fn(&S::Record) -> bool + Sync),
         collector: &mut TopK<S::Record>,
-    ) -> Result<()> {
+    ) {
         // Buffer chunks occupy the low positions, so sealed segments continue above
         // them. Setting it here rather than in each driver is what makes the sequential
         // and parallel paths produce the same answer instead of two defensible ones.
@@ -806,7 +797,7 @@ impl<S: RecordSchema> RecordStore<S> {
 
         if prunable {
             self.stats.segments_pruned.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+            return;
         }
         self.stats.segments_scanned.fetch_add(1, Ordering::Relaxed);
 
@@ -823,7 +814,18 @@ impl<S: RecordSchema> RecordStore<S> {
             }
         };
 
-        segment.scan_batches_where(Some(selection), |batch| {
+        // A read failure here is a damaged file, not a bad query. Aborting denied the
+        // caller every healthy segment in the same time range because of one bad
+        // sector, which is the opposite of useful in the tool you reach for when
+        // things are already broken. Skip it, say so once, and count it.
+        if segment.is_unreadable() {
+            self.stats
+                .segments_unreadable
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        let outcome = segment.scan_batches_where(Some(selection), |batch| {
             // Rows here already passed the pushed-down predicate; `select_rows`
             // re-checks because a batch may still carry rows the reader kept for
             // its own alignment reasons, and correctness must not depend on that.
@@ -843,7 +845,24 @@ impl<S: RecordSchema> RecordStore<S> {
                 }
             }
             Ok(Flow::Continue)
-        })
+        });
+
+        if let Err(error) = outcome {
+            if segment.mark_unreadable() {
+                tracing::error!(
+                    signal = %S::SIGNAL,
+                    segment = %manifest.id,
+                    rows = manifest.rows,
+                    %error,
+                    "segment is unreadable and will be skipped by every query from now \
+                     on; the data in it is lost. Delete the segment directory to stop \
+                     this being reported."
+                );
+            }
+            self.stats
+                .segments_unreadable
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn selects(
@@ -1043,6 +1062,7 @@ impl<S: RecordSchema> RecordStore<S> {
             segment_bytes: segments.iter().map(|s| s.manifest.bytes).sum(),
             appended_records: self.stats.appended.load(Ordering::Relaxed),
             sealed_segments: self.stats.sealed_segments.load(Ordering::Relaxed),
+            segments_unreadable: self.stats.segments_unreadable.load(Ordering::Relaxed),
             recovered_records: self.stats.recovered.load(Ordering::Relaxed),
             oldest_record_nanos: oldest,
             newest_record_nanos: newest,

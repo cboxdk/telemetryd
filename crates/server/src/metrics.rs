@@ -114,6 +114,11 @@ pub const DESCRIPTORS: &[Descriptor] = &[
         help: "Segments sealed since start, by signal",
     },
     Descriptor {
+        name: "telemetryd_segments_unreadable_total",
+        kind: Kind::Counter,
+        help: "Query reads skipped because a segment file is damaged — non-zero means data was lost",
+    },
+    Descriptor {
         name: "telemetryd_query_segments_scanned_total",
         kind: Kind::Counter,
         help: "Segments opened and decoded to answer queries — the number to watch when queries slow down",

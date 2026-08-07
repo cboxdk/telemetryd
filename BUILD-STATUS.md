@@ -27,6 +27,12 @@ and counted so the producer bug stays visible.
 stream dictionary, Bloom filters for exact-key lookup, retention by age and by a global
 disk budget. One engine serves all three signals.
 
+**Damage is survivable.** A truncated, zero-length, garbled or deleted segment file
+costs that segment and nothing else: the query answers from what is left, the segment
+is marked so later queries skip it cheaply, and the loss is reported in `/status` and
+as `telemetryd_segments_unreadable_total` rather than being inferred. Verified by
+damaging a real data directory five different ways.
+
 **Query.** LogQL, TraceQL and PromQL subsets, each parsed in full and lowered so an
 unsupported construct reports itself by name. Live tail over WebSocket. Label and series
 queries answered from metadata with no file I/O.

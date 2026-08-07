@@ -164,21 +164,34 @@ fn gauges(state: &AppState) -> Result<Vec<Sample>, Error> {
         ));
     }
 
-    let logs = &snapshot.logs;
-    for (name, value) in [
-        ("telemetryd_records_buffered", logs.buffered_records as f64),
-        (
-            "telemetryd_records_appended_total",
-            logs.appended_records as f64,
-        ),
-        ("telemetryd_segments", logs.segments as f64),
-        ("telemetryd_segment_rows", logs.segment_rows as f64),
-        (
-            "telemetryd_segments_sealed_total",
-            logs.sealed_segments as f64,
-        ),
+    // All three signals, not just logs. A trace store filling up or a metric segment
+    // going unreadable is exactly as worth alerting on, and it used to be invisible
+    // here while showing up in /status — two answers to the same question.
+    for (signal, stats) in [
+        ("logs", &snapshot.logs),
+        ("traces", &snapshot.traces),
+        ("metrics", &snapshot.metrics),
     ] {
-        samples.push(Sample::new(name, &[("signal", "logs")], value));
+        for (name, value) in [
+            ("telemetryd_records_buffered", stats.buffered_records as f64),
+            (
+                "telemetryd_records_appended_total",
+                stats.appended_records as f64,
+            ),
+            ("telemetryd_segments", stats.segments as f64),
+            ("telemetryd_segment_rows", stats.segment_rows as f64),
+            (
+                "telemetryd_segments_sealed_total",
+                stats.sealed_segments as f64,
+            ),
+            // Non-zero means data has been lost to a damaged file. Worth an alert.
+            (
+                "telemetryd_segments_unreadable_total",
+                stats.segments_unreadable as f64,
+            ),
+        ] {
+            samples.push(Sample::new(name, &[("signal", signal)], value));
+        }
     }
 
     // Retention outcomes belong in metrics, not just logs: deleting a user's data is

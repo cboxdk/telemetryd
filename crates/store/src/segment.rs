@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use arrow::record_batch::RecordBatch;
@@ -212,6 +213,13 @@ pub struct Segment {
     pub dir: PathBuf,
     /// Exact-match filter over the schema's key column, when it declares one.
     pub(crate) bloom: Option<Bloom>,
+    /// Set once a read of this segment has failed.
+    ///
+    /// A damaged Parquet file used to abort the whole query, so one bad sector denied
+    /// access to every healthy segment in the same time range. Marking the segment
+    /// instead lets the rest of the answer through, and makes the failure something
+    /// reported rather than something that has to be re-discovered on every query.
+    pub(crate) unreadable: Arc<AtomicBool>,
     /// Parquet footer, parsed once and reused.
     ///
     /// Segments are immutable, so their metadata can never go stale. Re-reading and
@@ -221,6 +229,18 @@ pub struct Segment {
 }
 
 impl Segment {
+    /// Whether a previous read of this segment failed.
+    #[must_use]
+    pub fn is_unreadable(&self) -> bool {
+        self.unreadable.load(Ordering::Relaxed)
+    }
+
+    /// Mark it unreadable. Returns `true` the first time, so the caller can log once
+    /// rather than on every query.
+    pub fn mark_unreadable(&self) -> bool {
+        !self.unreadable.swap(true, Ordering::Relaxed)
+    }
+
     pub fn data_path(&self) -> PathBuf {
         self.dir.join(DATA_FILE)
     }
@@ -269,6 +289,7 @@ impl Segment {
             bloom: Bloom::read(dir),
             manifest,
             dir: dir.to_path_buf(),
+            unreadable: Arc::new(AtomicBool::new(false)),
             metadata: Arc::new(OnceLock::new()),
         }))
     }
@@ -559,6 +580,7 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
         manifest,
         dir: final_dir,
         bloom,
+        unreadable: Arc::new(AtomicBool::new(false)),
         metadata: Arc::new(OnceLock::new()),
     })
 }
