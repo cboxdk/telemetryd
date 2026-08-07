@@ -206,10 +206,23 @@ jobs:
     needs: [check, deny, msrv, supply-chain, build]
     runs-on: ubuntu-latest
     steps:
+      # Parsed with jq rather than grep. The grep version worked, but only because
+      # execution fell through to a trailing `echo` that reset the exit status — the
+      # kind of correctness that survives until someone edits the last line.
+      #
+      # This also names which job failed instead of printing the whole blob, and takes
+      # `needs` through the environment rather than interpolating it into the script,
+      # so a job name can never terminate the quoting and run as shell.
       - name: verify every job succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
         run: |
-          echo '${{ toJSON(needs) }}'
-          if echo '${{ toJSON(needs) }}' | grep -qv '"result": "success"'; then
-            echo '${{ toJSON(needs) }}' | grep '"result"' | grep -v success && exit 1
+          echo "$NEEDS"
+          # Anything not "success" fails the gate, including "skipped" — a job that
+          # never ran has not verified anything.
+          failed=$(echo "$NEEDS" | jq -r 'to_entries[] | select(.value.result != "success") | "\(.key)=\(.value.result)"')
+          if [ -n "$failed" ]; then
+            echo "::error::jobs that did not succeed: $(echo "$failed" | tr '\n' ' ')"
+            exit 1
           fi
           echo "all jobs succeeded"
