@@ -1,125 +1,229 @@
 //! telemetryd's storage engine.
 //!
-//! M0 provides the durable foundation the later milestones build on: the data
-//! directory and its single-writer lock, the write-ahead log with crash recovery, and
-//! the status surface that reports what is actually on disk. Segments, compaction and
-//! the retention reaper arrive with M1 (see ADR-001).
+//! Two engines, one lifecycle (ADR-001). The record store handles logs, spans and
+//! events — identical machinery, different Arrow schema. Metrics get their own chunk
+//! store in M3. Both register in one retention pass, so the disk budget means the same
+//! thing everywhere.
 
 pub mod datadir;
+pub mod logs;
+pub mod records;
+pub mod retention;
+pub mod schema;
+pub mod segment;
 pub mod wal;
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
+use std::time::Duration;
 
-use telemetryd_core::config::StorageConfig;
-use telemetryd_core::{Error, Result, Signal};
+use telemetryd_core::config::{Config, RetentionConfig};
+use telemetryd_core::{LogRecord, Result, Signal};
 
 pub use datadir::{DataDir, DiskUsage};
+pub use logs::LogSchema;
+pub use records::{RecordStore, RecordStoreStatus, StoreSettings};
+pub use retention::{Candidate, Plan, ReaperReport};
+pub use segment::{Segment, SegmentManifest};
 pub use wal::{Truncation, TruncationReason, Wal, WalStats};
+
+/// Wall-clock now, in Unix nanoseconds.
+pub fn now_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+}
 
 /// The storage engine handle. One per process — [`DataDir`] enforces that.
 #[derive(Debug)]
 pub struct Store {
     data_dir: DataDir,
-    wals: BTreeMap<Signal, Mutex<Wal>>,
+    logs: RecordStore<LogSchema>,
     disk_budget: u64,
-    recovery: RecoveryReport,
+    retention: RetentionConfig,
+    reaper: Mutex<ReaperReport>,
+    /// Kept for the process lifetime rather than only logged at startup — a crash
+    /// that cost records should stay visible in `/status`.
+    wal_truncations: RwLock<Vec<Truncation>>,
 }
 
 impl Store {
-    /// Open (or create) the store, replaying every write-ahead log.
-    ///
-    /// Replay happens before any log is opened for append, so a torn tail from a crash
-    /// is repaired rather than being appended after.
-    pub fn open(config: &StorageConfig) -> Result<Self> {
-        let root = config.resolve_data_dir();
+    /// Open (or create) the store, replaying whatever the write-ahead log still holds.
+    pub fn open(config: &Config) -> Result<Self> {
+        let root = config.storage.resolve_data_dir();
         let data_dir = DataDir::open(&root)?;
         data_dir.clean_tmp()?;
 
-        let mut recovery = RecoveryReport::default();
-        let mut wals = BTreeMap::new();
-
-        for signal in Signal::ALL {
-            let dir = data_dir.wal_dir(signal);
-
-            // M0 counts what it recovers; M1 replaces the closure with the record
-            // decoder that rebuilds the in-memory segment buffer.
-            let replayed = wal::replay(&dir, |_payload| Ok(()))?;
-            recovery.records += replayed.records;
-            recovery.bytes += replayed.bytes;
-            if let Some(truncation) = replayed.truncated {
-                recovery.truncations.push(truncation);
-            }
-
-            let wal = Wal::open(
-                &dir,
-                config.wal_sync,
-                config.wal_sync_interval,
-                config.max_segment_bytes.as_u64(),
-            )?;
-            wals.insert(signal, Mutex::new(wal));
-        }
-
-        if recovery.records > 0 {
-            tracing::info!(
-                records = recovery.records,
-                bytes = recovery.bytes,
-                "replayed write-ahead log"
-            );
-        }
+        let settings = StoreSettings::from(&config.storage);
+        let logs = RecordStore::<LogSchema>::open(
+            &data_dir.wal_dir(Signal::Logs),
+            data_dir.segments_dir(Signal::Logs),
+            data_dir.tmp_dir(),
+            settings,
+        )?;
 
         Ok(Self {
             data_dir,
-            wals,
-            disk_budget: config.disk_budget.as_u64(),
-            recovery,
+            logs,
+            disk_budget: config.storage.disk_budget.as_u64(),
+            retention: config.retention.clone(),
+            reaper: Mutex::new(ReaperReport::default()),
+            wal_truncations: RwLock::new(Vec::new()),
         })
     }
 
-    /// Append a raw record to a signal's write-ahead log.
-    ///
-    /// Blocking, and called from async handlers only via `spawn_blocking` until M1
-    /// introduces the dedicated writer task with group commit.
-    pub fn append(&self, signal: Signal, payload: &[u8]) -> Result<()> {
-        self.with_wal(signal, |wal| wal.append(payload))
-    }
-
-    /// Flush and fsync every log. Called on graceful shutdown so a clean stop never
-    /// loses the interval-sync window.
-    pub fn sync_all(&self) -> Result<()> {
-        for signal in Signal::ALL {
-            self.with_wal(signal, Wal::sync)?;
-        }
-        Ok(())
+    pub fn logs(&self) -> &RecordStore<LogSchema> {
+        &self.logs
     }
 
     pub fn data_dir(&self) -> &DataDir {
         &self.data_dir
     }
 
-    pub fn recovery(&self) -> &RecoveryReport {
-        &self.recovery
+    /// Append log records. Durable before this returns.
+    pub fn append_logs(&self, records: &[LogRecord]) -> Result<()> {
+        self.logs.append(records)
+    }
+
+    /// Flush and fsync every log. Called on graceful shutdown so a clean stop never
+    /// loses the interval-sync window.
+    pub fn sync_all(&self) -> Result<()> {
+        self.logs.sync()
+    }
+
+    /// Apply the configured sync policy without forcing a flush.
+    pub fn maybe_sync(&self) -> Result<()> {
+        self.logs.maybe_sync()
+    }
+
+    /// Seal any buffer whose window has elapsed.
+    pub fn maybe_seal(&self) -> Result<()> {
+        self.logs.maybe_seal()?;
+        Ok(())
+    }
+
+    /// Seal everything, regardless of window. Used on shutdown and by tests.
+    pub fn seal_all(&self) -> Result<()> {
+        self.logs.seal_now()?;
+        Ok(())
+    }
+
+    /// Run one retention pass: expire by age, then enforce the disk budget.
+    ///
+    /// Every deletion is reported — logged, counted, and reflected in `/status`.
+    /// Silently discarding a user's telemetry to stay under a budget would be the
+    /// single most damaging thing this process could do quietly.
+    pub fn run_retention(&self) -> Result<ReaperReport> {
+        let usage = self.data_dir.usage()?;
+        let segments = self.logs.segments();
+
+        let candidates: Vec<Candidate> = segments
+            .iter()
+            .map(|segment| Candidate {
+                signal: segment.manifest.signal,
+                id: segment.manifest.id.clone(),
+                max_time_nanos: segment.manifest.max_time_nanos,
+                bytes: segment.manifest.bytes,
+            })
+            .collect();
+
+        let segment_bytes: u64 = candidates.iter().map(|c| c.bytes).sum();
+        let non_segment_bytes = usage.total().saturating_sub(segment_bytes);
+
+        let plan = retention::plan(
+            &candidates,
+            now_nanos(),
+            &self.retention_windows(),
+            self.disk_budget,
+            non_segment_bytes,
+        );
+
+        let mut report = ReaperReport {
+            last_run_unix_nanos: now_nanos(),
+            ..ReaperReport::default()
+        };
+
+        for candidate in &plan.by_age {
+            if self.delete_segment(candidate)? {
+                report.deleted_by_age += 1;
+                report.bytes_freed += candidate.bytes;
+            }
+        }
+        for candidate in &plan.by_budget {
+            if self.delete_segment(candidate)? {
+                report.deleted_by_budget += 1;
+                report.bytes_freed += candidate.bytes;
+            }
+        }
+
+        if report.deleted_by_age > 0 {
+            tracing::info!(
+                segments = report.deleted_by_age,
+                bytes = report.bytes_freed,
+                "expired segments past their retention window"
+            );
+        }
+        if report.deleted_by_budget > 0 {
+            // Deleting data the operator asked to keep is a WARN, always. It means the
+            // budget and the retention window are in conflict and one of them is wrong.
+            tracing::warn!(
+                segments = report.deleted_by_budget,
+                budget_bytes = self.disk_budget,
+                "deleted segments that were still inside their retention window to \
+                 stay under storage.disk_budget — raise the budget or shorten retention"
+            );
+        }
+
+        let after = self.data_dir.usage()?.total();
+        report.still_over_budget = after > self.disk_budget;
+        if report.still_over_budget {
+            tracing::error!(
+                used_bytes = after,
+                budget_bytes = self.disk_budget,
+                "still over the disk budget after deleting everything eligible"
+            );
+        }
+
+        *lock(&self.reaper) = report.clone();
+        Ok(report)
+    }
+
+    fn delete_segment(&self, candidate: &Candidate) -> Result<bool> {
+        match candidate.signal {
+            Signal::Logs => self.logs.remove_segment(&candidate.id),
+            // Traces and events land in M2, metrics in M3. Nothing else produces
+            // candidates yet, so this is a loud no-op rather than a silent skip.
+            other => {
+                tracing::warn!(signal = %other, "retention has no store for this signal yet");
+                Ok(false)
+            }
+        }
+    }
+
+    fn retention_windows(&self) -> BTreeMap<Signal, Duration> {
+        BTreeMap::from([
+            (Signal::Logs, self.retention.logs.get()),
+            (Signal::Traces, self.retention.traces.get()),
+            (Signal::Events, self.retention.events.get()),
+            (Signal::Metrics, self.retention.metrics.get()),
+        ])
+    }
+
+    pub fn record_wal_truncation(&self, truncation: Truncation) {
+        lock_write(&self.wal_truncations).push(truncation);
     }
 
     /// A point-in-time view for `/status`.
     pub fn snapshot(&self) -> Result<StoreStatus> {
         let usage = self.data_dir.usage()?;
-        let mut wal_stats = BTreeMap::new();
-        for signal in Signal::ALL {
-            wal_stats.insert(signal, self.with_wal(signal, |wal| Ok(wal.stats()))?);
-        }
-
         let used = usage.total();
+
         Ok(StoreStatus {
             data_dir: self.data_dir.root().display().to_string(),
             disk_budget_bytes: self.disk_budget,
             disk_used_bytes: used,
             // Reported, not clamped: a ratio above 1.0 is exactly the signal an
             // operator needs to see, and hiding it would defeat the point.
-            //
-            // The f64 conversion loses precision above 2^53 bytes (8 PiB). This is a
-            // single-node store with a default 10 GiB budget; a ratio displayed to one
-            // decimal place does not care.
             #[allow(clippy::cast_precision_loss)]
             disk_used_ratio: if self.disk_budget == 0 {
                 0.0
@@ -128,33 +232,11 @@ impl Store {
             },
             over_budget: used > self.disk_budget,
             usage,
-            wal: wal_stats,
-            recovered_records: self.recovery.records,
-            wal_truncations: self.recovery.truncations.clone(),
+            logs: self.logs.status(),
+            retention: lock(&self.reaper).clone(),
+            wal_truncations: lock_read(&self.wal_truncations).clone(),
         })
     }
-
-    fn with_wal<T>(&self, signal: Signal, f: impl FnOnce(&mut Wal) -> Result<T>) -> Result<T> {
-        let cell = self
-            .wals
-            .get(&signal)
-            .ok_or_else(|| Error::BadRequest(format!("no write-ahead log for signal {signal}")))?;
-        // A poisoned lock means a previous writer panicked mid-append. The WAL is
-        // still structurally sound — a torn frame is exactly what replay repairs — so
-        // recovering is safer than propagating a panic to every later request.
-        let mut wal = cell.lock().unwrap_or_else(|poisoned| {
-            tracing::error!(%signal, "write-ahead log mutex was poisoned by a panicking writer");
-            poisoned.into_inner()
-        });
-        f(&mut wal)
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct RecoveryReport {
-    pub records: u64,
-    pub bytes: u64,
-    pub truncations: Vec<Truncation>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -165,11 +247,26 @@ pub struct StoreStatus {
     pub disk_used_ratio: f64,
     pub over_budget: bool,
     pub usage: DiskUsage,
-    pub wal: BTreeMap<Signal, WalStats>,
-    pub recovered_records: u64,
-    /// Non-empty when a crash cost us records. Kept in `/status` for the process
-    /// lifetime rather than only logged at startup — "degrade loudly".
+    pub logs: RecordStoreStatus,
+    pub retention: ReaperReport,
+    /// Non-empty when a crash cost us records. "Degrade loudly."
     pub wal_truncations: Vec<Truncation>,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn lock_read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn lock_write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
@@ -177,11 +274,32 @@ pub struct StoreStatus {
 mod tests {
     use super::*;
     use bytesize::ByteSize;
+    use telemetryd_core::config::{DurationSetting, StorageConfig};
+    use telemetryd_core::{Labels, Severity};
 
-    fn config(dir: &std::path::Path) -> StorageConfig {
-        StorageConfig {
-            data_dir: Some(dir.to_path_buf()),
-            ..StorageConfig::default()
+    fn config(dir: &std::path::Path) -> Config {
+        Config {
+            storage: StorageConfig {
+                data_dir: Some(dir.to_path_buf()),
+                ..StorageConfig::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    fn record(ts: u64, body: &str) -> LogRecord {
+        let mut stream = Labels::new();
+        stream.insert("app", "checkout");
+        stream.insert("level", "info");
+        LogRecord {
+            timestamp_nanos: ts,
+            stream,
+            severity: Severity::Info,
+            severity_text: "INFO".to_owned(),
+            body: body.to_owned(),
+            attributes: Labels::new(),
+            trace_id: None,
+            span_id: None,
         }
     }
 
@@ -190,80 +308,24 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = config(&tmp.path().join("data"));
 
-        let store = Store::open(&config).unwrap();
-        assert_eq!(store.recovery().records, 0);
-        for i in 0..25u32 {
-            store
-                .append(Signal::Logs, format!("log-{i}").as_bytes())
-                .unwrap();
+        {
+            let store = Store::open(&config).unwrap();
+            let records: Vec<LogRecord> =
+                (0..25).map(|i| record(now_nanos() + i, "hello")).collect();
+            store.append_logs(&records).unwrap();
+            store.sync_all().unwrap();
         }
-        store.append(Signal::Traces, b"span").unwrap();
-        store.sync_all().unwrap();
-        drop(store);
 
         let reopened = Store::open(&config).unwrap();
-        assert_eq!(reopened.recovery().records, 26);
-        assert!(reopened.recovery().truncations.is_empty());
-    }
-
-    #[test]
-    fn status_reports_budget_and_usage() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut config = config(&tmp.path().join("data"));
-        config.disk_budget = ByteSize::kib(1);
-
-        let store = Store::open(&config).unwrap();
-        let before = store.snapshot().unwrap();
-        assert!(!before.over_budget);
-        assert_eq!(before.wal.len(), 4);
-
-        for _ in 0..200 {
-            store.append(Signal::Logs, &[0u8; 64]).unwrap();
-        }
-        store.sync_all().unwrap();
-
-        let after = store.snapshot().unwrap();
-        assert!(after.disk_used_bytes > before.disk_used_bytes);
-        // Over-budget must be visible rather than clamped away.
-        assert!(after.over_budget);
-        assert!(after.disk_used_ratio > 1.0);
-    }
-
-    #[test]
-    fn a_crash_torn_tail_surfaces_in_status_after_restart() {
-        use std::io::Write;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let config = config(&tmp.path().join("data"));
-
-        let store = Store::open(&config).unwrap();
-        store.append(Signal::Logs, b"durable").unwrap();
-        store.sync_all().unwrap();
-        let wal_path = store.data_dir().wal_dir(Signal::Logs).join("00000001.wal");
-        drop(store);
-
-        // Half a frame, as a `kill -9` mid-append would leave.
-        let mut file = std::fs::File::options()
-            .append(true)
-            .open(&wal_path)
-            .unwrap();
-        file.write_all(&[32, 0, 0, 0, 9, 9, 9, 9]).unwrap();
-        file.write_all(b"partial").unwrap();
-        drop(file);
-
-        let reopened = Store::open(&config).unwrap();
-        assert_eq!(reopened.recovery().records, 1);
-
-        let status = reopened.snapshot().unwrap();
-        assert_eq!(status.wal_truncations.len(), 1);
+        assert_eq!(reopened.logs().status().recovered_records, 25);
         assert_eq!(
-            status.wal_truncations[0].reason,
-            TruncationReason::PartialFrame
+            reopened
+                .logs()
+                .query(0, u64::MAX, &[], &|_| true)
+                .unwrap()
+                .len(),
+            25
         );
-
-        // And the store is fully usable afterwards.
-        reopened.append(Signal::Logs, b"after-recovery").unwrap();
-        reopened.sync_all().unwrap();
     }
 
     #[test]
@@ -273,6 +335,102 @@ mod tests {
 
         let _first = Store::open(&config).unwrap();
         let err = Store::open(&config).unwrap_err();
-        assert!(matches!(err, Error::DataDirLocked { .. }), "got {err:?}");
+        assert!(
+            matches!(err, telemetryd_core::Error::DataDirLocked { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn retention_expires_segments_past_the_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = config(&tmp.path().join("data"));
+        config.retention.logs = DurationSetting(Duration::from_secs(3600));
+        config.storage.segment_duration = DurationSetting(Duration::from_secs(60));
+
+        let store = Store::open(&config).unwrap();
+        let now = now_nanos();
+
+        // One segment well past the window, one inside it.
+        store
+            .append_logs(&[record(now - 10 * 3_600_000_000_000, "ancient")])
+            .unwrap();
+        store.seal_all().unwrap();
+        store.append_logs(&[record(now, "recent")]).unwrap();
+        store.seal_all().unwrap();
+        assert_eq!(store.logs().segments().len(), 2);
+
+        let report = store.run_retention().unwrap();
+        assert_eq!(report.deleted_by_age, 1);
+        assert_eq!(report.deleted_by_budget, 0);
+
+        let remaining = store.logs().query(0, u64::MAX, &[], &|_| true).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].body, "recent");
+    }
+
+    #[test]
+    fn retention_enforces_the_disk_budget_and_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = config(&tmp.path().join("data"));
+        config.storage.disk_budget = ByteSize::kib(8);
+
+        let store = Store::open(&config).unwrap();
+        let now = now_nanos();
+        for i in 0..12u64 {
+            store
+                .append_logs(&[record(now + i * 1_000_000, &"payload ".repeat(200))])
+                .unwrap();
+            store.seal_all().unwrap();
+        }
+
+        let before = store.snapshot().unwrap();
+        assert!(
+            before.over_budget,
+            "test needs to actually exceed the budget"
+        );
+
+        let report = store.run_retention().unwrap();
+        assert!(
+            report.deleted_by_budget > 0,
+            "budget enforcement never fired"
+        );
+        assert!(report.bytes_freed > 0);
+
+        // And the outcome is visible without reading logs.
+        let after = store.snapshot().unwrap();
+        assert_eq!(after.retention.deleted_by_budget, report.deleted_by_budget);
+    }
+
+    #[test]
+    fn a_healthy_store_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&config(&tmp.path().join("data"))).unwrap();
+        store.append_logs(&[record(now_nanos(), "x")]).unwrap();
+        store.seal_all().unwrap();
+
+        let report = store.run_retention().unwrap();
+        assert_eq!(report.deleted_by_age, 0);
+        assert_eq!(report.deleted_by_budget, 0);
+        assert!(!report.still_over_budget);
+        assert_eq!(store.logs().segments().len(), 1);
+    }
+
+    #[test]
+    fn status_reports_budget_usage_and_log_storage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&config(&tmp.path().join("data"))).unwrap();
+
+        let empty = store.snapshot().unwrap();
+        assert!(!empty.over_budget);
+        assert_eq!(empty.logs.segments, 0);
+
+        store.append_logs(&[record(now_nanos(), "x")]).unwrap();
+        store.seal_all().unwrap();
+
+        let after = store.snapshot().unwrap();
+        assert_eq!(after.logs.segments, 1);
+        assert_eq!(after.logs.segment_rows, 1);
+        assert!(after.disk_used_bytes > 0);
     }
 }

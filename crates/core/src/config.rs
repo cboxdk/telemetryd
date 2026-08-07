@@ -31,9 +31,50 @@ pub struct Config {
     pub storage: StorageConfig,
     pub retention: RetentionConfig,
     pub limits: LimitsConfig,
+    pub ingest: IngestConfig,
     pub log: LogConfig,
     #[serde(default)]
     pub scrape: Vec<ScrapeConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct IngestConfig {
+    /// Resource attributes promoted to *stream* labels, in addition to `app` and
+    /// `level` which are always present.
+    ///
+    /// This list is the cardinality contract. Promoting every resource attribute
+    /// would be the friendly-looking default and a trap: attributes like `host.id`,
+    /// `process.pid` or `container.id` change per deploy or per process and would
+    /// multiply streams without bound. Anything not listed here is still stored and
+    /// still queryable through label filters — it just does not create a new stream.
+    pub stream_labels: Vec<String>,
+
+    /// Truncate an over-long log body instead of rejecting the record.
+    ///
+    /// Default is to truncate: a 300 KiB stack trace is usually the single most
+    /// interesting line of the day, and dropping it entirely to enforce a size cap
+    /// loses exactly the record someone is looking for. The truncation is marked in
+    /// the body and counted, so it is never invisible.
+    pub truncate_oversized_bodies: bool,
+}
+
+impl Default for IngestConfig {
+    fn default() -> Self {
+        Self {
+            stream_labels: [
+                "service_name",
+                "service_namespace",
+                "service_version",
+                "deployment_environment",
+                "deployment_environment_name",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            truncate_oversized_bodies: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -406,6 +447,10 @@ const ENV_KEYS: &[(&str, &str)] = &[
     (
         "TELEMETRYD_LIMITS_INGEST_QUEUE_DEPTH",
         "limits.ingest_queue_depth",
+    ),
+    (
+        "TELEMETRYD_INGEST_TRUNCATE_OVERSIZED_BODIES",
+        "ingest.truncate_oversized_bodies",
     ),
     ("TELEMETRYD_LOG_LEVEL", "log.level"),
     ("TELEMETRYD_LOG_FORMAT", "log.format"),

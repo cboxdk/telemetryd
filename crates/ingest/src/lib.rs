@@ -1,23 +1,165 @@
 //! Ingest decoders.
 //!
-//! Turns wire formats into the internal signal types, applies the limits from
-//! `[limits]`, and hands records to `telemetryd-store`. Rejections are never silent:
-//! every one increments `telemetryd_ingest_rejected_total{signal,reason}` and is
-//! visible in `/status`.
+//! Turns wire formats into the typed records in `telemetryd-core`, applies the
+//! configured limits, and reports exactly what it rejected and why.
 //!
-//! # Planned surface
+//! # Rejections are never silent
 //!
-//! | Format                              | Endpoint          | Milestone |
-//! |-------------------------------------|-------------------|-----------|
-//! | OTLP/HTTP **JSON** logs             | `/v1/logs`        | M1        |
-//! | OTLP/HTTP **JSON** traces           | `/v1/traces`      | M2        |
-//! | OTLP/HTTP **JSON** metrics          | `/v1/metrics`     | M3        |
-//! | Prometheus `remote_write`           | `/api/v1/write`   | M3        |
-//! | Prometheus scrape (client)          | `[[scrape]]`      | M3        |
+//! Every rejected record carries a [`RejectReason`], which becomes the `reason` label
+//! on `telemetryd_ingest_rejected_total` and is summarised back to the client through
+//! OTLP's own `partialSuccess` field. A caller that sends 500 lines and gets 499
+//! stored is told so in the response rather than discovering it in a dashboard later.
 //!
 //! JSON is the first-class OTLP encoding because that is what `cboxdk/laravel-telemetry`
-//! emits — no protobuf, no C extension on the client. Protobuf on the *server* side is
-//! fine, which is why `remote_write` (snappy + protobuf) is in scope; OTLP/gRPC is not,
-//! in v1.
+//! emits — no protobuf, no C extension on the client path.
 
-#![doc(html_root_url = "https://docs.rs/telemetryd-ingest")]
+pub mod logs;
+pub mod otlp;
+
+/// Why a record was refused. The string form is the metric label, so it is a closed
+/// set rather than free text — an operator can alert on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RejectReason {
+    BodyTooLarge,
+    TooManyAttributes,
+    TooManyLabels,
+    LabelNameTooLong,
+    LabelValueTooLong,
+}
+
+impl RejectReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BodyTooLarge => "body_too_large",
+            Self::TooManyAttributes => "too_many_attributes",
+            Self::TooManyLabels => "too_many_labels",
+            Self::LabelNameTooLong => "label_name_too_long",
+            Self::LabelValueTooLong => "label_value_too_long",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Rejection {
+    pub reason: RejectReason,
+    /// Human-readable specifics, surfaced in the `partialSuccess` error message.
+    pub detail: String,
+}
+
+impl Rejection {
+    pub fn new(reason: RejectReason, detail: impl Into<String>) -> Self {
+        Self {
+            reason,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// The result of decoding one request.
+#[derive(Debug)]
+pub struct Decoded<T> {
+    pub records: Vec<T>,
+    pub rejections: Vec<Rejection>,
+    /// Records whose timestamp was in the wrong unit and was corrected. Counted so a
+    /// producer bug stays visible rather than being papered over.
+    pub rescaled_timestamps: u64,
+    /// Bodies that exceeded `max_log_line_bytes` and were truncated rather than
+    /// dropped.
+    pub truncated_bodies: u64,
+}
+
+impl<T> Default for Decoded<T> {
+    fn default() -> Self {
+        Self {
+            records: Vec::new(),
+            rejections: Vec::new(),
+            rescaled_timestamps: 0,
+            truncated_bodies: 0,
+        }
+    }
+}
+
+impl<T> Decoded<T> {
+    pub fn accepted(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn rejected(&self) -> usize {
+        self.rejections.len()
+    }
+
+    /// One-line summary for OTLP `partialSuccess.errorMessage`.
+    ///
+    /// Names the distinct reasons and gives one concrete example, which is what makes
+    /// a partial success actionable instead of just alarming.
+    pub fn rejection_summary(&self) -> Option<String> {
+        let first = self.rejections.first()?;
+        let mut reasons: Vec<&str> = self
+            .rejections
+            .iter()
+            .map(|r| r.reason.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        reasons.sort_unstable();
+
+        Some(format!(
+            "{} record(s) rejected ({}); for example: {}",
+            self.rejections.len(),
+            reasons.join(", "),
+            first.detail
+        ))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reject_reasons_are_a_closed_label_set() {
+        for reason in [
+            RejectReason::BodyTooLarge,
+            RejectReason::TooManyAttributes,
+            RejectReason::TooManyLabels,
+            RejectReason::LabelNameTooLong,
+            RejectReason::LabelValueTooLong,
+        ] {
+            let label = reason.as_str();
+            assert!(!label.is_empty());
+            assert!(
+                label.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "{label} is not a usable metric label value"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clean_decode_has_no_summary() {
+        let decoded: Decoded<()> = Decoded::default();
+        assert_eq!(decoded.rejection_summary(), None);
+        assert_eq!(decoded.accepted(), 0);
+    }
+
+    #[test]
+    fn the_summary_names_the_reasons_and_gives_a_concrete_example() {
+        let decoded = Decoded::<()> {
+            rejections: vec![
+                Rejection::new(RejectReason::BodyTooLarge, "log body of 900000 bytes"),
+                Rejection::new(RejectReason::TooManyLabels, "61 stream labels"),
+                Rejection::new(RejectReason::BodyTooLarge, "log body of 800000 bytes"),
+            ],
+            ..Decoded::default()
+        };
+
+        let summary = decoded.rejection_summary().unwrap();
+        assert!(summary.contains("3 record(s) rejected"), "{summary}");
+        assert!(summary.contains("body_too_large"), "{summary}");
+        assert!(summary.contains("too_many_labels"), "{summary}");
+        assert!(
+            summary.contains("900000"),
+            "should include a concrete example: {summary}"
+        );
+    }
+}

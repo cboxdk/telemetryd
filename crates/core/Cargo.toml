@@ -22,6 +22,7 @@ directories.workspace = true
 tracing.workspace = true
 sha2.workspace = true
 subtle.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

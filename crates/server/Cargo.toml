@@ -13,6 +13,8 @@ workspace = true
 [dependencies]
 telemetryd-core.workspace = true
 telemetryd-store.workspace = true
+telemetryd-ingest.workspace = true
+telemetryd-query.workspace = true
 
 tokio.workspace = true
 axum.workspace = true
@@ -26,5 +28,9 @@ humantime.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+bytesize.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "net", "time"] }
 http-body-util.workspace = true
 tower = { workspace = true, features = ["util"] }

@@ -163,14 +163,19 @@ impl Wal {
     }
 
     /// Close the current segment and start the next one.
-    pub fn rotate(&mut self) -> Result<()> {
+    ///
+    /// Returns the sequence number of the segment just closed. The caller records it
+    /// in the sealed segment's manifest, which is what makes replay able to tell
+    /// "already durable on disk" from "must be recovered" after a crash.
+    pub fn rotate(&mut self) -> Result<u64> {
         self.sync()?;
+        let closed = self.seq;
         self.seq += 1;
         let (file, bytes) = open_segment(&self.dir, self.seq)?;
         self.writer = BufWriter::new(file);
         self.segment_bytes = bytes;
         tracing::debug!(dir = %self.dir.display(), seq = self.seq, "rotated WAL segment");
-        Ok(())
+        Ok(closed)
     }
 
     /// Delete every segment strictly older than the current one.
@@ -190,6 +195,31 @@ impl Wal {
             }
         }
         Ok(removed)
+    }
+
+    /// Delete every WAL segment with sequence <= `sequence`.
+    ///
+    /// Called only after the records in those segments are durable inside a sealed
+    /// on-disk segment. Until then the WAL is the only copy.
+    pub fn remove_up_to(&mut self, sequence: u64) -> Result<u64> {
+        let mut removed = 0;
+        for seq in segment_sequences(&self.dir)? {
+            // Never remove the segment currently being appended to.
+            if seq <= sequence && seq < self.seq {
+                let path = segment_path(&self.dir, seq);
+                match fs::remove_file(&path) {
+                    Ok(()) => removed += 1,
+                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                    Err(e) => return Err(Error::io(format!("removing {}", path.display()), e)),
+                }
+            }
+        }
+        Ok(removed)
+    }
+
+    /// The sequence currently being appended to.
+    pub fn current_sequence(&self) -> u64 {
+        self.seq
     }
 
     pub fn path(&self) -> PathBuf {
@@ -266,12 +296,29 @@ pub struct Replay {
 ///
 /// `visit` is called for each intact record in append order. Records are streamed
 /// rather than collected so replaying a large log does not need it all in memory.
-pub fn replay<F>(dir: impl AsRef<Path>, mut visit: F) -> Result<Replay>
+pub fn replay<F>(dir: impl AsRef<Path>, visit: F) -> Result<Replay>
+where
+    F: FnMut(&[u8]) -> Result<()>,
+{
+    replay_from(dir, 0, visit)
+}
+
+/// Replay only segments with sequence **greater than** `after_sequence`.
+///
+/// This is what closes the duplicate window around sealing. A crash between
+/// publishing a sealed segment and deleting the write-ahead log that fed it would
+/// otherwise replay those records back into the buffer and store them twice — the
+/// same log line appearing twice in a query result, with nothing to indicate why.
+/// The sealed segment records the sequence it consumed, so replay can skip it.
+pub fn replay_from<F>(dir: impl AsRef<Path>, after_sequence: u64, mut visit: F) -> Result<Replay>
 where
     F: FnMut(&[u8]) -> Result<()>,
 {
     let dir = dir.as_ref();
-    let sequences = segment_sequences(dir)?;
+    let sequences: Vec<u64> = segment_sequences(dir)?
+        .into_iter()
+        .filter(|seq| *seq > after_sequence)
+        .collect();
     let mut outcome = Replay::default();
 
     for (index, seq) in sequences.iter().copied().enumerate() {

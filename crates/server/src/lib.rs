@@ -6,6 +6,9 @@
 
 pub mod auth;
 pub mod error;
+pub mod ingest;
+pub mod loki;
+pub mod maintenance;
 pub mod metrics;
 pub mod routes;
 pub mod state;
@@ -28,7 +31,7 @@ pub use state::AppState;
 
 /// The milestone this build implements, reported by `/status`. Keeping it in the
 /// binary means a user can always tell which slice of the contract they have.
-pub const MILESTONE: &str = "M0";
+pub const MILESTONE: &str = "M1";
 
 /// Build the complete router.
 pub fn router(state: AppState) -> Router {
@@ -45,16 +48,26 @@ pub fn router(state: AppState) -> Router {
     let query = Router::new()
         .route("/status", get(routes::status))
         .route("/metrics", get(routes::metrics))
+        // Loki-compatible read APIs (M1).
+        .route("/loki/api/v1/query_range", get(loki::query_range))
+        .route("/loki/api/v1/labels", get(loki::labels))
+        .route("/loki/api/v1/label/{name}/values", get(loki::label_values))
+        .route("/loki/api/v1/series", get(loki::series))
+        .route("/loki/api/v1/tail", get(loki::tail))
         .merge(planned_query_routes())
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_query_token,
         ));
 
-    let ingest = planned_ingest_routes().route_layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        auth::require_ingest_token,
-    ));
+    let ingest = Router::new()
+        // OTLP/HTTP JSON logs — the first-class ingest path (M1).
+        .route("/v1/logs", axum::routing::post(ingest::otlp_logs))
+        .merge(planned_ingest_routes())
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_ingest_token,
+        ));
 
     Router::new()
         .merge(public)
@@ -76,11 +89,9 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Ingest endpoints from the contract. OTLP/HTTP JSON is the first-class format —
-/// `laravel-telemetry` sends JSON, so protobuf is never on the client's critical path.
+/// Ingest endpoints still to come.
 fn planned_ingest_routes() -> Router<AppState> {
     Router::new()
-        .route("/v1/logs", routes::planned("/v1/logs", "M1"))
         .route("/v1/traces", routes::planned("/v1/traces", "M2"))
         .route("/v1/metrics", routes::planned("/v1/metrics", "M3"))
         .route("/api/v1/write", routes::planned("/api/v1/write", "M3"))
@@ -181,12 +192,17 @@ pub async fn serve(config: Arc<Config>, store: Arc<Store>) -> Result<()> {
         );
     }
 
+    let maintenance = maintenance::Maintenance::start(&store, config.storage.wal_sync_interval);
+
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| telemetryd_core::Error::io("serving HTTP", e))?;
 
-    // In-flight requests are drained by then; this is the last chance to make the
+    // Stop the timers first, so nothing is mid-seal while we are trying to stop.
+    maintenance.stop();
+
+    // In-flight requests are drained by now; this is the last chance to make the
     // interval-sync window durable, so a clean stop never loses records.
     tracing::info!("draining complete, flushing write-ahead log");
     store.sync_all()?;

@@ -66,6 +66,24 @@ max_attrs_per_record  = 128
 max_spans_per_trace   = 10000
 ingest_queue_depth    = 8192         # full queue → 429 with Retry-After, not unbounded buffering
 
+[ingest]
+# Which resource attributes become *stream* labels, on top of `app` and `level`
+# which are always present. This list is the cardinality contract: attributes not
+# listed here are still stored and still queryable through label filters, they just
+# do not create a new stream. Promoting something per-process or per-deploy here
+# (host.id, process.pid, container.id) is how a log store dies of cardinality.
+stream_labels = [
+  "service_name",
+  "service_namespace",
+  "service_version",
+  "deployment_environment",
+  "deployment_environment_name",
+]
+# Truncate an over-long body rather than rejecting the record outright. A giant
+# stack trace is usually the most interesting line of the day. Truncation is marked
+# in the body and counted, never invisible.
+truncate_oversized_bodies = true
+
 [log]
 level  = "info"                      # RUST_LOG overrides this when set
 format = "text"                      # text | json

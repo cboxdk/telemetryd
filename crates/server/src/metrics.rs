@@ -74,6 +74,71 @@ pub const DESCRIPTORS: &[Descriptor] = &[
         help: "1 when disk usage exceeds the configured budget",
     },
     Descriptor {
+        name: "telemetryd_ingest_accepted_total",
+        kind: Kind::Counter,
+        help: "Records accepted at ingest, by signal",
+    },
+    Descriptor {
+        name: "telemetryd_ingest_timestamps_rescaled_total",
+        kind: Kind::Counter,
+        help: "Records whose timestamp was in the wrong unit and was corrected — a producer bug",
+    },
+    Descriptor {
+        name: "telemetryd_ingest_bodies_truncated_total",
+        kind: Kind::Counter,
+        help: "Log bodies that exceeded max_log_line_bytes and were truncated",
+    },
+    Descriptor {
+        name: "telemetryd_records_buffered",
+        kind: Kind::Gauge,
+        help: "Records held in the in-memory buffer, not yet sealed into a segment",
+    },
+    Descriptor {
+        name: "telemetryd_records_appended_total",
+        kind: Kind::Counter,
+        help: "Records appended since start, by signal",
+    },
+    Descriptor {
+        name: "telemetryd_segments",
+        kind: Kind::Gauge,
+        help: "Sealed segments on disk, by signal",
+    },
+    Descriptor {
+        name: "telemetryd_segment_rows",
+        kind: Kind::Gauge,
+        help: "Rows held in sealed segments, by signal",
+    },
+    Descriptor {
+        name: "telemetryd_segments_sealed_total",
+        kind: Kind::Counter,
+        help: "Segments sealed since start, by signal",
+    },
+    Descriptor {
+        name: "telemetryd_retention_deleted_total",
+        kind: Kind::Counter,
+        help: "Segments deleted by retention, by reason (age or disk_budget)",
+    },
+    Descriptor {
+        name: "telemetryd_tail_subscribers",
+        kind: Kind::Gauge,
+        help: "Live-tail WebSocket clients currently connected",
+    },
+    Descriptor {
+        name: "telemetryd_tail_connections_total",
+        kind: Kind::Counter,
+        help: "Live-tail connections opened since start",
+    },
+    Descriptor {
+        name: "telemetryd_tail_disconnects_total",
+        kind: Kind::Counter,
+        help: "Live-tail connections closed since start",
+    },
+    Descriptor {
+        name: "telemetryd_tail_dropped_total",
+        kind: Kind::Counter,
+        help: "Entries a live-tail client missed by falling behind the buffer",
+    },
+    Descriptor {
         name: "telemetryd_wal_segments",
         kind: Kind::Gauge,
         help: "Write-ahead log segments on disk, by signal",

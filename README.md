@@ -16,9 +16,10 @@ ship one 2.6 MB binary instead of a stack of services to operate. If you outgrow
 node, you have outgrown telemetryd, and we would rather say so than pretend
 otherwise.
 
-> **Status: M0.** The skeleton is in place — configuration, storage foundations, the
-> HTTP surface and self-observability. Ingest and query endpoints are registered and
-> answer `501` naming the milestone they land in. See [Milestones](#milestones).
+> **Status: M1.** Logs work end to end: OTLP/HTTP JSON in, Parquet segments on disk,
+> the Loki query APIs and live tail out, with retention enforcing both time and a disk
+> budget. Traces and metrics endpoints are registered and answer `501` naming the
+> milestone they land in. See [Milestones](#milestones).
 
 ## Quickstart
 
@@ -32,6 +33,13 @@ and 30 days of metrics, and stays under a 10 GiB disk budget.
 
 ```bash
 telemetryd status
+```
+
+Point `cboxdk/laravel-telemetry` at `http://127.0.0.1:4319` and query it back:
+
+```bash
+curl -G http://127.0.0.1:4319/loki/api/v1/query_range \
+  --data-urlencode '{app="checkout", level="error"} |= "declined"'
 ```
 
 ## Design
@@ -105,8 +113,8 @@ error, rather than dropping data quietly.
 | | Scope | Status |
 |---|---|---|
 | **M0** | Workspace, config, data dir, WAL, HTTP surface, self-observability, CI | **done** |
-| M1 | OTLP JSON logs → segments → Loki `query_range`, labels, live tail; retention reaper | next |
-| M2 | OTLP traces, trace-by-id, Tempo search | |
+| **M1** | OTLP JSON logs → Parquet segments → Loki `query_range`, labels, series, live tail; retention reaper | **done** |
+| M2 | OTLP traces, trace-by-id, Tempo search | next |
 | M3 | `remote_write`, OTLP metrics, PromQL subset, cardinality caps | |
 | M4 | Run `laravel-telemetry-ui` against telemetryd, freeze `COMPATIBILITY.md`, contract-test | |
 | M5 | cargo-dist, install script, brew tap, `.deb`, `service install` | |

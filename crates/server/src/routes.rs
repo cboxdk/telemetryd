@@ -164,24 +164,41 @@ fn gauges(state: &AppState) -> Result<Vec<Sample>, Error> {
         ));
     }
 
-    for (signal, wal) in &snapshot.wal {
-        let signal = signal.as_str();
-        samples.push(Sample::new(
-            "telemetryd_wal_segments",
-            &[("signal", signal)],
-            wal.segments as f64,
-        ));
-        samples.push(Sample::new(
-            "telemetryd_wal_records_total",
-            &[("signal", signal)],
-            wal.appended_records as f64,
-        ));
-        samples.push(Sample::new(
-            "telemetryd_wal_unsynced_records",
-            &[("signal", signal)],
-            wal.unsynced_records as f64,
-        ));
+    let logs = &snapshot.logs;
+    for (name, value) in [
+        ("telemetryd_records_buffered", logs.buffered_records as f64),
+        (
+            "telemetryd_records_appended_total",
+            logs.appended_records as f64,
+        ),
+        ("telemetryd_segments", logs.segments as f64),
+        ("telemetryd_segment_rows", logs.segment_rows as f64),
+        (
+            "telemetryd_segments_sealed_total",
+            logs.sealed_segments as f64,
+        ),
+    ] {
+        samples.push(Sample::new(name, &[("signal", "logs")], value));
     }
+
+    // Retention outcomes belong in metrics, not just logs: deleting a user's data is
+    // never something they should have to grep for.
+    let reaper = &snapshot.retention;
+    samples.push(Sample::new(
+        "telemetryd_retention_deleted_total",
+        &[("reason", "age")],
+        reaper.deleted_by_age as f64,
+    ));
+    samples.push(Sample::new(
+        "telemetryd_retention_deleted_total",
+        &[("reason", "disk_budget")],
+        reaper.deleted_by_budget as f64,
+    ));
+    samples.push(Sample::new(
+        "telemetryd_tail_subscribers",
+        &[],
+        state.tail_subscribers() as f64,
+    ));
 
     Ok(samples)
 }

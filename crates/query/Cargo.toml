@@ -13,3 +13,12 @@ workspace = true
 [dependencies]
 telemetryd-core.workspace = true
 telemetryd-store.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true

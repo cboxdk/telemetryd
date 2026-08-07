@@ -33,7 +33,7 @@ pub fn run(config_file: Option<&std::path::Path>, overrides: &Overrides) -> anyh
 
 fn open_store(config: &Config) -> anyhow::Result<Store> {
     let data_dir = config.storage.resolve_data_dir();
-    Store::open(&config.storage).with_context(|| {
+    Store::open(config).with_context(|| {
         format!(
             "opening the data directory at {}\n\
              \n\
@@ -48,15 +48,21 @@ fn open_store(config: &Config) -> anyhow::Result<Store> {
 /// log means records that were accepted over HTTP did not survive, and that should
 /// never be something an operator has to go looking for.
 fn report_recovery(store: &Store) {
-    let recovery = store.recovery();
-    if recovery.records > 0 {
+    let status = match store.snapshot() {
+        Ok(status) => status,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read storage status at startup");
+            return;
+        }
+    };
+
+    if status.logs.recovered_records > 0 {
         tracing::info!(
-            records = recovery.records,
-            bytes = recovery.bytes,
-            "recovered records from the write-ahead log"
+            records = status.logs.recovered_records,
+            "recovered buffered records from the write-ahead log"
         );
     }
-    for truncation in &recovery.truncations {
+    for truncation in &status.wal_truncations {
         tracing::warn!(
             path = %truncation.path.display(),
             discarded_bytes = truncation.discarded_bytes,

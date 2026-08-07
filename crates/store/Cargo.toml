@@ -17,6 +17,10 @@ serde.workspace = true
 bytesize.workspace = true
 crc32fast.workspace = true
 tracing.workspace = true
+serde_json.workspace = true
+arrow.workspace = true
+parquet.workspace = true
+postcard.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -36,7 +36,7 @@ impl Harness {
         configure(&mut config);
         config.validate().unwrap();
 
-        let store = Arc::new(Store::open(&config.storage).unwrap());
+        let store = Arc::new(Store::open(&config).unwrap());
         let state = AppState::new(Arc::new(config), store).unwrap();
         Self {
             router: router(state),
@@ -117,7 +117,7 @@ async fn status_reports_the_shape_operators_and_the_cli_depend_on() {
 
     let json: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(json["milestone"], "M0");
+    assert_eq!(json["milestone"], "M1");
     assert_eq!(json["storage_format_version"], 1);
     assert_eq!(json["insecure"], false);
     assert_eq!(json["auth"]["ingest"], "disabled");
@@ -132,12 +132,16 @@ async fn status_reports_the_shape_operators_and_the_cli_depend_on() {
     );
     assert_eq!(json["storage"]["over_budget"], false);
     assert!(json["storage"]["data_dir"].is_string());
-    for signal in ["logs", "traces", "events", "metrics"] {
-        assert!(
-            json["storage"]["wal"][signal].is_object(),
-            "missing WAL stats for {signal}"
-        );
-    }
+    assert!(
+        json["storage"]["logs"].is_object(),
+        "missing log storage stats"
+    );
+    assert!(
+        json["storage"]["retention"].is_object(),
+        "missing the retention report"
+    );
+    assert_eq!(json["storage"]["logs"]["segments"], 0);
+    assert_eq!(json["storage"]["logs"]["buffered_records"], 0);
 
     assert_eq!(json["retention"]["logs"], "7days");
     assert_eq!(json["retention"]["metrics"], "30days");
@@ -220,8 +224,9 @@ async fn ingest_and_query_tokens_are_independent() {
     // Each opens its own.
     let (status, _, _) = harness.get_with_token("/status", "query-secret").await;
     assert_eq!(status, StatusCode::OK);
+    // /v1/logs is implemented, so a correct token gets past auth (405 for GET).
     let (status, _, _) = harness.get_with_token("/v1/logs", "ingest-secret").await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -266,12 +271,9 @@ async fn contract_endpoints_answer_501_naming_their_milestone() {
     let harness = Harness::new(|_| {});
 
     let expected = [
-        ("/v1/logs", "M1"),
         ("/v1/traces", "M2"),
         ("/v1/metrics", "M3"),
         ("/api/v1/write", "M3"),
-        ("/loki/api/v1/query_range", "M1"),
-        ("/loki/api/v1/tail", "M1"),
         ("/api/traces/abc123", "M2"),
         ("/api/search", "M2"),
         ("/api/v1/query", "M3"),
@@ -312,8 +314,14 @@ async fn a_genuinely_unknown_route_is_still_a_404() {
 #[tokio::test]
 async fn contract_endpoints_answer_every_method_not_just_get() {
     let harness = Harness::new(|_| {});
+    // A GET to an unbuilt ingest endpoint says "not implemented until M2", not
+    // "method not allowed", which would send someone hunting for the wrong problem.
     let (status, _, _) = harness
-        .request(Request::post("/v1/logs").body(Body::from("{}")).unwrap())
+        .request(Request::get("/v1/traces").body(Body::empty()).unwrap())
+        .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    let (status, _, _) = harness
+        .request(Request::post("/v1/traces").body(Body::from("{}")).unwrap())
         .await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
 }
@@ -336,8 +344,9 @@ async fn metrics_exposition_is_well_formed_prometheus_text() {
         "telemetryd_uptime_seconds",
         "telemetryd_disk_used_bytes",
         "telemetryd_disk_budget_bytes",
-        "telemetryd_wal_segments",
+        "telemetryd_segments",
         "telemetryd_ingest_rejected_total",
+        "telemetryd_retention_deleted_total",
     ] {
         assert!(
             body.contains(&format!("# HELP {metric} ")),
@@ -353,7 +362,7 @@ async fn metrics_exposition_is_well_formed_prometheus_text() {
         r#"telemetryd_build_info{{version="{}"}} 1"#,
         env!("CARGO_PKG_VERSION")
     )));
-    assert!(body.contains(r#"telemetryd_wal_segments{signal="logs"}"#));
+    assert!(body.contains(r#"telemetryd_segments{signal="logs"}"#));
 
     // Every non-comment line must parse as `name[{labels}] value`.
     for line in body
