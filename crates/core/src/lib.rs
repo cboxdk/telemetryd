@@ -11,6 +11,7 @@ pub mod metric;
 pub mod record;
 pub mod secret;
 pub mod signal;
+pub mod sizing;
 pub mod span;
 
 pub use config::Config;

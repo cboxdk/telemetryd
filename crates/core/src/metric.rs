@@ -77,11 +77,7 @@ impl MetricSample {
     /// labels are interned per segment, so the per-sample cost on disk is a `u32`, a
     /// timestamp and a float.
     pub fn size_estimate(&self) -> usize {
-        self.series
-            .iter()
-            .map(|(k, v)| k.len() + v.len() + 2)
-            .sum::<usize>()
-            + 32
+        std::mem::size_of::<Self>() + crate::sizing::labels_bytes(&self.series)
     }
 }
 

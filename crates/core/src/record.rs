@@ -244,19 +244,15 @@ impl LogRecord {
 
     /// Approximate heap cost, used to decide when to seal a segment.
     pub fn size_estimate(&self) -> usize {
-        let labels = |labels: &Labels| {
-            labels
-                .iter()
-                .map(|(k, v)| k.len() + v.len() + 2)
-                .sum::<usize>()
-        };
-        self.body.len()
-            + self.severity_text.len()
-            + labels(&self.stream)
-            + labels(&self.attributes)
-            + self.trace_id.as_ref().map_or(0, String::len)
-            + self.span_id.as_ref().map_or(0, String::len)
-            + 32
+        use crate::sizing::{labels_bytes, optional_string_bytes, string_bytes};
+
+        std::mem::size_of::<Self>()
+            + string_bytes(&self.body)
+            + string_bytes(&self.severity_text)
+            + labels_bytes(&self.stream)
+            + labels_bytes(&self.attributes)
+            + optional_string_bytes(self.trace_id.as_ref())
+            + optional_string_bytes(self.span_id.as_ref())
     }
 }
 

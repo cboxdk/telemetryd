@@ -94,19 +94,157 @@ impl<S: RecordSchema> std::fmt::Debug for RecordStore<S> {
     }
 }
 
+/// Records per frozen chunk.
+///
+/// This is the unit of work a reader can never be forced to copy: it snapshots whole
+/// chunks by cloning an `Arc`, and the only thing it ever has to wait for is the
+/// active chunk being frozen, which is a pointer move. Smaller chunks mean shorter
+/// lock holds and more `Arc`s to clone; a few thousand records puts both well inside
+/// the noise.
+const CHUNK_RECORDS: usize = 4096;
+
+/// Scan positions reserved for live-buffer chunks, above which sealed segments start.
+///
+/// Ties break on scan position, so buffer and segment records need positions from one
+/// shared sequence. The buffer always sorts before sealed data for a descending query
+/// — it holds the newest records — and this reserves it enough room that a segment can
+/// never be mistaken for a chunk.
+const BUFFER_UNITS: usize = 1 << 20;
+
+/// The unsealed records, as a list of immutable chunks plus the one being filled.
+///
+/// It used to be a single `Vec`, and queries walked it while holding the same lock
+/// that appends need. That made every query block all ingest for as long as it took to
+/// scan the whole buffer — measured at a 45% throughput loss from a *single* reader,
+/// with query latency of 777 ms against a benchmark of 1.4 ms.
+///
+/// Freezing filled chunks behind `Arc`s decouples the two: a reader takes the lock
+/// only long enough to freeze the active chunk and clone a handful of pointers, then
+/// releases it and scans the frozen data while writes continue underneath.
 struct Buffer<S: RecordSchema> {
-    records: Vec<S::Record>,
+    /// Immutable once pushed, which is what makes sharing them safe.
+    chunks: Vec<Arc<Chunk<S>>>,
+    /// The chunk being appended to. Never read by a query without being frozen first.
+    active: Vec<S::Record>,
+    active_min: u64,
+    active_max: u64,
+    records: usize,
     bytes: usize,
     opened_at: Instant,
+}
+
+/// A frozen run of buffered records, with the time bounds a query prunes on.
+///
+/// The bounds are the reason this is a struct rather than a bare `Vec`. Without them a
+/// `limit=100` query had to examine every buffered record, because nothing said which
+/// ones could not possibly be in the newest hundred — the same problem sealed segments
+/// solve with their manifest, and the same solution.
+struct Chunk<S: RecordSchema> {
+    records: Vec<S::Record>,
+    min_nanos: u64,
+    max_nanos: u64,
+}
+
+impl<S: RecordSchema> Chunk<S> {
+    fn overlaps(&self, start_nanos: u64, end_nanos: u64) -> bool {
+        self.min_nanos <= end_nanos && self.max_nanos >= start_nanos
+    }
 }
 
 impl<S: RecordSchema> Buffer<S> {
     fn new() -> Self {
         Self {
-            records: Vec::new(),
+            chunks: Vec::new(),
+            active: Vec::with_capacity(CHUNK_RECORDS),
+            active_min: u64::MAX,
+            active_max: u64::MIN,
+            records: 0,
             bytes: 0,
             opened_at: Instant::now(),
         }
+    }
+
+    fn push(&mut self, record: S::Record) {
+        let ts = S::timestamp(&record);
+        self.active_min = self.active_min.min(ts);
+        self.active_max = self.active_max.max(ts);
+        self.bytes += S::size_estimate(&record);
+        self.active.push(record);
+        self.records += 1;
+        if self.active.len() >= CHUNK_RECORDS {
+            self.freeze();
+        }
+    }
+
+    /// Move the active chunk into the frozen list. O(1) — the `Vec` is moved, not
+    /// copied, and none of the records are cloned.
+    fn freeze(&mut self) {
+        if !self.active.is_empty() {
+            let records = std::mem::replace(&mut self.active, Vec::with_capacity(CHUNK_RECORDS));
+            self.chunks.push(Arc::new(Chunk {
+                records,
+                min_nanos: self.active_min,
+                max_nanos: self.active_max,
+            }));
+            self.active_min = u64::MAX;
+            self.active_max = u64::MIN;
+        }
+    }
+
+    /// A consistent view of everything buffered, cheap enough to take under the lock.
+    ///
+    /// Cost is one pointer move plus one `Arc` clone per chunk, independent of how many
+    /// records are buffered. That independence is the entire point.
+    fn snapshot(&mut self) -> Vec<Arc<Chunk<S>>> {
+        self.freeze();
+        self.chunks.clone()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.records == 0
+    }
+
+    fn len(&self) -> usize {
+        self.records
+    }
+
+    /// Take everything for sealing, as one contiguous run.
+    ///
+    /// Chunks whose only holder is the buffer are moved out; a chunk a query is still
+    /// reading is copied instead, so sealing never waits on a reader and a reader never
+    /// sees records vanish mid-scan.
+    fn drain(&mut self) -> Vec<S::Record> {
+        self.freeze();
+        let chunks = std::mem::take(&mut self.chunks);
+        let mut out = Vec::with_capacity(self.records);
+        for chunk in chunks {
+            match Arc::try_unwrap(chunk) {
+                Ok(chunk) => out.extend(chunk.records),
+                Err(shared) => out.extend(shared.records.iter().cloned()),
+            }
+        }
+        self.records = 0;
+        self.bytes = 0;
+        out
+    }
+
+    /// Put records back at the front, preserving order, after a failed seal.
+    fn restore(&mut self, records: Vec<S::Record>) {
+        if records.is_empty() {
+            return;
+        }
+        self.bytes += records.iter().map(S::size_estimate).sum::<usize>();
+        self.records += records.len();
+        let min_nanos = records.iter().map(S::timestamp).min().unwrap_or(0);
+        let max_nanos = records.iter().map(S::timestamp).max().unwrap_or(0);
+        self.chunks.insert(
+            0,
+            Arc::new(Chunk {
+                records,
+                min_nanos,
+                max_nanos,
+            }),
+        );
     }
 }
 
@@ -239,7 +377,7 @@ impl<S: RecordSchema> RecordStore<S> {
             match postcard::from_bytes::<S::Record>(payload) {
                 Ok(record) => {
                     buffer.bytes += S::size_estimate(&record);
-                    buffer.records.push(record);
+                    buffer.push(record);
                     Ok(())
                 }
                 Err(e) => {
@@ -262,14 +400,14 @@ impl<S: RecordSchema> RecordStore<S> {
             settings.max_segment_bytes,
         )?;
 
-        if !buffer.records.is_empty() {
+        if !buffer.is_empty() {
             tracing::info!(
                 signal = %S::SIGNAL,
-                records = buffer.records.len(),
+                records = buffer.len(),
                 "recovered buffered records from the write-ahead log"
             );
         }
-        let recovered = buffer.records.len() as u64;
+        let recovered = buffer.len() as u64;
         let _ = replayed;
 
         let seal_sequence = segments
@@ -308,8 +446,7 @@ impl<S: RecordSchema> RecordStore<S> {
                 let payload = postcard::to_stdvec(record)
                     .map_err(|e| Error::Config(format!("encoding a {} record: {e}", S::SIGNAL)))?;
                 writer.wal.append(&payload)?;
-                writer.buffer.bytes += S::size_estimate(record);
-                writer.buffer.records.push(record.clone());
+                writer.buffer.push(record.clone());
             }
             writer.buffer.bytes as u64 >= self.settings.max_segment_bytes
         };
@@ -331,7 +468,7 @@ impl<S: RecordSchema> RecordStore<S> {
     pub fn maybe_seal(&self) -> Result<Option<Arc<Segment>>> {
         let due = {
             let writer = lock(&self.writer);
-            !writer.buffer.records.is_empty()
+            !writer.buffer.is_empty()
                 && writer.buffer.opened_at.elapsed() >= self.settings.segment_duration
         };
         if due { self.seal_now() } else { Ok(None) }
@@ -346,14 +483,13 @@ impl<S: RecordSchema> RecordStore<S> {
     pub fn seal_now(&self) -> Result<Option<Arc<Segment>>> {
         let (records, wal_sequence) = {
             let mut writer = lock(&self.writer);
-            if writer.buffer.records.is_empty() {
+            if writer.buffer.is_empty() {
                 return Ok(None);
             }
             // Rotate and drain under the same lock that appends hold, so the boundary
             // between "in this segment" and "still in the log" is exact.
             let wal_sequence = writer.wal.rotate()?;
-            let records = std::mem::take(&mut writer.buffer.records);
-            writer.buffer.bytes = 0;
+            let records = writer.buffer.drain();
             writer.buffer.opened_at = Instant::now();
             (records, wal_sequence)
         };
@@ -377,12 +513,7 @@ impl<S: RecordSchema> RecordStore<S> {
                 // Put the records back rather than dropping them on the floor. They
                 // are still in the WAL, so they would survive a restart either way,
                 // but a running process must not silently lose queryable data.
-                let mut writer = lock(&self.writer);
-                let bytes: usize = records.iter().map(S::size_estimate).sum();
-                let mut restored = records;
-                restored.append(&mut writer.buffer.records);
-                writer.buffer.records = restored;
-                writer.buffer.bytes += bytes;
+                lock(&self.writer).buffer.restore(records);
                 tracing::error!(
                     signal = %S::SIGNAL,
                     error = %error,
@@ -493,10 +624,33 @@ impl<S: RecordSchema> RecordStore<S> {
         // from it maximises how many sealed segments the cutoff can then skip.
         {
             collector.set_unit(0);
-            let writer = lock(&self.writer);
-            for record in &writer.buffer.records {
-                if Self::selects(record, &request, matchers, extra) {
-                    collector.push(S::timestamp(record), record.clone());
+            // Snapshot, then release. Holding the lock across the scan is what made a
+            // single reader cost 45% of ingest throughput: appends need the same lock,
+            // so every query stalled every writer for a full buffer walk.
+            let mut buffered = lock(&self.writer).buffer.snapshot();
+
+            // Visit chunks from the end the caller asked for, so the collector's cutoff
+            // tightens immediately and the rest can be skipped on their bounds alone.
+            // A `limit=100` query used to read every buffered record — at a quarter of
+            // a million of them that was the whole cost of the query.
+            match request.order {
+                Order::Descending => buffered.sort_by_key(|c| std::cmp::Reverse(c.max_nanos)),
+                Order::Ascending => buffered.sort_by_key(|c| c.min_nanos),
+            }
+
+            for (ordinal, chunk) in buffered.iter().enumerate() {
+                if !chunk.overlaps(request.start_nanos, request.end_nanos)
+                    || collector.can_skip_range(chunk.min_nanos, chunk.max_nanos)
+                {
+                    continue;
+                }
+                // Chunks are ordered among themselves, so they are scan positions in
+                // their own right; ties inside one still break on row order.
+                collector.set_unit(u32::try_from(ordinal).unwrap_or(u32::MAX));
+                for record in &chunk.records {
+                    if Self::selects(record, &request, matchers, extra) {
+                        collector.push(S::timestamp(record), record.clone());
+                    }
                 }
             }
         }
@@ -625,10 +779,10 @@ impl<S: RecordSchema> RecordStore<S> {
         extra: &(dyn Fn(&S::Record) -> bool + Sync),
         collector: &mut TopK<S::Record>,
     ) -> Result<()> {
-        // Position 0 is the live buffer, so sealed segments start at 1. Setting it here
-        // rather than in each driver is what makes the sequential and parallel paths
-        // produce the same answer instead of two defensible ones.
-        collector.set_unit(u32::try_from(ordinal + 1).unwrap_or(u32::MAX));
+        // Buffer chunks occupy the low positions, so sealed segments continue above
+        // them. Setting it here rather than in each driver is what makes the sequential
+        // and parallel paths produce the same answer instead of two defensible ones.
+        collector.set_unit(u32::try_from(ordinal.saturating_add(BUFFER_UNITS)).unwrap_or(u32::MAX));
 
         let manifest = &segment.manifest;
         // Evaluate the matchers once per distinct stream, not once per row. A
@@ -725,10 +879,12 @@ impl<S: RecordSchema> RecordStore<S> {
                 names.extend(segment.manifest.labels.keys().cloned());
             }
         }
-        for record in &lock(&self.writer).buffer.records {
-            let ts = S::timestamp(record);
-            if ts >= start_nanos && ts <= end_nanos {
-                names.extend(S::index_labels(record).names().map(str::to_owned));
+        for chunk in lock(&self.writer).buffer.snapshot() {
+            for record in &chunk.records {
+                let ts = S::timestamp(record);
+                if ts >= start_nanos && ts <= end_nanos {
+                    names.extend(S::index_labels(record).names().map(str::to_owned));
+                }
             }
         }
         names.into_iter().collect()
@@ -783,13 +939,15 @@ impl<S: RecordSchema> RecordStore<S> {
             }
         }
 
-        for record in &lock(&self.writer).buffer.records {
-            let ts = S::timestamp(record);
-            if ts >= start_nanos
-                && ts <= end_nanos
-                && let Some(value) = S::index_labels(record).get(name)
-            {
-                values.insert(value.to_owned());
+        for chunk in lock(&self.writer).buffer.snapshot() {
+            for record in &chunk.records {
+                let ts = S::timestamp(record);
+                if ts >= start_nanos
+                    && ts <= end_nanos
+                    && let Some(value) = S::index_labels(record).get(name)
+                {
+                    values.insert(value.to_owned());
+                }
             }
         }
 
@@ -835,13 +993,15 @@ impl<S: RecordSchema> RecordStore<S> {
             );
         }
 
-        for record in &lock(&self.writer).buffer.records {
-            let ts = S::timestamp(record);
-            if ts >= start_nanos
-                && ts <= end_nanos
-                && matches_all(matchers, S::index_labels(record))
-            {
-                seen.insert(S::index_labels(record).clone());
+        for chunk in lock(&self.writer).buffer.snapshot() {
+            for record in &chunk.records {
+                let ts = S::timestamp(record);
+                if ts >= start_nanos
+                    && ts <= end_nanos
+                    && matches_all(matchers, S::index_labels(record))
+                {
+                    seen.insert(S::index_labels(record).clone());
+                }
             }
         }
 
@@ -850,20 +1010,25 @@ impl<S: RecordSchema> RecordStore<S> {
 
     pub fn status(&self) -> RecordStoreStatus {
         let segments = self.segments();
-        let writer = lock(&self.writer);
-        let buffer = &writer.buffer;
+        let (buffered, buffered_records, buffered_bytes) = {
+            let mut writer = lock(&self.writer);
+            let counts = (writer.buffer.len() as u64, writer.buffer.bytes as u64);
+            (writer.buffer.snapshot(), counts.0, counts.1)
+        };
 
         let mut oldest = segments.iter().map(|s| s.manifest.min_time_nanos).min();
         let mut newest = segments.iter().map(|s| s.manifest.max_time_nanos).max();
-        for record in &buffer.records {
-            let ts = S::timestamp(record);
-            oldest = Some(oldest.map_or(ts, |o| o.min(ts)));
-            newest = Some(newest.map_or(ts, |n| n.max(ts)));
+        for chunk in &buffered {
+            for record in &chunk.records {
+                let ts = S::timestamp(record);
+                oldest = Some(oldest.map_or(ts, |o| o.min(ts)));
+                newest = Some(newest.map_or(ts, |n| n.max(ts)));
+            }
         }
 
         RecordStoreStatus {
-            buffered_records: buffer.records.len() as u64,
-            buffered_bytes: buffer.bytes as u64,
+            buffered_records,
+            buffered_bytes,
             segments: segments.len() as u64,
             segment_rows: segments.iter().map(|s| s.manifest.rows).sum(),
             segment_bytes: segments.iter().map(|s| s.manifest.bytes).sum(),

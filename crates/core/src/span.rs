@@ -185,24 +185,22 @@ impl SpanRecord {
     }
 
     pub fn size_estimate(&self) -> usize {
-        let labels = |labels: &Labels| {
-            labels
-                .iter()
-                .map(|(k, v)| k.len() + v.len() + 2)
-                .sum::<usize>()
-        };
-        self.trace_id.len()
-            + self.span_id.len()
-            + self.name.len()
-            + self.status_message.len()
-            + labels(&self.stream)
-            + labels(&self.attributes)
+        use crate::sizing::{labels_bytes, optional_string_bytes, string_bytes, vec_bytes};
+
+        std::mem::size_of::<Self>()
+            + string_bytes(&self.trace_id)
+            + string_bytes(&self.span_id)
+            + optional_string_bytes(self.parent_span_id.as_ref())
+            + string_bytes(&self.name)
+            + string_bytes(&self.status_message)
+            + labels_bytes(&self.stream)
+            + labels_bytes(&self.attributes)
+            + vec_bytes::<SpanEvent>(self.events.len())
             + self
                 .events
                 .iter()
-                .map(|e| e.name.len() + labels(&e.attributes) + 16)
+                .map(|e| string_bytes(&e.name) + labels_bytes(&e.attributes))
                 .sum::<usize>()
-            + 64
     }
 }
 
