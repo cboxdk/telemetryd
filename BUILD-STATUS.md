@@ -34,15 +34,20 @@ queries answered from metadata with no file I/O.
 **Operations.** `/healthz`, `/status`, `/metrics`. `telemetryd validate` prints every
 resolved value with its origin. `telemetryd service install` writes a hardened unit.
 
-**Packaging.** Four cross-compiled targets, install script with checksum *and*
-signature verification, Homebrew formula, `.deb`, deterministic CycloneDX SBOM with a
+**Packaging.** Four cross-compiled targets, install script with checksum verification
+(and signature verification, once a signed release exists), Homebrew formula, `.deb`, deterministic CycloneDX SBOM with a
 CI drift check.
 
-**Release signing.** `SHA256SUMS` carries a keyless Sigstore signature, made by the
-release workflow's own OIDC identity and recorded in the public transparency log.
-There is no private key to store or rotate. The release job verifies its own signature
-before publishing, and `install.sh` verifies it when `cosign` is present — pinning
-`--certificate-identity`, without which any valid Sigstore signature would pass.
+**Release signing — implemented, not yet exercised.** `SHA256SUMS` is signed by the
+release workflow's own OIDC identity, keyless, with no private key to store or rotate.
+The release job verifies its own signature before publishing, and `install.sh` verifies
+it when `cosign` is present, pinning `--certificate-identity` — without which any valid
+Sigstore signature by anyone would pass.
+
+Stated precisely because it matters: **no release has run this code yet**, so the
+signing path is reviewed and syntactically checked but not proven. The first release to
+publish `SHA256SUMS.cosign.bundle` is the one that verifies it, and until then this
+belongs under "written" rather than "working".
 
 ## Gates
 
