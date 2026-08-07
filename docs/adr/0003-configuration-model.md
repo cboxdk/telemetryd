@@ -38,8 +38,9 @@ Absence of a config file is not an error. An unreadable or malformed file *is* â
 not silently fall back to defaults when the operator clearly intended a file.
 
 **Env var naming:** `TELEMETRYD_<SECTION>_<KEY>`, uppercased, `.` â†’ `_`. So
-`storage.data_dir` is `TELEMETRYD_STORAGE_DATA_DIR`. Nested arrays (scrape targets)
-are file-only; env is for scalars, which is where the container use case actually is.
+`storage.data_dir` is `TELEMETRYD_STORAGE_DATA_DIR`. Env is for scalars, which is
+where the container use case actually is; if a nested array is ever needed it will be
+file-only.
 
 **Unknown keys are rejected** (`#[serde(deny_unknown_fields)]`). A typo'd
 `retetnion` that silently does nothing is a worse experience than a startup error

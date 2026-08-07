@@ -157,6 +157,10 @@ Not gaps. These are decisions, each with an ADR:
 - **Plugins, relabelling rules, write-path transformations** — shape data in the
   instrumentation
 - **OTLP/gRPC** — JSON is first-class because that is what the client emits
+- **Scraping Prometheus targets** — telemetryd receives (`remote_write`, OTLP), it
+  does not go and fetch. A `[[scrape]]` config section existed, complete with
+  validation and documentation, and was read by nothing; it has been removed rather
+  than left to look like a feature
 - **A bespoke metric chunk store** — superseded by ADR-007, with the cost stated
 
 ## Where the reasoning lives

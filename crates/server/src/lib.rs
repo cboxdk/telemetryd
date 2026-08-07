@@ -170,10 +170,35 @@ pub async fn serve(config: Arc<Config>, store: Arc<Store>) -> Result<()> {
 
     let maintenance = maintenance::Maintenance::start(&store, config.storage.wal_sync_interval);
 
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(|e| telemetryd_core::Error::io("serving HTTP", e))?;
+    // `server.shutdown_grace` bounds the drain. Without a bound, one client holding a
+    // long tail connection open keeps the process alive indefinitely, and the service
+    // manager eventually SIGKILLs it — losing the interval-sync window the graceful
+    // path exists to protect. Better to stop waiting and flush.
+    let grace = config.server.shutdown_grace;
+
+    // The clock starts when the signal arrives, not when the server does. Wrapping the
+    // whole serve future in a timeout would have exited a healthy process after
+    // `shutdown_grace` seconds of ordinary uptime.
+    let (signalled, mut wait_for_signal) = tokio::sync::watch::channel(false);
+    let serving = axum::serve(listener, router(state)).with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = signalled.send(true);
+    });
+    let deadline = async move {
+        // Ignore a send error: the sender is dropped once serving finishes, which is
+        // exactly the case where the deadline no longer matters.
+        let _ = wait_for_signal.wait_for(|started| *started).await;
+        tokio::time::sleep(grace).await;
+    };
+
+    tokio::select! {
+        result = serving => result.map_err(|e| telemetryd_core::Error::io("serving HTTP", e))?,
+        () = deadline => tracing::warn!(
+            grace_seconds = grace.as_secs(),
+            "connections were still open when server.shutdown_grace elapsed; \
+             stopping anyway and flushing the write-ahead log"
+        ),
+    }
 
     // Stop the timers first, so nothing is mid-seal while we are trying to stop.
     maintenance.stop();

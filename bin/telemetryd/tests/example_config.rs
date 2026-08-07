@@ -54,10 +54,11 @@ fn the_example_covers_every_configurable_section() {
             "{section} is missing from telemetryd.toml.example"
         );
     }
-    // Commented out, since an empty scrape list is the default — but present, so the
-    // feature is discoverable without reading the docs.
+    // And nothing that does not exist. `[[scrape]]` was documented here, with
+    // validation behind it, and was read by no code at all — an example file is where
+    // people learn what a tool can do, so a section here is a promise.
     assert!(
-        text.contains("[[scrape]]"),
-        "scrape targets should be shown as a commented example"
+        !text.contains("[[scrape]]"),
+        "the example advertises a scrape feature that telemetryd does not have"
     );
 }

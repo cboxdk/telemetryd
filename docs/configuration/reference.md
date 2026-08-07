@@ -59,22 +59,13 @@ max_label_name_bytes    = 128
 max_label_value_bytes   = 2048
 max_log_line_bytes      = "256KiB"
 max_attrs_per_record    = 128
-max_spans_per_trace     = 10_000
 ingest_queue_depth      = 8192       # backpressure: full queue → 429 with Retry-After
 
 [log]                                # telemetryd's own logging
 level  = "info"                      # trace | debug | info | warn | error
 format = "text"                      # text | json
 
-# Optional Prometheus scrape targets. File-only (not settable via env).
-[[scrape]]
-job      = "laravel-app"
-targets  = ["127.0.0.1:9000"]
-interval = "15s"
-timeout  = "10s"
-path     = "/metrics"
-labels   = { app = "checkout" }
-```
+
 
 ## Data directory resolution
 

@@ -6,7 +6,6 @@
 //! environment and no flags is a complete, supported setup. Everything else is an
 //! override on top of that.
 
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -33,8 +32,6 @@ pub struct Config {
     pub limits: LimitsConfig,
     pub ingest: IngestConfig,
     pub log: LogConfig,
-    #[serde(default)]
-    pub scrape: Vec<ScrapeConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,7 +304,6 @@ pub struct LimitsConfig {
     pub max_label_value_bytes: u32,
     pub max_log_line_bytes: ByteSize,
     pub max_attrs_per_record: u32,
-    pub max_spans_per_trace: u32,
     /// Backpressure threshold: a full queue returns 429 with `Retry-After` rather than
     /// buffering without bound.
     pub ingest_queue_depth: u32,
@@ -323,7 +319,6 @@ impl Default for LimitsConfig {
             max_label_value_bytes: 2048,
             max_log_line_bytes: ByteSize::kib(256),
             max_attrs_per_record: 128,
-            max_spans_per_trace: 10_000,
             ingest_queue_depth: 8192,
         }
     }
@@ -350,31 +345,6 @@ impl Default for LogConfig {
 pub enum LogFormat {
     Text,
     Json,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ScrapeConfig {
-    pub job: String,
-    pub targets: Vec<String>,
-    #[serde(default = "default_scrape_interval")]
-    pub interval: DurationSetting,
-    #[serde(default = "default_scrape_timeout")]
-    pub timeout: DurationSetting,
-    #[serde(default = "default_scrape_path")]
-    pub path: String,
-    #[serde(default)]
-    pub labels: BTreeMap<String, String>,
-}
-
-fn default_scrape_interval() -> DurationSetting {
-    DurationSetting(Duration::from_secs(15))
-}
-fn default_scrape_timeout() -> DurationSetting {
-    DurationSetting(Duration::from_secs(10))
-}
-fn default_scrape_path() -> String {
-    "/metrics".to_owned()
 }
 
 /// A duration that round-trips as a humantime string (`7d`, `100ms`).
@@ -478,10 +448,6 @@ const ENV_KEYS: &[(&str, &str)] = &[
     (
         "TELEMETRYD_LIMITS_MAX_ATTRS_PER_RECORD",
         "limits.max_attrs_per_record",
-    ),
-    (
-        "TELEMETRYD_LIMITS_MAX_SPANS_PER_TRACE",
-        "limits.max_spans_per_trace",
     ),
     (
         "TELEMETRYD_LIMITS_INGEST_QUEUE_DEPTH",
@@ -649,24 +615,6 @@ impl Config {
                  per-app cap could never be reached",
                 self.limits.max_series_per_app, self.limits.max_series,
             )));
-        }
-
-        let mut jobs = std::collections::BTreeSet::new();
-        for scrape in &self.scrape {
-            if !jobs.insert(&scrape.job) {
-                return Err(Error::Config(format!(
-                    "duplicate scrape job name {:?}; job names must be unique",
-                    scrape.job
-                )));
-            }
-            if scrape.timeout.get() > scrape.interval.get() {
-                return Err(Error::Config(format!(
-                    "scrape job {:?} has timeout ({}) longer than interval ({})",
-                    scrape.job,
-                    humantime::format_duration(scrape.timeout.get()),
-                    humantime::format_duration(scrape.interval.get()),
-                )));
-            }
         }
 
         Ok(())
@@ -958,24 +906,6 @@ mod tests {
         let mut config = Config::default();
         config.limits.max_series_per_app = config.limits.max_series + 1;
         assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn duplicate_scrape_jobs_are_refused() {
-        let mut config = Config::default();
-        let job = |name: &str| ScrapeConfig {
-            job: name.to_owned(),
-            targets: vec!["127.0.0.1:9000".to_owned()],
-            interval: default_scrape_interval(),
-            timeout: default_scrape_timeout(),
-            path: default_scrape_path(),
-            labels: BTreeMap::new(),
-        };
-        config.scrape = vec![job("a"), job("a")];
-        assert!(config.validate().is_err());
-
-        config.scrape = vec![job("a"), job("b")];
-        config.validate().unwrap();
     }
 
     #[test]
