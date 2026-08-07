@@ -25,7 +25,7 @@ command to run instead — a tool that silently escalates is one you cannot reas
 Overrides:
 
 ```bash
-TELEMETRYD_VERSION=0.5.1 sh install.sh
+TELEMETRYD_VERSION=0.5.2 sh install.sh
 TELEMETRYD_INSTALL_DIR="$HOME/.local/bin" sh install.sh
 ```
 
@@ -41,7 +41,7 @@ Download the `.deb` for your architecture from the
 [releases page](https://github.com/cboxdk/telemetryd/releases) and install it:
 
 ```bash
-sudo dpkg -i telemetryd_0.5.1_amd64.deb
+sudo dpkg -i telemetryd_0.5.2_amd64.deb
 sudo systemctl enable --now telemetryd
 ```
 

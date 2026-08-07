@@ -56,6 +56,15 @@ jobs:
       - name: cargo doc
         run: cargo doc --workspace --no-deps --document-private-items
 
+      # Runs the actual binary over HTTP: all three signals in, queried back out,
+      # restarted, checked again. Every unit test passed on a release that shipped a
+      # TraceQL endpoint rejecting its own documented syntax — nothing in the suite
+      # was starting the server and asking it a question.
+      - name: end-to-end soak
+        run: |
+          cargo build --bin telemetryd
+          python3 scripts/soak.py target/debug/telemetryd
+
   supply-chain:
     name: SBOM and docs
     runs-on: ubuntu-latest

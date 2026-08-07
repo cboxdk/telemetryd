@@ -185,6 +185,14 @@ impl Parser<'_> {
     fn parse_field(&mut self) -> Result<Field> {
         let path = self.expect_ident("a field name")?;
 
+        // A leading `.` is TraceQL's explicit "unscoped attribute" marker, and it is
+        // checked before the intrinsics on purpose: `name` is the span's name, while
+        // `.name` is an attribute that a producer happened to call "name". Collapsing
+        // the two would answer a different question than the one asked.
+        if let Some(attribute) = path.strip_prefix('.') {
+            return Ok(Field::Unscoped(attribute.to_owned()));
+        }
+
         Ok(match path.split_once('.') {
             Some(("resource", rest)) => Field::Resource(sanitize_label_name(rest)),
             // Span attributes keep the producer's spelling; `get_relaxed` accepts either.
@@ -365,9 +373,15 @@ impl Condition {
             Field::Span(name) => self.compare_text(span.attributes.get_relaxed(name)),
             // Unscoped: span attributes take precedence, then resource labels — the
             // narrower scope wins, as in TraceQL.
-            Field::Unscoped(name) => {
-                self.compare_text(span.attributes.get(name).or_else(|| span.stream.get(name)))
-            }
+            //
+            // Both lookups are relaxed. Attributes keep the producer's spelling while
+            // stream labels are sanitized, so `.service.name` has to reach the
+            // `service_name` label — the dotted form is what a person actually types.
+            Field::Unscoped(name) => self.compare_text(
+                span.attributes
+                    .get_relaxed(name)
+                    .or_else(|| span.stream.get_relaxed(name)),
+            ),
         }
     }
 
@@ -548,6 +562,57 @@ mod tests {
             parse(r#"{ service_name = "checkout" }"#)
                 .unwrap()
                 .matches(&span())
+        );
+    }
+
+    /// The dotted form is what TraceQL actually specifies for an unscoped attribute,
+    /// and it is what a person types into a search box. It used to be a lexer error:
+    /// `.` could continue an identifier but never start one, so every canonical
+    /// TraceQL attribute filter came back as a 400 while the non-standard bare form
+    /// worked. Found by querying a released build rather than by a unit test.
+    #[test]
+    fn the_leading_dot_attribute_form_parses_and_matches() {
+        // A span attribute, reached by the producer's own dotted spelling.
+        assert!(
+            parse(r#"{ .http.method = "POST" }"#)
+                .unwrap()
+                .matches(&span())
+        );
+        assert!(
+            !parse(r#"{ .http.method = "GET" }"#)
+                .unwrap()
+                .matches(&span())
+        );
+
+        // A resource label, which ingest sanitized to `service_name`. The dotted
+        // name still has to reach it.
+        assert!(
+            parse(r#"{ .service.name = "checkout" }"#)
+                .unwrap()
+                .matches(&span())
+        );
+
+        // An attribute nobody set matches nothing rather than erroring.
+        assert!(!parse(r#"{ .nonexistent = "x" }"#).unwrap().matches(&span()));
+    }
+
+    /// `name` is the span's name; `.name` is an attribute a producer happened to call
+    /// "name". Collapsing them would answer a different question than the one asked.
+    #[test]
+    fn a_leading_dot_means_attribute_not_intrinsic() {
+        let mut s = span();
+        s.attributes.insert("name", "not-the-span-name");
+
+        assert!(parse(r#"{ name = "POST /checkout" }"#).unwrap().matches(&s));
+        assert!(
+            !parse(r#"{ .name = "POST /checkout" }"#)
+                .unwrap()
+                .matches(&s)
+        );
+        assert!(
+            parse(r#"{ .name = "not-the-span-name" }"#)
+                .unwrap()
+                .matches(&s)
         );
     }
 

@@ -160,9 +160,15 @@ followed by `| select(...)`:
 ```
 
 Supported: one spanset; `&&`-joined conditions; the operators `=`, `!=`, `=~`, `>`,
-`<`, `>=`, `<=`; `resource.*`, `span.*` and intrinsic fields (`name`, `status`,
-`duration`, `kind`); string, number, duration and `nil` literals; `| select(...)` is
-accepted and ignored (telemetryd always returns the matched spans).
+`<`, `>=`, `<=`; `resource.*`, `span.*`, unscoped `.attribute` and intrinsic fields
+(`name`, `status`, `duration`, `kind`); string, number, duration and `nil` literals;
+`| select(...)` is accepted and ignored (telemetryd always returns the matched spans).
+
+An unscoped `.attribute` searches span attributes first, then resource labels — the
+narrower scope wins, as in TraceQL. The leading dot is significant: `name` is the
+span's name, `.name` is an attribute a producer happened to call `name`. Because
+ingest sanitizes stream labels but leaves attribute keys in the producer's own
+spelling, `.service.name` still reaches the `service_name` label.
 
 *Not supported:* multiple spansets, `||` between conditions, structural operators
 (`>>`, `~`), aggregates (`count()`, `avg()`), and `by()`.

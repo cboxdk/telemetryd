@@ -206,6 +206,15 @@ impl<'a> Lexer<'a> {
             b'"' | b'\'' => self.lex_quoted(ch),
             b'`' => self.lex_raw(),
             b'0'..=b'9' => self.lex_number(),
+            // A leading `.` starts an identifier: TraceQL spells an unscoped attribute
+            // `.service.name`, meaning "look in span attributes, then resource". The
+            // lookahead must exclude digits so `.5` stays a number.
+            b'.' if self
+                .peek(1)
+                .is_some_and(|next| next.is_ascii_alphabetic() || next == b'_') =>
+            {
+                Ok(self.lex_ident())
+            }
             c if c.is_ascii_alphabetic() || c == b'_' || c == b':' => Ok(self.lex_ident()),
             _ => Err(self.error(format!(
                 "unexpected character {:?}",
@@ -537,6 +546,11 @@ mod tests {
             tokens("span.http.status_code"),
             vec![Token::Ident("span.http.status_code".into())]
         );
+        // TraceQL's unscoped-attribute form starts with the dot.
+        assert_eq!(
+            tokens(".service.name"),
+            vec![Token::Ident(".service.name".into())]
+        );
     }
 
     #[test]
@@ -544,6 +558,11 @@ mod tests {
         // The lookahead is what keeps these correct.
         assert_eq!(tokens("1.5"), vec![Token::Number(1.5)]);
         assert_eq!(tokens("1.5h"), vec![Token::Duration(5_400_000_000_000)]);
+        // A leading dot starts an identifier only before a name character. `.5` is
+        // therefore still rejected rather than becoming an attribute called "5" —
+        // a bare leading-dot decimal has never been accepted here, and allowing the
+        // TraceQL attribute form deliberately did not change that.
+        assert!(tokenize(".5").is_err());
         // A trailing dot is not part of the identifier, and `.` is not a token on its
         // own — so this is a syntax error rather than a silently truncated name.
         assert!(tokenize("foo.").is_err());
