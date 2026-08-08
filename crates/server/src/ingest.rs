@@ -1,5 +1,7 @@
 //! OTLP/HTTP ingest handlers.
 
+use std::borrow::Cow;
+
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
@@ -7,6 +9,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use telemetryd_core::Error;
+use telemetryd_ingest::compression::{self, Encoding};
 use telemetryd_ingest::logs::{self, DecodeContext};
 use telemetryd_ingest::otlp_metrics;
 use telemetryd_ingest::remote_write;
@@ -57,6 +60,7 @@ pub async fn otlp_logs(
     };
 
     reject_protobuf(&headers)?;
+    let body = decompress(&state, &headers, &body, "logs", &[])?;
 
     let mut decoded = {
         let limits = state.config.limits.clone();
@@ -153,6 +157,7 @@ pub async fn otlp_traces(
     };
 
     reject_protobuf(&headers)?;
+    let body = decompress(&state, &headers, &body, "traces", &[])?;
 
     let mut decoded = {
         let limits = state.config.limits.clone();
@@ -228,6 +233,7 @@ pub async fn otlp_metrics(
     };
 
     reject_protobuf(&headers)?;
+    let body = decompress(&state, &headers, &body, "metrics", &[])?;
 
     let decoded = {
         let limits = state.config.limits.clone();
@@ -256,6 +262,7 @@ pub async fn otlp_metrics(
 /// `POST /api/v1/write` — Prometheus remote_write.
 pub async fn remote_write(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
     // Bound concurrent ingest. A rejected request is a signal the producer can act on
@@ -268,6 +275,18 @@ pub async fn remote_write(
         );
         return Err(telemetryd_core::Error::Overloaded.into());
     };
+
+    // Prometheus sends `Content-Encoding: snappy`, and that snappy is the payload's
+    // own framing rather than a transport coding — `remote_write::decode` owns it. So
+    // it passes through here untouched, while a gzip added by a proxy in front of us
+    // is still undone.
+    let body = decompress(
+        &state,
+        &headers,
+        &body,
+        "metrics",
+        compression::REMOTE_WRITE_PASSTHROUGH,
+    )?;
 
     let decoded = {
         let limits = state.config.limits.clone();
@@ -341,6 +360,72 @@ async fn store_samples(
     };
 
     Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+/// Undo `Content-Encoding` before the body reaches a decoder.
+///
+/// OTLP/HTTP makes gzip part of the specification, and every OpenTelemetry SDK
+/// compresses batches past some size threshold — so a server that ignores the header
+/// is not "missing an optimisation", it is broken for every batch that carries data
+/// while still answering 200 to the empty one a health check sends.
+///
+/// The cap is `server.max_body_bytes`, the same number `RequestBodyLimitLayer`
+/// enforces on an uncompressed body, so the two paths agree: a client refused for
+/// sending 20 MiB of JSON is refused for sending the 30 KB of gzip that becomes it,
+/// and gets the same 413. Decompression happens while holding the ingest slot, which
+/// bounds how many of these buffers can exist at once.
+fn decompress<'a>(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &'a Bytes,
+    signal: &'static str,
+    already_handled: &[&str],
+) -> Result<Cow<'a, [u8]>, ApiError> {
+    let Some(value) = headers.get(header::CONTENT_ENCODING) else {
+        return Ok(Cow::Borrowed(body));
+    };
+    let Ok(value) = value.to_str() else {
+        reject(state, signal, "unsupported_encoding");
+        return Err(
+            Error::BadRequest("the Content-Encoding header is not valid text".to_owned()).into(),
+        );
+    };
+
+    let encoding = Encoding::parse(value, already_handled).inspect_err(|_| {
+        reject(state, signal, "unsupported_encoding");
+    })?;
+    if encoding == Encoding::Identity {
+        return Ok(Cow::Borrowed(body));
+    }
+
+    let max_body =
+        usize::try_from(state.config.server.max_body_bytes.as_u64()).unwrap_or(usize::MAX);
+    let decoded = compression::decode(encoding, body, max_body).inspect_err(|e| {
+        let reason = if matches!(e, Error::LimitExceeded { .. }) {
+            "decompressed_body_too_large"
+        } else {
+            "malformed_encoding"
+        };
+        reject(state, signal, reason);
+    })?;
+
+    if let Cow::Owned(bytes) = &decoded {
+        tracing::debug!(
+            signal,
+            encoding = encoding.as_str(),
+            compressed_bytes = body.len(),
+            decompressed_bytes = bytes.len(),
+            "decompressed an ingest body"
+        );
+    }
+    Ok(decoded)
+}
+
+fn reject(state: &AppState, signal: &'static str, reason: &'static str) {
+    state.metrics.incr(
+        "telemetryd_ingest_rejected_total",
+        &[("signal", signal), ("reason", reason)],
+    );
 }
 
 /// OTLP/HTTP also defines a protobuf encoding. We speak JSON, and saying so beats a

@@ -69,6 +69,14 @@ parquet = { version = "59", default-features = false, features = ["arrow", "zstd
 postcard = { version = "1", features = ["use-std"] }
 # Pure Rust; already in the tree via parquet's snappy support.
 snap = "1"
+
+# Request-body decompression on the ingest endpoints. gzip is part of the OTLP/HTTP
+# spec, so this is not optional. `flate2` is the only crate this adds — pure Rust
+# (miniz_oxide), no C — and it covers deflate for free. zstd was already in the tree
+# for Parquet; matching parquet's `default-features = false` keeps the feature
+# unification a no-op, so it costs nothing to also honour `Content-Encoding: zstd`.
+flate2 = "1"
+zstd = { version = "0.13", default-features = false }
 regex = "1"
 
 # dev

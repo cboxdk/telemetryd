@@ -61,16 +61,16 @@ impl Encoding {
                 continue;
             }
 
-            let parsed = if token.eq_ignore_ascii_case("gzip") || token.eq_ignore_ascii_case("x-gzip")
-            {
-                Self::Gzip
-            } else if token.eq_ignore_ascii_case("deflate") {
-                Self::Deflate
-            } else if token.eq_ignore_ascii_case("zstd") {
-                Self::Zstd
-            } else {
-                return Err(unsupported(token));
-            };
+            let parsed =
+                if token.eq_ignore_ascii_case("gzip") || token.eq_ignore_ascii_case("x-gzip") {
+                    Self::Gzip
+                } else if token.eq_ignore_ascii_case("deflate") {
+                    Self::Deflate
+                } else if token.eq_ignore_ascii_case("zstd") {
+                    Self::Zstd
+                } else {
+                    return Err(unsupported(token));
+                };
 
             if coding != Self::Identity {
                 // Two real codings stacked. Decodable in principle, and a shape no
@@ -106,7 +106,7 @@ pub const REMOTE_WRITE_PASSTHROUGH: &[&str] = &["snappy", "x-snappy-framed"];
 ///
 /// `Identity` borrows the body, so the uncompressed path costs exactly what it did
 /// before this existed: no copy, no allocation.
-pub fn decode<'a>(encoding: Encoding, body: &'a [u8], max_bytes: usize) -> Result<Cow<'a, [u8]>> {
+pub fn decode(encoding: Encoding, body: &[u8], max_bytes: usize) -> Result<Cow<'_, [u8]>> {
     match encoding {
         Encoding::Identity => Ok(Cow::Borrowed(body)),
         Encoding::Gzip => {
@@ -162,19 +162,15 @@ fn deflate(body: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
 }
 
 fn zstd_decode(body: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
-    let mut decoder = zstd::stream::read::Decoder::new(body)
-        .map_err(|e| malformed("zstd", &e.to_string()))?;
+    let mut decoder =
+        zstd::stream::read::Decoder::new(body).map_err(|e| malformed("zstd", &e.to_string()))?;
 
     // A zstd frame declares its own window size and the decoder allocates it up front,
     // before a single byte of output exists — attacker-controlled memory that the
     // output cap alone does not bound. No frame whose output fits in `max_bytes` needs
     // a window bigger than that, so cap the window there. The floor is zstd's smallest
     // legal window and the ceiling is its default limit, so this only ever tightens.
-    let window_log = max_bytes
-        .max(1)
-        .ilog2()
-        .saturating_add(1)
-        .clamp(10, 27);
+    let window_log = max_bytes.max(1).ilog2().saturating_add(1).clamp(10, 27);
     decoder
         .window_log_max(window_log)
         .map_err(|e| malformed("zstd", &e.to_string()))?;
@@ -242,8 +238,7 @@ mod tests {
     const MAX: usize = 1024 * 1024;
 
     fn gzip(bytes: &[u8]) -> Vec<u8> {
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(bytes).unwrap();
         encoder.finish().unwrap()
     }
@@ -321,7 +316,10 @@ mod tests {
     fn identity_borrows_the_body_untouched() {
         let body = b"{\"resourceLogs\":[]}";
         let decoded = decode(Encoding::Identity, body, MAX).unwrap();
-        assert!(matches!(decoded, Cow::Borrowed(_)), "identity must not copy");
+        assert!(
+            matches!(decoded, Cow::Borrowed(_)),
+            "identity must not copy"
+        );
         assert_eq!(&*decoded, body);
     }
 
@@ -400,10 +398,12 @@ mod tests {
         // Off-by-one on a limit is the difference between "16 MiB" and "16 MiB minus
         // one byte", and a client batching to the documented number would hit it.
         let payload = vec![b'y'; 4096];
-        let decoded = decode(Encoding::Gzip, &gzip(&payload), payload.len()).unwrap();
+        let compressed = gzip(&payload);
+
+        let decoded = decode(Encoding::Gzip, &compressed, payload.len()).unwrap();
         assert_eq!(decoded.len(), payload.len());
 
-        let err = decode(Encoding::Gzip, &gzip(&payload), payload.len() - 1).unwrap_err();
+        let err = decode(Encoding::Gzip, &compressed, payload.len() - 1).unwrap_err();
         assert!(matches!(err, Error::LimitExceeded { .. }));
     }
 
