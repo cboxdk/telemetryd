@@ -13,6 +13,7 @@
 //! JSON is the first-class OTLP encoding because that is what `cboxdk/laravel-telemetry`
 //! emits — no protobuf, no C extension on the client path.
 
+pub mod compression;
 pub mod logs;
 pub mod otlp;
 pub mod otlp_metrics;

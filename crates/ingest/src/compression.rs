@@ -211,8 +211,7 @@ fn bounded<R: Read>(
             limit: "server.max_body_bytes",
             detail: format!(
                 "the {coding} request body expands past the {max_bytes} byte limit \
-                 ({} compressed bytes received)",
-                compressed_len
+                 ({compressed_len} compressed bytes received)"
             ),
         });
     }
