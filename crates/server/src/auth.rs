@@ -18,6 +18,7 @@ use crate::state::AppState;
 pub enum Surface {
     Ingest,
     Query,
+    Admin,
 }
 
 impl Surface {
@@ -25,6 +26,7 @@ impl Surface {
         match self {
             Self::Ingest => "ingest",
             Self::Query => "query",
+            Self::Admin => "admin",
         }
     }
 }
@@ -37,6 +39,26 @@ pub async fn require_ingest_token(
     guard(
         Surface::Ingest,
         &state.ingest_tokens.clone(),
+        state,
+        request,
+        next,
+    )
+    .await
+}
+
+/// Guards the operational surface: `/status` and `/metrics`.
+///
+/// These describe the *deployment* rather than the telemetry — app names, per-app
+/// series counts and disk share, whether the instance is running unauthenticated —
+/// and that is a narrower audience than "may read logs".
+pub async fn require_admin_token(
+    state: State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    guard(
+        Surface::Admin,
+        &state.admin_tokens.clone(),
         state,
         request,
         next,

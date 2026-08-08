@@ -48,6 +48,7 @@ pub struct StatusResponse {
 pub struct AuthStatus {
     pub ingest: &'static str,
     pub query: &'static str,
+    pub admin: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -93,6 +94,7 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse
         auth: AuthStatus {
             ingest: enabled(state.ingest_tokens.is_empty()),
             query: enabled(state.query_tokens.is_empty()),
+            admin: enabled(state.admin_tokens.is_empty()),
         },
         storage,
         retention,

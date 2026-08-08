@@ -38,11 +38,27 @@ and use a reverse proxy, or pass `--insecure`), and generates a ready-to-paste r
 token in the error text. `--insecure` / `TELEMETRYD_SERVER_INSECURE=true` overrides,
 logs a `WARN` on every startup, and surfaces as `insecure: true` in `/status`.
 
-**Two independent tokens.** `ingest_token` guards `/v1/*` and `/api/v1/write`;
-`query_token` guards the Prometheus, Loki and Tempo read APIs. Either may be set
-without the other; an unset token means that surface is unauthenticated. The split
-exists because the trust boundaries genuinely differ — app servers push, humans and the
-UI read, and those are different credentials with different rotation cadences.
+**Three independent roles.** `ingest_token` (write) guards `/v1/*` and
+`/api/v1/write`; `query_token` (read) guards the Prometheus, Loki and Tempo read APIs;
+`admin_token` guards `/status` and `/metrics`. Any may be set without the others; an
+unset token means that surface is unauthenticated. The split exists because the trust
+boundaries genuinely differ — app servers push, humans and the UI read, and those are
+different credentials with different rotation cadences.
+
+**Why admin is separate from read.** The two answer different questions. Reading
+telemetry tells you about your applications. `/status` and `/metrics` tell you about
+the *deployment*: every app name, its series count, its share of the disk, whether the
+instance is running unauthenticated, how close the cardinality caps are. Handing that
+to everyone who may read logs is more than is usually meant, and it is the surface an
+attacker would enumerate first.
+
+The roles are not a hierarchy. Admin does not imply read, because the reason to hold an
+admin token — running a dashboard, wiring an alert — is not a reason to read anyone's
+log lines.
+
+**`admin_token` unset means `query_token` guards those routes**, which is exactly what
+guarded them before the role existed. A deployment that never hears about it keeps
+working; setting it is opting into the tighter split.
 
 **Multiple tokens per role.** Both fields accept a list, so a token can be rotated
 without a window where either the old or the new one is rejected. A single string is

@@ -29,6 +29,11 @@ pub struct AppState {
     /// silently failing every request.
     pub ingest_tokens: Arc<TokenSet>,
     pub query_tokens: Arc<TokenSet>,
+    /// Guards `/status` and `/metrics`.
+    ///
+    /// Falls back to the query tokens when unset, which is what guarded them before
+    /// the role existed — so a deployment that never heard of it keeps working.
+    pub admin_tokens: Arc<TokenSet>,
     pub started: Instant,
     pub started_at: OffsetDateTime,
     /// Bounds how many ingest requests are in flight at once.
@@ -57,6 +62,11 @@ impl AppState {
         Ok(Self {
             ingest_tokens: Arc::new(config.auth.ingest_token.resolve()?),
             query_tokens: Arc::new(config.auth.query_token.resolve()?),
+            admin_tokens: Arc::new(if config.auth.admin_token.is_empty() {
+                config.auth.query_token.resolve()?
+            } else {
+                config.auth.admin_token.resolve()?
+            }),
             config,
             store,
             metrics: Arc::new(Metrics::new()),

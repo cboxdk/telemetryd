@@ -28,6 +28,11 @@ shutdown_grace  = "15s"
 ingest_token = []                    # /v1/*, /api/v1/write
 query_token  = []                    # Loki/Tempo/Prometheus reads, /status, /metrics
 
+# Guards /status and /metrics, which describe the deployment rather than the
+# telemetry: app names, per-app series and disk share, whether this instance is
+# running unauthenticated. Unset means query_token guards them, as it always did.
+# admin_token = "..."
+
 [storage]
 # Empty = automatic: ./telemetryd-data if it already exists, else the platform data
 # directory. The resolved path is logged at startup and shown in /status.

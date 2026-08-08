@@ -414,19 +414,29 @@ async fn request_counters_are_keyed_by_matched_route_not_raw_path() {
 }
 
 #[tokio::test]
-async fn auth_failures_are_counted() {
+async fn auth_failures_are_counted_per_surface() {
     let harness = Harness::new(with_query_token);
 
+    // `/status` is the admin surface, `/loki/api/v1/labels` the query one. They are
+    // counted apart so a dashboard can tell "someone is probing the read API" from
+    // "someone is probing the operational one".
     harness.get("/status").await;
     harness.get_with_token("/status", "nope").await;
+    harness.get_with_token("/loki/api/v1/labels", "nope").await;
 
     let (_, _, body) = harness.get_with_token("/metrics", "query-secret").await;
-    let line = body
-        .lines()
-        .find(|l| l.starts_with("telemetryd_auth_failures_total{"))
-        .expect("auth failures should be counted");
-    assert!(line.contains(r#"surface="query""#), "{line}");
-    assert!(line.ends_with(" 2"), "{line}");
+    let counted = |surface: &str| {
+        body.lines()
+            .find(|line| {
+                line.starts_with("telemetryd_auth_failures_total{")
+                    && line.contains(&format!("surface=\"{surface}\""))
+            })
+            .unwrap_or_else(|| panic!("no auth failures counted for {surface} in:\n{body}"))
+            .to_owned()
+    };
+
+    assert!(counted("admin").ends_with(" 2"), "{}", counted("admin"));
+    assert!(counted("query").ends_with(" 1"), "{}", counted("query"));
 }
 
 /// `server.max_body_bytes` has to be the limit that applies.
@@ -666,4 +676,61 @@ async fn a_full_ingest_queue_is_refused_with_retry_after() {
     drop(held);
     let (status, _, _) = harness.request(request()).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// The admin token separates "may read telemetry" from "may see the deployment".
+///
+/// `/status` and `/metrics` list every app name, its series count and its share of the
+/// disk, and say whether the instance is running unauthenticated. That is a narrower
+/// audience than everyone who may read logs.
+#[tokio::test]
+async fn the_admin_surface_is_separate_from_the_read_surface() {
+    let harness = Harness::new(|config| {
+        config.auth.query_token = serde_json::from_str(r#""read-token""#).unwrap();
+        config.auth.admin_token = serde_json::from_str(r#""admin-token""#).unwrap();
+    });
+
+    // The read token opens the query APIs and nothing else.
+    let (status, _, _) = harness
+        .get_with_token("/loki/api/v1/labels", "read-token")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    for path in ["/status", "/metrics"] {
+        let (status, _, _) = harness.get_with_token(path, "read-token").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{path} should not open to a read-only token"
+        );
+        let (status, _, _) = harness.get_with_token(path, "admin-token").await;
+        assert_eq!(status, StatusCode::OK, "{path} should open to admin");
+    }
+
+    // And admin is not a superset: it does not silently grant reads.
+    let (status, _, _) = harness
+        .get_with_token("/loki/api/v1/labels", "admin-token")
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// A configuration written before the admin role existed keeps working unchanged.
+#[tokio::test]
+async fn without_an_admin_token_the_query_token_still_opens_status() {
+    let harness = Harness::new(with_query_token);
+
+    for path in ["/status", "/metrics"] {
+        let (status, _, _) = harness.get_with_token(path, "query-secret").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{path} must stay reachable for deployments that never set an admin token"
+        );
+    }
+    let (status, _, _) = harness.get("/status").await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "and still not open to nobody"
+    );
 }

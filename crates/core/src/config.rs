@@ -103,10 +103,22 @@ impl Default for ServerConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct AuthConfig {
-    /// Guards `/v1/*` and `/api/v1/write`.
+    /// **Write.** Guards `/v1/*` and `/api/v1/write`.
     pub ingest_token: TokenSpecs,
-    /// Guards the Prometheus/Loki/Tempo read APIs, plus `/status` and `/metrics`.
+    /// **Read.** Guards the Prometheus, Loki and Tempo read APIs.
     pub query_token: TokenSpecs,
+    /// **Admin.** Guards `/status` and `/metrics`.
+    ///
+    /// Separate from `query_token` because the two answer different questions.
+    /// Reading telemetry tells you about your applications; `/status` and `/metrics`
+    /// tell you about the *deployment* — every app name, its series count, its share
+    /// of the disk, whether the instance is running unauthenticated. Handing that to
+    /// everyone who may read logs is more than is usually meant.
+    ///
+    /// **Unset means `query_token` guards them**, which is what it did before this
+    /// existed, so adding the role breaks no deployment. Setting it is opting into
+    /// the tighter split.
+    pub admin_token: TokenSpecs,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,6 +409,7 @@ const ENV_KEYS: &[(&str, &str)] = &[
     ("TELEMETRYD_SERVER_SHUTDOWN_GRACE", "server.shutdown_grace"),
     ("TELEMETRYD_AUTH_INGEST_TOKEN", "auth.ingest_token"),
     ("TELEMETRYD_AUTH_QUERY_TOKEN", "auth.query_token"),
+    ("TELEMETRYD_AUTH_ADMIN_TOKEN", "auth.admin_token"),
     ("TELEMETRYD_STORAGE_DATA_DIR", "storage.data_dir"),
     ("TELEMETRYD_STORAGE_DISK_BUDGET", "storage.disk_budget"),
     (

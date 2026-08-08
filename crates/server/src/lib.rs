@@ -46,11 +46,20 @@ pub fn router(state: AppState) -> Router {
     // it to work before anyone has configured a token.
     let public = Router::new().route("/healthz", get(routes::healthz));
 
-    // `/status` and `/metrics` sit behind the *query* token: both disclose app names,
-    // volumes and cardinality, which is more than an unauthenticated caller should get.
-    let query = Router::new()
+    // `/status` and `/metrics` describe the deployment rather than the telemetry:
+    // every app name, its series count, its share of the disk, whether the instance is
+    // running unauthenticated. That is a narrower audience than "may read logs", so
+    // they sit behind the admin token — which falls back to the query token when
+    // unset, exactly as they were guarded before the role existed.
+    let admin = Router::new()
         .route("/status", get(routes::status))
         .route("/metrics", get(routes::metrics))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_admin_token,
+        ));
+
+    let query = Router::new()
         // Loki-compatible read APIs (M1).
         .route("/loki/api/v1/query_range", get(loki::query_range))
         .route("/loki/api/v1/labels", get(loki::labels))
@@ -98,6 +107,7 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .merge(public)
+        .merge(admin)
         .merge(query)
         .merge(ingest)
         .layer(axum::middleware::from_fn_with_state(
