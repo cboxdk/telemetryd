@@ -24,7 +24,7 @@ jobs:
       matrix:
         target: [logql, traceql, promql, otlp_logs, remote_write, body_decompression]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # libFuzzer needs nightly, which is why this is a separate workflow rather than a
       # job in CI: the rest of the project is pinned, deliberately.
       - uses: dtolnay/rust-toolchain@nightly

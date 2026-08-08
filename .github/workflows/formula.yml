@@ -51,7 +51,7 @@ jobs:
       # Check out the *tag*, not the default branch: `packaging/telemetryd.rb` is
       # versioned with the code it installs, and publishing the formula as it exists on
       # main would describe a build that tag never produced.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.event.release.tag_name || github.event.workflow_run.head_branch }}
 
