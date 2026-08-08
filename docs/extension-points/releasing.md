@@ -55,15 +55,17 @@ the runner is an installation token scoped to `homebrew-tap` alone that expires 
 hour later.
 
 Set up once: create an App under the `cboxdk` organisation with **Contents: read and
-write** and no webhook, install it on `cboxdk/homebrew-tap` only, then
-
-```bash
-gh secret set HOMEBREW_APP_ID --repo cboxdk/telemetryd
-```
+write** and no webhook, install it on `cboxdk/homebrew-tap` only, put its client id in
+`formula.yml`, and store the private key:
 
 ```bash
 gh secret set HOMEBREW_APP_PRIVATE_KEY --repo cboxdk/telemetryd < app.private-key.pem
 ```
+
+That is the only secret involved. The client id identifies the App rather than
+authenticating as it — any organisation member can read it back from
+`/orgs/cboxdk/installations` — so it lives in the workflow, where it also documents
+which App is doing the publishing.
 
 The private key goes in as the whole PEM, header and footer included — hence `<` a
 file rather than a paste.

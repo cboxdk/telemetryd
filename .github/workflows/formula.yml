@@ -99,7 +99,7 @@ jobs:
 
           if [ -z "${GH_TOKEN}" ]; then
             echo "::warning::No installation token, so cboxdk/homebrew-tap still serves \
-          the previous release. Check HOMEBREW_APP_ID and HOMEBREW_APP_PRIVATE_KEY, or \
+          the previous release. Check HOMEBREW_APP_PRIVATE_KEY, or \
           publish by hand with: python3 scripts/publish-formula.py ${TAG}"
             exit 0
           fi
