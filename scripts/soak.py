@@ -392,12 +392,23 @@ def check_disk_budget(binary: str) -> None:
                     errors += 1
             peak = max(peak, directory_bytes(data_dir) / 1024 / 1024)
 
-        check("no ingest errors while over budget", errors == 0, f"{errors} failed posts")
+        check("no ingest errors while enforcing the budget", errors == 0,
+              f"{errors} failed posts")
+
+        # That the budget path *ran* is checked by its counter, not by catching usage
+        # above the ceiling. Whether the peak ever exceeds the budget depends on whether
+        # the writer can outrun the reaper, which varies with the machine: an earlier
+        # version asserted exactly that and failed on a slower CI runner while the code
+        # was working correctly. Retention here is 30 days against timestamps from now,
+        # so nothing can expire by age and every deletion is the budget's doing.
+        _, metrics = request("/metrics")
+        deleted = 0.0
+        for line in str(metrics).splitlines():
+            if line.startswith('telemetryd_retention_deleted_total{reason="disk_budget"}'):
+                deleted = float(line.rsplit(" ", 1)[1])
+        check("the reaper deleted segments to hold the budget", deleted > 0,
+              f"deleted_by_budget={deleted:.0f}")
         # One segment of slack over the ceiling, not one reaper interval.
-        # If this never crossed the ceiling it proved nothing, so say so rather than
-        # reporting a pass for a code path that did not run.
-        check("the budget was actually exceeded", peak > budget_mib,
-              f"peak {peak:.1f} MB against a {budget_mib} MB budget — test too small")
         check("disk stays near the budget", peak < budget_mib * 1.5,
               f"peak {peak:.1f} MB against a {budget_mib} MB budget ({peak / budget_mib:.2f}x)")
 

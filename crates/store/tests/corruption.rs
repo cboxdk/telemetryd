@@ -196,3 +196,63 @@ fn a_damaged_segment_is_only_diagnosed_once() {
         "the segment should stay marked so later queries skip it cheaply"
     );
 }
+
+/// A segment written by an older build must still load and answer.
+///
+/// `stream_bounds` and the trigram sidecar were both added after v0.11, and an
+/// upgrade path that quietly stops reading existing data is the worst kind of
+/// regression: the store looks healthy and the history is simply gone. Neither
+/// addition bumped the segment format version, so this is what makes that claim
+/// checkable rather than merely intended.
+#[test]
+fn a_segment_from_before_these_fields_existed_still_reads() {
+    let harness = Harness::new();
+    let (store, victim) = store_with_three_segments(&harness);
+    assert_eq!(count(&store), 1500);
+
+    let dir = victim.parent().unwrap();
+
+    // Strip the manifest back to the fields an older build wrote, and delete the
+    // sidecar it would not have produced.
+    let manifest_path = dir.join("manifest.json");
+    let raw = std::fs::read_to_string(&manifest_path).unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let object = manifest.as_object_mut().unwrap();
+    assert!(
+        object.remove("stream_bounds").is_some(),
+        "the field should be there to remove, or this test has stopped testing anything"
+    );
+    std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+    let sidecar = dir.join("text.bloom");
+    assert!(sidecar.exists(), "expected a trigram sidecar to remove");
+    std::fs::remove_file(&sidecar).unwrap();
+
+    let store = harness.open();
+    assert_eq!(
+        count(&store),
+        1500,
+        "an older segment must still return all of its rows"
+    );
+
+    // And a substring filter must still be correct without an index to prune with.
+    let matchers = [LabelMatcher::equal("app", "checkout")];
+    let found = store
+        .scan(
+            Scan {
+                start_nanos: 0,
+                end_nanos: u64::MAX,
+                limit: 0,
+                order: Order::Ascending,
+                exact_key: None,
+                columns: None,
+                required_text: Some("line 7"),
+            },
+            &matchers,
+            &|record: &LogRecord| record.body.contains("line 7"),
+        )
+        .unwrap();
+    assert!(
+        !found.is_empty(),
+        "a segment with no trigram index must not be pruned away"
+    );
+}
