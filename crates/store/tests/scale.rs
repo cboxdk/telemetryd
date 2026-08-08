@@ -809,10 +809,14 @@ fn per_app_usage_is_reported_and_attributed() {
     assert_eq!(usage[0].app, "checkout");
 
     // Bytes are apportioned by row share, so the ratio should track the row ratio
-    // rather than being exact. Three to one, within a wide tolerance.
-    let ratio = by_app("checkout").estimated_bytes as f64 / by_app("cart").estimated_bytes as f64;
+    // rather than being exact. Three to one, checked in integers to keep the
+    // assertion about attribution rather than about floating point.
+    let (big, small) = (
+        by_app("checkout").estimated_bytes,
+        by_app("cart").estimated_bytes,
+    );
     assert!(
-        (2.0..4.0).contains(&ratio),
-        "expected bytes to track rows, got a ratio of {ratio}"
+        big >= small * 2 && big <= small * 4,
+        "expected bytes to track rows (3:1), got {big} against {small}"
     );
 }
