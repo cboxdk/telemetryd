@@ -46,6 +46,10 @@ pub struct AppState {
     ingest_permits: Arc<Semaphore>,
     /// Cbox ID token validation. Disabled unless an issuer is configured.
     pub oidc: Arc<crate::oidc::Oidc>,
+    /// Relay client credentials, each carrying the app it is allowed to be (ADR-013).
+    pub relay_clients: Arc<telemetryd_core::ClientTokens>,
+    /// Forwarding upstream. `None` unless `relay.upstream` is set.
+    pub relay: Option<Arc<crate::relay::Relay>>,
     tail: broadcast::Sender<Arc<LogRecord>>,
 }
 
@@ -62,6 +66,19 @@ impl AppState {
         let (tail, _) = broadcast::channel(TAIL_BUFFER);
         let queue_depth = usize::try_from(config.limits.ingest_queue_depth).unwrap_or(usize::MAX);
         let oidc = Arc::new(crate::oidc::Oidc::new(config.auth.oidc.clone()));
+
+        let mut clients = Vec::with_capacity(config.relay.client.len());
+        for client in &config.relay.client {
+            clients.push((client.token.resolve_digest()?, client.app.clone()));
+        }
+        let relay_clients = Arc::new(telemetryd_core::ClientTokens::new(clients));
+
+        let relay = config.relay.is_enabled().then(|| {
+            Arc::new(crate::relay::Relay::new(
+                config.relay.clone(),
+                store.data_dir().root(),
+            ))
+        });
         Ok(Self {
             ingest_tokens: Arc::new(config.auth.ingest_token.resolve()?),
             query_tokens: Arc::new(config.auth.query_token.resolve()?),
@@ -77,6 +94,8 @@ impl AppState {
             started_at: OffsetDateTime::now_utc(),
             ingest_permits: Arc::new(Semaphore::new(queue_depth)),
             oidc,
+            relay_clients,
+            relay,
             tail,
         })
     }

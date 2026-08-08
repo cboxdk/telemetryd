@@ -12,6 +12,7 @@ pub mod maintenance;
 pub mod metrics;
 pub mod oidc;
 pub mod prometheus;
+pub mod relay;
 pub mod routes;
 pub mod state;
 pub mod tempo;
@@ -202,10 +203,21 @@ pub async fn serve(config: Arc<Config>, store: Arc<Store>) -> Result<()> {
         }
     }
 
+    if let Some(relay) = &state.relay {
+        tracing::info!(
+            upstream = %config.relay.upstream,
+            trust_client_identity = config.relay.trust_client_identity,
+            "relay mode: forwarding sealed segments upstream"
+        );
+        let _ = relay;
+    }
+
     let maintenance = maintenance::Maintenance::start_with(
         &store,
         config.storage.wal_sync_interval,
         Some(Arc::clone(&state.oidc)),
+        state.relay.clone(),
+        config.relay.interval,
     );
 
     // `server.shutdown_grace` bounds the drain. Without a bound, one client holding a

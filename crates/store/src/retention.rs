@@ -9,7 +9,7 @@
 //! failure mode here is deleting the wrong thing, and that is much easier to test when
 //! nothing has to touch a disk.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -33,23 +33,32 @@ pub struct Plan {
     pub by_age: Vec<Candidate>,
     /// Deleted early because the disk budget was exceeded.
     pub by_budget: Vec<Candidate>,
+    /// Deleted despite not having been forwarded yet, because the budget could not be
+    /// held any other way and the policy is `drop_oldest`.
+    ///
+    /// Always data loss. Separated from `by_budget` so it can be counted, logged and
+    /// alerted on as its own thing — "we deleted expired data" and "we deleted data
+    /// that never reached its destination" should never share a number.
+    pub undelivered_dropped: Vec<Candidate>,
+    /// The budget could not be held without deleting undelivered data, and the policy
+    /// said not to.
+    pub blocked_by_undelivered: bool,
 }
 
 impl Plan {
     pub fn is_empty(&self) -> bool {
-        self.by_age.is_empty() && self.by_budget.is_empty()
+        self.by_age.is_empty() && self.by_budget.is_empty() && self.undelivered_dropped.is_empty()
     }
 
     pub fn bytes_freed(&self) -> u64 {
-        self.by_age
-            .iter()
-            .chain(&self.by_budget)
-            .map(|c| c.bytes)
-            .sum()
+        self.all().map(|c| c.bytes).sum()
     }
 
     pub fn all(&self) -> impl Iterator<Item = &Candidate> {
-        self.by_age.iter().chain(&self.by_budget)
+        self.by_age
+            .iter()
+            .chain(&self.by_budget)
+            .chain(&self.undelivered_dropped)
     }
 }
 
@@ -58,12 +67,27 @@ impl Plan {
 /// Age first, then budget on whatever is left — so a run that is over budget deletes
 /// genuinely expired data before it starts eating into data the operator asked to
 /// keep.
+/// Segments held back from the reaper because a relay has not forwarded them yet, and
+/// what to do when the budget cannot be held without them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Undelivered<'a> {
+    pub ids: Option<&'a BTreeSet<String>>,
+    pub drop_when_full: bool,
+}
+
+impl Undelivered<'_> {
+    fn protects(&self, id: &str) -> bool {
+        self.ids.is_some_and(|ids| ids.contains(id))
+    }
+}
+
 pub fn plan(
     candidates: &[Candidate],
     now_nanos: u64,
     retention: &BTreeMap<Signal, Duration>,
     disk_budget: u64,
     non_segment_bytes: u64,
+    undelivered: Undelivered<'_>,
 ) -> Plan {
     let mut plan = Plan::default();
     let mut surviving: Vec<&Candidate> = Vec::new();
@@ -76,7 +100,10 @@ pub fn plan(
         let cutoff = now_nanos.saturating_sub(u64::try_from(window.as_nanos()).unwrap_or(u64::MAX));
         // Strictly older: a segment whose newest record sits exactly on the cutoff is
         // still inside the window.
-        if candidate.max_time_nanos < cutoff {
+        // Expired *and* undelivered still survives. Retention answers "how long do we
+        // keep this", not "may we lose it before it arrives" — and a segment the
+        // reaper removes before it ships is gone with no trace anywhere.
+        if candidate.max_time_nanos < cutoff && !undelivered.protects(&candidate.id) {
             plan.by_age.push(candidate.clone());
         } else {
             surviving.push(candidate);
@@ -98,12 +125,38 @@ pub fn plan(
             .then_with(|| a.id.cmp(&b.id))
     });
 
-    for candidate in surviving {
+    // Delivered data first: given a choice between losing something upstream already
+    // has and something it has never seen, the copy upstream holds is the cheaper one.
+    let (protected, free): (Vec<&Candidate>, Vec<&Candidate>) = surviving
+        .into_iter()
+        .partition(|candidate| undelivered.protects(&candidate.id));
+
+    for candidate in free {
+        if used <= disk_budget {
+            return plan;
+        }
+        used = used.saturating_sub(candidate.bytes);
+        plan.by_budget.push(candidate.clone());
+    }
+
+    if used <= disk_budget {
+        return plan;
+    }
+
+    if !undelivered.drop_when_full {
+        // Nothing left that may be deleted. The caller stops accepting writes; the
+        // alternative is deleting telemetry that never reached its destination, and
+        // that has to be an explicit choice rather than what happens by default.
+        plan.blocked_by_undelivered = true;
+        return plan;
+    }
+
+    for candidate in protected {
         if used <= disk_budget {
             break;
         }
         used = used.saturating_sub(candidate.bytes);
-        plan.by_budget.push(candidate.clone());
+        plan.undelivered_dropped.push(candidate.clone());
     }
 
     plan
@@ -119,6 +172,14 @@ pub struct ReaperReport {
     /// True when the run finished still over budget — the reaper freed everything it
     /// could and it was not enough.
     pub still_over_budget: bool,
+    /// Segments deleted although a relay had not forwarded them. Always data loss, and
+    /// counted apart from the budget deletions because it is a different event.
+    #[serde(default)]
+    pub dropped_undelivered: u64,
+    /// The budget is full of unforwarded data and the policy forbids deleting it, so
+    /// ingest is being refused until upstream drains.
+    #[serde(default)]
+    pub blocked_by_undelivered: bool,
     pub last_run_unix_nanos: u64,
 }
 
@@ -158,6 +219,7 @@ mod tests {
             &retention(&[(Signal::Logs, 7)]),
             u64::MAX,
             0,
+            Undelivered::default(),
         );
 
         assert_eq!(plan.by_age.len(), 1);
@@ -181,6 +243,7 @@ mod tests {
             &retention(&[(Signal::Logs, 7)]),
             u64::MAX,
             0,
+            Undelivered::default(),
         );
         assert!(plan.is_empty());
     }
@@ -192,7 +255,14 @@ mod tests {
             candidate("metric", Signal::Metrics, 10 * DAY, 100),
         ];
         let policy = retention(&[(Signal::Logs, 7), (Signal::Metrics, 30)]);
-        let plan = plan(&candidates, NOW, &policy, u64::MAX, 0);
+        let plan = plan(
+            &candidates,
+            NOW,
+            &policy,
+            u64::MAX,
+            0,
+            Undelivered::default(),
+        );
 
         assert_eq!(plan.by_age.len(), 1);
         assert_eq!(plan.by_age[0].signal, Signal::Logs);
@@ -206,7 +276,14 @@ mod tests {
             candidate("middle", Signal::Logs, 3 * HOUR, 400),
         ];
         // 1200 bytes in use, budget 900 -> must free at least 300.
-        let plan = plan(&candidates, NOW, &retention(&[]), 900, 0);
+        let plan = plan(
+            &candidates,
+            NOW,
+            &retention(&[]),
+            900,
+            0,
+            Undelivered::default(),
+        );
 
         assert!(plan.by_age.is_empty());
         assert_eq!(plan.by_budget.len(), 1);
@@ -223,7 +300,14 @@ mod tests {
             candidate("wanted", Signal::Logs, HOUR, 400),
         ];
         // Deleting the expired segment alone brings usage to 400, under the budget.
-        let plan = plan(&candidates, NOW, &retention(&[(Signal::Logs, 7)]), 450, 0);
+        let plan = plan(
+            &candidates,
+            NOW,
+            &retention(&[(Signal::Logs, 7)]),
+            450,
+            0,
+            Undelivered::default(),
+        );
 
         assert_eq!(plan.by_age.len(), 1);
         assert!(
@@ -237,8 +321,25 @@ mod tests {
         let candidates = vec![candidate("only", Signal::Logs, HOUR, 100)];
 
         // Segments alone fit; with the WAL they do not.
-        assert!(plan(&candidates, NOW, &retention(&[]), 500, 0).is_empty());
-        let with_wal = plan(&candidates, NOW, &retention(&[]), 500, 450);
+        assert!(
+            plan(
+                &candidates,
+                NOW,
+                &retention(&[]),
+                500,
+                0,
+                Undelivered::default()
+            )
+            .is_empty()
+        );
+        let with_wal = plan(
+            &candidates,
+            NOW,
+            &retention(&[]),
+            500,
+            450,
+            Undelivered::default(),
+        );
         assert_eq!(with_wal.by_budget.len(), 1);
     }
 
@@ -251,7 +352,8 @@ mod tests {
                 NOW,
                 &retention(&[(Signal::Logs, 7)]),
                 10_000,
-                0
+                0,
+                Undelivered::default(),
             )
             .is_empty()
         );
@@ -265,7 +367,14 @@ mod tests {
         ];
         // Non-segment bytes alone blow the budget; deleting segments cannot fix it,
         // but the reaper must still free what it can and let the caller alarm.
-        let plan = plan(&candidates, NOW, &retention(&[]), 50, 1000);
+        let plan = plan(
+            &candidates,
+            NOW,
+            &retention(&[]),
+            50,
+            1000,
+            Undelivered::default(),
+        );
         assert_eq!(plan.by_budget.len(), 2);
         assert_eq!(plan.bytes_freed(), 200);
     }
@@ -279,6 +388,7 @@ mod tests {
             &retention(&[(Signal::Logs, 7)]),
             u64::MAX,
             0,
+            Undelivered::default(),
         );
         assert!(
             plan.is_empty(),
@@ -292,12 +402,120 @@ mod tests {
             candidate("expired", Signal::Logs, 30 * DAY, 500),
             candidate("fresh", Signal::Logs, HOUR, 500),
         ];
-        let plan = plan(&candidates, NOW, &retention(&[(Signal::Logs, 7)]), 1, 0);
+        let plan = plan(
+            &candidates,
+            NOW,
+            &retention(&[(Signal::Logs, 7)]),
+            1,
+            0,
+            Undelivered::default(),
+        );
 
         let mut ids: Vec<&str> = plan.all().map(|c| c.id.as_str()).collect();
         let before = ids.len();
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), before, "a segment appeared in both delete lists");
+    }
+
+    fn protected(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    /// The silent-data-loss guard.
+    ///
+    /// Retention answers "how long do we keep this", not "may we lose it before it
+    /// arrives". A segment the reaper deletes before a relay ships it is gone with no
+    /// trace at either end — nothing upstream ever saw it, and nothing here remembers
+    /// it existed.
+    #[test]
+    fn expired_but_undelivered_data_is_not_deleted() {
+        let candidates = vec![
+            candidate("old-and-sent", Signal::Logs, 8 * 24 * HOUR, 100),
+            candidate("old-and-unsent", Signal::Logs, 8 * 24 * HOUR, 100),
+        ];
+        let held = protected(&["old-and-unsent"]);
+        let plan = plan(
+            &candidates,
+            NOW,
+            &retention(&[(Signal::Logs, 7)]),
+            u64::MAX,
+            0,
+            Undelivered {
+                ids: Some(&held),
+                drop_when_full: true,
+            },
+        );
+
+        assert_eq!(plan.by_age.len(), 1);
+        assert_eq!(plan.by_age[0].id, "old-and-sent");
+        assert!(plan.undelivered_dropped.is_empty());
+    }
+
+    /// Given a choice, lose the copy that exists in two places.
+    #[test]
+    fn the_budget_eats_delivered_data_before_undelivered() {
+        let candidates = vec![
+            candidate("sent", Signal::Logs, HOUR, 100),
+            candidate("unsent", Signal::Logs, 2 * HOUR, 100),
+        ];
+        let held = protected(&["unsent"]);
+        let plan = plan(
+            &candidates,
+            NOW,
+            &retention(&[]),
+            150,
+            0,
+            Undelivered {
+                ids: Some(&held),
+                drop_when_full: true,
+            },
+        );
+
+        // "unsent" is older, so an ordering-only reaper would take it first.
+        assert_eq!(plan.by_budget.len(), 1);
+        assert_eq!(plan.by_budget[0].id, "sent");
+        assert!(plan.undelivered_dropped.is_empty());
+    }
+
+    #[test]
+    fn drop_oldest_loses_undelivered_data_only_as_a_last_resort() {
+        let candidates = vec![candidate("unsent", Signal::Logs, HOUR, 500)];
+        let held = protected(&["unsent"]);
+        let plan = plan(
+            &candidates,
+            NOW,
+            &retention(&[]),
+            100,
+            0,
+            Undelivered {
+                ids: Some(&held),
+                drop_when_full: true,
+            },
+        );
+
+        assert_eq!(plan.undelivered_dropped.len(), 1);
+        assert!(!plan.blocked_by_undelivered);
+    }
+
+    #[test]
+    fn reject_keeps_the_data_and_says_so_instead() {
+        let candidates = vec![candidate("unsent", Signal::Logs, HOUR, 500)];
+        let held = protected(&["unsent"]);
+        let plan = plan(
+            &candidates,
+            NOW,
+            &retention(&[]),
+            100,
+            0,
+            Undelivered {
+                ids: Some(&held),
+                drop_when_full: false,
+            },
+        );
+
+        // Nothing deleted, and the caller is told why so it can stop accepting writes.
+        assert!(plan.is_empty());
+        assert!(plan.blocked_by_undelivered);
     }
 }

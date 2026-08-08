@@ -283,7 +283,20 @@ impl Store {
         self.logs.sealed_count() + self.traces.sealed_count() + self.metrics.sealed_count()
     }
 
+    /// Reap with nothing held back. What a store that forwards nowhere does.
     pub fn run_retention(&self) -> Result<ReaperReport> {
+        self.run_retention_protecting(retention::Undelivered::default())
+    }
+
+    /// Reap while holding back segments a relay has not forwarded yet (ADR-013).
+    ///
+    /// The store does not know what a relay is, and should not: it is handed the ids
+    /// to protect. That keeps delivery policy in the layer that owns delivery, and
+    /// keeps this function testable without a network.
+    pub fn run_retention_protecting(
+        &self,
+        undelivered: retention::Undelivered<'_>,
+    ) -> Result<ReaperReport> {
         let usage = self.data_dir.usage()?;
 
         // Every signal contributes candidates to one plan, because the disk budget is
@@ -311,6 +324,7 @@ impl Store {
             &self.retention_windows(),
             self.disk_budget(),
             non_segment_bytes,
+            undelivered,
         );
 
         let mut report = ReaperReport {
@@ -329,6 +343,35 @@ impl Store {
                 report.deleted_by_budget += 1;
                 report.bytes_freed += candidate.bytes;
             }
+        }
+        for candidate in &plan.undelivered_dropped {
+            if self.delete_segment(candidate)? {
+                report.dropped_undelivered += 1;
+                report.bytes_freed += candidate.bytes;
+            }
+        }
+        report.blocked_by_undelivered = plan.blocked_by_undelivered;
+
+        if report.dropped_undelivered > 0 {
+            // Telemetry that never reached its destination and now never will. Louder
+            // than the budget warning below, because the budget one costs a copy and
+            // this one costs the only copy.
+            tracing::error!(
+                segments = report.dropped_undelivered,
+                budget_bytes = self.disk_budget(),
+                "deleted segments that were never forwarded upstream: the disk budget \
+                 could not be held any other way. Raise storage.disk_budget, or set \
+                 relay.when_full = \"reject\" to push back on clients instead of \
+                 losing their telemetry."
+            );
+        }
+        if report.blocked_by_undelivered {
+            tracing::error!(
+                budget_bytes = self.disk_budget(),
+                "the disk budget is full of telemetry that has not been forwarded \
+                 upstream, and relay.when_full = \"reject\", so ingest is being \
+                 refused. Fix the upstream, or raise storage.disk_budget."
+            );
         }
 
         if report.deleted_by_age > 0 {

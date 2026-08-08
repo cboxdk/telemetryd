@@ -13,6 +13,18 @@ use crate::error::ApiError;
 use crate::oidc::Rejected;
 use crate::state::AppState;
 
+/// Who a request turned out to be, decided by the credential rather than the payload.
+///
+/// Inserted into the request's extensions by the guard, because the identity is
+/// established where the credential is checked and needed where the records are
+/// decoded. Passing it any other way would mean the ingest handler re-deriving it, and
+/// two places deciding who someone is, is one too many.
+#[derive(Debug, Clone)]
+pub struct ClientIdentity {
+    /// The `app` this client is allowed to be.
+    pub app: String,
+}
+
 /// Which set of tokens guards a surface. The value doubles as the `surface` label on
 /// `telemetryd_auth_failures_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,7 +103,7 @@ async fn guard(
 ) -> Result<Response, ApiError> {
     // An unguarded surface stays unguarded only while *nothing* guards it. Turning on
     // Cbox ID must not leave a surface open just because its static token is unset.
-    if tokens.is_empty() && !state.oidc.is_enabled() {
+    if tokens.is_empty() && !state.oidc.is_enabled() && state.relay_clients.is_empty() {
         return Ok(next.run(request).await);
     }
 
@@ -100,6 +112,18 @@ async fn guard(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(bearer);
+
+    // A relay client's credential is checked first and identifies it at the same
+    // time: one lookup answers both "may you write" and "as whom".
+    if surface == Surface::Ingest
+        && let Some(token) = presented
+        && let Some(app) = state.relay_clients.identify(token)
+    {
+        let app = app.to_owned();
+        let mut request = request;
+        request.extensions_mut().insert(ClientIdentity { app });
+        return Ok(next.run(request).await);
+    }
 
     match presented {
         Some(token) if tokens.verify(token) => Ok(next.run(request).await),
@@ -123,8 +147,21 @@ async fn guard(
                 }
             }
             match outcome {
-                Ok(subject) => {
-                    tracing::debug!(surface = surface.as_str(), %subject, "authorized by Cbox ID");
+                Ok(authorized) => {
+                    tracing::debug!(
+                        surface = surface.as_str(),
+                        subject = %authorized.subject,
+                        "authorized by Cbox ID"
+                    );
+                    let mut request = request;
+                    // `client_id` names the application the token was issued to, and
+                    // the issuer reserves it against being overwritten. `sub` is a
+                    // *user*, which is not what a record's `app` label means.
+                    if let Some(client_id) = authorized.client_id {
+                        request
+                            .extensions_mut()
+                            .insert(ClientIdentity { app: client_id });
+                    }
                     Ok(next.run(request).await)
                 }
                 Err(reason) => {

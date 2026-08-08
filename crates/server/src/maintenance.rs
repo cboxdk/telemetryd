@@ -40,9 +40,108 @@ pub struct Maintenance {
 }
 
 impl Maintenance {
+    /// Expiry by age, the disk budget, and whatever a relay still owes upstream.
+    fn spawn_retention(
+        tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+        store: &Arc<Store>,
+        relay: Option<Arc<crate::relay::Relay>>,
+    ) {
+        let store = Arc::clone(store);
+        let reaper_relay = relay;
+        tasks.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(RETENTION_TICK);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut seen_seals = store.sealed_count();
+            let mut last_run = tokio::time::Instant::now();
+            loop {
+                ticker.tick().await;
+
+                // A full pass walks the data directory. Doing that every second
+                // would be wasteful, and skipping it until a fixed minute has
+                // passed is how the budget got overshot — so the trigger is the
+                // thing that actually changes usage: a segment being sealed.
+                let seals = store.sealed_count();
+                let due = seals != seen_seals || last_run.elapsed() >= RETENTION_FLOOR;
+                if !due {
+                    continue;
+                }
+                seen_seals = seals;
+                last_run = tokio::time::Instant::now();
+
+                let store = Arc::clone(&store);
+                // What the relay has not forwarded is held back from the reaper.
+                // Deleting it would lose telemetry that never reached anywhere,
+                // and nothing downstream would ever know it existed.
+                let protected = reaper_relay.clone();
+                let result = tokio::task::spawn_blocking(move || match protected {
+                    Some(relay) => {
+                        let mut ids = std::collections::BTreeSet::new();
+                        for signal in [
+                            telemetryd_core::Signal::Logs,
+                            telemetryd_core::Signal::Traces,
+                            telemetryd_core::Signal::Metrics,
+                        ] {
+                            ids.extend(relay.undelivered(&store, signal));
+                        }
+                        store.run_retention_protecting(telemetryd_store::retention::Undelivered {
+                            ids: Some(&ids),
+                            drop_when_full: relay.drops_when_full(),
+                        })
+                    }
+                    None => store.run_retention(),
+                })
+                .await;
+                match result {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::error!(error = %e, "retention pass failed"),
+                    Err(e) => tracing::error!(error = %e, "retention task panicked"),
+                }
+            }
+        }));
+    }
+
+    /// The forwarding loop, split out so `start_with` stays readable.
+    fn spawn_relay(
+        tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+        store: &Arc<Store>,
+        relay: Option<Arc<crate::relay::Relay>>,
+        relay_interval: Duration,
+    ) {
+        let Some(relay) = relay else {
+            return;
+        };
+
+        let store = Arc::clone(store);
+        let interval = if relay_interval.is_zero() {
+            Duration::from_secs(30)
+        } else {
+            relay_interval
+        };
+        tasks.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let (relay, store) = (Arc::clone(&relay), Arc::clone(&store));
+                // Bounded per pass so one enormous backlog cannot hold the
+                // blocking pool for minutes; the next tick continues from the
+                // cursor, which is exactly what the cursor is for.
+                let result = tokio::task::spawn_blocking(move || relay.ship(&store, 32)).await;
+                match result {
+                    Ok(Ok(0)) => {}
+                    Ok(Ok(shipped)) => {
+                        tracing::debug!(segments = shipped, "forwarded upstream");
+                    }
+                    Ok(Err(e)) => tracing::warn!(error = %e, "relay pass failed"),
+                    Err(e) => tracing::error!(error = %e, "relay task panicked"),
+                }
+            }
+        }));
+    }
+
     /// Start the maintenance tasks against `store`.
     pub fn start(store: &Arc<Store>, wal_sync_interval: Duration) -> Self {
-        Self::start_with(store, wal_sync_interval, None)
+        Self::start_with(store, wal_sync_interval, None, None, Duration::ZERO)
     }
 
     /// As [`Self::start`], plus refreshing the Cbox ID key set when one is configured.
@@ -50,6 +149,8 @@ impl Maintenance {
         store: &Arc<Store>,
         wal_sync_interval: Duration,
         oidc: Option<Arc<crate::oidc::Oidc>>,
+        relay: Option<Arc<crate::relay::Relay>>,
+        relay_interval: Duration,
     ) -> Self {
         let mut tasks = Vec::new();
 
@@ -122,39 +223,9 @@ impl Maintenance {
             }));
         }
 
-        // Retention: expire by age, then enforce the disk budget.
-        {
-            let store = Arc::clone(store);
-            tasks.push(tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(RETENTION_TICK);
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                let mut seen_seals = store.sealed_count();
-                let mut last_run = tokio::time::Instant::now();
-                loop {
-                    ticker.tick().await;
+        Self::spawn_retention(&mut tasks, store, relay.clone());
 
-                    // A full pass walks the data directory. Doing that every second
-                    // would be wasteful, and skipping it until a fixed minute has
-                    // passed is how the budget got overshot — so the trigger is the
-                    // thing that actually changes usage: a segment being sealed.
-                    let seals = store.sealed_count();
-                    let due = seals != seen_seals || last_run.elapsed() >= RETENTION_FLOOR;
-                    if !due {
-                        continue;
-                    }
-                    seen_seals = seals;
-                    last_run = tokio::time::Instant::now();
-
-                    let store = Arc::clone(&store);
-                    let result = tokio::task::spawn_blocking(move || store.run_retention()).await;
-                    match result {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(e)) => tracing::error!(error = %e, "retention pass failed"),
-                        Err(e) => tracing::error!(error = %e, "retention task panicked"),
-                    }
-                }
-            }));
-        }
+        Self::spawn_relay(&mut tasks, store, relay, relay_interval);
 
         Self { tasks }
     }

@@ -15,6 +15,7 @@ use telemetryd_ingest::otlp_metrics;
 use telemetryd_ingest::remote_write;
 use telemetryd_ingest::traces;
 
+use crate::auth::ClientIdentity;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -42,12 +43,58 @@ pub struct PartialSuccess {
     pub error_message: String,
 }
 
+/// Overwrite what a client claimed to be with what its credential says it is.
+///
+/// The security boundary of relay mode (ADR-013). `app` arrives in the payload, which
+/// means the least trusted party picks it — fine when every writer is something you
+/// deployed, and not fine when the writer is a mobile binary anyone can extract a
+/// token from. Every alert, dashboard and retention rule downstream is keyed on this
+/// label.
+///
+/// Does nothing unless relay mode is on with `trust_client_identity = false`, and
+/// nothing when the request carried no identity — an unidentified writer cannot be
+/// stamped, and config validation refuses that combination at startup rather than
+/// leaving it to be discovered here.
+fn stamp<'a, I>(state: &AppState, identity: Option<&ClientIdentity>, streams: I)
+where
+    I: Iterator<Item = &'a mut telemetryd_core::Labels>,
+{
+    if state.config.relay.trust_client_identity || !state.config.relay.is_enabled() {
+        return;
+    }
+    let Some(identity) = identity else {
+        return;
+    };
+    let mut stamped = 0u64;
+    for stream in streams {
+        if stream.get(telemetryd_core::record::APP_LABEL) != Some(identity.app.as_str()) {
+            stamped += 1;
+        }
+        stream.insert(
+            telemetryd_core::record::APP_LABEL.to_owned(),
+            identity.app.clone(),
+        );
+    }
+    if stamped > 0 {
+        // Worth counting: a client that keeps claiming someone else's app is either
+        // misconfigured or probing, and either way you want to see it before it is a
+        // support ticket.
+        state.metrics.add(
+            "telemetryd_relay_identity_overridden_total",
+            &[("app", identity.app.as_str())],
+            stamped,
+        );
+    }
+}
+
 /// `POST /v1/logs`
 pub async fn otlp_logs(
     State(state): State<AppState>,
+    identity: Option<axum::Extension<ClientIdentity>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    let identity = identity.map(|axum::Extension(identity)| identity);
     // Bound concurrent ingest. A rejected request is a signal the producer can act on
     // — back off, batch harder — where an accepted one that queues behind a hundred
     // others is the unbounded buffering `limits.ingest_queue_depth` exists to prevent.
@@ -82,6 +129,15 @@ pub async fn otlp_logs(
             Error::BadRequest(format!("could not decode the OTLP logs payload: {e}"))
         })?
     };
+
+    // Before the tail, before storage, before the per-app counters: everything
+    // downstream must see the identity the credential proved, never the one the
+    // payload asked for.
+    stamp(
+        &state,
+        identity.as_ref(),
+        decoded.records.iter_mut().map(|record| &mut record.stream),
+    );
 
     for rejection in &decoded.rejections {
         state.metrics.incr(
@@ -142,9 +198,11 @@ pub async fn otlp_logs(
 /// `POST /v1/traces`
 pub async fn otlp_traces(
     State(state): State<AppState>,
+    identity: Option<axum::Extension<ClientIdentity>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    let identity = identity.map(|axum::Extension(identity)| identity);
     // Bound concurrent ingest. A rejected request is a signal the producer can act on
     // — back off, batch harder — where an accepted one that queues behind a hundred
     // others is the unbounded buffering `limits.ingest_queue_depth` exists to prevent.
@@ -186,6 +244,12 @@ pub async fn otlp_traces(
         );
     }
 
+    stamp(
+        &state,
+        identity.as_ref(),
+        decoded.records.iter_mut().map(|record| &mut record.stream),
+    );
+
     if !decoded.records.is_empty() {
         let store = std::sync::Arc::clone(&state.store);
         let records = decoded.records.clone();
@@ -218,9 +282,11 @@ pub async fn otlp_traces(
 /// `POST /v1/metrics`
 pub async fn otlp_metrics(
     State(state): State<AppState>,
+    identity: Option<axum::Extension<ClientIdentity>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    let identity = identity.map(|axum::Extension(identity)| identity);
     // Bound concurrent ingest. A rejected request is a signal the producer can act on
     // — back off, batch harder — where an accepted one that queues behind a hundred
     // others is the unbounded buffering `limits.ingest_queue_depth` exists to prevent.
@@ -256,15 +322,23 @@ pub async fn otlp_metrics(
         })?
     };
 
+    let mut decoded = decoded;
+    stamp(
+        &state,
+        identity.as_ref(),
+        decoded.records.iter_mut().map(|sample| &mut sample.series),
+    );
     store_samples(&state, decoded).await
 }
 
 /// `POST /api/v1/write` — Prometheus remote_write.
 pub async fn remote_write(
     State(state): State<AppState>,
+    identity: Option<axum::Extension<ClientIdentity>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    let identity = identity.map(|axum::Extension(identity)| identity);
     // Bound concurrent ingest. A rejected request is a signal the producer can act on
     // — back off, batch harder — where an accepted one that queues behind a hundred
     // others is the unbounded buffering `limits.ingest_queue_depth` exists to prevent.
@@ -306,6 +380,13 @@ pub async fn remote_write(
             );
         })?
     };
+
+    let mut decoded = decoded;
+    stamp(
+        &state,
+        identity.as_ref(),
+        decoded.records.iter_mut().map(|sample| &mut sample.series),
+    );
 
     // remote_write has no partial-success envelope; Prometheus expects 204 on success
     // and treats anything else as a failure worth retrying.

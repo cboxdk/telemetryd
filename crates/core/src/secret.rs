@@ -140,6 +140,17 @@ impl<'de> Deserialize<'de> for TokenSpecs {
     }
 }
 
+impl Secret {
+    /// Resolve the indirection and hash the result, ready for comparison.
+    ///
+    /// The plaintext exists only inside this call: it is hashed and dropped, so a
+    /// relay client's credential is never held in memory in a form that could be
+    /// logged.
+    pub fn resolve_digest(&self) -> Result<[u8; 32]> {
+        Ok(digest(&self.resolve()?))
+    }
+}
+
 /// Resolved, pre-hashed tokens ready for request-time comparison.
 #[derive(Clone, Default)]
 pub struct TokenSet(Vec<[u8; 32]>);
@@ -162,6 +173,68 @@ impl TokenSet {
             matched |= known.ct_eq(&candidate);
         }
         matched.into()
+    }
+}
+
+/// Ingest credentials that each carry a fixed identity (ADR-013).
+///
+/// A relay decides what a client *is* from the credential it presented, so the lookup
+/// answers "which app" rather than "was this valid at all".
+///
+/// Every entry is compared on every call. Returning as soon as one matches would make
+/// the response time depend on a token's position in the list, and an attacker who can
+/// measure that learns how close a guess is — the same reason `TokenSet::verify`
+/// accumulates instead of returning early.
+#[derive(Clone, Default)]
+pub struct ClientTokens(Vec<([u8; 32], String)>);
+
+impl ClientTokens {
+    pub fn new(clients: Vec<([u8; 32], String)>) -> Self {
+        Self(clients)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The app this credential is registered as, if it is one of ours.
+    pub fn identify(&self, presented: &str) -> Option<&str> {
+        let candidate = digest(presented);
+        let mut found: Option<&str> = None;
+        for (known, app) in &self.0 {
+            let hit: bool = known.ct_eq(&candidate).into();
+            if hit {
+                found = Some(app);
+            }
+        }
+        found
+    }
+
+    /// Whether this credential is one of ours at all, in constant time.
+    pub fn verify(&self, presented: &str) -> bool {
+        let candidate = digest(presented);
+        let mut matched = subtle::Choice::from(0u8);
+        for (known, _) in &self.0 {
+            matched |= known.ct_eq(&candidate);
+        }
+        matched.into()
+    }
+}
+
+impl fmt::Debug for ClientTokens {
+    /// App names only. They are not secret — they end up on every record — but the
+    /// digests have no business in a log line either.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientTokens")
+            .field(
+                "apps",
+                &self.0.iter().map(|(_, app)| app).collect::<Vec<_>>(),
+            )
+            .finish()
     }
 }
 

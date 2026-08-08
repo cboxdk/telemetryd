@@ -41,7 +41,10 @@ impl IntoResponse for ApiError {
             | Error::StorageVersionMismatch { .. }
             | Error::DataDirLocked { .. }
             | Error::Io { .. }
-            | Error::WalCorrupt { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            | Error::WalCorrupt { .. }
+            // Never reaches a client: relay delivery runs on the maintenance loop, not
+            // in a request. Listed so adding a variant stays a compile error.
+            | Error::RelayDelivery(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
         // Log genuine faults only. A 501 is a 5xx by status but a deliberate,

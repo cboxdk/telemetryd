@@ -38,6 +38,9 @@ pub enum Error {
     #[error("a configured token resolved to an empty value")]
     SecretEmpty,
 
+    #[error("relay delivery failed: {0}")]
+    RelayDelivery(String),
+
     // ---- request handling ----
     #[error("authentication required")]
     Unauthorized,
@@ -137,6 +140,7 @@ impl Error {
             Self::StorageVersionMismatch { .. } => "storage_version_mismatch",
             Self::DataDirLocked { .. } => "data_dir_locked",
             Self::Io { .. } => "io_error",
+            Self::RelayDelivery(_) => "relay_delivery",
             Self::WalCorrupt { .. } => "wal_corrupt",
         }
     }

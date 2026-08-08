@@ -67,6 +67,11 @@ struct Claims {
     scope: String,
     #[serde(default)]
     sub: String,
+    /// The application the token was issued to (RFC 9068). Cbox ID sets it on every
+    /// access token and reserves it against being overwritten by enrichment, which is
+    /// what makes it usable as an identity rather than a hint.
+    #[serde(default)]
+    client_id: Option<String>,
     /// RFC 9449 sender constraint. Present means the issuer bound this token to a
     /// key, and a bearer alone is not supposed to be enough.
     #[serde(default)]
@@ -88,6 +93,15 @@ impl std::fmt::Debug for Oidc {
             .field("keys", &self.key_count())
             .finish_non_exhaustive()
     }
+}
+
+/// A token that passed every check, and who it says the caller is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Authorized {
+    /// `sub` — a user, or the client itself for a client-credentials grant.
+    pub subject: String,
+    /// `client_id` — the application. `None` from an issuer that omits it.
+    pub client_id: Option<String>,
 }
 
 /// Why a token was refused, for the log line. Deliberately coarse in what it returns
@@ -147,7 +161,7 @@ impl Oidc {
     /// it is somewhere a blocking network call is acceptable, and it never is on an
     /// async runtime worker. [`Self::refresh_if_due`] is the other half, and
     /// `auth::guard` runs it on a blocking thread before trying once more.
-    pub fn authorize(&self, token: &str, surface: Surface) -> Result<String, Rejected> {
+    pub fn authorize(&self, token: &str, surface: Surface) -> Result<Authorized, Rejected> {
         let header = decode_header(token).map_err(|_| Rejected::NotAJwt)?;
 
         // RFC 9068 gives access tokens the media type `at+jwt`, and Cbox ID sets it on
@@ -193,7 +207,10 @@ impl Oidc {
         }
 
         if data.claims.scope.split(' ').any(|scope| scope == wanted) {
-            Ok(data.claims.sub)
+            Ok(Authorized {
+                subject: data.claims.sub,
+                client_id: data.claims.client_id,
+            })
         } else {
             Err(Rejected::NoMatchingScope)
         }
@@ -570,7 +587,7 @@ mod tests {
 
         let read_only = issuer.token(&claims("telemetry:read"));
         assert_eq!(
-            oidc.authorize(&read_only, Surface::Query).unwrap(),
+            oidc.authorize(&read_only, Surface::Query).unwrap().subject,
             "user-1"
         );
         // Not a hierarchy: reading telemetry is not permission to write it or to see
@@ -859,8 +876,8 @@ mod tests {
         oidc.keys.write().unwrap().keys = keys;
 
         assert_eq!(
-            oidc.authorize(&token, Surface::Query),
-            Ok("user-1".to_owned())
+            oidc.authorize(&token, Surface::Query).unwrap().subject,
+            "user-1"
         );
     }
 

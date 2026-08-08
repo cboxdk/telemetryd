@@ -19,7 +19,7 @@ pub use error::{Error, Result};
 pub use matcher::{LabelMatcher, MatchOp, matches_all};
 pub use metric::{METRIC_NAME_LABEL, MetricKind, MetricSample};
 pub use record::{APP_LABEL, LEVEL_LABEL, Labels, LogRecord, Severity, UNKNOWN_APP};
-pub use secret::{Secret, TokenSet};
+pub use secret::{ClientTokens, Secret, TokenSet};
 pub use signal::Signal;
 pub use span::{SpanEvent, SpanKind, SpanRecord, SpanStatus};
 

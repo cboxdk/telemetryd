@@ -16,6 +16,7 @@ use figment::providers::{Env, Format, Toml};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::secret::Secret;
 use crate::secret::TokenSpecs;
 
 // ---------------------------------------------------------------------------
@@ -32,6 +33,9 @@ pub struct Config {
     pub limits: LimitsConfig,
     pub ingest: IngestConfig,
     pub log: LogConfig,
+    /// Forwarding to a central instance (ADR-013). Off unless `upstream` is set.
+    #[serde(default)]
+    pub relay: RelayConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +129,67 @@ pub struct AuthConfig {
     /// host. Setting an issuer turns it on.
     #[serde(default)]
     pub oidc: OidcConfig,
+}
+
+/// One client application allowed to write through a relay.
+///
+/// The token identifies the app; the app is not taken from the payload. That is the
+/// whole point — see [ADR-013](../../../docs/adr/0013-relay-mode.md).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RelayClient {
+    /// The `app` label every record from this credential is stamped with.
+    pub app: String,
+    /// Its ingest credential. Accepts `file:` and `env:` indirection like any other.
+    pub token: Secret,
+}
+
+/// What to do when the disk budget cannot be held because undelivered data is
+/// protected from the reaper.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WhenFull {
+    /// Keep accepting; lose the oldest undelivered telemetry.
+    ///
+    /// The default, because a relay in front of clients that cannot buffer should stay
+    /// available — a phone has nowhere to put what we refuse.
+    #[default]
+    DropOldest,
+    /// Stop accepting with `429`, and let clients that *can* buffer hold it.
+    Reject,
+}
+
+/// Forwarding to a central instance, as a safe front door for untrusted clients.
+///
+/// Unset means telemetryd stores what it receives and sends nothing onward, which is
+/// what it has always done.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RelayConfig {
+    /// Base URL of the instance that receives what this one accepts. Empty = off.
+    pub upstream: String,
+    /// Credential for `upstream`. This is the one the clients must never hold.
+    pub token: Secret,
+    /// Take the `app` label from the payload instead of from the credential.
+    ///
+    /// `false` in relay mode, and that is the security boundary: a client that picks
+    /// its own `app` can impersonate any other, and everything downstream — alerts,
+    /// dashboards, retention — is keyed on it.
+    pub trust_client_identity: bool,
+    /// What to do when undelivered data fills the disk budget.
+    pub when_full: WhenFull,
+    /// How often to look for sealed segments to ship.
+    #[serde(with = "humantime_serde")]
+    pub interval: Duration,
+    /// Per-client ingest credentials, each bound to an app name.
+    pub client: Vec<RelayClient>,
+}
+
+impl RelayConfig {
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        !self.upstream.trim().is_empty()
+    }
 }
 
 /// Validating tokens issued by a Cbox ID instance.
@@ -665,6 +730,62 @@ impl Config {
         })
     }
 
+    /// Relay mode's own checks, kept out of `validate` so neither grows past reading.
+    fn validate_relay(&self) -> Result<()> {
+        if !self.relay.is_enabled() {
+            return Ok(());
+        }
+
+        let upstream = self.relay.upstream.trim();
+        let loopback = upstream.starts_with("http://127.0.0.1")
+            || upstream.starts_with("http://[::1]")
+            || upstream.starts_with("http://localhost");
+        if !upstream.starts_with("https://") && !loopback {
+            return Err(Error::Config(format!(
+                "relay.upstream must be https (got {upstream:?}). Everything this \
+                 instance accepts is forwarded there, so plaintext exposes every \
+                 record and the upstream credential with it. Loopback is allowed \
+                 for testing."
+            )));
+        }
+
+        for client in &self.relay.client {
+            if client.app.trim().is_empty() {
+                return Err(Error::Config(
+                    "every relay.client needs a non-empty app: it is the identity \
+                     stamped onto that client's records, and an empty one would \
+                     make its telemetry indistinguishable from an unidentified \
+                     producer's"
+                        .to_owned(),
+                ));
+            }
+            if client.token.is_empty() {
+                return Err(Error::Config(format!(
+                    "relay.client {:?} has no token. Without one it cannot be \
+                     identified, which is the only thing a relay client is for",
+                    client.app
+                )));
+            }
+        }
+
+        // A bare ingest token has no app attached to it, so there is nothing to
+        // stamp. Silently trusting the payload for those writers would leave a
+        // hole in exactly the boundary this mode exists to draw, so it is refused
+        // rather than quietly special-cased.
+        if !self.relay.trust_client_identity && !self.auth.ingest_token.is_empty() {
+            return Err(Error::Config(
+                "auth.ingest_token is set while relay.trust_client_identity is \
+                 false. A bare ingest token carries no identity, so records \
+                 arriving with it could only keep the app they claim — which is \
+                 the impersonation this mode prevents. Move those writers to \
+                 [[relay.client]] entries, or set trust_client_identity = true if \
+                 every writer really is trusted."
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Cross-field rules. Run at load time rather than at first use, so a bad
     /// configuration fails at startup instead of at 3am on the first query.
     pub fn validate(&self) -> Result<()> {
@@ -736,6 +857,8 @@ impl Config {
                 }
             }
         }
+
+        self.validate_relay()?;
 
         if self.limits.ingest_queue_depth == 0 {
             return Err(Error::Config(
