@@ -36,19 +36,43 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.event.release.tag_name }}
 
-      # Skipped, loudly, when the secret is absent. A tap that silently stops being
-      # updated looks exactly like one that is up to date, and `brew install` would go
-      # on serving the previous release without anyone noticing.
+      # A GitHub App rather than a personal access token: the App's own credentials
+      # never expire, so nothing silently stops working on a date nobody wrote down,
+      # and what reaches the runner is an installation token that dies an hour later.
+      # It is also not tied to a person — a PAT leaves with whoever created it.
+      #
+      # Narrowed to the one repository it may write. An installation token inherits the
+      # App's permissions across everything it is installed on unless you say otherwise.
+      - name: mint an installation token
+        id: app-token
+        if: ${{ secrets.HOMEBREW_APP_ID != '' }}
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.HOMEBREW_APP_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          owner: cboxdk
+          repositories: homebrew-tap
+
+      # Falls back to the PAT while the App is being set up, and skips loudly when
+      # neither is configured. A tap that silently stops being updated looks exactly
+      # like one that is up to date, and `brew install` would go on serving the
+      # previous release without anyone noticing.
       - name: publish the Homebrew formula
         env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.HOMEBREW_TAP_TOKEN }}
+          USING_APP: ${{ steps.app-token.outputs.token != '' }}
           TAG: ${{ github.event.inputs.tag || github.event.release.tag_name }}
         run: |
           if [ -z "${GH_TOKEN}" ]; then
-            echo "::warning::HOMEBREW_TAP_TOKEN is not set, so cboxdk/homebrew-tap still \
-          serves the previous release. Publish it by hand with: \
-          python3 scripts/publish-formula.py ${TAG}"
+            echo "::warning::No credential for cboxdk/homebrew-tap, so it still serves \
+          the previous release. Set HOMEBREW_APP_ID and HOMEBREW_APP_PRIVATE_KEY, or \
+          publish by hand with: python3 scripts/publish-formula.py ${TAG}"
             exit 0
+          fi
+          if [ "${USING_APP}" != "true" ]; then
+            echo "::warning::Publishing with HOMEBREW_TAP_TOKEN. That PAT expires; the \
+          App credentials do not. Set HOMEBREW_APP_ID and HOMEBREW_APP_PRIVATE_KEY and \
+          this warning goes away."
           fi
           # The script pushes with plain git. Locally that rides on SSH; a runner has
           # no key, so point git's credential helper at the token gh is already using.
