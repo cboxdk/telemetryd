@@ -24,6 +24,7 @@ than quietly corrected, because the reasoning is the useful part.
 | [ADR-010](0010-trigram-index.md) | Trigrams for substring search, and why not tokens |
 | [ADR-011](0011-cbox-id-integration.md) | Validating Cbox ID tokens locally, never by asking the provider |
 | [ADR-012](0012-import-and-export.md) | Portability in both directions, through query APIs rather than storage formats |
+| [ADR-013](0013-relay-mode.md) | A safe front door for untrusted clients, and why the value is stamping identity |
 
 ## Two worth reading first
 

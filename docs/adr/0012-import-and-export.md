@@ -221,6 +221,13 @@ from a one-shot transfer. It also contradicts the single-binary posture in a way
 `export`/`import` pair does not. If a copy needs to be continuous, the collector that
 is already fanning out to telemetryd is the right place to fan out again.
 
+> **Narrowed by [ADR-013](0013-relay-mode.md).** Half of the reasoning above is wrong on
+> the facts: telemetryd already durably stores everything it accepts, so the WAL and the
+> sealed segments *are* the outbound queue, and what is missing is a cursor rather than a
+> buffer. The rest holds for the purpose argued here — mirroring as a preference is not
+> worth a delivery subsystem. It does not hold when forwarding is the point of the
+> deployment, as it is for a relay in front of untrusted clients.
+
 **A parser for any other backend's on-disk format.** Covered above: their read APIs are
 a contract, their storage layout is not.
 
