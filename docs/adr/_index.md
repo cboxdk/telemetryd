@@ -22,6 +22,7 @@ than quietly corrected, because the reasoning is the useful part.
 | [ADR-008](0008-parallel-segment-scanning.md) | Parallel scanning, and why only for unbounded queries |
 | [ADR-009](0009-allocator.md) | Why the binary ships mimalloc, and the musl numbers that forced it |
 | [ADR-010](0010-trigram-index.md) | Trigrams for substring search, and why not tokens |
+| [ADR-011](0011-cbox-id-integration.md) | **Proposed** — validating Cbox ID tokens locally, never by asking the provider |
 
 ## Two worth reading first
 
