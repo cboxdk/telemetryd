@@ -35,6 +35,10 @@ TELEMETRYD_INSTALL_DIR="$HOME/.local/bin" sh install.sh
 brew install cboxdk/tap/telemetryd
 ```
 
+The formula is generated from a published release by
+`scripts/publish-formula.py`, so it can only ever describe a build that exists. It
+carries the release's own checksums and Homebrew verifies them on install.
+
 ## Debian and Ubuntu
 
 Download the `.deb` for your architecture from the

@@ -1,8 +1,12 @@
 # Homebrew formula for telemetryd.
 #
-# Lives here so it is versioned with the code that it installs; the release workflow
-# copies it into the cboxdk/homebrew-tap repository. Keeping the source of truth next to
-# the binary means the formula cannot describe a version that was never built.
+# Lives here so it is versioned with the code it installs, which is what stops the
+# formula describing a version that was never built.
+#
+# `scripts/publish-formula.py` fills in the checksums from a published release and
+# pushes the result to cboxdk/homebrew-tap. The placeholders below are deliberate: a
+# formula with real-looking checksums that nobody verified is worse than one that
+# obviously is not ready.
 class Telemetryd < Formula
   desc "Single-binary observability backend: OTLP in, Loki/Tempo/Prometheus APIs out"
   homepage "https://github.com/cboxdk/telemetryd"

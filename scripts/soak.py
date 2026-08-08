@@ -375,39 +375,45 @@ def check_disk_budget(binary: str) -> None:
         now = int(time.time() * 1_000_000_000)
         peak = 0.0
         errors = 0
-        for round_index in range(24):
-            for batch in range(10):
+        deleted = 0.0
+        # Write until the reaper has actually deleted for the budget, rather than for a
+        # fixed number of rounds. How much a batch costs on disk depends on how well it
+        # compresses, and a fixed count that crossed the ceiling here sat under it on a
+        # CI runner — so the loop ends on the condition being tested, not on a guess.
+        for round_index in range(120):
+            for batch in range(5):
                 status, _ = request(
                     "/v1/logs",
                     {"resourceLogs": [{
                         "resource": RESOURCE,
                         "scopeLogs": [{"logRecords": [
-                            {"timeUnixNano": str(now + (round_index * 10 + batch) * 5000 * 1000 + i * 1000),
+                            {"timeUnixNano": str(now + (round_index * 5 + batch) * 5000 * 1000 + i * 1000),
                              "severityText": "INFO",
-                             "body": {"stringValue": f"payment attempt {i} for order {1000 + i}, padded"},
+                             # High-entropy tail, or zstd collapses a repetitive body to
+                             # almost nothing and the budget is never reached.
+                             "body": {"stringValue":
+                                      f"payment {i} order {1000 + i} "
+                                      f"{(i * 2654435761 + round_index * 40503) % 10**12:012x}"},
                              "attributes": []}
                             for i in range(5000)]}]}]},
                 )
                 if status != 200:
                     errors += 1
             peak = max(peak, directory_bytes(data_dir) / 1024 / 1024)
+            deleted = budget_deletions()
+            if deleted > 0:
+                break
 
         check("no ingest errors while enforcing the budget", errors == 0,
               f"{errors} failed posts")
 
         # That the budget path *ran* is checked by its counter, not by catching usage
-        # above the ceiling. Whether the peak ever exceeds the budget depends on whether
-        # the writer can outrun the reaper, which varies with the machine: an earlier
-        # version asserted exactly that and failed on a slower CI runner while the code
-        # was working correctly. Retention here is 30 days against timestamps from now,
-        # so nothing can expire by age and every deletion is the budget's doing.
-        _, metrics = request("/metrics")
-        deleted = 0.0
-        for line in str(metrics).splitlines():
-            if line.startswith('telemetryd_retention_deleted_total{reason="disk_budget"}'):
-                deleted = float(line.rsplit(" ", 1)[1])
+        # above the ceiling. Whether the peak is ever seen above the budget depends on
+        # whether the writer outruns the reaper, which varies with the machine.
+        # Retention is 30 days against timestamps from now, so nothing can expire by
+        # age and every deletion here is the budget's doing.
         check("the reaper deleted segments to hold the budget", deleted > 0,
-              f"deleted_by_budget={deleted:.0f}")
+              f"deleted_by_budget={deleted:.0f}, peak {peak:.1f} MB of a {budget_mib} MB budget")
         # One segment of slack over the ceiling, not one reaper interval.
         check("disk stays near the budget", peak < budget_mib * 1.5,
               f"peak {peak:.1f} MB against a {budget_mib} MB budget ({peak / budget_mib:.2f}x)")
@@ -420,6 +426,15 @@ def check_disk_budget(binary: str) -> None:
     finally:
         stop(proc)
         shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def budget_deletions() -> float:
+    """Segments the reaper has deleted to stay inside the disk budget."""
+    _, metrics = request("/metrics")
+    for line in str(metrics).splitlines():
+        if line.startswith('telemetryd_retention_deleted_total{reason="disk_budget"}'):
+            return float(line.rsplit(" ", 1)[1])
+    return 0.0
 
 
 def check_reload(binary: str) -> None:
