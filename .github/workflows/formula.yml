@@ -12,7 +12,19 @@ name: Homebrew formula
 # case is that Homebrew serves the previous version until this is re-run, which is
 # visible, recoverable, and costs nobody their release.
 
+# `workflow_run`, not `release: published`. The release is created by the release
+# workflow using GITHUB_TOKEN, and events raised by GITHUB_TOKEN deliberately do not
+# trigger further workflows — otherwise a workflow could set itself off forever. So
+# `release: published` looked correct, was accepted by GitHub, and would simply never
+# have fired. v0.13.1 is where that was noticed: the release went green and the tap
+# stayed on the previous version.
+#
+# `release: published` is kept for a release published by hand, which does carry a
+# human's identity and does trigger.
 on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
   release:
     types: [published]
   workflow_dispatch:
@@ -28,6 +40,8 @@ jobs:
   publish:
     name: publish to cboxdk/homebrew-tap
     runs-on: ubuntu-latest
+    # A failed release has nothing worth publishing a formula for.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     # Lifted to `env` because the `secrets` context is not available in a step's `if`.
     # The App id is not sensitive — it is in the App's public URL — but it lives in
     # secrets so that "is the App configured?" is one question, not two.
@@ -39,7 +53,7 @@ jobs:
       # main would describe a build that tag never produced.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.event.release.tag_name }}
+          ref: ${{ github.event.inputs.tag || github.event.release.tag_name || github.event.workflow_run.head_branch }}
 
       # A GitHub App rather than a personal access token: the App's own credentials
       # never expire, so nothing silently stops working on a date nobody wrote down,
@@ -64,8 +78,21 @@ jobs:
       - name: publish the Homebrew formula
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          TAG: ${{ github.event.inputs.tag || github.event.release.tag_name }}
+          TAG: ${{ github.event.inputs.tag || github.event.release.tag_name || github.event.workflow_run.head_branch }}
         run: |
+          # `workflow_run.head_branch` is whatever ref set the release workflow off.
+          # For a tag push that is the tag, but it is not guaranteed to be one, and a
+          # formula published from the wrong ref would describe a build that ref never
+          # produced. Refuse rather than guess.
+          case "${TAG}" in
+            v[0-9]*) ;;
+            *)
+              echo "::warning::'${TAG}' is not a release tag, so nothing was published \
+          to the tap. Run this workflow manually with the tag if that is wrong."
+              exit 0
+              ;;
+          esac
+
           if [ -z "${GH_TOKEN}" ]; then
             echo "::warning::No installation token, so cboxdk/homebrew-tap still serves \
           the previous release. Check HOMEBREW_APP_ID and HOMEBREW_APP_PRIVATE_KEY, or \
