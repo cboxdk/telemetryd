@@ -25,7 +25,7 @@ command to run instead — a tool that silently escalates is one you cannot reas
 Overrides:
 
 ```bash
-TELEMETRYD_VERSION=0.13.4 sh install.sh
+TELEMETRYD_VERSION=0.14.0 sh install.sh
 TELEMETRYD_INSTALL_DIR="$HOME/.local/bin" sh install.sh
 ```
 
@@ -45,7 +45,7 @@ Download the `.deb` for your architecture from the
 [releases page](https://github.com/cboxdk/telemetryd/releases) and install it:
 
 ```bash
-sudo dpkg -i telemetryd_0.13.4_amd64.deb
+sudo dpkg -i telemetryd_0.14.0_amd64.deb
 sudo systemctl enable --now telemetryd
 ```
 
@@ -70,7 +70,7 @@ when it is not. To check by hand:
 ```bash
 cosign verify-blob \
   --bundle SHA256SUMS.cosign.bundle \
-  --certificate-identity "https://github.com/cboxdk/telemetryd/.github/workflows/release.yml@refs/tags/v0.13.4" \
+  --certificate-identity "https://github.com/cboxdk/telemetryd/.github/workflows/release.yml@refs/tags/v0.14.0" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   SHA256SUMS
 ```
