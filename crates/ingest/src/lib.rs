@@ -19,6 +19,7 @@
 pub mod compression;
 pub mod logs;
 pub mod otlp;
+pub mod otlp_encode;
 pub mod otlp_metrics;
 pub mod protobuf;
 pub mod remote_write;

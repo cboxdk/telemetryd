@@ -54,9 +54,14 @@ contract for both sides.
 ### Export emits OTLP
 
 Not a bespoke format, and not Parquet. OTLP is what every other backend already
-ingests, and telemetryd already has the encoders because OTLP is what it ingests
-itself. That makes the format choice nearly free to implement and nearly free for
-whoever receives it.
+ingests, which makes it nearly free for whoever receives it.
+
+An earlier draft of this ADR claimed it was nearly free to *implement* too, "because
+telemetryd already has the encoders". It does not. It has decoders; writing records
+back out is code that did not exist, and was built for relay mode
+([ADR-013](0013-relay-mode.md)) in `crates/ingest/src/otlp_encode.rs`. The work is
+mechanical rather than hard, but it is work, and the round trip through our own decoder
+is what keeps it honest — the first version of that test failed.
 
 It also makes **import from our own export free**: OTLP JSON out is exactly what
 `/v1/logs`, `/v1/traces` and `/v1/metrics` take in. `telemetryd export | telemetryd
