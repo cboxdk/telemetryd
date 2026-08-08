@@ -1,0 +1,56 @@
+name: Homebrew formula
+
+# Deliberately its own workflow rather than a step in the release.
+#
+# Two reasons, both learned the hard way. `publish-formula.py` reads the digests from
+# the *published* `SHA256SUMS`, so it cannot run before the release exists — as a step
+# inside the release job it sat above `publish release` and would have 404'd on the
+# first tag after the token was set, failing the job with the artifacts built, signed,
+# and never published.
+#
+# And a tap that cannot be written to is not a reason to lose a release. Here the worst
+# case is that Homebrew serves the previous version until this is re-run, which is
+# visible, recoverable, and costs nobody their release.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish to the tap (must already be published)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: publish to cboxdk/homebrew-tap
+    runs-on: ubuntu-latest
+    steps:
+      # Check out the *tag*, not the default branch: `packaging/telemetryd.rb` is
+      # versioned with the code it installs, and publishing the formula as it exists on
+      # main would describe a build that tag never produced.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.event.release.tag_name }}
+
+      # Skipped, loudly, when the secret is absent. A tap that silently stops being
+      # updated looks exactly like one that is up to date, and `brew install` would go
+      # on serving the previous release without anyone noticing.
+      - name: publish the Homebrew formula
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.event.release.tag_name }}
+        run: |
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN is not set, so cboxdk/homebrew-tap still \
+          serves the previous release. Publish it by hand with: \
+          python3 scripts/publish-formula.py ${TAG}"
+            exit 0
+          fi
+          # The script pushes with plain git. Locally that rides on SSH; a runner has
+          # no key, so point git's credential helper at the token gh is already using.
+          gh auth setup-git
+          python3 scripts/publish-formula.py "${TAG}"
