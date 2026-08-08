@@ -422,7 +422,7 @@ async fn the_two_kinds_of_decode_failure_stay_distinguishable() {
     );
 
     let (status, response) = harness
-        .post_otlp("/v1/metrics", Some("gzip"), gzip(b"not json at all"))
+        .post_otlp("/v1/metrics", Some("gzip"), gzip(b"<not json at all>"))
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(response["error"]["code"], "bad_request");
@@ -433,7 +433,31 @@ async fn the_two_kinds_of_decode_failure_stay_distinguishable() {
     );
     assert!(
         message.contains("line 1 column 1"),
-        "and keep serde's position, which is the useful part: {message}"
+        "and keep serde's position, which is the useful part — it points into the \
+         decompressed body, which is the one the client wrote: {message}"
+    );
+}
+
+/// The header decides, not the bytes.
+///
+/// Sniffing gzip's magic number would have "fixed" the reported symptom and quietly
+/// changed what a body means, so a client that mislabels a compressed body still gets
+/// the parse error it always did — and the operator gets one rule to reason about.
+#[tokio::test]
+async fn a_compressed_body_with_no_header_is_still_a_parse_error() {
+    let harness = Harness::new();
+    let (status, response) = harness
+        .post_otlp("/v1/metrics", None, gzip(&otlp_metrics()))
+        .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(response["error"]["code"], "bad_request");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("could not decode the OTLP metrics payload"),
+        "{response}"
     );
 }
 
