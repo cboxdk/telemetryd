@@ -5,6 +5,7 @@
 //! produce "not yet, planned for M1", not a `404` that reads as a wrong URL.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 
 use axum::Json;
 use axum::extract::State;
@@ -42,6 +43,9 @@ pub struct StatusResponse {
     pub apps: Vec<telemetryd_store::AppUsage>,
     pub retention: BTreeMap<&'static str, String>,
     pub limits: LimitsStatus,
+    /// Forwarding upstream. Absent unless relay mode is on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay: Option<crate::relay::RelayStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,6 +126,7 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse
             max_log_line_bytes: config.limits.max_log_line_bytes.as_u64(),
             ingest_queue_depth: config.limits.ingest_queue_depth,
         },
+        relay: state.relay.as_ref().map(|relay| relay.status(&state.store)),
     }))
 }
 
@@ -157,6 +162,35 @@ fn push_auth_and_cardinality_gauges(state: &AppState, samples: &mut Vec<Sample>)
             &[],
             state.oidc.key_count() as f64,
         ));
+    }
+
+    if let Some(relay) = &state.relay {
+        // The backlog is the number worth alerting on: delivered totals only rise, so
+        // they cannot tell you the shipper has stopped, and a backlog that keeps
+        // growing is the only thing that says so.
+        for (signal, pending) in relay.backlog(&state.store) {
+            samples.push(Sample::new(
+                "telemetryd_relay_pending_segments",
+                &[("signal", signal.as_str())],
+                pending as f64,
+            ));
+        }
+        for (name, value) in [
+            (
+                "telemetryd_relay_segments_delivered_total",
+                relay.stats.segments_delivered.load(Ordering::Relaxed),
+            ),
+            (
+                "telemetryd_relay_records_delivered_total",
+                relay.stats.records_delivered.load(Ordering::Relaxed),
+            ),
+            (
+                "telemetryd_relay_failures_total",
+                relay.stats.failures.load(Ordering::Relaxed),
+            ),
+        ] {
+            samples.push(Sample::new(name, &[], value as f64));
+        }
     }
 
     let (active_series, rejected_series, max_series, _) = state.store.cardinality_status();

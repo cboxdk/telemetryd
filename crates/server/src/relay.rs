@@ -56,6 +56,26 @@ struct Cursor {
     delivered: BTreeMap<String, Position>,
 }
 
+/// What a relay looks like from outside, for `/status` and `/metrics`.
+///
+/// `pending` is the number to watch. Delivered totals only ever go up, so they cannot
+/// tell you the shipper has stopped; a backlog that keeps growing is the one signal
+/// that says so, and it is what an alert should be written against.
+#[derive(Debug, Serialize)]
+pub struct RelayStatus {
+    pub upstream: String,
+    pub trust_client_identity: bool,
+    pub when_full: &'static str,
+    /// Sealed segments not yet accepted upstream, by signal.
+    pub pending: BTreeMap<String, usize>,
+    pub segments_delivered: u64,
+    pub records_delivered: u64,
+    /// Failed delivery attempts since start. Retried, not lost.
+    pub failures: u64,
+    /// How far each signal has been delivered. Absent means nothing has yet.
+    pub delivered_through: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Default)]
 pub struct RelayStats {
     pub segments_delivered: AtomicU64,
@@ -150,6 +170,44 @@ impl Relay {
         })?;
         std::fs::rename(&temporary, &self.cursor_path)
             .map_err(|e| telemetryd_core::Error::io(format!("renaming {}", temporary.display()), e))
+    }
+
+    #[must_use]
+    pub fn status(&self, store: &Store) -> RelayStatus {
+        let mut pending = BTreeMap::new();
+        let mut delivered_through = BTreeMap::new();
+        for signal in [Signal::Logs, Signal::Traces, Signal::Metrics] {
+            pending.insert(
+                signal.as_str().to_owned(),
+                self.pending(store, signal).len(),
+            );
+            if let Some(position) = self.position(signal) {
+                delivered_through.insert(signal.as_str().to_owned(), position.id);
+            }
+        }
+        RelayStatus {
+            upstream: self.config.upstream.clone(),
+            trust_client_identity: self.config.trust_client_identity,
+            when_full: if self.drops_when_full() {
+                "drop_oldest"
+            } else {
+                "reject"
+            },
+            pending,
+            segments_delivered: self.stats.segments_delivered.load(Ordering::Relaxed),
+            records_delivered: self.stats.records_delivered.load(Ordering::Relaxed),
+            failures: self.stats.failures.load(Ordering::Relaxed),
+            delivered_through,
+        }
+    }
+
+    /// Sealed segments not yet accepted upstream, by signal.
+    #[must_use]
+    pub fn backlog(&self, store: &Store) -> Vec<(Signal, usize)> {
+        [Signal::Logs, Signal::Traces, Signal::Metrics]
+            .into_iter()
+            .map(|signal| (signal, self.pending(store, signal).len()))
+            .collect()
     }
 
     /// Segment ids for `signal` that have not been delivered.

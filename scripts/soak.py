@@ -931,6 +931,26 @@ def relay_logs(count: int, claimed_app: str, token: str, offset_nanos: int = 0) 
     return with_token("/v1/logs", token, entry)
 
 
+def admin_json(path: str) -> dict:
+    req = urllib.request.Request(BASE + path)
+    req.add_header("authorization", "Bearer static-admin")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.loads(response.read())
+    except (urllib.error.HTTPError, ValueError):
+        return {}
+
+
+def admin_metrics() -> str:
+    req = urllib.request.Request(BASE + "/metrics")
+    req.add_header("authorization", "Bearer static-admin")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return response.read().decode()
+    except urllib.error.HTTPError:
+        return ""
+
+
 def check_relay(binary: str) -> None:
     """Forwarding, and the identity stamp that is the point of it."""
     print("\n=== relay mode ===")
@@ -1005,6 +1025,32 @@ def check_relay(binary: str) -> None:
         check("upstream sees the stamped identity, never the claimed one",
               upstream.apps() == {"mobile"}, f"{upstream.apps() or 'nothing'}")
 
+        # Visible, or an operator is reading log files to find out how far behind the
+        # shipper is. Checked before the restart: these are "since start" counters, and
+        # resetting is what a Prometheus counter is supposed to do.
+        relay = admin_json("/status").get("relay", {})
+        check("/status reports the relay",
+              relay.get("upstream", "").startswith("http://127.0.0.1")
+              and relay.get("segments_delivered", 0) > 0,
+              f"delivered={relay.get('segments_delivered', 'absent')}")
+        check("the backlog is reported per signal",
+              isinstance(relay.get("pending"), dict)
+              and relay["pending"].get("logs") == 0,
+              f"pending={relay.get('pending', 'absent')}")
+        check("the stamp is reported as on", relay.get("trust_client_identity") is False)
+        delivered_through = relay.get("delivered_through", {}).get("logs")
+        check("the cursor position is reported", bool(delivered_through),
+              delivered_through or "absent")
+
+        metrics = admin_metrics()
+        for name in [
+            "telemetryd_relay_pending_segments",
+            "telemetryd_relay_segments_delivered_total",
+            "telemetryd_relay_records_delivered_total",
+            "telemetryd_relay_identity_overridden_total",
+        ]:
+            check(f"{name} is exported", f"{name}{{" in metrics or f"\n{name} " in metrics)
+
         # The cursor is durable: a restart must not re-send what already arrived.
         before = len(upstream.lines())
         stop(proc)
@@ -1024,6 +1070,15 @@ def check_relay(binary: str) -> None:
         check("a restart does not re-send what was already delivered",
               len(upstream.lines()) == before,
               f"{len(upstream.lines())} lines, was {before}")
+
+        # The counters reset, and should: they are "since start". What must survive is
+        # the cursor, and that is the field an operator should read to answer "did this
+        # actually get there" after a restart.
+        after = admin_json("/status").get("relay", {})
+        check("the cursor survives the restart, even though the counters do not",
+              after.get("delivered_through", {}).get("logs") == delivered_through,
+              f"{after.get('delivered_through', {}).get('logs') or 'absent'} "
+              f"(was {delivered_through})")
     finally:
         stop(proc)
         upstream.server.shutdown()

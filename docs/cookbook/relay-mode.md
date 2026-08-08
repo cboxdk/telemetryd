@@ -92,6 +92,41 @@ Both log an error when they fire, and `drop_oldest` counts what it lost separate
 ordinary budget deletions — "we deleted expired data" and "we deleted data that never
 arrived anywhere" are not the same event.
 
+## Watching it
+
+```bash
+curl -sS -H "Authorization: Bearer $ADMIN_TOKEN" localhost:4319/status | jq .relay
+```
+
+```json
+{
+  "upstream": "https://telemetry.internal",
+  "trust_client_identity": false,
+  "when_full": "drop_oldest",
+  "pending": { "logs": 2, "traces": 0, "metrics": 0 },
+  "segments_delivered": 1184,
+  "records_delivered": 9433021,
+  "failures": 3,
+  "delivered_through": { "logs": "01786226724746643968-00000001" }
+}
+```
+
+**`telemetryd_relay_pending_segments` is the one to alert on.** Delivered totals only
+ever rise, so they cannot tell you the shipper has stopped; a backlog that keeps growing
+is the only thing that says so. A few pending segments is normal — that is the seal
+interval. A number that climbs for an hour is not.
+
+`failures` counts delivery attempts that were retried, not records lost. Some is normal
+on a flaky link; a rate that matches your tick interval means every attempt is failing.
+
+After a restart the counters start again from zero, which is what a counter should do.
+`delivered_through` is the field that survives: it is the cursor, read from disk, and it
+is how you answer "did this actually get there" without trusting an in-memory number.
+
+The two that mean data was lost live under `retention` rather than here:
+`dropped_undelivered` and `blocked_by_undelivered`. Neither should ever be non-zero on a
+healthy relay.
+
 ## The relay is still queryable
 
 It is the same binary, so the last few hours are sitting right there, answerable through

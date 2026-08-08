@@ -119,6 +119,31 @@ pub const DESCRIPTORS: &[Descriptor] = &[
         help: "Cbox ID signing keys currently cached — zero means every Cbox ID token is being refused",
     },
     Descriptor {
+        name: "telemetryd_relay_pending_segments",
+        kind: Kind::Gauge,
+        help: "Sealed segments not yet accepted upstream, by signal — the number to alert on, since delivered totals only ever rise",
+    },
+    Descriptor {
+        name: "telemetryd_relay_segments_delivered_total",
+        kind: Kind::Counter,
+        help: "Segments accepted upstream since start",
+    },
+    Descriptor {
+        name: "telemetryd_relay_records_delivered_total",
+        kind: Kind::Counter,
+        help: "Records accepted upstream since start",
+    },
+    Descriptor {
+        name: "telemetryd_relay_failures_total",
+        kind: Kind::Counter,
+        help: "Failed delivery attempts since start. Retried from the cursor, not lost",
+    },
+    Descriptor {
+        name: "telemetryd_relay_identity_overridden_total",
+        kind: Kind::Counter,
+        help: "Records whose claimed app was replaced by the credential's, by app — a client that keeps claiming another app is misconfigured or probing",
+    },
+    Descriptor {
         name: "telemetryd_app_series",
         kind: Kind::Gauge,
         help: "Distinct series per app — what limits.max_series_per_app is enforced against",
