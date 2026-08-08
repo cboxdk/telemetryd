@@ -682,13 +682,19 @@ class Issuer:
         signed = pow(int.from_bytes(padded, "big"), self.d, self.n)
         return signed.to_bytes(self.size, "big")
 
-    def token(self, scope: str, lifetime: int = 300, audience: str | None = None) -> str:
-        header = {"alg": "RS256", "typ": "JWT", "kid": self.kid}
+    def token(self, scope: str, lifetime: int = 300, audience: str | None = None,
+              typ: str = "at+jwt", cnf: bool = False) -> str:
+        # `at+jwt`, per RFC 9068 and what Cbox ID's JwtTokenIssuer actually signs. The
+        # obvious `JWT` is an *id* token's media type, and a stand-in issuer that mints
+        # it is not standing in for the real one.
+        header = {"alg": "RS256", "typ": typ, "kid": self.kid}
         now = int(time.time())
         claims = {
             "iss": self.url, "aud": audience or self.url, "sub": "soak-user",
             "iat": now, "exp": now + lifetime, "scope": scope,
         }
+        if cnf:
+            claims["cnf"] = {"jkt": "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I"}
         body = b64url(json.dumps(header).encode()) + "." + b64url(json.dumps(claims).encode())
         return body + "." + b64url(self.sign(body.encode()))
 
@@ -783,6 +789,11 @@ def check_oidc(binary: str) -> None:
             "a near-miss scope": issuer.token("telemetry:readonly"),
             "a token with no signature": issuer.token("telemetry:read").rsplit(".", 1)[0] + ".",
             "not a token at all": "hunter2",
+            # An id token is signed by the same key and authorises nothing.
+            "an id token in an access token's place": issuer.token("telemetry:read", typ="JWT"),
+            # RFC 9449: the issuer bound this to a key the client holds. Accepting it as
+            # a plain bearer would hand back the property the binding was bought for.
+            "a sender-constrained token": issuer.token("telemetry:read", cnf=True),
         }
         for name, token in refused.items():
             check(f"{name} is refused", with_token("/loki/api/v1/labels", token) == 401)

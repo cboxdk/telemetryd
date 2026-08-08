@@ -110,8 +110,11 @@ the request and discards what the payload claimed.
 
 - A **static token** maps to a configured app name. One token per client application,
   revocable independently, which is the whole reason not to share one.
-- A **Cbox ID token** maps from a claim. The relay never has to trust the payload
-  because the token was signed by the issuer and validated locally.
+- A **Cbox ID token** maps from its **`client_id`** claim. Read out of
+  `JwtTokenIssuer`: every access token carries it, both grants funnel through the one
+  `issue()` that sets it from the registered client, and it is on the reserved list
+  that `applyEnrichment()` refuses to overwrite — so no hook can forge it. RFC 9068
+  names the same claim, so this is the standard field rather than a local invention.
 
 This is a write-path transformation, which [ADR-001](0001-storage-architecture.md)
 refuses on the grounds that data should be shaped in the instrumentation. That refusal
@@ -196,14 +199,26 @@ The last one is the one to write first. A cursor that advances before delivery i
 confirmed turns a crash into silent data loss, and it is the kind of bug that only
 appears under a crash nobody arranged.
 
-## Open questions
+## Sender-constrained tokens change the premise
 
-**Which claim identifies a client application in a Cbox ID token.** `sub` is a user, not
-an app, and the relay wants the app. `laravel-id`'s access tokens may carry a client
-identifier suitable for this; ADR-011 was written from that source but did not need this
-field, so it has not been checked. **This ADR should not be accepted until it has
-been** — the mapping is the security boundary, and inventing a claim name that turns out
-not to exist would leave a config key that quietly matches nothing.
+The context above says a mobile binary cannot keep a credential. That is true of a
+bearer token and **not** true of what Cbox ID can already issue: `JwtTokenIssuer`
+supports DPoP (RFC 9449), binding a token to a key the client generates and holds, and
+stamping the thumbprint into a `cnf` claim. A token lifted out of a binary is then
+useless without the key that never left the device.
+
+That does not remove the need for the identity stamp — a client with a perfectly valid,
+perfectly bound token can still lie about `app` — but it changes how bad a leaked
+credential is, and it makes per-client credentials genuinely enforceable.
+
+It also surfaced a defect in what is already shipped, fixed alongside this ADR rather
+than waiting for relay mode: telemetryd ignored `cnf` entirely, so it accepted a
+sender-constrained token as a plain bearer and silently handed back the exact property
+the binding was bought to provide. It now refuses such tokens instead. Validating DPoP
+proofs — and thereby *accepting* bound tokens — is work relay mode should do, and is
+the strongest available answer to the credential problem this ADR opens with.
+
+## Open questions
 
 **Whether relay mode should also lower the retention defaults.** A relay is a waypoint
 rather than a store, and keeping seven days of everything on an edge box is probably not

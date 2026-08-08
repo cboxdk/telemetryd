@@ -67,6 +67,10 @@ struct Claims {
     scope: String,
     #[serde(default)]
     sub: String,
+    /// RFC 9449 sender constraint. Present means the issuer bound this token to a
+    /// key, and a bearer alone is not supposed to be enough.
+    #[serde(default)]
+    cnf: Option<serde_json::Value>,
 }
 
 pub struct Oidc {
@@ -95,6 +99,10 @@ pub enum Rejected {
     UnknownKey,
     BadSignatureOrClaims(String),
     NoMatchingScope,
+    /// Not an access token — an id token presented in its place, most likely.
+    WrongTokenType(String),
+    /// Sender-constrained, and telemetryd cannot check the constraint.
+    SenderConstrained,
 }
 
 impl Oidc {
@@ -141,6 +149,20 @@ impl Oidc {
     /// `auth::guard` runs it on a blocking thread before trying once more.
     pub fn authorize(&self, token: &str, surface: Surface) -> Result<String, Rejected> {
         let header = decode_header(token).map_err(|_| Rejected::NotAJwt)?;
+
+        // RFC 9068 gives access tokens the media type `at+jwt`, and Cbox ID sets it on
+        // every one it mints. An id token says `JWT`, is signed by the same key, and
+        // is *not* an authorization to do anything — so a `typ` that disagrees is
+        // refused. Absent is tolerated: not every issuer sets it, and this is the one
+        // check we can afford to be lenient about, because `aud` and `scope` still
+        // have to hold.
+        if let Some(typ) = &header.typ
+            && !typ.eq_ignore_ascii_case("at+jwt")
+            && !typ.eq_ignore_ascii_case("jwt+at")
+        {
+            return Err(Rejected::WrongTokenType(typ.clone()));
+        }
+
         let kid = header.kid.ok_or(Rejected::NotAJwt)?;
 
         let key = self.key(&kid).ok_or(Rejected::UnknownKey)?;
@@ -160,6 +182,16 @@ impl Oidc {
             Surface::Query => &self.config.scope_read,
             Surface::Admin => &self.config.scope_admin,
         };
+        // RFC 9449: `cnf` means the issuer bound this token to a client-held key, so
+        // possession of the token alone should not be enough. telemetryd does not
+        // validate DPoP proofs, and accepting the token anyway would silently downgrade
+        // a sender-constrained credential to a bearer one — handing an attacker exactly
+        // what the binding was bought to deny them. Refuse instead: the issuer thought
+        // it was buying something, and we are not the ones to spend it.
+        if data.claims.cnf.is_some() {
+            return Err(Rejected::SenderConstrained);
+        }
+
         if data.claims.scope.split(' ').any(|scope| scope == wanted) {
             Ok(data.claims.sub)
         } else {
@@ -428,7 +460,7 @@ mod tests {
         let oidc = Oidc::new(config());
         // A well-formed header naming a key we do not hold. With no keys cached and
         // no issuer reachable, this must refuse — never fall back to "try them all".
-        let header = base64_url(br#"{"alg":"RS256","typ":"JWT","kid":"nope"}"#);
+        let header = base64_url(br#"{"alg":"RS256","typ":"at+jwt","kid":"nope"}"#);
         let token = format!("{header}.{}.{}", base64_url(b"{}"), base64_url(b"sig"));
         assert!(matches!(
             oidc.authorize(&token, Surface::Query),
@@ -484,13 +516,22 @@ mod tests {
 
         /// A token whose header names a key id the verifier has never seen.
         fn token_with_kid(&self, claims: &serde_json::Value, kid: &str) -> String {
-            let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+            let mut header = Self::header();
             header.kid = Some(kid.to_owned());
             jsonwebtoken::encode(&header, claims, &self.encoding).unwrap()
         }
 
-        fn token(&self, claims: &serde_json::Value) -> String {
+        /// `jsonwebtoken` defaults `typ` to `JWT`, which is an *id* token's media
+        /// type. Cbox ID mints access tokens as `at+jwt` (RFC 9068), so a test issuer
+        /// that leaves the default is not testing what the server will actually meet.
+        fn header() -> jsonwebtoken::Header {
             let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+            header.typ = Some("at+jwt".to_owned());
+            header
+        }
+
+        fn token(&self, claims: &serde_json::Value) -> String {
+            let mut header = Self::header();
             header.kid = Some(self.kid.clone());
             jsonwebtoken::encode(&header, claims, &self.encoding).unwrap()
         }
@@ -618,6 +659,10 @@ mod tests {
 
         let attacker_key = jsonwebtoken::EncodingKey::from_secret(b"not the issuer's key");
         let mut header = jsonwebtoken::Header::new(Algorithm::HS256);
+        // `at+jwt`, because an attacker would. Leaving the library's `JWT` default
+        // here would have the media-type check refuse the token first, and this test
+        // would silently stop exercising algorithm confusion at all.
+        header.typ = Some("at+jwt".to_owned());
         header.kid = Some(real.kid.clone());
         let forged =
             jsonwebtoken::encode(&header, &claims("telemetry:admin"), &attacker_key).unwrap();
@@ -690,6 +735,59 @@ mod tests {
             }
         }
         out
+    }
+
+    /// An id token is signed by the same key as an access token and authorises
+    /// nothing. RFC 9068 separates them by media type, and Cbox ID sets it.
+    #[test]
+    fn an_id_token_is_not_an_access_token() {
+        let issuer = TestIssuer::new();
+        let oidc = loaded(config(), &issuer.jwks);
+
+        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+        header.kid = Some(issuer.kid.clone());
+        header.typ = Some("JWT".to_owned());
+        let token =
+            jsonwebtoken::encode(&header, &claims("telemetry:read"), &issuer.encoding).unwrap();
+
+        assert_eq!(
+            oidc.authorize(&token, Surface::Query),
+            Err(Rejected::WrongTokenType("JWT".to_owned()))
+        );
+    }
+
+    /// A token with no `typ` is still accepted: not every issuer sets one, and `aud`
+    /// and `scope` still have to hold.
+    #[test]
+    fn a_missing_token_type_is_tolerated() {
+        let issuer = TestIssuer::new();
+        let oidc = loaded(config(), &issuer.jwks);
+        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+        header.kid = Some(issuer.kid.clone());
+        header.typ = None;
+        let token =
+            jsonwebtoken::encode(&header, &claims("telemetry:read"), &issuer.encoding).unwrap();
+
+        assert!(oidc.authorize(&token, Surface::Query).is_ok());
+    }
+
+    /// The downgrade this closes: `cnf` means the issuer bound the token to a key the
+    /// client holds, so a stolen token alone should be useless. telemetryd cannot
+    /// check that binding, and accepting the token anyway would quietly hand back the
+    /// exact property the binding was bought for.
+    #[test]
+    fn a_sender_constrained_token_is_refused_rather_than_downgraded() {
+        let issuer = TestIssuer::new();
+        let oidc = loaded(config(), &issuer.jwks);
+
+        let mut bound = claims("telemetry:read");
+        bound["cnf"] = serde_json::json!({"jkt": "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I"});
+
+        assert_eq!(
+            oidc.authorize(&issuer.token(&bound), Surface::Query),
+            Err(Rejected::SenderConstrained),
+            "a DPoP-bound token must not be accepted as a plain bearer"
+        );
     }
 
     /// The regression this file was restructured for.
