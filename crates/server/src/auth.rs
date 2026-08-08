@@ -10,6 +10,7 @@ use axum::response::Response;
 use telemetryd_core::{Error, TokenSet};
 
 use crate::error::ApiError;
+use crate::oidc::Rejected;
 use crate::state::AppState;
 
 /// Which set of tokens guards a surface. The value doubles as the `surface` label on
@@ -105,22 +106,39 @@ async fn guard(
         // A static token is checked first and in constant time; only something that is
         // not one reaches the token validator, so enabling Cbox ID costs a static
         // deployment nothing.
-        Some(token) if state.oidc.is_enabled() => match state.oidc.authorize(token, surface) {
-            Ok(subject) => {
-                tracing::debug!(surface = surface.as_str(), %subject, "authorized by Cbox ID");
-                Ok(next.run(request).await)
+        Some(token) if state.oidc.is_enabled() => {
+            let mut outcome = state.oidc.authorize(token, surface);
+            // A key id we have not seen is what a rotation looks like, so refetch once
+            // and try again. The refetch talks to the network, and this is an async
+            // runtime worker — doing it inline would park the worker for as long as
+            // the issuer feels like taking, and an attacker picks when that happens by
+            // choosing the `kid`. `refresh_if_due` rate-limits it to once a minute.
+            if outcome == Err(Rejected::UnknownKey) {
+                let oidc = std::sync::Arc::clone(&state.oidc);
+                if tokio::task::spawn_blocking(move || oidc.refresh_if_due())
+                    .await
+                    .is_ok()
+                {
+                    outcome = state.oidc.authorize(token, surface);
+                }
             }
-            Err(reason) => {
-                // The reason is logged, never returned: a 401 that explains *why* is a
-                // hint to whoever is guessing.
-                tracing::debug!(surface = surface.as_str(), ?reason, "token refused");
-                state.metrics.incr(
-                    "telemetryd_auth_failures_total",
-                    &[("surface", surface.as_str())],
-                );
-                Err(Error::Unauthorized.into())
+            match outcome {
+                Ok(subject) => {
+                    tracing::debug!(surface = surface.as_str(), %subject, "authorized by Cbox ID");
+                    Ok(next.run(request).await)
+                }
+                Err(reason) => {
+                    // The reason is logged, never returned: a 401 that explains *why* is a
+                    // hint to whoever is guessing.
+                    tracing::debug!(surface = surface.as_str(), ?reason, "token refused");
+                    state.metrics.incr(
+                        "telemetryd_auth_failures_total",
+                        &[("surface", surface.as_str())],
+                    );
+                    Err(Error::Unauthorized.into())
+                }
             }
-        },
+        }
         _ => {
             // Counted, but deliberately not logged per-request: a scanner hitting an
             // exposed instance would otherwise write our disk full with our own logs.

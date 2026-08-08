@@ -132,19 +132,18 @@ impl Oidc {
         Ok(count)
     }
 
-    /// Decide whether a bearer token grants `surface`.
+    /// Decide whether a bearer token grants `surface`, against the cached keys.
+    ///
+    /// **Does no I/O.** An unseen key id returns [`Rejected::UnknownKey`] rather than
+    /// fetching, because this runs inside the request path: the caller decides whether
+    /// it is somewhere a blocking network call is acceptable, and it never is on an
+    /// async runtime worker. [`Self::refresh_if_due`] is the other half, and
+    /// `auth::guard` runs it on a blocking thread before trying once more.
     pub fn authorize(&self, token: &str, surface: Surface) -> Result<String, Rejected> {
         let header = decode_header(token).map_err(|_| Rejected::NotAJwt)?;
         let kid = header.kid.ok_or(Rejected::NotAJwt)?;
 
-        let key = if let Some(key) = self.key(&kid) {
-            key
-        } else {
-            // A key id we have not seen is what a rotation looks like, so refresh once
-            // and try again — but not on every forged id that arrives.
-            self.refresh_if_due();
-            self.key(&kid).ok_or(Rejected::UnknownKey)?
-        };
+        let key = self.key(&kid).ok_or(Rejected::UnknownKey)?;
 
         // The algorithm comes from the key, not from `header.alg`.
         let mut validation = Validation::new(key.algorithm);
@@ -197,8 +196,11 @@ impl Oidc {
             .map(Arc::clone)
     }
 
-    /// Refresh on an unknown key id, at most once a minute.
-    fn refresh_if_due(&self) {
+    /// Refresh after an unknown key id, at most once a minute.
+    ///
+    /// **Blocks on the network.** Call it from a blocking thread. The cooldown is what
+    /// stops a stream of forged key ids becoming a stream of outbound requests.
+    pub fn refresh_if_due(&self) {
         const COOLDOWN: Duration = Duration::from_secs(60);
         {
             let keys = self
@@ -220,12 +222,31 @@ impl Oidc {
     }
 }
 
+/// Fetch the key set, with a bound on how long it may take and how much it may be.
+///
+/// Every one of ureq's timeouts defaults to `None`, so without this an issuer that
+/// accepts a connection and then says nothing holds the caller forever. That matters
+/// more than it looks: this runs on a blocking thread, but the thread pool is finite,
+/// and an unbounded wait leaks one per refresh.
+///
+/// The body limit is well under ureq's own 10 MB default. A JWKS is a handful of
+/// public keys — kilobytes — and a response that is not is not one we want to parse.
 fn fetch(url: &str) -> Result<String, String> {
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+    const TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
+    const MAX_JWKS_BYTES: u64 = 512 * 1024;
+
     let mut response = ureq::get(url)
+        .config()
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_global(Some(TOTAL_TIMEOUT))
+        .build()
         .call()
         .map_err(|e| format!("fetching {url}: {e}"))?;
     response
         .body_mut()
+        .with_config()
+        .limit(MAX_JWKS_BYTES)
         .read_to_string()
         .map_err(|e| format!("reading {url}: {e}"))
 }
@@ -454,6 +475,20 @@ mod tests {
             }
         }
 
+        /// Republish the same key under a new id. A rotation, as far as the code
+        /// under test can tell — it keys off the id, not the bytes.
+        fn rotate(&mut self, kid: &str) {
+            self.jwks = self.jwks.replace(&self.kid, kid);
+            self.kid = kid.to_owned();
+        }
+
+        /// A token whose header names a key id the verifier has never seen.
+        fn token_with_kid(&self, claims: &serde_json::Value, kid: &str) -> String {
+            let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+            header.kid = Some(kid.to_owned());
+            jsonwebtoken::encode(&header, claims, &self.encoding).unwrap()
+        }
+
         fn token(&self, claims: &serde_json::Value) -> String {
             let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
             header.kid = Some(self.kid.clone());
@@ -655,5 +690,98 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The regression this file was restructured for.
+    ///
+    /// `authorize` used to fetch the key set when it met an unfamiliar `kid`. It runs
+    /// inside the request path on an async runtime worker, so that parked a worker for
+    /// as long as the issuer took to answer — and the attacker chooses when, by
+    /// choosing the `kid`. Every ureq timeout defaults to `None`, so "as long as it
+    /// takes" had no upper bound at all.
+    ///
+    /// Pointed at a port with nothing behind it: if this ever does I/O again, the test
+    /// pays a connect timeout and the assertion on elapsed time fails.
+    #[test]
+    fn an_unknown_key_id_does_no_network_io() {
+        let issuer = TestIssuer::new();
+
+        // A listener that accepts and then says nothing. A *closed* port is no use
+        // here: it answers ECONNREFUSED instantly, so a fetch would cost no time and
+        // the test would pass whether or not the I/O happened. This is what the first
+        // version of this test got wrong — it passed against the bug it was written
+        // to catch. A connection that hangs is the case that actually hurts, and the
+        // only one that shows up as elapsed time.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(30));
+                drop(stream);
+            }
+        });
+
+        let mut config = config();
+        config.issuer = format!("http://127.0.0.1:{port}");
+        let oidc = loaded(config, &issuer.jwks);
+        let token = issuer.token_with_kid(&claims("telemetry:read"), "a-kid-nobody-published");
+
+        let started = Instant::now();
+        let outcome = oidc.authorize(&token, Surface::Query);
+        let elapsed = started.elapsed();
+
+        assert_eq!(outcome, Err(Rejected::UnknownKey));
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "authorize took {elapsed:?}: it went to the network from inside the \
+             request path, which parks an async runtime worker for as long as the \
+             issuer feels like taking"
+        );
+    }
+
+    /// Key rotation, which is the reason the unknown-`kid` refresh exists at all.
+    ///
+    /// The same key material republished under a new id is enough: what the code keys
+    /// off is the id being unfamiliar, not the bytes being different.
+    #[test]
+    fn a_rotated_key_id_is_picked_up_by_a_refresh() {
+        let mut issuer = TestIssuer::new();
+        let oidc = loaded(config(), &issuer.jwks);
+
+        issuer.rotate("test-key-2");
+        let token = issuer.token(&claims("telemetry:read"));
+        assert_eq!(
+            oidc.authorize(&token, Surface::Query),
+            Err(Rejected::UnknownKey),
+            "the new key id is not in the cache yet"
+        );
+
+        // What `auth::guard` does on a blocking thread, minus the network.
+        let keys = parse_jwks(&issuer.jwks).unwrap();
+        oidc.keys.write().unwrap().keys = keys;
+
+        assert_eq!(
+            oidc.authorize(&token, Surface::Query),
+            Ok("user-1".to_owned())
+        );
+    }
+
+    /// The cooldown is the only thing between a forged `kid` and an outbound request
+    /// per token presented.
+    #[test]
+    fn the_refresh_cooldown_suppresses_a_second_attempt() {
+        let issuer = TestIssuer::new();
+        let mut config = config();
+        // Nothing is listening; a refresh that is not suppressed would try to connect.
+        config.issuer = "http://127.0.0.1:1".to_owned();
+        let oidc = loaded(config, &issuer.jwks);
+        oidc.keys.write().unwrap().attempted_at = Some(Instant::now());
+
+        let started = Instant::now();
+        oidc.refresh_if_due();
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "the cooldown did not suppress the refresh"
+        );
     }
 }
