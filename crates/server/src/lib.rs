@@ -10,6 +10,7 @@ pub mod ingest;
 pub mod loki;
 pub mod maintenance;
 pub mod metrics;
+pub mod oidc;
 pub mod prometheus;
 pub mod routes;
 pub mod state;
@@ -178,7 +179,34 @@ pub async fn serve(config: Arc<Config>, store: Arc<Store>) -> Result<()> {
         );
     }
 
-    let maintenance = maintenance::Maintenance::start(&store, config.storage.wal_sync_interval);
+    // Fetch the key set before serving, so the first request does not pay for it —
+    // but do not *require* it. An identity provider that is down must not stop
+    // telemetryd starting: static tokens keep working, and the refresh loop recovers
+    // when it returns. Failing closed here would be the coupling ADR-011 exists to
+    // avoid, in its worst form.
+    if state.oidc.is_enabled() {
+        let oidc = Arc::clone(&state.oidc);
+        match tokio::task::spawn_blocking(move || oidc.refresh()).await {
+            Ok(Ok(keys)) => tracing::info!(
+                issuer = %config.auth.oidc.issuer,
+                keys,
+                "accepting Cbox ID tokens"
+            ),
+            Ok(Err(error)) => tracing::warn!(
+                issuer = %config.auth.oidc.issuer,
+                %error,
+                "could not load the Cbox ID key set at startup; Cbox ID tokens will be \
+                 refused until it can be fetched. Static tokens are unaffected."
+            ),
+            Err(error) => tracing::error!(%error, "the key fetch task panicked"),
+        }
+    }
+
+    let maintenance = maintenance::Maintenance::start_with(
+        &store,
+        config.storage.wal_sync_interval,
+        Some(Arc::clone(&state.oidc)),
+    );
 
     // `server.shutdown_grace` bounds the drain. Without a bound, one client holding a
     // long tail connection open keeps the process alive indefinitely, and the service

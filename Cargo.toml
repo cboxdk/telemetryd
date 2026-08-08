@@ -62,6 +62,9 @@ subtle = "2.6"
 
 # cli http client — plain HTTP only, no TLS stack (see ADR-004: v1 has no TLS)
 ureq = { version = "3", default-features = false }
+# Signature and claim verification for Cbox ID tokens (ADR-011). Exactly the code you
+# must not hand-roll: algorithm confusion and `alg: none` live here.
+jsonwebtoken = { version = "9", default-features = false }
 
 # storage engine
 arrow = { version = "59", default-features = false, features = ["ipc"] }

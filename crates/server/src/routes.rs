@@ -49,6 +49,18 @@ pub struct AuthStatus {
     pub ingest: &'static str,
     pub query: &'static str,
     pub admin: &'static str,
+    /// Present only when an issuer is configured. `keys: 0` is the shape to alert on:
+    /// it means Cbox ID tokens are being refused because the key set never loaded, and
+    /// nothing else in the response would say so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oidc: Option<OidcStatus>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OidcStatus {
+    pub issuer: String,
+    pub keys: usize,
+    pub keys_stale: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -95,6 +107,11 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse
             ingest: enabled(state.ingest_tokens.is_empty()),
             query: enabled(state.query_tokens.is_empty()),
             admin: enabled(state.admin_tokens.is_empty()),
+            oidc: state.oidc.is_enabled().then(|| OidcStatus {
+                issuer: config.auth.oidc.issuer.clone(),
+                keys: state.oidc.key_count(),
+                keys_stale: state.oidc.is_stale(),
+            }),
         },
         storage,
         retention,
@@ -128,6 +145,30 @@ pub async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError
 /// Read live gauge values at scrape time. See [`crate::metrics::Metrics::render`] for
 /// why these are not cached.
 ///
+/// Series limits and the Cbox ID key set.
+///
+/// Split out so `gauges` stays readable; both describe the *deployment* rather than
+/// the telemetry, which is why they sit behind the admin token.
+#[allow(clippy::cast_precision_loss)]
+fn push_auth_and_cardinality_gauges(state: &AppState, samples: &mut Vec<Sample>) {
+    if state.oidc.is_enabled() {
+        samples.push(Sample::new(
+            "telemetryd_oidc_keys",
+            &[],
+            state.oidc.key_count() as f64,
+        ));
+    }
+
+    let (active_series, rejected_series, max_series, _) = state.store.cardinality_status();
+    for (name, value) in [
+        ("telemetryd_series_active", active_series as f64),
+        ("telemetryd_series_rejected_total", rejected_series as f64),
+        ("telemetryd_series_limit", max_series as f64),
+    ] {
+        samples.push(Sample::new(name, &[], value));
+    }
+}
+
 /// Every sample is `f64` because that is what the Prometheus exposition format is; the
 /// counts and byte totals here are far below the 2^53 boundary where that matters.
 #[allow(clippy::cast_precision_loss)]
@@ -196,14 +237,7 @@ fn gauges(state: &AppState) -> Result<Vec<Sample>, Error> {
         }
     }
 
-    let (active_series, rejected_series, max_series, _) = state.store.cardinality_status();
-    for (name, value) in [
-        ("telemetryd_series_active", active_series as f64),
-        ("telemetryd_series_rejected_total", rejected_series as f64),
-        ("telemetryd_series_limit", max_series as f64),
-    ] {
-        samples.push(Sample::new(name, &[], value));
-    }
+    push_auth_and_cardinality_gauges(state, &mut samples);
 
     // Per app, so a dashboard can show who is growing rather than only that the total
     // is. Cardinality is capped per app, and until this existed the cap was enforceable

@@ -88,7 +88,9 @@ async fn guard(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    if tokens.is_empty() {
+    // An unguarded surface stays unguarded only while *nothing* guards it. Turning on
+    // Cbox ID must not leave a surface open just because its static token is unset.
+    if tokens.is_empty() && !state.oidc.is_enabled() {
         return Ok(next.run(request).await);
     }
 
@@ -100,6 +102,25 @@ async fn guard(
 
     match presented {
         Some(token) if tokens.verify(token) => Ok(next.run(request).await),
+        // A static token is checked first and in constant time; only something that is
+        // not one reaches the token validator, so enabling Cbox ID costs a static
+        // deployment nothing.
+        Some(token) if state.oidc.is_enabled() => match state.oidc.authorize(token, surface) {
+            Ok(subject) => {
+                tracing::debug!(surface = surface.as_str(), %subject, "authorized by Cbox ID");
+                Ok(next.run(request).await)
+            }
+            Err(reason) => {
+                // The reason is logged, never returned: a 401 that explains *why* is a
+                // hint to whoever is guessing.
+                tracing::debug!(surface = surface.as_str(), ?reason, "token refused");
+                state.metrics.incr(
+                    "telemetryd_auth_failures_total",
+                    &[("surface", surface.as_str())],
+                );
+                Err(Error::Unauthorized.into())
+            }
+        },
         _ => {
             // Counted, but deliberately not logged per-request: a scanner hitting an
             // exposed instance would otherwise write our disk full with our own logs.

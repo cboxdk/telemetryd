@@ -42,7 +42,46 @@ pub struct Maintenance {
 impl Maintenance {
     /// Start the maintenance tasks against `store`.
     pub fn start(store: &Arc<Store>, wal_sync_interval: Duration) -> Self {
+        Self::start_with(store, wal_sync_interval, None)
+    }
+
+    /// As [`Self::start`], plus refreshing the Cbox ID key set when one is configured.
+    pub fn start_with(
+        store: &Arc<Store>,
+        wal_sync_interval: Duration,
+        oidc: Option<Arc<crate::oidc::Oidc>>,
+    ) -> Self {
         let mut tasks = Vec::new();
+
+        // Keys, on a timer. A rotation is also picked up on demand when a token
+        // arrives with an unseen key id, so this is the ceiling on staleness rather
+        // than the mechanism — and it is what recovers after the issuer has been down.
+        if let Some(oidc) = oidc.filter(|oidc| oidc.is_enabled()) {
+            tasks.push(tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(60));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    if !oidc.is_stale() {
+                        continue;
+                    }
+                    let oidc = Arc::clone(&oidc);
+                    let result = tokio::task::spawn_blocking(move || oidc.refresh()).await;
+                    match result {
+                        Ok(Ok(count)) => {
+                            tracing::debug!(keys = count, "refreshed the Cbox ID key set");
+                        }
+                        // Keeps serving the keys it already has: a provider that goes
+                        // down must not take authentication with it.
+                        Ok(Err(error)) => tracing::warn!(
+                            %error,
+                            "could not refresh the Cbox ID key set; continuing with the cached one"
+                        ),
+                        Err(e) => tracing::error!(error = %e, "key refresh task panicked"),
+                    }
+                }
+            }));
+        }
 
         // Sync: honour `wal_sync = "interval"` even when no request is in flight.
         // Without this, "at most 100ms of loss" would silently become "at most 100ms

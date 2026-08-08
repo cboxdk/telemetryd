@@ -14,3 +14,4 @@ description: "Task-shaped recipes for running telemetryd in anger."
 
 - [Back up and restore](back-up-and-restore.md)
 - [Query from the shell](query-from-the-shell.md)
+- [Single sign-on with Cbox ID](single-sign-on.md)

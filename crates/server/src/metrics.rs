@@ -114,6 +114,11 @@ pub const DESCRIPTORS: &[Descriptor] = &[
         help: "Segments sealed since start, by signal",
     },
     Descriptor {
+        name: "telemetryd_oidc_keys",
+        kind: Kind::Gauge,
+        help: "Cbox ID signing keys currently cached — zero means every Cbox ID token is being refused",
+    },
+    Descriptor {
         name: "telemetryd_app_series",
         kind: Kind::Gauge,
         help: "Distinct series per app — what limits.max_series_per_app is enforced against",

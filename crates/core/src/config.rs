@@ -119,6 +119,99 @@ pub struct AuthConfig {
     /// existed, so adding the role breaks no deployment. Setting it is opting into
     /// the tighter split.
     pub admin_token: TokenSpecs,
+    /// Accept Cbox ID access tokens alongside the static ones (ADR-011).
+    ///
+    /// Unset means static tokens only, which is a complete answer for one team on one
+    /// host. Setting an issuer turns it on.
+    #[serde(default)]
+    pub oidc: OidcConfig,
+}
+
+/// Validating tokens issued by a Cbox ID instance.
+///
+/// Tokens are checked **locally** against the issuer's published keys. telemetryd
+/// never asks the provider about a token, because it is the thing you open when
+/// something is broken: if the identity provider is unreachable, introspection would
+/// mean you cannot read the logs that would tell you why. Keys are cached, so a
+/// provider that goes down stops new tokens being *issued* while every token already
+/// in hand keeps working.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct OidcConfig {
+    /// The issuer URL, e.g. `https://id.example.com`. Empty disables the whole thing.
+    ///
+    /// Must match the token's `iss` exactly — it is what ties a token to the provider
+    /// you meant rather than any provider.
+    pub issuer: String,
+
+    /// The `aud` a token must carry.
+    ///
+    /// Cbox ID always sets one (RFC 9068 §2.2 requires it): the requested resource, or
+    /// the issuer itself when no resource was named. Leaving this empty accepts the
+    /// issuer's own value, which is right for a single telemetryd. Set it when several
+    /// resource servers share an issuer, so a token minted for one cannot be replayed
+    /// at another.
+    pub audience: String,
+
+    /// Scope that grants each role. A token may hold several.
+    pub scope_write: String,
+    pub scope_read: String,
+    pub scope_admin: String,
+
+    /// How often to refetch the key set.
+    ///
+    /// A key rotation is also picked up immediately on a token whose `kid` is unknown,
+    /// so this is the ceiling on staleness rather than the mechanism.
+    #[serde(with = "humantime_serde")]
+    pub refresh_interval: Duration,
+
+    /// Tolerance for clock difference between this host and the issuer.
+    #[serde(with = "humantime_serde")]
+    pub clock_skew: Duration,
+}
+
+impl Default for OidcConfig {
+    fn default() -> Self {
+        Self {
+            issuer: String::new(),
+            audience: String::new(),
+            // Namespaced, so they cannot collide with another resource server's scopes
+            // on a shared issuer.
+            scope_write: "telemetry:write".to_owned(),
+            scope_read: "telemetry:read".to_owned(),
+            scope_admin: "telemetry:admin".to_owned(),
+            refresh_interval: Duration::from_secs(3600),
+            clock_skew: Duration::from_secs(60),
+        }
+    }
+}
+
+impl OidcConfig {
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        !self.issuer.trim().is_empty()
+    }
+
+    /// Where the key set lives.
+    ///
+    /// Cbox ID publishes it at the well-known path its `KeyManager` documents.
+    #[must_use]
+    pub fn jwks_url(&self) -> String {
+        format!(
+            "{}/.well-known/jwks.json",
+            self.issuer.trim_end_matches('/')
+        )
+    }
+
+    /// The audience a token must carry: the configured one, or the issuer.
+    #[must_use]
+    pub fn expected_audience(&self) -> &str {
+        if self.audience.trim().is_empty() {
+            self.issuer.trim_end_matches('/')
+        } else {
+            self.audience.trim()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -611,6 +704,37 @@ impl Config {
                 self.storage.max_segment_bytes,
                 ByteSize::b(floor),
             )));
+        }
+
+        if self.auth.oidc.is_enabled() {
+            let issuer = self.auth.oidc.issuer.trim();
+            // Keys fetched over plaintext can be substituted in flight, and whoever
+            // substitutes them mints their own admin tokens. Loopback is exempt
+            // because that is how it is tested.
+            let loopback = issuer.starts_with("http://127.0.0.1")
+                || issuer.starts_with("http://localhost")
+                || issuer.starts_with("http://[::1]");
+            if !issuer.starts_with("https://") && !loopback {
+                return Err(Error::Config(format!(
+                    "auth.oidc.issuer must be https (got {issuer:?}).\n\
+                     telemetryd fetches the issuer's signing keys from it, so anyone \
+                     able to answer that request over plaintext can mint tokens this \
+                     instance will accept."
+                )));
+            }
+            for (name, scope) in [
+                ("scope_write", &self.auth.oidc.scope_write),
+                ("scope_read", &self.auth.oidc.scope_read),
+                ("scope_admin", &self.auth.oidc.scope_admin),
+            ] {
+                if scope.trim().is_empty() || scope.contains(' ') {
+                    return Err(Error::Config(format!(
+                        "auth.oidc.{name} must be a single non-empty scope (got \
+                         {scope:?}); scopes are matched whole against a \
+                         space-separated claim"
+                    )));
+                }
+            }
         }
 
         if self.limits.ingest_queue_depth == 0 {

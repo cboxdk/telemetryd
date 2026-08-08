@@ -31,7 +31,20 @@ shutdown_grace   = "15s"             # drain in-flight requests, then flush WAL
 # Accepts a string or a list of strings (rotation).
 # Indirection: "file:/run/secrets/tok" or "env:MY_VAR".
 ingest_token = []                    # guards /v1/*, /api/v1/write
-query_token  = []                    # guards Prometheus/Loki/Tempo reads, /status, /metrics
+query_token  = []                    # guards the Prometheus/Loki/Tempo read APIs
+admin_token  = []                    # guards /status and /metrics
+
+[auth.oidc]
+# Accept Cbox ID access tokens alongside the static ones. Unset = static only.
+# Tokens are validated locally against the issuer's published keys; telemetryd
+# never asks the provider about a token. See ADR-011.
+issuer           = ""                # https:// (or loopback); the only required key
+audience         = ""                # "" = accept the issuer's own value
+scope_write      = "telemetry:write"
+scope_read       = "telemetry:read"
+scope_admin      = "telemetry:admin"
+refresh_interval = "1h"              # how often the key set is refetched
+clock_skew       = "1m"              # allowance on exp/nbf
 
 [storage]
 data_dir          = ""               # "" = auto (see resolution order below)
@@ -65,6 +78,22 @@ level  = "info"                      # trace | debug | info | warn | error
 format = "text"                      # text | json
 
 
+
+## What `auth.oidc.issuer` changes about the other keys
+
+**Setting it guards every surface, including ones whose static token is empty.**
+
+An empty `query_token` means "unguarded" only while nothing else guards that surface.
+Once Cbox ID is on, a request to the read API must present *something* valid — and a
+token carrying `telemetry:admin` is not valid there, because the scopes are not a
+hierarchy.
+
+This is the safe direction, but it is a behaviour change: a surface you were leaving
+open on purpose stops being open the moment you set an issuer. Decide per surface,
+before enabling it, and check with the tokens you expect people to hold.
+
+Static tokens are checked first and in constant time, so turning this on costs a purely
+static deployment nothing.
 
 ## Data directory resolution
 

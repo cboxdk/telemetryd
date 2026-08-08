@@ -17,9 +17,15 @@ Exits non-zero on the first failed expectation, and always stops the server it b
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import http.server
 import json
 import os
+import pathlib
 import signal
+import socket
+import threading
 import shutil
 import subprocess
 import sys
@@ -344,6 +350,8 @@ def main() -> int:
     check_disk_budget(binary)
     check_reload(binary)
     check_damaged_segment(binary)
+    check_oidc(binary)
+    check_oidc_survives_a_missing_provider(binary)
 
     print("\n" + "=" * 52)
     if failures:
@@ -588,6 +596,250 @@ def directory_bytes(path: str) -> int:
             except OSError:
                 pass
     return total
+
+
+# --- Cbox ID, stood in for ------------------------------------------------------
+#
+# The unit tests sign real tokens and verify them through the real path, but they do
+# it inside the crate. What they cannot see is the part that only exists once the
+# binary is running: fetching a key set over the network at startup, surviving a
+# provider that is not there yet, and mapping a scope onto a route. That is exactly
+# the seam the `.deb` unit-file defect lived in, so it gets covered here too.
+#
+# The signing below is written out rather than imported. soak.py runs anywhere a
+# stock python3 does — the same promise the binary makes — and one phase is not worth
+# giving that up for.
+
+RSA_KEY_DER = "crates/server/tests/data/oidc-test-key.der"
+# EMSA-PKCS1-v1_5 DigestInfo prefix for SHA-256 (RFC 8017 §9.2, notes on DigestInfo).
+SHA256_DIGEST_INFO = bytes.fromhex("3031300d060960864801650304020105000420")
+
+
+def der_integers(blob: bytes) -> list[int]:
+    """Every INTEGER in a PKCS#1 RSAPrivateKey, in order: version, n, e, d, p, q, ..."""
+    if blob[0] != 0x30:
+        raise ValueError("not a DER SEQUENCE")
+    at = 1
+    length = blob[at]
+    at += 1
+    if length & 0x80:
+        at += length & 0x7F
+    out = []
+    while at < len(blob):
+        tag, at = blob[at], at + 1
+        length, at = blob[at], at + 1
+        if length & 0x80:
+            count = length & 0x7F
+            length = int.from_bytes(blob[at:at + count], "big")
+            at += count
+        if tag == 0x02:
+            out.append(int.from_bytes(blob[at:at + length], "big"))
+        at += length
+    return out
+
+
+def b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+class Issuer:
+    """A stand-in Cbox ID: a key pair, a JWKS endpoint, and tokens signed with it."""
+
+    def __init__(self) -> None:
+        _, self.n, self.e, self.d = der_integers(pathlib.Path(RSA_KEY_DER).read_bytes())[:4]
+        self.size = (self.n.bit_length() + 7) // 8
+        self.kid = "test-key-1"
+        self.jwks = json.dumps({"keys": [{
+            "kty": "RSA", "kid": self.kid, "use": "sig", "alg": "RS256",
+            "n": b64url(self.n.to_bytes(self.size, "big")),
+            "e": b64url(self.e.to_bytes((self.e.bit_length() + 7) // 8, "big")),
+        }]}).encode()
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), self._handler())
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def _handler(self):
+        jwks = self
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path != "/.well-known/jwks.json":
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(jwks.jwks)))
+                self.end_headers()
+                self.wfile.write(jwks.jwks)
+
+            def log_message(self, *_args) -> None:
+                pass
+        return Handler
+
+    def sign(self, message: bytes) -> bytes:
+        digest = SHA256_DIGEST_INFO + hashlib.sha256(message).digest()
+        # PKCS#1 v1.5: 0x00 0x01 <0xFF padding> 0x00 <DigestInfo>
+        padded = b"\x00\x01" + b"\xff" * (self.size - len(digest) - 3) + b"\x00" + digest
+        signed = pow(int.from_bytes(padded, "big"), self.d, self.n)
+        return signed.to_bytes(self.size, "big")
+
+    def token(self, scope: str, lifetime: int = 300, audience: str | None = None) -> str:
+        header = {"alg": "RS256", "typ": "JWT", "kid": self.kid}
+        now = int(time.time())
+        claims = {
+            "iss": self.url, "aud": audience or self.url, "sub": "soak-user",
+            "iat": now, "exp": now + lifetime, "scope": scope,
+        }
+        body = b64url(json.dumps(header).encode()) + "." + b64url(json.dumps(claims).encode())
+        return body + "." + b64url(self.sign(body.encode()))
+
+
+def oidc_status(token: str) -> dict:
+    """`/status`'s OIDC block. Needs the admin token — `/status` is an admin surface."""
+    req = urllib.request.Request(BASE + "/status")
+    req.add_header("authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            body = json.loads(response.read())
+    except (urllib.error.HTTPError, ValueError):
+        return {}
+    block = body.get("auth", {}).get("oidc")
+    return block if isinstance(block, dict) else {}
+
+
+def with_token(path: str, token: str | None, payload: object | None = None) -> int:
+    """Status code only — this phase is about who gets in, not what comes back."""
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(BASE + path, data=data, method="POST" if data else "GET")
+    if data:
+        req.add_header("content-type", "application/json")
+    if token:
+        req.add_header("authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        return error.code
+
+
+def check_oidc(binary: str) -> None:
+    """A scope has to open exactly the surface it names, from outside the process."""
+    print("\n=== Cbox ID tokens ===")
+    issuer = Issuer()
+    data_dir = tempfile.mkdtemp(prefix="telemetryd-soak-oidc-")
+    config = os.path.join(data_dir, "telemetryd.toml")
+    with open(config, "w", encoding="utf-8") as handle:
+        handle.write(
+            "[auth]\nadmin_token = [\"static-admin\"]\n"
+            f"[auth.oidc]\nissuer = \"{issuer.url}\"\n"
+        )
+
+    proc = subprocess.Popen(
+        [binary, "serve", "--config", config, "--listen", f"127.0.0.1:{PORT}",
+         "--data-dir", data_dir],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env={**os.environ},
+    )
+    try:
+        for _ in range(240):
+            try:
+                if request("/healthz")[0] == 200:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.25)
+
+        # Zero keys is the failure that looks like working software: the server is up,
+        # every token is refused, and nothing else in the response says why.
+        oidc = oidc_status("static-admin")
+        check("the key set was fetched at startup", oidc.get("keys") == 1,
+              f"keys={oidc.get('keys', 'absent')}")
+
+        entry = {"resourceLogs": [{"resource": {"attributes": [
+            {"key": "service.name", "value": {"stringValue": "soak"}}]},
+            "scopeLogs": [{"logRecords": [{
+                "timeUnixNano": str(NOW), "body": {"stringValue": "oidc"}}]}]}]}
+
+        surfaces = {
+            "query": lambda t: with_token("/loki/api/v1/labels", t),
+            "status": lambda t: with_token("/status", t),
+            "ingest": lambda t: with_token("/v1/logs", t, entry),
+        }
+        # Not a hierarchy: admin does not imply read. Running a dashboard is not a
+        # reason to be able to read anyone's log lines.
+        expected = {
+            "telemetry:read":   {"query": 200, "status": 401, "ingest": 401},
+            "telemetry:admin":  {"query": 401, "status": 200, "ingest": 401},
+            "telemetry:write":  {"query": 401, "status": 401, "ingest": 200},
+        }
+        for scope, wanted in expected.items():
+            token = issuer.token(scope)
+            got = {name: call(token) for name, call in surfaces.items()}
+            check(f"{scope} opens exactly its own surface", got == wanted,
+                  " ".join(f"{k}={v}" for k, v in got.items()))
+
+        refused = {
+            "an expired token": issuer.token("telemetry:read", lifetime=-3600),
+            "a token for another audience": issuer.token("telemetry:read", audience="https://elsewhere"),
+            "a near-miss scope": issuer.token("telemetry:readonly"),
+            "a token with no signature": issuer.token("telemetry:read").rsplit(".", 1)[0] + ".",
+            "not a token at all": "hunter2",
+        }
+        for name, token in refused.items():
+            check(f"{name} is refused", with_token("/loki/api/v1/labels", token) == 401)
+
+        check("no token is refused", with_token("/loki/api/v1/labels", None) == 401)
+        # Turning this on must not cost an existing static deployment anything.
+        check("a static token still works alongside it",
+              with_token("/status", "static-admin") == 200)
+    finally:
+        stop(proc)
+        issuer.server.shutdown()
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def check_oidc_survives_a_missing_provider(binary: str) -> None:
+    """telemetryd must start when the identity provider does not answer.
+
+    Refusing to start would be the coupling ADR-011 exists to avoid, in its worst
+    form: the tool you open when something is broken, refusing to open because
+    something is broken.
+    """
+    print("\n=== Cbox ID unreachable ===")
+    data_dir = tempfile.mkdtemp(prefix="telemetryd-soak-nooidc-")
+    config = os.path.join(data_dir, "telemetryd.toml")
+    # A port with nothing behind it, chosen by binding and immediately releasing.
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        dead = probe.getsockname()[1]
+    with open(config, "w", encoding="utf-8") as handle:
+        handle.write(
+            "[auth]\nadmin_token = [\"static-admin\"]\n"
+            f"[auth.oidc]\nissuer = \"http://127.0.0.1:{dead}\"\n"
+        )
+
+    proc = subprocess.Popen(
+        [binary, "serve", "--config", config, "--listen", f"127.0.0.1:{PORT}",
+         "--data-dir", data_dir],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ},
+    )
+    try:
+        healthy = False
+        for _ in range(240):
+            try:
+                if request("/healthz")[0] == 200:
+                    healthy = True
+                    break
+            except OSError:
+                pass
+            time.sleep(0.25)
+        check("the server starts anyway", healthy)
+        check("static tokens are unaffected", with_token("/status", "static-admin") == 200)
+        oidc = oidc_status("static-admin")
+        check("the empty key set is visible rather than silent", oidc.get("keys") == 0,
+              f"keys={oidc.get('keys', 'absent')}")
+    finally:
+        stop(proc)
+        shutil.rmtree(data_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -44,6 +44,8 @@ pub struct AppState {
     /// excess would be the unbounded buffering the setting exists to prevent, just
     /// moved somewhere less visible.
     ingest_permits: Arc<Semaphore>,
+    /// Cbox ID token validation. Disabled unless an issuer is configured.
+    pub oidc: Arc<crate::oidc::Oidc>,
     tail: broadcast::Sender<Arc<LogRecord>>,
 }
 
@@ -59,6 +61,7 @@ impl AppState {
     pub fn new(config: Arc<Config>, store: Arc<Store>) -> Result<Self> {
         let (tail, _) = broadcast::channel(TAIL_BUFFER);
         let queue_depth = usize::try_from(config.limits.ingest_queue_depth).unwrap_or(usize::MAX);
+        let oidc = Arc::new(crate::oidc::Oidc::new(config.auth.oidc.clone()));
         Ok(Self {
             ingest_tokens: Arc::new(config.auth.ingest_token.resolve()?),
             query_tokens: Arc::new(config.auth.query_token.resolve()?),
@@ -73,6 +76,7 @@ impl AppState {
             started: Instant::now(),
             started_at: OffsetDateTime::now_utc(),
             ingest_permits: Arc::new(Semaphore::new(queue_depth)),
+            oidc,
             tail,
         })
     }
