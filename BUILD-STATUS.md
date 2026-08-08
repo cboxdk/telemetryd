@@ -73,6 +73,13 @@ every surface, including any whose static token is deliberately empty. That is t
 direction, and it is documented in the configuration reference because it is a
 behaviour change, not a default.
 
+**Relay mode.** telemetryd can stand in front of a central instance and decide who each
+client is from its credential rather than from its payload — the point of it for mobile
+fleets, where the credential lives in a binary anyone can open (ADR-013). Sealed
+segments are forwarded in arrival order behind a durable cursor that advances only after
+upstream confirms; retention will not delete what has not been forwarded, and
+`relay.when_full` decides between losing the oldest unsent data and refusing new writes.
+
 **Operations.** `telemetryd query` runs a LogQL query from the shell — for debugging
 over SSH when the UI is the thing you cannot reach, and for getting data out as JSON
 lines. `telemetryd bench` measures what the machine can ingest and query, on a

@@ -42,6 +42,17 @@ query_token  = []                    # Loki/Tempo/Prometheus reads, /status, /me
 # audience = "https://telemetry.example.com"   # when several services share an issuer
 # scope_read = "telemetry:read"
 
+# Stand in front of a central instance and decide who each client is from its
+# credential rather than from its payload. For mobile fleets, where the credential
+# lives in a binary anyone can open. See docs/cookbook/relay-mode.md.
+# [relay]
+# upstream = "https://telemetry.internal"
+# token    = "file:/run/secrets/upstream"
+#
+# [[relay.client]]
+# app   = "mobile-ios"
+# token = "file:/run/secrets/mobile-ios"
+
 [storage]
 # Empty = automatic: ./telemetryd-data if it already exists, else the platform data
 # directory. The resolved path is logged at startup and shown in /status.

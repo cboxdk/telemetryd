@@ -73,6 +73,21 @@ max_log_line_bytes      = "256KiB"
 max_attrs_per_record    = 128
 ingest_queue_depth      = 8192       # backpressure: full queue → 429 with Retry-After
 
+[relay]
+# Forward what this instance accepts to a central one, as a safe front door for
+# clients you do not trust (ADR-013). Unset = store locally and send nothing on.
+# upstream  = "https://telemetry.internal"   # https, or loopback for testing
+# token     = "file:/run/secrets/upstream"   # the credential clients must never hold
+trust_client_identity = false        # take `app` from the payload instead of the credential
+when_full             = "drop_oldest"  # drop_oldest | reject, when undelivered data fills the budget
+interval              = "30s"        # how often to look for sealed segments to ship
+
+# One entry per client application. The token identifies it; the app is stamped onto
+# every record it sends, replacing whatever the payload claimed.
+# [[relay.client]]
+# app   = "mobile-ios"
+# token = "file:/run/secrets/mobile-ios"
+
 [log]                                # telemetryd's own logging
 level  = "info"                      # trace | debug | info | warn | error
 format = "text"                      # text | json

@@ -6,7 +6,7 @@ description: "A safe front door for untrusted clients: why the value is stamping
 
 # ADR-013: Relay mode
 
-- **Status:** Proposed
+- **Status:** **Accepted and built.**
 - **Date:** 2026-08-08
 - **Amends:** [ADR-012](0012-import-and-export.md), which ruled forwarding out
 - **Builds on:** [ADR-004](0004-auth-and-network-binding.md), [ADR-011](0011-cbox-id-integration.md)
@@ -180,9 +180,11 @@ a read proxy as well means merging local and remote results, reconciling two ret
 windows, and inheriting upstream's availability into every query — which is the coupling
 [ADR-011](0011-cbox-id-integration.md) exists to avoid, in a new place.
 
-## How it will be kept honest
+## How it is kept honest
 
-The delivery guarantee is the thing to test, and the tests are the unhappy paths:
+Built as described. The delivery guarantee is the thing to test, and the tests are the
+unhappy paths — the soak runs them against the real binary with a stand-in upstream it
+can switch off:
 
 - upstream refuses connections for the whole run, then recovers: everything accepted is
   eventually delivered, in order, exactly once per shipped segment
@@ -195,9 +197,10 @@ The delivery guarantee is the thing to test, and the tests are the unhappy paths
   stamp wins, and this is asserted, because it is the entire security claim
 - `kill -9` mid-shipment: the cursor does not advance past what was delivered
 
-The last one is the one to write first. A cursor that advances before delivery is
-confirmed turns a crash into silent data loss, and it is the kind of bug that only
-appears under a crash nobody arranged.
+The soak found one defect immediately, and it was an interaction no unit test could
+see: registering relay clients closed the *read* API, because the check for "is this
+surface unguarded" counted ingest credentials against every surface. The read API
+demanded a token, and nothing in the configuration could satisfy it.
 
 ## Sender-constrained tokens change the premise
 
