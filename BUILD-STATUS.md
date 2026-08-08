@@ -3,7 +3,7 @@
 The living record of what is built, what is not, and what is deliberately absent. Kept
 current so scope and gaps are always auditable without reading the source.
 
-Last updated at **M5**.
+Last updated at **M5**, plus the authentication work that followed it.
 
 ## Milestones
 
@@ -60,6 +60,19 @@ damaging a real data directory five different ways.
 unsupported construct reports itself by name. Live tail over WebSocket. Label and series
 queries answered from metadata with no file I/O.
 
+**Authentication.** Three surfaces — ingest, query, admin — each guarded by its own
+static bearer token, with rotation via a list and indirection through a file or
+environment variable. Cbox ID access tokens are accepted alongside them, validated
+locally against the issuer's published key set so that an identity provider being down
+never stops you reading your telemetry (ADR-011). The algorithm comes from the key the
+`kid` selects, never from the token. Scopes are not a hierarchy: admin does not imply
+read.
+
+The roles are also not a hierarchy of *convenience*: setting an OIDC issuer guards
+every surface, including any whose static token is deliberately empty. That is the safe
+direction, and it is documented in the configuration reference because it is a
+behaviour change, not a default.
+
 **Operations.** `telemetryd query` runs a LogQL query from the shell — for debugging
 over SSH when the UI is the thing you cannot reach, and for getting data out as JSON
 lines. `telemetryd bench` measures what the machine can ingest and query, on a
@@ -72,16 +85,16 @@ level; anything else that changed in the file is refused by name rather than ign
 (and signature verification, once a signed release exists), Homebrew formula, `.deb`, deterministic CycloneDX SBOM with a
 CI drift check.
 
-**Release signing — implemented, not yet exercised.** `SHA256SUMS` is signed by the
-release workflow's own OIDC identity, keyless, with no private key to store or rotate.
-The release job verifies its own signature before publishing, and `install.sh` verifies
-it when `cosign` is present, pinning `--certificate-identity` — without which any valid
+**Release signing — exercised.** `SHA256SUMS` is signed by the release workflow's own
+OIDC identity, keyless, with no private key to store or rotate. The release job
+verifies its own signature before publishing, and `install.sh` verifies it when
+`cosign` is present, pinning `--certificate-identity` — without which any valid
 Sigstore signature by anyone would pass.
 
-Stated precisely because it matters: **no release has run this code yet**, so the
-signing path is reviewed and syntactically checked but not proven. The first release to
-publish `SHA256SUMS.cosign.bundle` is the one that verifies it, and until then this
-belongs under "written" rather than "working".
+This entry used to say the path was written but unproven. It is proven now: v0.13.0's
+bundle was downloaded from the published release and verified against
+`refs/tags/v0.13.0` with the same command the documentation gives users, on a machine
+that had not built it.
 
 ## Gates
 
@@ -115,7 +128,7 @@ against the exact artifact being published, before anything is uploaded.
 Plus: all four release targets cross-compile, and the musl builds are asserted to be
 statically linked.
 
-**Fuzzing runs nightly, not on the merge gate.** Five targets cover every parser that
+**Fuzzing runs nightly, not on the merge gate.** Six targets cover every parser that
 reads untrusted bytes — the three query languages, OTLP JSON, and the hand-rolled
 `remote_write` protobuf. A clean sixty seconds proves very little, so making a merge
 wait on one would trade real signal for the appearance of it.

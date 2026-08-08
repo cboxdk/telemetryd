@@ -99,19 +99,33 @@ tells you the three ways to fix it and generates a token to paste.
 [auth]
 ingest_token = "file:/run/secrets/ingest"   # guards /v1/*, /api/v1/write
 query_token  = ["old-token", "new-token"]   # guards the read APIs; a list rotates
+admin_token  = "env:TELEMETRYD_ADMIN"       # guards /status and /metrics
 ```
 
-Two independent tokens, because app servers push and humans read — different
-credentials, different rotation. Comparison is constant-time over SHA-256, so token
-length does not leak. Token values never reach a log line, `/status`, or
-`telemetryd validate` output; that is enforced by the type, not by discipline.
+Three independent tokens, because app servers push, humans read, and dashboards
+scrape — different credentials, different rotation. They are not a hierarchy: an admin
+token does not grant reads. Comparison is constant-time over SHA-256, so token length
+does not leak. Token values never reach a log line, `/status`, or `telemetryd validate`
+output; that is enforced by the type, not by discipline.
+
+Point it at Cbox ID and it will accept access tokens too, validated against the
+issuer's published keys rather than by calling the provider — so an identity provider
+that is down never stops you reading the logs that would explain why:
+
+```toml
+[auth.oidc]
+issuer = "https://id.example.com"
+```
+
+Scopes map to the same three roles. See the [single sign-on
+guide](docs/cookbook/single-sign-on.md).
 
 **Deliberately out of scope in v1**, and stated rather than silently absent:
 
 - **TLS.** Terminate it at a reverse proxy. Shipping TLS means shipping certificate
   lifecycle management, and the deployment story does not need it.
 - **Per-app tokens.** The `app` label is a namespace, not a security boundary.
-- **mTLS, OIDC, user accounts.** Out of frame for a single-team tool.
+- **mTLS, user accounts.** Out of frame for a single-team tool.
 
 ## Durability
 

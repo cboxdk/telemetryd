@@ -21,10 +21,27 @@ the binds that actually expose an instance; treating "unspecified" as "probably 
 is how data ends up public. The refusal can be overridden with `--insecure`, which
 logs a warning on every start and is reported as `insecure: true` in `/status`.
 
-**Two independent bearer tokens.** `ingest_token` guards the write endpoints,
-`query_token` guards the read APIs plus `/status` and `/metrics`. Both accept a list
-so a token can be rotated without a window where either the old or the new one is
+**Three independent bearer tokens.** `ingest_token` guards the write endpoints,
+`query_token` the read APIs, and `admin_token` `/status` and `/metrics`. Each accepts a
+list so a token can be rotated without a window where either the old or the new one is
 rejected.
+
+They are not a hierarchy. An admin token does not grant reads — operating an instance
+and reading the telemetry inside it are different privileges, and a dashboard scraping
+`/metrics` is not a reason to hand out everyone's log lines.
+
+**Single sign-on, without a runtime dependency on the provider.** Cbox ID access tokens
+are accepted alongside the static ones. They are validated locally against the issuer's
+published key set; the provider is never asked about a token, so an identity provider
+that is down stops new tokens being issued without stopping you reading the telemetry
+that would explain why. The signing algorithm is taken from the key the token's `kid`
+selects, never from the token itself, which is what closes `alg: none` and
+RS256-verified-as-HS256 confusion. `iss`, `aud` and `exp` are all required. See
+[ADR-011](docs/adr/0011-cbox-id-integration.md).
+
+Setting an issuer guards **every** surface, including any whose static token is
+deliberately empty — an empty token means "unguarded" only while nothing else guards
+that surface.
 
 **Constant-time comparison.** Presented and configured tokens are SHA-256'd and
 compared with `subtle::ConstantTimeEq`. Hashing first makes the comparison
@@ -58,8 +75,9 @@ indistinguishable from a bug.
 - **Per-app authorization.** The `app` label is a query namespace, not a security
   boundary. A holder of the ingest token can write any `app` value, and a holder of
   the query token can read every app.
-- **mTLS, OIDC, user accounts, audit logging of queries.** Out of frame for a
-  single-team tool.
+- **mTLS, user accounts, audit logging of queries.** Out of frame for a single-team
+  tool. OIDC was on this list until Cbox ID support was built; it is now described
+  above.
 - **Encryption at rest.** Use full-disk or filesystem-level encryption. telemetryd
   stores plain Parquet and its own log format, on purpose — the data directory is
   meant to be inspectable with ordinary tools.
@@ -70,9 +88,14 @@ indistinguishable from a bug.
 
 telemetryd does not implement cryptographic primitives. Token hashing uses
 [`sha2`](https://crates.io/crates/sha2) and constant-time comparison uses
-[`subtle`](https://crates.io/crates/subtle), both from the RustCrypto project. There
-is no bespoke crypto, no custom protocol verification, and no signature validation
-code in this repository.
+[`subtle`](https://crates.io/crates/subtle), both from the RustCrypto project.
+
+**JWT signature verification is delegated, not written here.**
+[`jsonwebtoken`](https://crates.io/crates/jsonwebtoken) parses and verifies tokens, and
+`ring` performs the signature checks. This is exactly the code not to hand-roll, so the
+choice was a vetted dependency or no single sign-on at all. What this repository does
+own is the policy around it: which key is selected, which algorithm is permitted, and
+which claims are required — decisions a library cannot make correctly on your behalf.
 
 ## Supply chain
 
