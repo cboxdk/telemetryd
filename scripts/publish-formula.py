@@ -54,7 +54,7 @@ def checksums(tag: str) -> dict[str, str]:
     return digests
 
 
-def render(formula: str, digests: dict[str, str]) -> str:
+def render(formula: str, version: str, digests: dict[str, str]) -> str:
     # Placeholders are substituted positionally, so the formula listing its archives in
     # a different order would pair every checksum with the wrong target — and Homebrew
     # would only find out on someone else's machine. Check the order first.
@@ -71,6 +71,15 @@ def render(formula: str, digests: dict[str, str]) -> str:
 
     if PLACEHOLDER in out:
         sys.exit("a placeholder survived substitution; refusing to publish")
+
+    # Homebrew reads the version out of the URL, so a `version` stanza alongside a
+    # URL that already spells it out is redundant — `brew audit --strict` says so. The
+    # source formula needs it, because that is where `#{version}` comes from and it is
+    # what pins the formula to a release; the published one does not.
+    out = out.replace("#{version}", version)
+    out = re.sub(r'^ *version "[^"]+"\n', "", out, count=1, flags=re.M)
+    if "#{version}" in out or re.search(r'^ *version "', out, flags=re.M):
+        sys.exit("the version stanza did not resolve cleanly; refusing to publish")
     return out
 
 
@@ -90,7 +99,7 @@ def main() -> int:
             "bump it before publishing so the tap cannot serve a stale formula"
         )
 
-    rendered = render(formula, checksums(args.tag))
+    rendered = render(formula, version, checksums(args.tag))
 
     if args.dry_run:
         print(rendered)
