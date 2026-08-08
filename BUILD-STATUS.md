@@ -158,6 +158,21 @@ instead.
 interning does not obviously apply. Only paid for rows that survive filtering, so it no
 longer dominates a query (ADR-006).
 
+**Segment count does not need compacting.** Listed as a gap from reasoning — segments
+accumulate and are never merged — and then measured, which said otherwise. Over a
+sixteenfold increase in segment count:
+
+| segments | newest 100 | label names | line filter, common trigrams |
+|---|---|---|---|
+| 252 | 2.5 ms | 0.4 ms | 31 ms |
+| 4,002 | **2.9 ms** | **0.5 ms** | 474 ms |
+
+Limited queries and metadata queries are flat: per-stream bounds let the cutoff skip
+segments on their manifests, so the count barely matters. The line filter grows
+linearly — but the *data* grew sixteenfold too, so that is cost per byte scanned, not
+per segment, and merging segments would not reduce a byte of it. Compaction would be
+work that buys nothing measurable.
+
 **Substring search prunes, but not equally well for every pattern.** A per-segment
 trigram index (ADR-010) skips segments that cannot contain a `|=` filter's text. A term
 present nowhere went from 3.9 s to 6 ms over 405 MB — 98 s to 0.2 s extrapolated to a

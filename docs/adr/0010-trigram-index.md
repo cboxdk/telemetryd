@@ -83,6 +83,13 @@ Bounding the time range still works and remains the general answer: the same que
 the newest 1% of the store is milliseconds. This is a real limitation, not a rounding
 error, and it is why the index is a filter rather than a search engine.
 
+## Not fixed by compacting segments
+
+Worth stating, because it is the obvious next idea. Measured over a sixteenfold
+increase in segment count, a filter made of common trigrams grew from 31 ms to 474 ms
+— but the data grew sixteenfold with it. The cost is per byte scanned, not per segment
+opened, so merging segments would leave it exactly where it is.
+
 ## Revisit if
 
 - searches for high-entropy identifiers become common enough that 3 seconds hurts, in
