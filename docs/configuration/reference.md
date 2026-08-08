@@ -22,7 +22,7 @@ Durations are humantime strings (`500ms`, `30s`, `7d`). Sizes are byte strings
 [server]
 listen           = "127.0.0.1:4319"  # one port: ingest + query + UI APIs
 insecure         = false             # allow non-loopback bind with no token
-max_body_bytes   = "16MiB"           # per ingest request
+max_body_bytes   = "16MiB"           # per ingest request, before *and* after decompression
 request_timeout  = "30s"
 shutdown_grace   = "15s"             # drain in-flight requests, then flush WAL
 

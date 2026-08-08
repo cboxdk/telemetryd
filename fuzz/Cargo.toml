@@ -47,3 +47,10 @@ path = "fuzz_targets/remote_write.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "body_decompression"
+path = "fuzz_targets/body_decompression.rs"
+test = false
+doc = false
+bench = false

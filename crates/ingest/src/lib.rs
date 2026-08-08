@@ -12,6 +12,9 @@
 //!
 //! JSON is the first-class OTLP encoding because that is what `cboxdk/laravel-telemetry`
 //! emits — no protobuf, no C extension on the client path.
+//!
+//! [`compression`] sits in front of all of it: bodies arrive compressed more often than
+//! not, and undoing that is the first thing done with untrusted bytes on the write path.
 
 pub mod compression;
 pub mod logs;

@@ -70,6 +70,27 @@ no C extension on the client path. A protobuf `Content-Type` is refused with a n
 `unsupported_feature` rather than a parse error full of binary. **OTLP/gRPC is out of
 scope for v1.**
 
+### Content-Encoding
+
+| Value | Behaviour |
+|---|---|
+| absent, `identity` | body used as-is |
+| `gzip`, `x-gzip` | decompressed — this is the one every OTLP SDK sends |
+| `deflate` | decompressed; zlib-wrapped per RFC 9110, bare deflate accepted too |
+| `zstd` | decompressed |
+| `snappy` on `/api/v1/write` only | passes through; it names the `remote_write` payload's own framing |
+| anything else | `400` with `unsupported_feature`, naming the coding |
+
+gzip is part of OTLP/HTTP rather than an optional extra, and every SDK turns it on
+above some batch size — so ignoring the header does not lose an optimisation, it loses
+every batch that carries data while still answering `200` to the empty one a health
+check sends.
+
+**`server.max_body_bytes` bounds the decompressed body**, not only the bytes received.
+A body that expands past it is refused with `413` and `limit_exceeded` naming the
+setting — identical to what an oversized uncompressed body gets, because a compressed
+request must not be able to buy more memory than an uncompressed one.
+
 Accepted beyond the strict spec, because real producers send it:
 
 - `int64` fields as JSON numbers as well as strings.

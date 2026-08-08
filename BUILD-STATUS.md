@@ -23,6 +23,21 @@ Last updated at **M5**.
 with OTLP `partialSuccess`. Timestamps in the wrong unit are detected and corrected,
 and counted so the producer bug stays visible.
 
+**Compressed bodies.** `Content-Encoding: gzip`, `deflate` and `zstd` are undone before
+decoding, on every ingest route; an unknown coding is a `400` naming it. gzip is part of
+the OTLP/HTTP spec and every SDK enables it above some batch size, so this was not an
+optimisation we were missing — it was a server that worked for empty batches and failed
+for real ones. Reported from the field exactly that way: a health check sending an empty
+batch got `200` and said "all checks passed" while the 8.6 KB batch behind it got `400`
+and vanished.
+
+Every decoder is bounded by `server.max_body_bytes` through a `Take`, so a compression
+bomb is refused with the same `413` an oversized raw body gets rather than inflated into
+memory and measured afterwards, and zstd's declared window is capped at the same number
+so the frame header cannot buy an allocation either. Fuzzed as
+`fuzz/fuzz_targets/body_decompression.rs`, which asserts the cap holds rather than only
+that nothing panicked.
+
 **Cardinality is capped.** `limits.max_series` and `limits.max_series_per_app` refuse
 records that would create a *new* series past the limit, while series already being
 stored keep ingesting — a labelling mistake should not take out the telemetry that

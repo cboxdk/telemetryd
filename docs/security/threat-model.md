@@ -30,6 +30,16 @@ and attribute counts are all capped. A caller cannot drive telemetryd out of mem
 mint unbounded cardinality — including in telemetryd's own metrics, which are keyed by
 matched route rather than raw path.
 
+**Compression bombs.** Ingest accepts `Content-Encoding`, which means a few KB on the
+wire can ask for gigabytes of memory — and the request-body limit never sees it, because
+that limit only ever measured the compressed bytes. So the decompressed body is held to
+the same `server.max_body_bytes` through a bounded reader: output stops one byte past
+the cap and the request is refused, rather than being inflated and measured afterwards.
+Buffers are never pre-sized from a length the sender declares (gzip's trailing `ISIZE` is
+four bytes the attacker chooses), and a zstd frame's declared window — allocated before
+any output exists — is capped at the same limit. The bound is fuzzed as an assertion,
+not just tested by example.
+
 **Malformed input.** The parsers are fuzzed with property tests asserting they never
 panic and that every failure is attributable to the client rather than reported as an
 internal error. That testing found a real reachable panic during development, in the

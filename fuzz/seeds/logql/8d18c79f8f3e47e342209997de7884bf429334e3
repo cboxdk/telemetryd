@@ -1,1 +1,0 @@
-{app="a"} |~ "(?i)error" | log.mt | duration > 100ms

@@ -13,7 +13,7 @@
 [server]
 listen          = "127.0.0.1:4319"   # one port: ingest + query + UI APIs
 insecure        = false              # allow a non-loopback bind with no token — see [auth]
-max_body_bytes  = "16MiB"
+max_body_bytes  = "16MiB"            # applies to the decompressed body too
 request_timeout = "30s"
 shutdown_grace  = "15s"
 

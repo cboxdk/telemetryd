@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [logql, traceql, promql, otlp_logs, remote_write]
+        target: [logql, traceql, promql, otlp_logs, remote_write, body_decompression]
     steps:
       - uses: actions/checkout@v4
       # libFuzzer needs nightly, which is why this is a separate workflow rather than a
@@ -36,7 +36,8 @@ jobs:
       - name: fuzz ${{ matrix.target }}
         run: |
           SECONDS_PER_TARGET=$(( ${{ github.event.inputs.minutes || 5 }} * 60 ))
-          cargo fuzz run ${{ matrix.target }} fuzz/seeds/${{ matrix.target }} \
+          cargo fuzz run ${{ matrix.target }} \
+            fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} \
             -- -max_total_time="${SECONDS_PER_TARGET}" -print_final_stats=1
 
       # A crashing input is the whole product of a run. Keep it, or the next person
