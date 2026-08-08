@@ -115,9 +115,22 @@ def main() -> int:
             return 0
 
         subprocess.run(
-            ["git", "commit", "-m", f"telemetryd {version}"], cwd=workspace, check=True
+            [
+                "git",
+                "-c",
+                "user.email=sn@cbox.dk",
+                "-c",
+                "user.name=Cbox",
+                "commit",
+                "-m",
+                f"telemetryd {version}",
+            ],
+            cwd=workspace,
+            check=True,
         )
-        subprocess.run(["git", "push"], cwd=workspace, check=True)
+        # `-u origin HEAD` rather than a bare push: a tap that has never been written
+        # to has no upstream branch, and that is exactly the first time this runs.
+        subprocess.run(["git", "push", "-u", "origin", "HEAD"], cwd=workspace, check=True)
 
     print(f"published telemetryd {version} to {TAP}")
     print(f"verify with: brew install {TAP.replace('homebrew-', '')}/telemetryd")
