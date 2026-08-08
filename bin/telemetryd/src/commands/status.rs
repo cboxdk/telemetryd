@@ -73,7 +73,7 @@ pub fn run(args: &StatusArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn user_agent() -> String {
+pub(crate) fn user_agent() -> String {
     format!("telemetryd/{}", telemetryd_core::VERSION)
 }
 

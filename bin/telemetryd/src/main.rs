@@ -68,6 +68,9 @@ enum Command {
     /// Pretty-print the status of a running instance.
     Status(commands::status::StatusArgs),
 
+    /// Run a LogQL query, for debugging over SSH or for exporting.
+    Query(commands::query::QueryArgs),
+
     /// Check a configuration and show where every value came from.
     Validate(ConfigArgs),
 
@@ -158,6 +161,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             commands::serve::run(args.config.config.as_deref(), &args.overrides())
         }
         Command::Status(args) => commands::status::run(&args),
+        Command::Query(args) => commands::query::run(&args),
         Command::Validate(args) => {
             commands::validate::run(args.config.as_deref(), args.data_dir.as_deref())
         }

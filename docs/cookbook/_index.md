@@ -13,3 +13,4 @@ description: "Task-shaped recipes for running telemetryd in anger."
 - [Diagnose a query that returns nothing](diagnose-empty-results.md)
 
 - [Back up and restore](back-up-and-restore.md)
+- [Query from the shell](query-from-the-shell.md)

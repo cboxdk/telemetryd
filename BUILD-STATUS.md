@@ -45,8 +45,10 @@ damaging a real data directory five different ways.
 unsupported construct reports itself by name. Live tail over WebSocket. Label and series
 queries answered from metadata with no file I/O.
 
-**Operations.** `telemetryd bench` measures what the machine can ingest and query, on
-a throwaway directory, so sizing is a measurement rather than a guess.
+**Operations.** `telemetryd query` runs a LogQL query from the shell — for debugging
+over SSH when the UI is the thing you cannot reach, and for getting data out as JSON
+lines. `telemetryd bench` measures what the machine can ingest and query, on a
+throwaway directory, so sizing is a measurement rather than a guess.
 `/healthz`, `/status`, `/metrics`. `telemetryd validate` prints every
 resolved value with its origin. `SIGHUP` reloads retention, the disk budget and the log
 level; anything else that changed in the file is refused by name rather than ignored. `telemetryd service install` writes a hardened unit.

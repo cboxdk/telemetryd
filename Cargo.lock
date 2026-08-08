@@ -2063,6 +2063,7 @@ dependencies = [
  "telemetryd-server",
  "telemetryd-store",
  "tempfile",
+ "time",
  "tokio",
  "toml",
  "tracing",
