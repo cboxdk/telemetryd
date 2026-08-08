@@ -28,6 +28,11 @@ jobs:
   publish:
     name: publish to cboxdk/homebrew-tap
     runs-on: ubuntu-latest
+    # Lifted to `env` because the `secrets` context is not available in a step's `if`.
+    # The App id is not sensitive — it is in the App's public URL — but it lives in
+    # secrets so that "is the App configured?" is one question, not two.
+    env:
+      HOMEBREW_APP_ID: ${{ secrets.HOMEBREW_APP_ID }}
     steps:
       # Check out the *tag*, not the default branch: `packaging/telemetryd.rb` is
       # versioned with the code it installs, and publishing the formula as it exists on
@@ -45,7 +50,7 @@ jobs:
       # App's permissions across everything it is installed on unless you say otherwise.
       - name: mint an installation token
         id: app-token
-        if: ${{ secrets.HOMEBREW_APP_ID != '' }}
+        if: env.HOMEBREW_APP_ID != ''
         uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.HOMEBREW_APP_ID }}
