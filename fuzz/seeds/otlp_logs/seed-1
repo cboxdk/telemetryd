@@ -1,0 +1,1 @@
+{"resource_logs": [{"scope_logs": [{"log_records": [{"time_unix_nano": 1760000000000000000, "severity_number": 9, "body": {"string_value": "snake"}, "attributes": []}]}]}]}

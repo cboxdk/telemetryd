@@ -1,0 +1,1 @@
+sum by (app) (rate(x[1m]))

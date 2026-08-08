@@ -1,0 +1,49 @@
+[package]
+name = "telemetryd-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+telemetryd-core = { path = "../crates/core" }
+telemetryd-ingest = { path = "../crates/ingest" }
+telemetryd-query = { path = "../crates/query" }
+
+[[bin]]
+name = "logql"
+path = "fuzz_targets/logql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "traceql"
+path = "fuzz_targets/traceql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "promql"
+path = "fuzz_targets/promql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "otlp_logs"
+path = "fuzz_targets/otlp_logs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "remote_write"
+path = "fuzz_targets/remote_write.rs"
+test = false
+doc = false
+bench = false

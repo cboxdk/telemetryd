@@ -1,0 +1,49 @@
+name: Fuzz
+
+# Not part of the merge gate. Fuzzing is a search, not a verdict: a clean sixty seconds
+# proves very little, and making a merge wait on one would trade real signal for the
+# appearance of it. This runs nightly, and on demand when a parser changes.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Minutes per target"
+        default: "5"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [logql, traceql, promql, otlp_logs, remote_write]
+    steps:
+      - uses: actions/checkout@v4
+      # libFuzzer needs nightly, which is why this is a separate workflow rather than a
+      # job in CI: the rest of the project is pinned, deliberately.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: fuzz ${{ matrix.target }}
+        run: |
+          SECONDS_PER_TARGET=$(( ${{ github.event.inputs.minutes || 5 }} * 60 ))
+          cargo fuzz run ${{ matrix.target }} fuzz/seeds/${{ matrix.target }} \
+            -- -max_total_time="${SECONDS_PER_TARGET}" -print_final_stats=1
+
+      # A crashing input is the whole product of a run. Keep it, or the next person
+      # has to rediscover it.
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore

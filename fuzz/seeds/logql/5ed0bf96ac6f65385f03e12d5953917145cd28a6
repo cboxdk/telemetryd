@@ -1,0 +1,1 @@
+{app=~"check.*"} | json | level= error"

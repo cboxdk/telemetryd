@@ -98,6 +98,11 @@ against the exact artifact being published, before anything is uploaded.
 Plus: all four release targets cross-compile, and the musl builds are asserted to be
 statically linked.
 
+**Fuzzing runs nightly, not on the merge gate.** Five targets cover every parser that
+reads untrusted bytes — the three query languages, OTLP JSON, and the hand-rolled
+`remote_write` protobuf. A clean sixty seconds proves very little, so making a merge
+wait on one would trade real signal for the appearance of it.
+
 ## Load, measured on the target platform
 
 All numbers are the musl release build — the one that ships — driven over HTTP.

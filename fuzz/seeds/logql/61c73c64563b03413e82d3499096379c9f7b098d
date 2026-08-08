@@ -1,0 +1,1 @@
+{app="a"} |~ "(?i)e*ror" | logfmt | duration > 100ms

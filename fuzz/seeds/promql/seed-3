@@ -1,0 +1,1 @@
+histogram_quantile(0.95, sum(rate(x_bucket[5m])) by (le))

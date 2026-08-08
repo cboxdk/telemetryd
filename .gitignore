@@ -2,3 +2,11 @@
 /telemetryd-data
 *.profraw
 .DS_Store
+
+# cargo-fuzz working directories. `fuzz/seeds/` is the committed starting corpus;
+# everything the fuzzer discovers from it is reproducible and belongs to a run, not
+# to the repository.
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/target
+/fuzz/Cargo.lock

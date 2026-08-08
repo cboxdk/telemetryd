@@ -1,0 +1,1 @@
+{app="a"} |~ "(?i)rr" /| l "(?i)err" | logfgfds

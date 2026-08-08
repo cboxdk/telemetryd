@@ -1,0 +1,1 @@
+{"resourceLogs": [{"resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "checkout"}}]}, "scopeLogs": [{"logRecords": [{"timeUnixNano": "1760000000000000000", "severityText": "INFO", "body": {"stringValue": "hello"}, "attributes": [{"key": "a", "value": {"intValue": "7"}}]}]}]}]}
