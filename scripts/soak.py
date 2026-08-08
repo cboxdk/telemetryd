@@ -352,6 +352,7 @@ def main() -> int:
     check_damaged_segment(binary)
     check_oidc(binary)
     check_oidc_survives_a_missing_provider(binary)
+    check_relay(binary)
 
     print("\n" + "=" * 52)
     if failures:
@@ -850,6 +851,182 @@ def check_oidc_survives_a_missing_provider(binary: str) -> None:
               f"keys={oidc.get('keys', 'absent')}")
     finally:
         stop(proc)
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+# --- relay mode --------------------------------------------------------------------
+#
+# The delivery guarantee is the part worth testing, and the interesting cases are the
+# unhappy ones: an upstream that is down when the data arrives, and a client that lies
+# about who it is. Both are silent failures — the server answers 200 either way — so
+# neither shows up without asserting on it.
+
+
+class Upstream:
+    """A stand-in central instance. Can be told to fail, and remembers what arrived."""
+
+    def __init__(self) -> None:
+        self.received: list[dict] = []
+        self.failing = False
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), self._handler())
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def _handler(self):
+        upstream = self
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("content-length", "0"))
+                raw = self.rfile.read(length)
+                if upstream.failing:
+                    # 503, not a dropped connection: the cursor must not advance on a
+                    # refusal the shipper *did* get an answer to.
+                    self.send_response(503)
+                    self.send_header("content-length", "0")
+                    self.end_headers()
+                    return
+                try:
+                    upstream.received.append(json.loads(raw))
+                except ValueError:
+                    upstream.received.append({})
+                self.send_response(200)
+                self.send_header("content-length", "0")
+                self.end_headers()
+
+            def log_message(self, *_args) -> None:
+                pass
+        return Handler
+
+    def lines(self) -> list[str]:
+        out = []
+        for payload in self.received:
+            for resource in payload.get("resourceLogs", []):
+                for scope in resource.get("scopeLogs", []):
+                    for record in scope.get("logRecords", []):
+                        out.append(record.get("body", {}).get("stringValue", ""))
+        return out
+
+    def apps(self) -> set[str]:
+        out = set()
+        for payload in self.received:
+            for resource in payload.get("resourceLogs", []):
+                for attribute in resource.get("resource", {}).get("attributes", []):
+                    if attribute.get("key") == "app":
+                        out.add(attribute.get("value", {}).get("stringValue", ""))
+        return out
+
+
+def relay_logs(count: int, claimed_app: str, token: str, offset_nanos: int = 0) -> int:
+    entry = {"resourceLogs": [{
+        "resource": {"attributes": [
+            # The client says it is `claimed_app`. It does not get a vote.
+            {"key": "app", "value": {"stringValue": claimed_app}},
+            {"key": "service.name", "value": {"stringValue": claimed_app}},
+        ]},
+        "scopeLogs": [{"logRecords": [
+            {"timeUnixNano": str(NOW + offset_nanos + i), "body": {"stringValue": f"relay-{i}"}}
+            for i in range(count)
+        ]}],
+    }]}
+    return with_token("/v1/logs", token, entry)
+
+
+def check_relay(binary: str) -> None:
+    """Forwarding, and the identity stamp that is the point of it."""
+    print("\n=== relay mode ===")
+    upstream = Upstream()
+    upstream.failing = True  # down before the first record even arrives
+    data_dir = tempfile.mkdtemp(prefix="telemetryd-soak-relay-")
+    config = os.path.join(data_dir, "telemetryd.toml")
+    with open(config, "w", encoding="utf-8") as handle:
+        handle.write(
+            "[auth]\nadmin_token = [\"static-admin\"]\n"
+            # Small segments so a seal happens within the test rather than in an hour.
+            "[storage]\nmax_segment_bytes = \"16KiB\"\nsegment_duration = \"2s\"\n"
+            f"[relay]\nupstream = \"{upstream.url}\"\ninterval = \"1s\"\n"
+            "[[relay.client]]\napp = \"mobile\"\ntoken = \"mobile-secret\"\n"
+        )
+
+    proc = subprocess.Popen(
+        [binary, "serve", "--config", config, "--listen", f"127.0.0.1:{PORT}",
+         "--data-dir", data_dir],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ},
+    )
+    try:
+        for _ in range(240):
+            try:
+                if request("/healthz")[0] == 200:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.25)
+
+        check("an unregistered credential cannot write",
+              relay_logs(1, "payments", "not-a-client") == 401)
+
+        status = relay_logs(400, "payments", "mobile-secret")
+        check("a registered client can write", status == 200, f"HTTP {status}")
+
+        # Stored under the credential's identity, not the payload's claim. This is the
+        # whole security argument: everything downstream is keyed on this label.
+        deadline = time.time() + 30
+        stamped = claimed = -1
+        while time.time() < deadline:
+            _, body = query("/loki/api/v1/query_range", query='{app="mobile"}',
+                            start=NOW - SECOND, end=NOW + 10 * SECOND, limit=1000)
+            stamped = log_lines(body)
+            _, body = query("/loki/api/v1/query_range", query='{app="payments"}',
+                            start=NOW - SECOND, end=NOW + 10 * SECOND, limit=1000)
+            claimed = log_lines(body)
+            if stamped > 0:
+                break
+            time.sleep(0.5)
+        check("the credential decides the app, not the payload",
+              stamped == 400 and claimed == 0,
+              f"app=mobile:{stamped} app=payments:{claimed}")
+
+        # Upstream has been refusing the whole time. Nothing may be lost, and the
+        # cursor must not have moved past anything it did not deliver.
+        time.sleep(3)
+        check("nothing is delivered while upstream refuses", not upstream.lines(),
+              f"{len(upstream.lines())} lines")
+
+        upstream.failing = False
+        delivered = []
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            delivered = upstream.lines()
+            if len(delivered) >= 400:
+                break
+            time.sleep(1)
+
+        check("everything accepted is delivered once upstream recovers",
+              len(delivered) >= 400, f"{len(delivered)} of 400 lines")
+        check("upstream sees the stamped identity, never the claimed one",
+              upstream.apps() == {"mobile"}, f"{upstream.apps() or 'nothing'}")
+
+        # The cursor is durable: a restart must not re-send what already arrived.
+        before = len(upstream.lines())
+        stop(proc)
+        proc = subprocess.Popen(
+            [binary, "serve", "--config", config, "--listen", f"127.0.0.1:{PORT}",
+             "--data-dir", data_dir],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ},
+        )
+        for _ in range(240):
+            try:
+                if request("/healthz")[0] == 200:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.25)
+        time.sleep(4)
+        check("a restart does not re-send what was already delivered",
+              len(upstream.lines()) == before,
+              f"{len(upstream.lines())} lines, was {before}")
+    finally:
+        stop(proc)
+        upstream.server.shutdown()
         shutil.rmtree(data_dir, ignore_errors=True)
 
 

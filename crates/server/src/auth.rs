@@ -103,7 +103,11 @@ async fn guard(
 ) -> Result<Response, ApiError> {
     // An unguarded surface stays unguarded only while *nothing* guards it. Turning on
     // Cbox ID must not leave a surface open just because its static token is unset.
-    if tokens.is_empty() && !state.oidc.is_enabled() && state.relay_clients.is_empty() {
+    // Relay clients are *ingest* credentials, so they guard that surface and no
+    // other. Counting them everywhere locked the read API behind a token no client
+    // could present — the surface demanded one, and nothing could satisfy it.
+    let relay_guards_this = surface == Surface::Ingest && !state.relay_clients.is_empty();
+    if tokens.is_empty() && !state.oidc.is_enabled() && !relay_guards_this {
         return Ok(next.run(request).await);
     }
 
