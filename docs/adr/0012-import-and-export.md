@@ -1,0 +1,251 @@
+---
+title: "ADR-012: Import and export"
+weight: 12
+description: "Portability in both directions, why it goes through query APIs rather than storage formats, and the three things it cannot promise."
+---
+
+# ADR-012: Import and export
+
+- **Status:** Proposed
+- **Date:** 2026-08-08
+- **Builds on:** [ADR-005](0005-compatibility-audit.md), [ADR-004](0004-auth-and-network-binding.md)
+
+## Context
+
+telemetryd asks for a commitment: point your instrumentation at it, and your telemetry
+lives in its data directory. That is a reasonable thing to ask only if leaving is as
+easy as arriving.
+
+Today half of that exists, and it is worth being precise about which half, because it
+changes how much is left to build.
+
+**Reading telemetryd from elsewhere already works.** It serves the Loki, Tempo and
+Prometheus read APIs, so anything that queries those can query it. Moving a dashboard
+onto telemetryd is a URL change, and moving it back off is the same change in reverse.
+
+**Writing live data into telemetryd already works.** It accepts OTLP and Prometheus
+`remote_write`, which is what collectors already emit.
+
+What is missing is everything to do with *data that already exists*:
+
+- No bulk export of a time range. `telemetryd query --output json` is logs only, goes
+  through LogQL, and is bounded by `--limit`. Traces and metrics cannot come out in
+  bulk at all.
+- No way to bring an existing store's history in. Not for migration, and — the case
+  that actually recurs — not for pulling a slice of production onto a laptop to
+  reproduce something.
+
+The second is the one that gets used weekly. Migration happens once; debugging happens
+on Tuesday.
+
+## Decision
+
+**Two commands, and neither one ever reads or writes another system's storage.**
+
+```
+telemetryd export --since 24h --signal logs,traces > dump.ndjson
+telemetryd import --from https://logs.internal --since 24h
+telemetryd import --file dump.ndjson
+```
+
+Everything crosses the boundary as HTTP, over interfaces that are already a documented
+contract for both sides.
+
+### Export emits OTLP
+
+Not a bespoke format, and not Parquet. OTLP is what every other backend already
+ingests, and telemetryd already has the encoders because OTLP is what it ingests
+itself. That makes the format choice nearly free to implement and nearly free for
+whoever receives it.
+
+It also makes **import from our own export free**: OTLP JSON out is exactly what
+`/v1/logs`, `/v1/traces` and `/v1/metrics` take in. `telemetryd export | telemetryd
+import --file -` is a complete instance-to-instance copy with no new code path. The
+`--file` source exists anyway because a 4 GB dump wants chunking and progress rather
+than a single request.
+
+One request-shaped JSON object per line. NDJSON streams, survives being cut in half,
+and every tool on the machine can read it.
+
+### Import speaks read APIs, not storage
+
+An importer that parsed another backend's on-disk format would be a maintenance
+treadmill against a format nobody promised us. Their read APIs, by contrast, are a
+published contract — and we are unusually well placed to consume them, because we
+already parse LogQL, TraceQL and PromQL, and already *emit* those exact response
+shapes. Both ends of the wire are code we own and test.
+
+The consequence worth noticing: because telemetryd serves those same APIs, **one
+importer also copies from another telemetryd**. Migration in, migration out, and
+instance-to-instance are one code path, not three.
+
+### telemetryd never writes to a foreign store
+
+Export produces a file. It does not push to a remote backend, and there is no
+`--to <url>`.
+
+This is not timidity, it is the same posture the desktop app already commits to in
+`config/telemetry-desktop.php` — *"This app never writes to a connected store"* — a
+claim asserted in its tests rather than merely configured. A tool that reads your
+production observability store is a tool you can point at production without a
+meeting. One that writes to it is not. Keeping that true is worth more than the
+convenience of a `--to` flag, and a file plus one `curl` is not a hardship.
+
+Import writes only to the local instance. That does not breach the posture: the local
+store is the destination, never the connection.
+
+## Progress
+
+A bulk transfer that prints nothing for forty minutes is indistinguishable from one
+that has hung. Progress is part of the feature, not decoration on it.
+
+**stdout is data. stderr is progress.** That single rule is what lets
+`telemetryd export | gzip > dump.gz` show a live progress meter without corrupting a
+byte of the output.
+
+`--progress` takes:
+
+| | |
+|---|---|
+| `auto` (default) | a live meter when stderr is a terminal, periodic plain lines when it is not |
+| `tty` | force the live meter |
+| `plain` | one line every few seconds — a log file, not a redraw |
+| `json` | NDJSON progress events on stderr |
+| `none` | silence |
+
+`auto` is what makes this behave under `systemd`, in CI, and in a pipe without anyone
+passing a flag. A redraw with carriage returns and ANSI escapes is right in a terminal
+and is garbage in a log file; detecting which one is present costs nothing and guessing
+wrong is the difference between readable output and a smear.
+
+`json` exists for the desktop app, and it is why progress is structured rather than
+formatted. Each event carries the signal, the window boundaries reached, records
+transferred, bytes, rejections so far, and the high-water timestamp:
+
+```json
+{"event":"progress","signal":"logs","window_end":"2026-08-01T12:00:00Z","records":184320,"rejected":12,"high_water":"2026-08-01T12:00:00Z"}
+```
+
+The final event is `{"event":"done", ...}` or `{"event":"failed","error":"..."}`, and
+both carry the high-water mark. That last field is the whole resumability story: an
+import that dies at 60% tells you exactly where to start again, and resuming is the
+same command with a different `--start`.
+
+Interrupting with Ctrl-C is a clean stop that reports the high-water mark, not a
+stack trace.
+
+## The desktop app
+
+The desktop app already has the two things this needs. Profiles hold connections
+(`ActiveProfile`, `ConnectionMapper`, `ProfileSwitcher`), and a local sidecar
+telemetryd is provisioned as its own profile (`LocalProfileProvisioner`,
+`TelemetrydSupervisor`). It also already runs the binary as a supervised subprocess and
+listens to its output (`SidecarOutputListener`, `SidecarJournal`).
+
+So "copy the last six hours from *production* into my local store" is, in the app's own
+vocabulary, a transfer from a connection in the active profile into the sidecar's
+profile — and `--progress=json` on stderr lands in a listener that already exists.
+
+Two things follow that the CLI must get right for the app's sake:
+
+- **Every knob is a flag.** No interactive prompts, no confirmation that requires a
+  keypress. The app cannot answer a question typed at a terminal it does not have.
+  Where a run should be refused (see retention, below) it is refused with a distinct
+  exit code and a machine-readable reason, not a `[y/N]`.
+- **The connection's credentials come from the app**, through the same
+  `--token` / `TELEMETRYD_AUTH_QUERY_TOKEN` path the CLI already uses, so secrets stay
+  in the app's encrypted store and never reach a command line where `ps` can read them.
+  This is the rule `telemetryd query` already documents; import inherits it rather than
+  inventing a second one.
+
+With more than one connection configured, the interesting operation is not "export
+everything" but "bring *this* connection's last N hours local". Scoping import to one
+source at a time keeps provenance answerable, which matters once the local store holds
+data from three places at once — see `--label`, below.
+
+## Use cases, walked through
+
+| | |
+|---|---|
+| **Evaluate telemetryd** without moving production | import a day from the existing store, query it locally, keep the original untouched |
+| **Adopt telemetryd** | run both in parallel, import the history that predates the switch |
+| **Leave telemetryd** | export the range, feed it to whatever ingests OTLP |
+| **Debug an incident** | pull the incident window onto a laptop; query it offline, repeatedly, without load on production |
+| **Move instances** | export from one, import to the other; no storage-format coupling |
+| **Share a reproduction** | an NDJSON file is a bug report someone else can load |
+| **Back up a window** | the whole data directory is still the better answer for a full backup; export is for a slice |
+
+The debugging case is the one that shapes the defaults. It wants a bounded time range,
+a single connection, an obvious progress display, and a local store it can throw away
+afterwards.
+
+## What it costs, honestly
+
+**Retention will delete what you just imported, and this is the trap.** Ingest applies
+no age limit, so old records go in perfectly well — and then the reaper removes
+anything past `retention.logs`, seven days by default. Import thirty days into a
+default configuration and you watch it evaporate, possibly while the import is still
+running. `import` therefore compares the requested range against the configured
+retention and **refuses** when the range reaches further back, naming the setting to
+raise. Refusing is right here: the alternative is a command that appears to succeed and
+silently produces nothing.
+
+**Metrics come back resampled, not raw.** A range query over the Prometheus API returns
+points at a `step` — a rendering of the series, not the series. Logs and traces round
+trip faithfully; imported metrics are an approximation unless `step` matches the
+original interval, and they should not be treated as a source of truth for anything
+that cares about exact sample times. Stated here rather than buried in a footnote,
+because it is the one place the round trip loses information.
+
+**Import is not idempotent.** telemetryd is append-only with no upsert, so importing an
+overlapping range twice stores the records twice. There is no dedup, and adding one
+would mean a key and an index that the ingest path deliberately does not carry. The
+mitigation is the workflow: import into a fresh data directory, which is what the
+debugging case wants anyway. Documented, not solved.
+
+**Pagination is where the work is.** Read APIs cap results per request, so a range is
+walked in windows with a cutoff that moves, and export streams rather than buffering a
+range in memory. This is the engineering; the format choices above are comparatively
+easy.
+
+**Production-shaped data will hit the cardinality limits.** Those already reject with
+labelled counters rather than dropping silently, but a transfer that quietly rejected
+9% of its records has failed at its job. The summary at the end reports rejections by
+reason, and a non-zero count is visible in the exit status.
+
+## Deliberately not built
+
+**Continuous forwarding or mirroring to another backend.** That is an outbound agent —
+durable queue, retries, backpressure, its own failure modes — and a different product
+from a one-shot transfer. It also contradicts the single-binary posture in a way a
+`export`/`import` pair does not. If a copy needs to be continuous, the collector that
+is already fanning out to telemetryd is the right place to fan out again.
+
+**A parser for any other backend's on-disk format.** Covered above: their read APIs are
+a contract, their storage layout is not.
+
+**`export --to <url>`.** Covered above: writing to a foreign store is a line worth not
+crossing.
+
+## How it will be kept honest
+
+The round trip is the test: ingest a known corpus, export it, import it into a second
+instance, and assert the second instance answers the same queries as the first. That
+one test covers the format, the pagination, the label handling and the timestamp
+handling at once, and it fails loudly if any of them drifts.
+
+Beyond it: a soak phase that imports from a stand-in remote serving the Loki and
+Prometheus APIs; an assertion that a range exceeding retention is refused rather than
+half-performed; and an assertion that `--progress=json` emits parseable NDJSON on
+stderr while stdout stays byte-exact, since that separation is what the desktop app
+depends on.
+
+## Open question
+
+Whether import should accept `--label name=value` to stamp provenance onto everything
+it brings in. It is clearly useful once a local store holds data from three
+connections, and `source="prod"` is the obvious way to tell them apart. It also cuts
+against [ADR-001](0001-storage-architecture.md)'s refusal of write-path
+transformations — "shape data in the instrumentation" is not advice you can follow
+about someone else's historical data. The exception is narrow and the alternative is
+worse, but it is a real exception and it is called out here rather than smuggled in.

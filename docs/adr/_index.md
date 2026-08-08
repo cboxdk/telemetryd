@@ -23,6 +23,7 @@ than quietly corrected, because the reasoning is the useful part.
 | [ADR-009](0009-allocator.md) | Why the binary ships mimalloc, and the musl numbers that forced it |
 | [ADR-010](0010-trigram-index.md) | Trigrams for substring search, and why not tokens |
 | [ADR-011](0011-cbox-id-integration.md) | Validating Cbox ID tokens locally, never by asking the provider |
+| [ADR-012](0012-import-and-export.md) | Portability in both directions, through query APIs rather than storage formats |
 
 ## Two worth reading first
 
