@@ -218,12 +218,18 @@ jobs:
 
       # Verify here, with the same command the docs give users. A signature nobody
       # checked is a file, not a guarantee.
+      # The identity has to be the *tag*, not $GITHUB_REF. On a tag push they are the
+      # same; on a workflow_dispatch $GITHUB_REF is the branch, so a manually triggered
+      # release would carry a signature that install.sh — which pins refs/tags/vX.Y.Z —
+      # could never verify. The failure would land on the user's machine, not here.
       - name: verify the signature we just made
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           cd artifacts
           cosign verify-blob \
             --bundle SHA256SUMS.cosign.bundle \
-            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             SHA256SUMS
 
