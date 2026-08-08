@@ -36,7 +36,17 @@ jobs:
       - name: fuzz ${{ matrix.target }}
         run: |
           SECONDS_PER_TARGET=$(( ${{ github.event.inputs.minutes || 5 }} * 60 ))
-          cargo fuzz run ${{ matrix.target }} \
+          # `+nightly` explicitly. Installing nightly is not enough: rust-toolchain.toml
+          # pins 1.97.1 and rustup honours the file over the installed default, so
+          # `cargo fuzz` resolved to stable and died on `-Z sanitizer=address`.
+          #
+          # And the corpus directory has to exist. Only the seeds are committed — the
+          # corpus is generated — so on a fresh checkout libFuzzer's first positional
+          # argument names a directory that is not there, and it refuses to start.
+          # Order matters and is not alphabetical: libFuzzer *writes* to the first
+          # directory, so the corpus goes first and the seeds stay read-only.
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          cargo +nightly fuzz run ${{ matrix.target }} \
             fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} \
             -- -max_total_time="${SECONDS_PER_TARGET}" -print_final_stats=1
 
