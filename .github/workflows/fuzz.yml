@@ -45,8 +45,14 @@ jobs:
           # argument names a directory that is not there, and it refuses to start.
           # Order matters and is not alphabetical: libFuzzer *writes* to the first
           # directory, so the corpus goes first and the seeds stay read-only.
+          # `--target` explicitly, because cargo-fuzz defaults it to the triple
+          # *cargo-fuzz itself* was built for rather than the host's. install-action
+          # ships a static musl build, so it picked musl on a gnu runner — and ASAN
+          # cannot link against a static libc: "sanitizer is incompatible with
+          # statically linked libc". Locally the same command picks the host and works,
+          # which is exactly why this never showed up until it ran here.
           mkdir -p fuzz/corpus/${{ matrix.target }}
-          cargo +nightly fuzz run ${{ matrix.target }} \
+          cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} \
             fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} \
             -- -max_total_time="${SECONDS_PER_TARGET}" -print_final_stats=1
 
