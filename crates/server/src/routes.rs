@@ -37,6 +37,9 @@ pub struct StatusResponse {
     pub insecure: bool,
     pub auth: AuthStatus,
     pub storage: StoreStatus,
+    /// What each app holds, largest first. The answer to "who is filling my disk",
+    /// which every other number here is a total of.
+    pub apps: Vec<telemetryd_store::AppUsage>,
     pub retention: BTreeMap<&'static str, String>,
     pub limits: LimitsStatus,
 }
@@ -93,6 +96,7 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse
         },
         storage,
         retention,
+        apps: state.store.app_usage(),
         limits: LimitsStatus {
             max_series: config.limits.max_series,
             max_series_per_app: config.limits.max_series_per_app,
@@ -197,6 +201,24 @@ fn gauges(state: &AppState) -> Result<Vec<Sample>, Error> {
         ("telemetryd_series_limit", max_series as f64),
     ] {
         samples.push(Sample::new(name, &[], value));
+    }
+
+    // Per app, so a dashboard can show who is growing rather than only that the total
+    // is. Cardinality is capped per app, and until this existed the cap was enforceable
+    // but not observable.
+    for usage in state.store.app_usage() {
+        let app = [("app", usage.app.as_str())];
+        samples.push(Sample::new(
+            "telemetryd_app_series",
+            &app,
+            usage.series as f64,
+        ));
+        samples.push(Sample::new("telemetryd_app_rows", &app, usage.rows as f64));
+        samples.push(Sample::new(
+            "telemetryd_app_bytes_estimate",
+            &app,
+            usage.estimated_bytes as f64,
+        ));
     }
 
     // Retention outcomes belong in metrics, not just logs: deleting a user's data is

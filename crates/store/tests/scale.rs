@@ -763,3 +763,56 @@ fn a_pattern_that_appears_nowhere_reads_no_segments() {
         "a term present in no segment should read none of the {segments}, but read {scanned}"
     );
 }
+
+/// "Which app is filling my disk" has to be answerable, and answerable without I/O.
+///
+/// Every number the store reported was a total, while the tenancy model, the
+/// cardinality cap and the retention budget are all about apps. An operator whose
+/// budget alarm fired had nothing to look at.
+#[test]
+fn per_app_usage_is_reported_and_attributed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = telemetryd_core::Config::default();
+    config.storage.data_dir = Some(tmp.path().to_path_buf());
+    config.storage.max_segment_bytes = bytesize::ByteSize::mib(1);
+
+    {
+        let store = telemetryd_store::Store::open(&config).unwrap();
+        // Interleaved, so every segment holds both apps — as concurrent producers do,
+        // and the case that makes attribution non-trivial.
+        for round in 0..6u64 {
+            let mut batch = Vec::new();
+            for i in 0..600 {
+                batch.push(log(BASE + (round * 600 + i) * 1000, "checkout", "line"));
+            }
+            for i in 0..200 {
+                batch.push(log(BASE + (round * 200 + i) * 1000, "cart", "line"));
+            }
+            store.append_logs(&batch).unwrap();
+            store.seal_all().unwrap();
+        }
+    }
+
+    let store = telemetryd_store::Store::open(&config).unwrap();
+    let usage = store.app_usage();
+    let by_app = |name: &str| {
+        usage
+            .iter()
+            .find(|u| u.app == name)
+            .unwrap_or_else(|| panic!("{name} missing from {usage:?}"))
+    };
+
+    assert_eq!(by_app("checkout").rows, 3_600, "rows must be exact");
+    assert_eq!(by_app("cart").rows, 1_200);
+
+    // Largest first: the answer belongs at the top, not in alphabetical order.
+    assert_eq!(usage[0].app, "checkout");
+
+    // Bytes are apportioned by row share, so the ratio should track the row ratio
+    // rather than being exact. Three to one, within a wide tolerance.
+    let ratio = by_app("checkout").estimated_bytes as f64 / by_app("cart").estimated_bytes as f64;
+    assert!(
+        (2.0..4.0).contains(&ratio),
+        "expected bytes to track rows, got a ratio of {ratio}"
+    );
+}

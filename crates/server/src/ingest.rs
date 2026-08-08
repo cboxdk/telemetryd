@@ -45,6 +45,17 @@ pub async fn otlp_logs(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    // Bound concurrent ingest. A rejected request is a signal the producer can act on
+    // — back off, batch harder — where an accepted one that queues behind a hundred
+    // others is the unbounded buffering `limits.ingest_queue_depth` exists to prevent.
+    let Some(_slot) = state.ingest_slot() else {
+        state.metrics.incr(
+            "telemetryd_ingest_rejected_total",
+            &[("signal", "logs"), ("reason", "queue_full")],
+        );
+        return Err(telemetryd_core::Error::Overloaded.into());
+    };
+
     reject_protobuf(&headers)?;
 
     let mut decoded = {
@@ -130,6 +141,17 @@ pub async fn otlp_traces(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    // Bound concurrent ingest. A rejected request is a signal the producer can act on
+    // — back off, batch harder — where an accepted one that queues behind a hundred
+    // others is the unbounded buffering `limits.ingest_queue_depth` exists to prevent.
+    let Some(_slot) = state.ingest_slot() else {
+        state.metrics.incr(
+            "telemetryd_ingest_rejected_total",
+            &[("signal", "traces"), ("reason", "queue_full")],
+        );
+        return Err(telemetryd_core::Error::Overloaded.into());
+    };
+
     reject_protobuf(&headers)?;
 
     let mut decoded = {
@@ -194,6 +216,17 @@ pub async fn otlp_metrics(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    // Bound concurrent ingest. A rejected request is a signal the producer can act on
+    // — back off, batch harder — where an accepted one that queues behind a hundred
+    // others is the unbounded buffering `limits.ingest_queue_depth` exists to prevent.
+    let Some(_slot) = state.ingest_slot() else {
+        state.metrics.incr(
+            "telemetryd_ingest_rejected_total",
+            &[("signal", "metrics"), ("reason", "queue_full")],
+        );
+        return Err(telemetryd_core::Error::Overloaded.into());
+    };
+
     reject_protobuf(&headers)?;
 
     let decoded = {
@@ -225,6 +258,17 @@ pub async fn remote_write(
     State(state): State<AppState>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    // Bound concurrent ingest. A rejected request is a signal the producer can act on
+    // — back off, batch harder — where an accepted one that queues behind a hundred
+    // others is the unbounded buffering `limits.ingest_queue_depth` exists to prevent.
+    let Some(_slot) = state.ingest_slot() else {
+        state.metrics.incr(
+            "telemetryd_ingest_rejected_total",
+            &[("signal", "metrics"), ("reason", "queue_full")],
+        );
+        return Err(telemetryd_core::Error::Overloaded.into());
+    };
+
     let decoded = {
         let limits = state.config.limits.clone();
         remote_write::decode(

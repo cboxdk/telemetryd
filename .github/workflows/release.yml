@@ -233,6 +233,22 @@ jobs:
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             SHA256SUMS
 
+      # Skipped, loudly, when the secret is absent. A tap that silently stops being
+      # updated looks exactly like one that is up to date, and `brew install` would go
+      # on serving the previous release without anyone noticing.
+      - name: publish the Homebrew formula
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN is not set, so cboxdk/homebrew-tap still \
+          serves the previous release. Publish it by hand with: \
+          python3 scripts/publish-formula.py ${TAG}"
+            exit 0
+          fi
+          python3 scripts/publish-formula.py "${TAG}"
+
       - name: publish release
         uses: softprops/action-gh-release@v2
         with:

@@ -20,6 +20,8 @@ pub mod trigram;
 pub mod wal;
 
 use std::collections::BTreeMap;
+
+use serde::Serialize;
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
@@ -66,6 +68,25 @@ pub struct Store {
     /// Kept for the process lifetime rather than only logged at startup — a crash
     /// that cost records should stay visible in `/status`.
     wal_truncations: RwLock<Vec<Truncation>>,
+}
+
+/// What one app holds in the store.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct AppUsage {
+    pub app: String,
+    /// Distinct series. Exact.
+    pub series: u64,
+    /// Rows in sealed segments. Exact.
+    pub rows: u64,
+    /// Apportioned by row share, because a segment mixes apps. An estimate, named as
+    /// one so nobody builds billing on it.
+    pub estimated_bytes: u64,
+}
+
+fn app_of(labels: &Labels) -> &str {
+    labels
+        .get(telemetryd_core::APP_LABEL)
+        .unwrap_or(telemetryd_core::UNKNOWN_APP)
 }
 
 /// The reloadable half of the storage configuration.
@@ -413,6 +434,69 @@ impl Store {
         policy.retention = config.retention.clone();
 
         changes
+    }
+
+    /// What each app is costing, from segment manifests alone — no file is opened.
+    ///
+    /// The question an operator has when the disk budget alarm fires is "which app is
+    /// filling it", and until this existed there was no way to answer it: `app` is the
+    /// whole tenancy model, `max_series_per_app` is enforced per app, and yet every
+    /// number reported was a total.
+    ///
+    /// Rows and series are exact. **Bytes are apportioned by row share** and labelled
+    /// as an estimate, because a segment holds every app that was writing when it
+    /// sealed and Parquet does not record who owns which compressed page. An app
+    /// writing unusually long lines will be under-counted, and there is no honest way
+    /// to fix that short of one segment per app.
+    #[must_use]
+    pub fn app_usage(&self) -> Vec<AppUsage> {
+        let mut apps: BTreeMap<String, AppUsage> = BTreeMap::new();
+
+        for (signal, segments) in [
+            (Signal::Logs, self.logs.segments()),
+            (Signal::Traces, self.traces.segments()),
+            (Signal::Metrics, self.metrics.segments()),
+        ] {
+            let _ = signal;
+            for segment in &segments {
+                let manifest = &segment.manifest;
+                if manifest.stream_rows.len() != manifest.streams.len() {
+                    // Written before per-stream rows existed. Counting its series is
+                    // still right; attributing its bytes would be a guess.
+                    for labels in &manifest.streams {
+                        apps.entry(app_of(labels).to_owned()).or_default().series += 1;
+                    }
+                    continue;
+                }
+                for (labels, rows) in manifest.streams.iter().zip(&manifest.stream_rows) {
+                    let usage = apps.entry(app_of(labels).to_owned()).or_default();
+                    usage.series += 1;
+                    usage.rows += rows;
+                    if let Some(share) = manifest
+                        .bytes
+                        .saturating_mul(*rows)
+                        .checked_div(manifest.rows)
+                    {
+                        usage.estimated_bytes += share;
+                    }
+                }
+            }
+        }
+
+        let mut usage: Vec<AppUsage> = apps
+            .into_iter()
+            .map(|(app, mut counts)| {
+                counts.app = app;
+                counts
+            })
+            .collect();
+        // Largest first: the answer to "who is filling my disk" belongs at the top.
+        usage.sort_by(|a, b| {
+            b.estimated_bytes
+                .cmp(&a.estimated_bytes)
+                .then(a.app.cmp(&b.app))
+        });
+        usage
     }
 
     /// Recount active series from the segments that still exist plus what is buffered.

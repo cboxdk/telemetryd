@@ -84,6 +84,13 @@ pub struct SegmentManifest {
     /// to the whole-segment range.
     #[serde(default)]
     pub stream_bounds: Vec<(u64, u64)>,
+    /// Rows contributed by each entry of `streams`, in the same order.
+    ///
+    /// A segment holds every app that was writing when it sealed, so `rows` alone
+    /// cannot answer "which app is filling my disk" — the question an operator has
+    /// when the budget alarm fires. Empty on segments written before this existed.
+    #[serde(default)]
+    pub stream_rows: Vec<u64>,
 }
 
 impl SegmentManifest {
@@ -485,14 +492,14 @@ fn segment_corrupt(path: &Path, error: &dyn std::fmt::Display) -> Error {
     }
 }
 
-/// Event-time bounds for each interned stream, in stream-id order.
+/// Event-time bounds and row count for each interned stream, in stream-id order.
 ///
 /// One pass over the records with a hash lookup each. Sealing already encodes every
 /// record into Arrow and compresses it, so this is not the expensive part.
-fn stream_time_bounds<S: RecordSchema>(
+fn stream_statistics<S: RecordSchema>(
     records: &[S::Record],
     streams: &[Labels],
-) -> Vec<(u64, u64)> {
+) -> (Vec<(u64, u64)>, Vec<u64>) {
     let index: std::collections::HashMap<u64, usize> = streams
         .iter()
         .enumerate()
@@ -500,14 +507,16 @@ fn stream_time_bounds<S: RecordSchema>(
         .collect();
 
     let mut bounds = vec![(u64::MAX, u64::MIN); streams.len()];
+    let mut rows = vec![0u64; streams.len()];
     for record in records {
         if let Some(&id) = index.get(&S::index_labels(record).fingerprint()) {
             let at = S::timestamp(record);
             bounds[id].0 = bounds[id].0.min(at);
             bounds[id].1 = bounds[id].1.max(at);
+            rows[id] += 1;
         }
     }
-    bounds
+    (bounds, rows)
 }
 
 /// Assigns a dense id to each distinct stream label set.
@@ -619,7 +628,7 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
         .map_err(|e| Error::io(format!("creating {}", staging.display()), e))?;
 
     let (batch, streams) = S::to_batch(records)?;
-    let stream_bounds = stream_time_bounds::<S>(records, &streams);
+    let (stream_bounds, stream_rows) = stream_statistics::<S>(records, &streams);
     let data_path = staging.join(DATA_FILE);
     let bytes = write_parquet(&data_path, &batch, options.compression)?;
 
@@ -636,6 +645,7 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
         labels: index.build(),
         streams,
         stream_bounds,
+        stream_rows,
     };
     write_manifest(&staging.join(MANIFEST_FILE), &manifest)?;
     if let Some(bloom) = &bloom {
@@ -796,6 +806,7 @@ mod tests {
             labels: labels_map,
             streams: Vec::new(),
             stream_bounds: Vec::new(),
+            stream_rows: Vec::new(),
         }
     }
 

@@ -20,6 +20,7 @@ use tower::ServiceExt;
 
 struct Harness {
     router: axum::Router,
+    state: AppState,
     _tmp: tempfile::TempDir,
 }
 
@@ -39,7 +40,8 @@ impl Harness {
         let store = Arc::new(Store::open(&config).unwrap());
         let state = AppState::new(Arc::new(config), store).unwrap();
         Self {
-            router: router(state),
+            router: router(state.clone()),
+            state,
             _tmp: tmp,
         }
     }
@@ -609,4 +611,59 @@ async fn an_existing_series_still_ingests_at_the_cap() {
             "an existing series must keep ingesting: {body}"
         );
     }
+}
+
+/// `limits.ingest_queue_depth` has to reject, not queue.
+///
+/// It documented itself as "a full queue returns 429 with Retry-After rather than
+/// buffering without bound" and enforced nothing — the 429 mapping and the Retry-After
+/// header both existed already; only the thing that triggers them was missing.
+///
+/// Rejecting is the point. Queueing the excess would be the unbounded buffering the
+/// setting exists to prevent, moved somewhere an operator cannot see it.
+#[tokio::test]
+async fn a_full_ingest_queue_is_refused_with_retry_after() {
+    let harness = Harness::new(|config| {
+        config.limits.ingest_queue_depth = 1;
+    });
+
+    let payload = serde_json::json!({
+        "resourceLogs": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "checkout"}}
+            ]},
+            "scopeLogs": [{"logRecords": [{
+                "timeUnixNano": "1786000000000000000",
+                "severityText": "INFO",
+                "body": {"stringValue": "x"},
+                "attributes": [],
+            }]}],
+        }]
+    })
+    .to_string();
+
+    let request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload.clone()))
+            .unwrap()
+    };
+
+    // Hold the only permit, then offer a second request.
+    let held = harness.state.ingest_slot().expect("the first slot is free");
+    let (status, headers, _) = harness.request(request()).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        headers
+            .iter()
+            .any(|(name, value)| name == "retry-after" && value == "1"),
+        "a rejected producer needs to be told when to come back, got {headers:?}"
+    );
+
+    // And once the slot frees, ingest resumes rather than staying wedged.
+    drop(held);
+    let (status, _, _) = harness.request(request()).await;
+    assert_eq!(status, StatusCode::OK);
 }

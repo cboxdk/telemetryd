@@ -6,7 +6,7 @@ use std::time::Instant;
 use telemetryd_core::{Config, LogRecord, Result, TokenSet};
 use telemetryd_store::Store;
 use time::OffsetDateTime;
-use tokio::sync::broadcast;
+use tokio::sync::{Semaphore, broadcast};
 
 use crate::metrics::Metrics;
 
@@ -31,12 +31,29 @@ pub struct AppState {
     pub query_tokens: Arc<TokenSet>,
     pub started: Instant,
     pub started_at: OffsetDateTime,
+    /// Bounds how many ingest requests are in flight at once.
+    ///
+    /// `limits.ingest_queue_depth` documented itself as "a full queue returns 429 with
+    /// Retry-After rather than buffering without bound", and enforced nothing: it was
+    /// reported in /status and acted on nowhere. Rejecting is the point — queueing the
+    /// excess would be the unbounded buffering the setting exists to prevent, just
+    /// moved somewhere less visible.
+    ingest_permits: Arc<Semaphore>,
     tail: broadcast::Sender<Arc<LogRecord>>,
 }
 
 impl AppState {
+    /// Claim a slot for one ingest request, or `None` when the queue is full.
+    ///
+    /// The permit is held for the whole handler, blocking work included, so this
+    /// bounds concurrent *work* rather than concurrent parsing.
+    pub fn ingest_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.ingest_permits).try_acquire_owned().ok()
+    }
+
     pub fn new(config: Arc<Config>, store: Arc<Store>) -> Result<Self> {
         let (tail, _) = broadcast::channel(TAIL_BUFFER);
+        let queue_depth = usize::try_from(config.limits.ingest_queue_depth).unwrap_or(usize::MAX);
         Ok(Self {
             ingest_tokens: Arc::new(config.auth.ingest_token.resolve()?),
             query_tokens: Arc::new(config.auth.query_token.resolve()?),
@@ -45,6 +62,7 @@ impl AppState {
             metrics: Arc::new(Metrics::new()),
             started: Instant::now(),
             started_at: OffsetDateTime::now_utc(),
+            ingest_permits: Arc::new(Semaphore::new(queue_depth)),
             tail,
         })
     }

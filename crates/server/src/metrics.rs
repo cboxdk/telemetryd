@@ -114,6 +114,21 @@ pub const DESCRIPTORS: &[Descriptor] = &[
         help: "Segments sealed since start, by signal",
     },
     Descriptor {
+        name: "telemetryd_app_series",
+        kind: Kind::Gauge,
+        help: "Distinct series per app — what limits.max_series_per_app is enforced against",
+    },
+    Descriptor {
+        name: "telemetryd_app_rows",
+        kind: Kind::Gauge,
+        help: "Rows in sealed segments per app",
+    },
+    Descriptor {
+        name: "telemetryd_app_bytes_estimate",
+        kind: Kind::Gauge,
+        help: "Disk per app, apportioned by row share — an estimate, since a segment mixes apps",
+    },
+    Descriptor {
         name: "telemetryd_series_active",
         kind: Kind::Gauge,
         help: "Distinct series counted against limits.max_series — the number that decides when ingest starts refusing new ones",

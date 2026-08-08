@@ -11,3 +11,5 @@ description: "Task-shaped recipes for running telemetryd in anger."
 - [Connect laravel-telemetry-ui](connect-the-ui.md)
 - [Size the disk budget](size-the-disk-budget.md)
 - [Diagnose a query that returns nothing](diagnose-empty-results.md)
+
+- [Back up and restore](back-up-and-restore.md)
