@@ -27,26 +27,52 @@ git tag -a v0.12.0 -m "…" && git push origin v0.12.0
 4. Signs `SHA256SUMS` with a keyless Sigstore signature, then **verifies its own
    signature** with the same command the documentation gives users.
 5. Publishes the archives, packages, checksums, signature bundle and SBOM.
-6. Updates the Homebrew tap.
 
-## The one secret
+The Homebrew tap is updated by a **separate** workflow, `formula.yml`, on
+`release: published`.
 
-Step 6 writes to a different repository, so it needs a token this repository does not
-have by default.
+## Why the tap is not part of the release
 
-Create a fine-grained personal access token with **contents: read and write** on
-`cboxdk/homebrew-tap` only, and add it to this repository as
-`HOMEBREW_TAP_TOKEN`:
+`publish-formula.py` reads the digests out of the *published* `SHA256SUMS`, so it
+cannot run before the release exists. It used to sit inside the release job, above the
+publishing step, where the file it fetches had not been uploaded yet. That never fired
+only because the credential was absent and the step always took its skip branch — for
+four releases it looked green. The first tag after a token was configured would have
+404'd, failed the job, and left a release built and signed but never published.
+
+Splitting it also bounds the damage: a tap that cannot be written to now costs nothing
+worse than Homebrew serving the previous version until the workflow is re-run, and
+`workflow_dispatch` makes that a single command.
+
+## The credential
+
+The tap is a different repository, so `GITHUB_TOKEN` cannot write to it.
+
+A **GitHub App** provides the credential, not a personal access token. An App's
+credentials do not expire, so nothing stops working on a date nobody wrote down, and
+it does not belong to a person — a PAT leaves with whoever created it. What reaches
+the runner is an installation token scoped to `homebrew-tap` alone that expires an
+hour later.
+
+Set up once: create an App under the `cboxdk` organisation with **Contents: read and
+write** and no webhook, install it on `cboxdk/homebrew-tap` only, then
 
 ```bash
-gh secret set HOMEBREW_TAP_TOKEN --repo cboxdk/telemetryd
+gh secret set HOMEBREW_APP_ID --repo cboxdk/telemetryd
 ```
 
-**Without it the release still succeeds** — the step warns and prints the command to
-run by hand:
+```bash
+gh secret set HOMEBREW_APP_PRIVATE_KEY --repo cboxdk/telemetryd < app.private-key.pem
+```
+
+The private key goes in as the whole PEM, header and footer included — hence `<` a
+file rather than a paste.
+
+**Without it the release still succeeds.** `formula.yml` warns and prints the command
+to run by hand:
 
 ```bash
-python3 scripts/publish-formula.py v0.12.0
+python3 scripts/publish-formula.py v0.13.0
 ```
 
 That is deliberate. A missing tap update should not fail a release that is otherwise
