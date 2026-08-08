@@ -11,7 +11,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.13.2"
+version = "0.13.3"
 edition = "2024"
 rust-version = "1.89"
 license = "Apache-2.0"
@@ -23,11 +23,11 @@ authors = ["Cbox"]
 mimalloc = "0.1"
 # internal — versioned as well as pathed so the workspace stays publishable and
 # `cargo deny` can tell a deliberate internal edge from an unpinned third-party one
-telemetryd-core = { path = "crates/core", version = "0.13.2" }
-telemetryd-store = { path = "crates/store", version = "0.13.2" }
-telemetryd-ingest = { path = "crates/ingest", version = "0.13.2" }
-telemetryd-query = { path = "crates/query", version = "0.13.2" }
-telemetryd-server = { path = "crates/server", version = "0.13.2" }
+telemetryd-core = { path = "crates/core", version = "0.13.3" }
+telemetryd-store = { path = "crates/store", version = "0.13.3" }
+telemetryd-ingest = { path = "crates/ingest", version = "0.13.3" }
+telemetryd-query = { path = "crates/query", version = "0.13.3" }
+telemetryd-server = { path = "crates/server", version = "0.13.3" }
 
 # runtime + http
 tokio = { version = "1.53", features = ["rt-multi-thread", "net", "signal", "fs", "sync", "time", "macros", "io-util"] }

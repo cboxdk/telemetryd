@@ -128,7 +128,15 @@ against the exact artifact being published, before anything is uploaded.
 Plus: all four release targets cross-compile, and the musl builds are asserted to be
 statically linked.
 
-**Fuzzing runs nightly, not on the merge gate.** Six targets cover every parser that
+**Fuzzing runs nightly, not on the merge gate.** It found a defect the first time it
+ever ran: eight bytes of snappy declaring 2.8 GB of output, which `/api/v1/write`
+allocated before decompressing anything. Three separate faults in the workflow had kept
+it from executing at all — a stable toolchain where it needed nightly, a corpus
+directory that only exists after a run, and a target triple ASAN cannot use — so
+"fuzzing runs nightly" was true of the schedule and false of the outcome. Worth stating
+plainly: the value arrived the moment it actually ran, not when it was written.
+
+Six targets cover every parser that
 reads untrusted bytes — the three query languages, OTLP JSON, and the hand-rolled
 `remote_write` protobuf. A clean sixty seconds proves very little, so making a merge
 wait on one would trade real signal for the appearance of it.
