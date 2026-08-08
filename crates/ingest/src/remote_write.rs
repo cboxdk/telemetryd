@@ -27,10 +27,37 @@ pub struct WriteContext<'a> {
     pub limits: &'a LimitsConfig,
     /// Used when a series carries no `app` label of its own.
     pub default_app: &'a str,
+    /// What the payload may expand to, from `server.max_body_bytes`.
+    ///
+    /// snappy reaches this decoder still compressed — it is the payload's own framing,
+    /// so the transport layer passes it through — which means this is the only place
+    /// its expansion can be bounded.
+    pub max_decompressed: usize,
 }
 
 /// Decompress and decode a `remote_write` request.
 pub fn decode(compressed: &[u8], ctx: WriteContext<'_>) -> Result<Decoded<MetricSample>> {
+    // A snappy stream states its uncompressed length in its header, and
+    // `decompress_vec` believes it: it allocates that much before decompressing a
+    // single byte. Eight bytes can ask for 2.8 GB, which is how a fuzzer found this.
+    //
+    // `decompress_len` reads the same header without allocating, so the claim can be
+    // checked before it is acted on. Same reasoning as the zstd window cap in
+    // `compression.rs`, at the one door that bypasses it.
+    if let Ok(claimed) = snap::raw::decompress_len(compressed)
+        && claimed > ctx.max_decompressed
+    {
+        return Err(Error::LimitExceeded {
+            limit: "server.max_body_bytes",
+            detail: format!(
+                "the remote_write payload declares {claimed} uncompressed bytes, past \
+                 the {} byte limit ({} compressed bytes received)",
+                ctx.max_decompressed,
+                compressed.len()
+            ),
+        });
+    }
+
     // Prometheus always compresses; a few clients send raw protobuf. Falling back
     // rather than failing costs one failed decompression and saves an afternoon of
     // debugging "400 Bad Request" with no explanation.
@@ -302,6 +329,7 @@ mod tests {
             WriteContext {
                 limits: &limits,
                 default_app: "unknown",
+                max_decompressed: 16 * 1024 * 1024,
             },
         )
         .unwrap()
@@ -438,11 +466,47 @@ mod tests {
             WriteContext {
                 limits: &limits,
                 default_app: "unknown",
+                max_decompressed: 16 * 1024 * 1024,
             },
         )
         .unwrap();
         assert!(decoded.records.is_empty());
         assert_eq!(decoded.rejections[0].reason, RejectReason::TooManyLabels);
+    }
+
+    /// Eight bytes that ask for 2.8 GB.
+    ///
+    /// A snappy header states the uncompressed length and `decompress_vec` allocates
+    /// it before decompressing anything, so the declared size — not the received
+    /// size — is what has to be checked. `server.max_body_bytes` bounds every other
+    /// body; snappy reaches this decoder still compressed, because it is the payload's
+    /// own framing, so this is the only place it can be applied.
+    ///
+    /// Found by the fuzzer, at 6,034 executions, the first time the workflow ever
+    /// managed to run. Kept here so finding it again does not need one.
+    #[test]
+    fn a_snappy_header_cannot_ask_for_more_than_the_body_limit() {
+        // Varint 0x80 0x82 0xda 0xda 0x0a = 2,874,573,056.
+        let payload = [0x80, 0x82, 0xda, 0xda, 0x0a, 0x80, 0x27, 0x24];
+        let limits = LimitsConfig::default();
+        let outcome = decode(
+            &payload,
+            WriteContext {
+                limits: &limits,
+                default_app: "test",
+                max_decompressed: 16 * 1024 * 1024,
+            },
+        );
+        assert!(
+            matches!(
+                outcome,
+                Err(Error::LimitExceeded {
+                    limit: "server.max_body_bytes",
+                    ..
+                })
+            ),
+            "expected the declared length to be refused, got {outcome:?}"
+        );
     }
 
     #[test]
@@ -492,6 +556,7 @@ mod tests {
                 WriteContext {
                     limits: &limits,
                     default_app: "unknown",
+                    max_decompressed: 16 * 1024 * 1024,
                 },
             );
             if let Err(error) = result {

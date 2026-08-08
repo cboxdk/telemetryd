@@ -295,6 +295,8 @@ pub async fn remote_write(
             remote_write::WriteContext {
                 limits: &limits,
                 default_app: telemetryd_core::record::UNKNOWN_APP,
+                max_decompressed: usize::try_from(state.config.server.max_body_bytes.as_u64())
+                    .unwrap_or(usize::MAX),
             },
         )
         .inspect_err(|_| {

@@ -16,6 +16,9 @@ fuzz_target!(|data: &[u8]| {
         WriteContext {
             limits: &limits,
             default_app: "fuzz",
+            // The server's default. A fuzzer that hands the decoder an unbounded
+            // budget is not fuzzing the configuration anyone runs.
+            max_decompressed: 16 * 1024 * 1024,
         },
     );
 });
