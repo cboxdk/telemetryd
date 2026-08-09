@@ -17,6 +17,8 @@
 
 use anyhow::{Context, bail};
 use clap::{Args, ValueEnum};
+use std::io::Write;
+
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -120,6 +122,23 @@ pub fn run(args: &QueryArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Write one line, or stop quietly when the reader has gone.
+///
+/// `println!` panics on a closed pipe — "failed printing to stdout: Broken pipe" — and
+/// this command's whole purpose is to be piped: its own documentation says to send it
+/// through `grep` and `wc`. `telemetryd query … | head -20` printed a panic and a
+/// backtrace instead of twenty lines.
+///
+/// Exiting 0 is what every other Unix tool does when its reader leaves. The alternative
+/// is treating a perfectly ordinary shell idiom as a crash.
+fn line(out: &mut impl Write, text: &str) -> std::ops::ControlFlow<()> {
+    match writeln!(out, "{text}") {
+        Ok(()) => std::ops::ControlFlow::Continue(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::ops::ControlFlow::Break(()),
+        Err(_) => std::ops::ControlFlow::Break(()),
+    }
+}
+
 fn print(response: &Value, output: Output) {
     let streams = response
         .get("data")
@@ -128,6 +147,9 @@ fn print(response: &Value, output: Output) {
     let Some(streams) = streams else {
         return;
     };
+
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
 
     for stream in streams {
         let labels = stream.get("stream").and_then(Value::as_object);
@@ -140,7 +162,7 @@ fn print(response: &Value, output: Output) {
                 continue;
             };
             let timestamp = pair.first().and_then(Value::as_str).unwrap_or("0");
-            let line = pair.get(1).and_then(Value::as_str).unwrap_or("");
+            let text = pair.get(1).and_then(Value::as_str).unwrap_or("");
 
             match output {
                 Output::Text => {
@@ -148,7 +170,9 @@ fn print(response: &Value, output: Output) {
                         .and_then(|l| l.get("app"))
                         .and_then(Value::as_str)
                         .unwrap_or("-");
-                    println!("{} {app} {line}", rfc3339(timestamp));
+                    if line(&mut out, &format!("{} {app} {text}", rfc3339(timestamp))).is_break() {
+                        return;
+                    }
                 }
                 Output::Json => {
                     // One object per line: the shape every other tool on the machine
@@ -156,7 +180,7 @@ fn print(response: &Value, output: Output) {
                     let mut record = serde_json::Map::new();
                     record.insert("timestamp".into(), Value::String(rfc3339(timestamp)));
                     record.insert("timestamp_nanos".into(), Value::String(timestamp.into()));
-                    record.insert("line".into(), Value::String(line.into()));
+                    record.insert("line".into(), Value::String(text.into()));
                     if let Some(labels) = labels {
                         record.insert("labels".into(), Value::Object(labels.clone()));
                     }
@@ -164,7 +188,9 @@ fn print(response: &Value, output: Output) {
                     if let Some(extra) = pair.get(2) {
                         record.insert("metadata".into(), extra.clone());
                     }
-                    println!("{}", Value::Object(record));
+                    if line(&mut out, &Value::Object(record).to_string()).is_break() {
+                        return;
+                    }
                 }
             }
         }
@@ -241,6 +267,32 @@ fn urlencode(value: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// The defect: `println!` panics on a closed pipe, and this command exists to be
+    /// piped — its own module documentation says to send it through `grep` and `wc`.
+    /// `telemetryd query … | head -20` printed a panic and a backtrace.
+    #[test]
+    fn a_closed_pipe_stops_output_rather_than_panicking() {
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        assert!(
+            line(&mut Closed, "anything").is_break(),
+            "a reader that has gone away means stop, not crash"
+        );
+
+        // And an open one keeps going, or the fix would be worse than the bug.
+        let mut open = Vec::new();
+        assert!(line(&mut open, "hello").is_continue());
+        assert_eq!(open, b"hello\n");
+    }
 
     #[test]
     fn a_query_survives_the_url() {
