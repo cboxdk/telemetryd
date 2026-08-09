@@ -190,6 +190,16 @@ Restart time is an availability number — it is how long you are blind after a 
 and it does not grow with the store, because sealed segments are read from their
 manifests rather than replayed.
 
+**Relay mode's per-request work is free, and that was checked rather than assumed.**
+Identity stamping and the per-client queue share both add work to the ingest path, and
+the share takes a mutex on every request — which is exactly the shape of the defect that
+once cost 45% of throughput when a query held the writer lock. Measured on an
+aarch64-apple-darwin laptop rather than the shipping musl build, so the absolute figure
+does not belong in the table above: 663–679k records/sec with relay on against 621–672k
+with it off, in both orders. The difference is noise, in the wrong direction as often as
+the right one. The mutex is held for a `HashMap` increment against the cost of parsing a
+500-record batch.
+
 **Sealing costs the request that triggers it, and only that one.** A seal writes a
 Parquet file, which adds roughly 120 ms to one ingest request; with six concurrent
 writers no request exceeded three times the median, because the Parquet write happens
