@@ -1385,12 +1385,16 @@ def check_export_import(binary: str) -> None:
                 pass
             time.sleep(0.25)
 
+        # Big enough that one window's response passes 10 MB, which is where ureq's
+        # default `read_to_string` ceiling sits. The first version of this phase used
+        # 400 short records — well under it — so export looked fine and failed on the
+        # first window anyone would actually export.
         records = [
             {"timeUnixNano": str(NOW - i * 1_000_000),
              "severityNumber": [9, 13, 17, 5][i % 4],
-             "body": {"stringValue": f"payment declined {i}"},
+             "body": {"stringValue": f"payment declined {i} " + "detail " * 250},
              "attributes": [{"key": "order.id", "value": {"stringValue": str(1000 + i)}}]}
-            for i in range(400)
+            for i in range(7_000)
         ]
         entry = {"resourceLogs": [{
             "resource": {"attributes": [
@@ -1429,6 +1433,9 @@ def check_export_import(binary: str) -> None:
         before, after = lines_at(PORT), lines_at(dest_port)
         check("the destination holds the same records", len(after) == len(before),
               f"{len(after)} of {len(before)}")
+        check("the export was large enough to have caught the response ceiling",
+              len(exported.stdout) > 10 * 1024 * 1024,
+              f"{len(exported.stdout) // (1024 * 1024)} MB")
         # The assertion that matters: same *content*, not the same number of rows.
         check("every field survived the round trip", after == before,
               "levels, timestamps, bodies and metadata all match" if after == before

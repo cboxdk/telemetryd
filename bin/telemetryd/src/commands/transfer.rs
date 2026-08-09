@@ -30,6 +30,18 @@ use serde_json::Value;
 /// Entries per request. Well under any sensible server-side cap, and small enough that
 /// one window's worth is a reasonable unit of progress.
 const WINDOW_LIMIT: usize = 5_000;
+/// How much of a response we will hold.
+///
+/// ureq caps `read_to_string` at 10 MB, which a window of ordinary log lines exceeds
+/// easily — 20,000 records of 400 bytes is already 8 MB of bodies before the JSON
+/// around them. The first version of this failed on any window worth exporting, and
+/// only small fixtures had been tried.
+///
+/// A window is bounded by *entry count*, not bytes, and `limits.max_log_line_bytes`
+/// allows 256 KiB per record — so no fixed ceiling is safe on its own. The ceiling
+/// keeps memory bounded; halving the window on hitting it is what makes any record
+/// size work.
+const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 /// The selector that means "everything". Anything else is a subset the caller asked
 /// for, which only the query path can express.
 const DEFAULT_SELECTOR: &str = r#"{app=~".+"}"#;
@@ -299,7 +311,11 @@ fn get(url: &str, token: Option<&str>) -> anyhow::Result<Value> {
         .with_context(|| format!("could not reach {url}"))?;
 
     let status = response.status().as_u16();
-    let body = response.body_mut().read_to_string()?;
+    let body = response
+        .body_mut()
+        .with_config()
+        .limit(MAX_RESPONSE_BYTES)
+        .read_to_string()?;
     if status != 200 {
         let detail: String = body.trim().chars().take(400).collect();
         bail!("{url} answered {status}: {detail}");
@@ -543,7 +559,11 @@ fn get_text(url: &str, token: Option<&str>) -> anyhow::Result<String> {
         .call()
         .with_context(|| format!("could not reach {url}"))?;
     let status = response.status().as_u16();
-    let body = response.body_mut().read_to_string()?;
+    let body = response
+        .body_mut()
+        .with_config()
+        .limit(MAX_RESPONSE_BYTES)
+        .read_to_string()?;
     if status != 200 {
         let detail: String = body.trim().chars().take(400).collect();
         bail!("{url} answered {status}: {detail}");
