@@ -245,7 +245,7 @@ fn explain(code: u16, base: &str, body: &str) -> String {
 ///
 /// Written out rather than pulled in: the alternative is a dependency for one
 /// function, on a binary whose whole promise is being one static file.
-fn urlencode(value: &str) -> String {
+pub fn urlencode(value: &str) -> String {
     let mut out = String::with_capacity(value.len() * 3);
     for byte in value.as_bytes() {
         match byte {

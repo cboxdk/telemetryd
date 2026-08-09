@@ -80,6 +80,13 @@ segments are forwarded in arrival order behind a durable cursor that advances on
 upstream confirms; retention will not delete what has not been forwarded, and
 `relay.when_full` decides between losing the oldest unsent data and refusing new writes.
 
+**Export and import.** `telemetryd export` writes a time range as OTLP NDJSON;
+`telemetryd import` reads one back, from a file or straight from another instance's
+Loki API. Neither reads the other side's storage, so the same pair covers migrating in,
+migrating out, and pulling an incident window onto a laptop. Logs round trip identically,
+asserted against a running pair rather than in prose. Traces and metrics are deliberately
+not exported (ADR-012).
+
 **Operations.** `telemetryd query` runs a LogQL query from the shell — for debugging
 over SSH when the UI is the thing you cannot reach, and for getting data out as JSON
 lines. `telemetryd bench` measures what the machine can ingest and query, on a

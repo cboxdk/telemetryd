@@ -355,6 +355,7 @@ def main() -> int:
     check_relay(binary)
     check_relay_fair_share(binary)
     check_relay_oversized_segments(binary)
+    check_export_import(binary)
 
     print("\n" + "=" * 52)
     if failures:
@@ -1340,6 +1341,116 @@ def check_relay_oversized_segments(binary: str) -> None:
         stop(proc)
         upstream.server.shutdown()
         shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def check_export_import(binary: str) -> None:
+    """The round trip is the test ADR-012 named, and it earned its place immediately.
+
+    The first version of the exporter produced matching record *counts* and different
+    content: `level` came back as `unknown`, because ingest derives it from
+    `severityNumber` and the exporter carried no severity at all. Counting is not
+    comparing.
+    """
+    print("\n=== export and import ===")
+    source_dir = tempfile.mkdtemp(prefix="telemetryd-soak-export-src-")
+    dest_dir = tempfile.mkdtemp(prefix="telemetryd-soak-export-dst-")
+    dump = os.path.join(source_dir, "dump.ndjson")
+    dest_port = PORT + 1
+
+    source = subprocess.Popen(
+        [binary, "serve", "--listen", f"127.0.0.1:{PORT}", "--data-dir", source_dir],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ})
+    dest = subprocess.Popen(
+        [binary, "serve", "--listen", f"127.0.0.1:{dest_port}", "--data-dir", dest_dir],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ})
+
+    def lines_at(port: str | int) -> list:
+        url = (f"http://127.0.0.1:{port}/loki/api/v1/query_range"
+               f"?query={urllib.parse.quote('{app=\"checkout\"}')}"
+               f"&start={NOW - 3600 * SECOND}&end={NOW + 60 * SECOND}&limit=5000")
+        with urllib.request.urlopen(url, timeout=60) as response:
+            body = json.loads(response.read())
+        return sorted(
+            (stream["stream"].get("level"), stream["stream"].get("service_name"),
+             value[0], value[1], json.dumps(value[2] if len(value) > 2 else {}, sort_keys=True))
+            for stream in body["data"]["result"] for value in stream["values"]
+        )
+
+    try:
+        for _ in range(240):
+            try:
+                if request("/healthz")[0] == 200:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.25)
+
+        records = [
+            {"timeUnixNano": str(NOW - i * 1_000_000),
+             "severityNumber": [9, 13, 17, 5][i % 4],
+             "body": {"stringValue": f"payment declined {i}"},
+             "attributes": [{"key": "order.id", "value": {"stringValue": str(1000 + i)}}]}
+            for i in range(400)
+        ]
+        entry = {"resourceLogs": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "checkout"}},
+                {"key": "app", "value": {"stringValue": "checkout"}}]},
+            "scopeLogs": [{"logRecords": records}]}]}
+        check("the source accepted the corpus", with_token("/v1/logs", None, entry) == 200)
+        time.sleep(1)
+
+        # stdout is data, stderr is progress. That separation is what lets an export be
+        # piped into gzip while a meter runs.
+        exported = subprocess.run(
+            [binary, "export", "--url", BASE, "--since", "1h",
+             "--progress", "json"],
+            capture_output=True, text=True, timeout=180, check=False)
+        check("export writes NDJSON to stdout", exported.returncode == 0
+              and exported.stdout.strip().startswith("{"), f"exit {exported.returncode}")
+        events = [json.loads(l) for l in exported.stderr.splitlines() if l.strip()]
+        check("progress goes to stderr as parseable NDJSON",
+              bool(events) and events[-1]["event"] == "done",
+              f"{len(events)} events")
+        check("the final event carries the high-water mark",
+              events and events[-1].get("high_water_nanos") is not None)
+
+        with open(dump, "w", encoding="utf-8") as handle:
+            handle.write(exported.stdout)
+
+        imported = subprocess.run(
+            [binary, "import", "--file", dump, "--url", f"http://127.0.0.1:{dest_port}",
+             "--progress", "none"],
+            capture_output=True, text=True, timeout=300, check=False)
+        check("import replays the file", imported.returncode == 0,
+              imported.stderr.strip()[:200] or f"exit {imported.returncode}")
+        time.sleep(1)
+
+        before, after = lines_at(PORT), lines_at(dest_port)
+        check("the destination holds the same records", len(after) == len(before),
+              f"{len(after)} of {len(before)}")
+        # The assertion that matters: same *content*, not the same number of rows.
+        check("every field survived the round trip", after == before,
+              "levels, timestamps, bodies and metadata all match" if after == before
+              else "content differs")
+
+        # Refusing beats an import that appears to work and silently produces nothing.
+        refused = subprocess.run(
+            [binary, "import", "--file", dump, "--url", f"http://127.0.0.1:{dest_port}",
+             "--since", "30d", "--progress", "none"],
+            capture_output=True, text=True, timeout=120, check=False)
+        check("a range past the destination's retention is refused",
+              refused.returncode != 0 and "retention" in refused.stderr.lower(),
+              refused.stderr.strip()[:120] or "no error")
+    finally:
+        stop(source)
+        dest.terminate()
+        try:
+            dest.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            dest.kill()
+        shutil.rmtree(source_dir, ignore_errors=True)
+        shutil.rmtree(dest_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

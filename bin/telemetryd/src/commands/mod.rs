@@ -3,5 +3,6 @@ pub mod query;
 pub mod serve;
 pub mod service;
 pub mod status;
+pub mod transfer;
 pub mod validate;
 pub mod version;

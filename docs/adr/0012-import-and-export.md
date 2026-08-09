@@ -6,7 +6,7 @@ description: "Portability in both directions, why it goes through query APIs rat
 
 # ADR-012: Import and export
 
-- **Status:** Proposed
+- **Status:** **Accepted. Logs built; traces and metrics deliberately not.**
 - **Date:** 2026-08-08
 - **Builds on:** [ADR-005](0005-compatibility-audit.md), [ADR-004](0004-auth-and-network-binding.md)
 
@@ -251,6 +251,24 @@ Prometheus APIs; an assertion that a range exceeding retention is refused rather
 half-performed; and an assertion that `--progress=json` emits parseable NDJSON on
 stderr while stdout stays byte-exact, since that separation is what the desktop app
 depends on.
+
+## What was built, and what was not
+
+Logs, both directions, verified by the round trip this ADR called for — and it earned
+its place on the first run. The exporter produced matching record *counts* and different
+content: `level` came back as `unknown`, because ingest derives it from `severityNumber`
+and the exporter carried no severity at all. Counting is not comparing, and a test that
+only counts would have passed.
+
+**Traces and metrics are not exported.** The reason is not effort, it is that the
+question does not have an honest answer through a query API. A trace search interface
+answers "which traces match this" and not "every trace in this window", so an exporter
+built on it returns a subset while looking like it returned everything. Metrics come
+back resampled at whatever `step` was asked for rather than as the samples that were
+stored — the ADR already said so, and shipping it anyway would make a lossy path look
+like a migration path.
+
+The whole data directory remains the way to move everything at once, and it always was.
 
 ## Open question
 

@@ -71,6 +71,12 @@ enum Command {
     /// Run a LogQL query, for debugging over SSH or for exporting.
     Query(commands::query::QueryArgs),
 
+    /// Write a time range out as OTLP, for migration or for a bug report.
+    Export(commands::transfer::ExportArgs),
+
+    /// Read a time range in, from another instance or from an export file.
+    Import(commands::transfer::ImportArgs),
+
     /// Check a configuration and show where every value came from.
     Validate(ConfigArgs),
 
@@ -162,6 +168,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Status(args) => commands::status::run(&args),
         Command::Query(args) => commands::query::run(&args),
+        Command::Export(args) => commands::transfer::export(&args),
+        Command::Import(args) => commands::transfer::import(&args),
         Command::Validate(args) => {
             commands::validate::run(args.config.as_deref(), args.data_dir.as_deref())
         }
