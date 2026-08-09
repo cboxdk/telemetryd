@@ -32,7 +32,7 @@
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
-use telemetryd_core::{Error, Signal};
+use telemetryd_core::Error;
 use telemetryd_ingest::otlp_encode;
 use telemetryd_store::{Order, Scan};
 
@@ -48,8 +48,12 @@ const MAX_LIMIT: usize = 200_000;
 
 #[derive(Debug, Deserialize)]
 pub struct ExportParams {
-    /// `logs`, `traces` or `metrics`.
-    pub signal: String,
+    /// Which signal to export.
+    ///
+    /// Typed rather than a free string, so serde rejects anything else before the
+    /// handler runs and the error names what was expected. A `String` here meant a
+    /// typo produced an empty export, which is indistinguishable from an empty range.
+    pub signal: Signal,
     /// Unix nanoseconds.
     pub start: u64,
     pub end: u64,
@@ -59,14 +63,23 @@ pub struct ExportParams {
     pub limit: Option<usize>,
 }
 
-fn signal_of(name: &str) -> Result<Signal, Error> {
-    match name {
-        "logs" => Ok(Signal::Logs),
-        "traces" => Ok(Signal::Traces),
-        "metrics" => Ok(Signal::Metrics),
-        other => Err(Error::BadRequest(format!(
-            "unknown signal {other:?}; expected logs, traces or metrics"
-        ))),
+/// The query parameter, as an enum so an unknown value is a 400 rather than an empty
+/// answer.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Signal {
+    Logs,
+    Traces,
+    Metrics,
+}
+
+impl From<Signal> for telemetryd_core::Signal {
+    fn from(signal: Signal) -> Self {
+        match signal {
+            Signal::Logs => Self::Logs,
+            Signal::Traces => Self::Traces,
+            Signal::Metrics => Self::Metrics,
+        }
     }
 }
 
@@ -78,7 +91,7 @@ pub async fn export(
     State(state): State<AppState>,
     Query(params): Query<ExportParams>,
 ) -> Result<Response, ApiError> {
-    let signal = signal_of(&params.signal)?;
+    let signal: telemetryd_core::Signal = params.signal.into();
     if params.end < params.start {
         return Err(Error::BadRequest("end is before start".to_owned()).into());
     }
@@ -104,19 +117,19 @@ pub async fn export(
 
         let mut lines = Vec::new();
         match signal {
-            Signal::Logs => {
+            telemetryd_core::Signal::Logs => {
                 let records = store.logs().scan(scan, &[], &|_| true)?;
                 for batch in records.chunks(BATCH) {
                     lines.push(otlp_encode::encode_logs(batch).to_string());
                 }
             }
-            Signal::Traces => {
+            telemetryd_core::Signal::Traces => {
                 let records = store.traces().scan(scan, &[], &|_| true)?;
                 for batch in records.chunks(BATCH) {
                     lines.push(otlp_encode::encode_spans(batch).to_string());
                 }
             }
-            Signal::Metrics => {
+            telemetryd_core::Signal::Metrics => {
                 let records = store.metrics().scan(scan, &[], &|_| true)?;
                 for batch in records.chunks(BATCH) {
                     lines.push(otlp_encode::encode_metrics(batch).to_string());
@@ -148,17 +161,15 @@ pub async fn export(
 mod tests {
     use super::*;
 
+    /// An unknown signal must be refused, not answered with nothing — an empty
+    /// export is indistinguishable from an empty range.
     #[test]
-    fn a_signal_name_is_matched_exactly() {
-        assert_eq!(signal_of("logs").unwrap(), Signal::Logs);
-        assert_eq!(signal_of("traces").unwrap(), Signal::Traces);
-        assert_eq!(signal_of("metrics").unwrap(), Signal::Metrics);
-        // Named rather than guessed at: a typo should be a 400 that says what was
-        // expected, not an empty export that looks like an empty range.
-        let error = signal_of("Logs").unwrap_err().to_string();
-        assert!(
-            error.contains("expected logs, traces or metrics"),
-            "{error}"
-        );
+    fn an_unknown_signal_is_refused_by_the_type() {
+        assert!(serde_json::from_str::<Signal>("\"logs\"").is_ok());
+        assert!(serde_json::from_str::<Signal>("\"traces\"").is_ok());
+        assert!(serde_json::from_str::<Signal>("\"metrics\"").is_ok());
+        // Case matters, and so does spelling.
+        assert!(serde_json::from_str::<Signal>("\"Logs\"").is_err());
+        assert!(serde_json::from_str::<Signal>("\"events\"").is_err());
     }
 }

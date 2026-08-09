@@ -88,6 +88,27 @@ wrong:
 API contract: [COMPATIBILITY.md](COMPATIBILITY.md) — derived from `laravel-telemetry-ui`'s
 actual connector source, not from the upstream API references.
 
+## Your data can leave
+
+A self-hosted tool that can only be read through its own interface has quietly become a
+place data goes in. Every signal moves in every direction, as OTLP — the format every
+other backend already accepts.
+
+```bash
+telemetryd export --since 24h > dump.ndjson          # to a file
+telemetryd export --to http://new-host:4319          # straight to another instance
+telemetryd import --from https://logs.internal       # in from somewhere else
+```
+
+Between two telemetryds, records are read straight from the store rather than
+re-derived from a query language, so all three signals come across as stored. From a
+foreign backend it goes through the read APIs each speaks — logs, traces, and metrics
+through Prometheus remote read, which is the only one of the three that returns stored
+samples rather than points on a `step` grid.
+
+`--progress` writes to stderr while the data goes to stdout, so `export | gzip` keeps
+its meter. See the [transfer guide](docs/cookbook/export-and-import.md).
+
 ## Security
 
 telemetryd **refuses to start** on a non-loopback address with no token configured —

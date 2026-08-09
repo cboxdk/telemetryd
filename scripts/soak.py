@@ -761,6 +761,11 @@ def check_oidc(binary: str) -> None:
         # Zero keys is the failure that looks like working software: the server is up,
         # every token is refused, and nothing else in the response says why.
         oidc = oidc_status("static-admin")
+        # The export endpoint returns telemetry, so it sits behind the query token.
+        # A new read surface that forgot its guard is the expensive kind of mistake.
+        check("the export endpoint refuses an unauthenticated read",
+              with_token("/api/v1/export?signal=logs&start=0&end=1", None) == 401)
+
         check("the key set was fetched at startup", oidc.get("keys") == 1,
               f"keys={oidc.get('keys', 'absent')}")
 

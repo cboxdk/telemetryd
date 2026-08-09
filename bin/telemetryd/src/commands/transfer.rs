@@ -46,6 +46,29 @@ const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 /// for, which only the query path can express.
 const DEFAULT_SELECTOR: &str = r#"{app=~".+"}"#;
 
+/// Which signal a transfer moves.
+///
+/// An enum rather than a string, so clap lists the choices in `--help`, rejects a typo
+/// with the valid values, and the match arms below cannot silently miss one. It was a
+/// `String` first, which meant `--signal Traces` was accepted, matched nothing, and
+/// exported an empty file that looked like an empty range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Signal {
+    Logs,
+    Traces,
+    Metrics,
+}
+
+impl Signal {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Logs => "logs",
+            Self::Traces => "traces",
+            Self::Metrics => "metrics",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Progress {
     /// A live meter on a terminal, periodic lines when it is not one.
@@ -105,8 +128,8 @@ pub struct ExportArgs {
     /// rather than re-deriving them from a query language — full fidelity, and the only
     /// way to enumerate traces at all. It therefore needs the source to *be* a
     /// telemetryd; `logs` also works against any Loki-compatible backend.
-    #[arg(long, default_value = "logs", value_name = "SIGNAL")]
-    pub signal: String,
+    #[arg(long, value_enum, default_value_t = Signal::Logs)]
+    pub signal: Signal,
 
     /// Where to write. `-` or omitted is stdout.
     #[arg(long, value_name = "PATH", conflicts_with = "to")]
@@ -154,14 +177,14 @@ pub struct ImportArgs {
     #[arg(long, value_name = "TOKEN", hide_env_values = true)]
     pub from_token: Option<String>,
 
-    /// Which signal to pull. `logs`, `traces` or `metrics`.
+    /// Which signal to pull.
     ///
     /// Metrics come through Prometheus remote read, which returns the stored samples
     /// with their own timestamps — a range query would return points on the `step`
     /// grid instead, which is resampling rather than migration. Remote read is not
     /// part of the stable API, so every run says so.
-    #[arg(long, default_value = "logs", value_name = "SIGNAL")]
-    pub signal: String,
+    #[arg(long, value_enum, default_value_t = Signal::Logs)]
+    pub signal: Signal,
 
     /// The instance to write into.
     #[arg(long, default_value = "http://127.0.0.1:4319", value_name = "URL")]
@@ -663,7 +686,7 @@ pub fn export(args: &ExportArgs) -> anyhow::Result<()> {
         };
         let outcome = walk_native(
             base,
-            &args.signal,
+            args.signal.as_str(),
             args.token.as_deref(),
             args.since.into(),
             &mut reporter,
@@ -688,7 +711,7 @@ pub fn export(args: &ExportArgs) -> anyhow::Result<()> {
         )),
     };
 
-    let outcome = if args.signal == "logs" && args.query != DEFAULT_SELECTOR {
+    let outcome = if args.signal == Signal::Logs && args.query != DEFAULT_SELECTOR {
         // A selector means the caller wants a subset, and only the query path can
         // answer that.
         walk(
@@ -707,7 +730,7 @@ pub fn export(args: &ExportArgs) -> anyhow::Result<()> {
         let mut emit = |line: &str| writeln!(sink, "{line}").context("writing the export");
         walk_native(
             base,
-            &args.signal,
+            args.signal.as_str(),
             args.token.as_deref(),
             args.since.into(),
             &mut reporter,
@@ -944,7 +967,7 @@ pub fn import(args: &ImportArgs) -> anyhow::Result<()> {
 
     let traces_url = format!("{destination}/v1/traces");
     let outcome = match (&args.from, &args.file) {
-        (Some(from), _) if args.signal == "metrics" => {
+        (Some(from), _) if args.signal == Signal::Metrics => {
             let metrics_url = format!("{destination}/v1/metrics");
             walk_metrics(
                 from.trim_end_matches('/'),
@@ -954,7 +977,7 @@ pub fn import(args: &ImportArgs) -> anyhow::Result<()> {
                 |batch| post(&metrics_url, args.token.as_deref(), &batch.to_string()),
             )
         }
-        (Some(from), _) if args.signal == "traces" => walk_traces(
+        (Some(from), _) if args.signal == Signal::Traces => walk_traces(
             from.trim_end_matches('/'),
             args.from_token.as_deref(),
             args.since.into(),
