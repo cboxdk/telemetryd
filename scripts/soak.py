@@ -354,6 +354,7 @@ def main() -> int:
     check_oidc_survives_a_missing_provider(binary)
     check_relay(binary)
     check_relay_fair_share(binary)
+    check_relay_oversized_segments(binary)
 
     print("\n" + "=" * 52)
     if failures:
@@ -866,9 +867,14 @@ def check_oidc_survives_a_missing_provider(binary: str) -> None:
 class Upstream:
     """A stand-in central instance. Can be told to fail, and remembers what arrived."""
 
-    def __init__(self) -> None:
+    def __init__(self, limit: int | None = None) -> None:
         self.received: list[dict] = []
         self.failing = False
+        # A body ceiling, as any real receiver has. `server.max_body_bytes` defaults to
+        # 16 MiB while a segment may be 256 MiB, so this is the normal case and not an
+        # exotic one.
+        self.limit = limit
+        self.refused_too_large = 0
         self.server = http.server.HTTPServer(("127.0.0.1", 0), self._handler())
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -879,6 +885,12 @@ class Upstream:
             def do_POST(self) -> None:  # noqa: N802
                 length = int(self.headers.get("content-length", "0"))
                 raw = self.rfile.read(length)
+                if upstream.limit is not None and length > upstream.limit:
+                    upstream.refused_too_large += 1
+                    self.send_response(413)
+                    self.send_header("content-length", "0")
+                    self.end_headers()
+                    return
                 if upstream.failing:
                     # 503, not a dropped connection: the cursor must not advance on a
                     # refusal the shipper *did* get an answer to.
@@ -1247,6 +1259,83 @@ def check_relay_fair_share(binary: str) -> None:
         check("the quiet client is never refused",
               quiet_codes and all(code == 200 for code in quiet_codes),
               f"{sorted(set(quiet_codes))}")
+    finally:
+        stop(proc)
+        upstream.server.shutdown()
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def check_relay_oversized_segments(binary: str) -> None:
+    """A segment is larger than any receiver will take in one request.
+
+    The defaults guarantee it — a 256 MiB segment against a 16 MiB body limit, and the
+    OTLP encoding is larger than the Parquet it came from. One request per segment meant
+    the first sealed segment was refused forever while the backlog grew until the disk
+    budget started discarding telemetry. This is that case, in miniature.
+    """
+    print("\n=== relay: a segment bigger than upstream accepts ===")
+    upstream = Upstream(limit=50 * 1024)
+    data_dir = tempfile.mkdtemp(prefix="telemetryd-soak-big-")
+    config = os.path.join(data_dir, "telemetryd.toml")
+    with open(config, "w", encoding="utf-8") as handle:
+        handle.write(
+            "[auth]\nadmin_token = [\"static-admin\"]\n"
+            "[storage]\nmax_segment_bytes = \"1MiB\"\nsegment_duration = \"2s\"\n"
+            f"[relay]\nupstream = \"{upstream.url}\"\ninterval = \"1s\"\n"
+            "[[relay.client]]\napp = \"mobile\"\ntoken = \"mobile-secret\"\n"
+        )
+
+    proc = subprocess.Popen(
+        [binary, "serve", "--config", config, "--listen", f"127.0.0.1:{PORT}",
+         "--data-dir", data_dir],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ},
+    )
+    try:
+        for _ in range(240):
+            try:
+                if request("/healthz")[0] == 200:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.25)
+
+        wanted = 0
+        for batch in range(5):
+            payload = {"resourceLogs": [{
+                "resource": {"attributes": [{"key": "app", "value": {"stringValue": "mobile"}}]},
+                "scopeLogs": [{"logRecords": [
+                    {"timeUnixNano": str(NOW + batch * 1000 + i),
+                     "body": {"stringValue": "x" * 300}}
+                    for i in range(800)
+                ]}],
+            }]}
+            with_token("/v1/logs", "mobile-secret", payload)
+            wanted += 800
+
+        delivered = 0
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            delivered = len(upstream.lines())
+            if delivered >= wanted:
+                break
+            time.sleep(1)
+
+        check("every record is delivered despite the size limit",
+              delivered >= wanted, f"{delivered} of {wanted}")
+        check("upstream did refuse oversized requests, so this was a real test",
+              upstream.refused_too_large > 0, f"{upstream.refused_too_large} refusals")
+
+        relay = admin_json("/status").get("relay", {})
+        check("the backlog drains rather than wedging",
+              relay.get("pending", {}).get("logs") == 0,
+              f"pending={relay.get('pending', 'absent')}")
+        check("nothing was dropped for being individually too large",
+              relay.get("records_dropped") == 0, f"{relay.get('records_dropped')}")
+        # Learned from upstream's refusals, so the descent is paid once rather than
+        # per batch forever.
+        check("the receiver's limit is learned",
+              (relay.get("learned_request_ceiling") or 0) > 0,
+              f"{relay.get('learned_request_ceiling')}")
     finally:
         stop(proc)
         upstream.server.shutdown()

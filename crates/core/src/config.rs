@@ -181,6 +181,14 @@ pub struct RelayConfig {
     /// How often to look for sealed segments to ship.
     #[serde(with = "humantime_serde")]
     pub interval: Duration,
+    /// The largest request this relay will send upstream.
+    ///
+    /// A segment is far bigger than any receiver will accept in one request — the
+    /// defaults are a 256 MiB segment against a 16 MiB body limit — so segments are
+    /// split into requests of at most this size. Well under the default limit on
+    /// purpose: a receiver whose own ceiling is lower still works, because a `413`
+    /// halves the batch and retries rather than stalling delivery.
+    pub max_request_bytes: ByteSize,
     /// The most of the ingest queue any one client may hold at once, as a fraction.
     ///
     /// `limits.ingest_queue_depth` is global, so without this one client can fill it
@@ -210,6 +218,7 @@ impl Default for RelayConfig {
             trust_client_identity: false,
             when_full: WhenFull::default(),
             interval: Duration::from_secs(30),
+            max_request_bytes: ByteSize::mib(4),
             max_queue_share: 0.5,
             client: Vec::new(),
         }

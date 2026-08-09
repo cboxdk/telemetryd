@@ -96,6 +96,22 @@ Refusals are counted as `telemetryd_ingest_rejected_total{reason="client_share"}
 is normal for a busy client; a lot means that client wants more of the queue than it is
 allowed, and the queue may simply be too small.
 
+## Requests are split to fit
+
+A segment is far larger than any receiver takes in one request — the defaults are a
+256 MiB segment against a 16 MiB body limit, and the OTLP encoding is bigger than the
+Parquet it came from. So segments are split into requests of at most
+`relay.max_request_bytes` (4 MiB by default).
+
+If your receiver's limit is lower than that, you do not have to tell telemetryd: a
+`413` halves the batch and retries, and the size that worked is remembered so the
+descent is paid once rather than per batch forever. `/status` reports it as
+`learned_request_ceiling`.
+
+`records_dropped` should always be zero. It counts records so large that one alone
+will not fit in a request, which `limits.max_log_line_bytes` makes all but impossible —
+and dropping one beats blocking everything behind it forever.
+
 ## When the disk fills
 
 Retention will not delete what has not been forwarded — that would lose telemetry

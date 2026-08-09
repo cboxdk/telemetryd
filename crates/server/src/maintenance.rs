@@ -120,16 +120,32 @@ impl Maintenance {
         tasks.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Consecutive passes that shipped everything they were allowed to.
+            let mut saturated = 0u32;
             loop {
                 ticker.tick().await;
                 let (relay, store) = (Arc::clone(&relay), Arc::clone(&store));
-                // Bounded per pass so one enormous backlog cannot hold the
-                // blocking pool for minutes; the next tick continues from the
-                // cursor, which is exactly what the cursor is for.
-                let result = tokio::task::spawn_blocking(move || relay.ship(&store, 32)).await;
+                // Bounded per pass so one enormous backlog cannot hold the blocking
+                // pool for minutes; the next tick continues from the cursor, which is
+                // exactly what the cursor is for.
+                //
+                // The bound moves with the backlog. A fixed 32 is about 64 segments a
+                // minute at the default interval, and relay mode is documented as
+                // wanting *small* segments to keep latency down — so the two settings
+                // pull against each other, and a busy relay would fall behind with no
+                // way back.
+                let batch = if saturated >= 2 { 256 } else { 32 };
+                let result = tokio::task::spawn_blocking(move || relay.ship(&store, batch)).await;
                 match result {
-                    Ok(Ok(0)) => {}
+                    Ok(Ok(0)) => saturated = 0,
                     Ok(Ok(shipped)) => {
+                        // A pass that filled its batch means more was waiting than it
+                        // took, so the next one takes more.
+                        saturated = if shipped >= batch as u64 {
+                            saturated.saturating_add(1)
+                        } else {
+                            0
+                        };
                         tracing::debug!(segments = shipped, "forwarded upstream");
                     }
                     Ok(Err(e)) => tracing::warn!(error = %e, "relay pass failed"),

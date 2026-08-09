@@ -368,6 +368,9 @@ pub struct RecordStoreStatus {
     pub newest_record_nanos: Option<u64>,
     pub segments_scanned: u64,
     pub segments_pruned: u64,
+    /// The write-ahead log's own numbers. `unsynced_records` is the one to watch: it
+    /// is how much would be lost to a power cut right now.
+    pub wal: crate::wal::WalStats,
 }
 
 impl<S: RecordSchema> RecordStore<S> {
@@ -1092,6 +1095,7 @@ impl<S: RecordSchema> RecordStore<S> {
             recovered_records: self.stats.recovered.load(Ordering::Relaxed),
             oldest_record_nanos: oldest,
             newest_record_nanos: newest,
+            wal: lock(&self.writer).wal.stats(),
             segments_scanned: self.stats.segments_scanned.load(Ordering::Relaxed),
             segments_pruned: self.stats.segments_pruned.load(Ordering::Relaxed),
         }

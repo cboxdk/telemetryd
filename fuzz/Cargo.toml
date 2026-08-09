@@ -54,3 +54,15 @@ path = "fuzz_targets/body_decompression.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "otlp_traces"
+path = "fuzz_targets/otlp_traces.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "otlp_metrics"
+path = "fuzz_targets/otlp_metrics.rs"
+test = false
+doc = false

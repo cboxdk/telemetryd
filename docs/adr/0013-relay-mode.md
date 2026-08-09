@@ -189,6 +189,25 @@ a read proxy as well means merging local and remote results, reconciling two ret
 windows, and inheriting upstream's availability into every query — which is the coupling
 [ADR-011](0011-cbox-id-integration.md) exists to avoid, in a new place.
 
+## What one request per segment cost
+
+Shipping a whole segment in one request was the first design, and it could not work.
+`storage.max_segment_bytes` defaults to 256 MiB while a receiving telemetryd's
+`server.max_body_bytes` defaults to 16 MiB, and the OTLP encoding of a segment is larger
+than the Parquet it came from — so the first sealed segment would be refused, the cursor
+would never advance, and the relay would retry it forever while the backlog grew until
+the disk budget began discarding telemetry.
+
+It was measured rather than reasoned about: 712 KB against a 50 KB ceiling gave twelve
+failures, zero deliveries, and a backlog that never drained. Segments are now split into
+requests bounded by `relay.max_request_bytes`, and a `413` halves the batch and retries —
+so a receiver whose limit is tighter than ours self-corrects instead of wedging. The
+accepted size is remembered, because the first attempt at that cost 45 rejected requests
+against 48 useful ones.
+
+The lesson worth keeping: the failure needed no unusual configuration. It needed the
+defaults.
+
 ## How it is kept honest
 
 Built as described. The delivery guarantee is the thing to test, and the tests are the

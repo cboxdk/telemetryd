@@ -205,6 +205,63 @@ fn push_auth_and_cardinality_gauges(state: &AppState, samples: &mut Vec<Sample>)
 
 /// Every sample is `f64` because that is what the Prometheus exposition format is; the
 /// counts and byte totals here are far below the 2^53 boundary where that matters.
+/// Per-signal storage and write-ahead-log numbers.
+///
+/// Split out of `gauges` for length, which is also why it is worth naming what these
+/// are for: `wal_unsynced_records` is how much a power cut would cost right now, and
+/// `segments_scanned` against `segments_pruned` is whether pruning is earning its keep.
+#[allow(clippy::cast_precision_loss)]
+fn push_per_signal_gauges(snapshot: &telemetryd_store::StoreStatus, samples: &mut Vec<Sample>) {
+    for (signal, stats) in [
+        ("logs", &snapshot.logs),
+        ("traces", &snapshot.traces),
+        ("metrics", &snapshot.metrics),
+    ] {
+        for (name, value) in [
+            ("telemetryd_records_buffered", stats.buffered_records as f64),
+            (
+                "telemetryd_records_appended_total",
+                stats.appended_records as f64,
+            ),
+            ("telemetryd_segments", stats.segments as f64),
+            ("telemetryd_segment_rows", stats.segment_rows as f64),
+            (
+                "telemetryd_segments_sealed_total",
+                stats.sealed_segments as f64,
+            ),
+            // Non-zero means data has been lost to a damaged file. Worth an alert.
+            (
+                "telemetryd_segments_unreadable_total",
+                stats.segments_unreadable as f64,
+            ),
+            // Whether pruning is doing anything: scanned against pruned is the ratio
+            // that says whether the manifests are earning their keep.
+            (
+                "telemetryd_query_segments_scanned_total",
+                stats.segments_scanned as f64,
+            ),
+            (
+                "telemetryd_query_segments_pruned_total",
+                stats.segments_pruned as f64,
+            ),
+            ("telemetryd_wal_segments", stats.wal.segments as f64),
+            (
+                "telemetryd_wal_records_total",
+                stats.wal.appended_records as f64,
+            ),
+            // How much a power cut would cost right now. All five of these were
+            // declared in the descriptor table and never given a value: `/metrics`
+            // published HELP and TYPE for numbers that could not exist.
+            (
+                "telemetryd_wal_unsynced_records",
+                stats.wal.unsynced_records as f64,
+            ),
+        ] {
+            samples.push(Sample::new(name, &[("signal", signal)], value));
+        }
+    }
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn gauges(state: &AppState) -> Result<Vec<Sample>, Error> {
     let snapshot = state.store.snapshot()?;
@@ -244,32 +301,7 @@ fn gauges(state: &AppState) -> Result<Vec<Sample>, Error> {
     // All three signals, not just logs. A trace store filling up or a metric segment
     // going unreadable is exactly as worth alerting on, and it used to be invisible
     // here while showing up in /status — two answers to the same question.
-    for (signal, stats) in [
-        ("logs", &snapshot.logs),
-        ("traces", &snapshot.traces),
-        ("metrics", &snapshot.metrics),
-    ] {
-        for (name, value) in [
-            ("telemetryd_records_buffered", stats.buffered_records as f64),
-            (
-                "telemetryd_records_appended_total",
-                stats.appended_records as f64,
-            ),
-            ("telemetryd_segments", stats.segments as f64),
-            ("telemetryd_segment_rows", stats.segment_rows as f64),
-            (
-                "telemetryd_segments_sealed_total",
-                stats.sealed_segments as f64,
-            ),
-            // Non-zero means data has been lost to a damaged file. Worth an alert.
-            (
-                "telemetryd_segments_unreadable_total",
-                stats.segments_unreadable as f64,
-            ),
-        ] {
-            samples.push(Sample::new(name, &[("signal", signal)], value));
-        }
-    }
+    push_per_signal_gauges(&snapshot, &mut samples);
 
     push_auth_and_cardinality_gauges(state, &mut samples);
 

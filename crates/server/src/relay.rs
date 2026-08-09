@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -74,6 +74,10 @@ pub struct RelayStatus {
     pub records_delivered: u64,
     /// Failed delivery attempts since start. Retried, not lost.
     pub failures: u64,
+    /// Records lost because one alone exceeded a request. Should always be zero.
+    pub records_dropped: u64,
+    /// The request size upstream has been observed to accept, once it has refused one.
+    pub learned_request_ceiling: Option<usize>,
     /// How far each signal has been delivered. Absent means nothing has yet.
     pub delivered_through: BTreeMap<String, String>,
 }
@@ -83,10 +87,19 @@ pub struct RelayStats {
     pub segments_delivered: AtomicU64,
     pub records_delivered: AtomicU64,
     pub failures: AtomicU64,
+    /// Records dropped because one alone exceeded a request. Always data loss.
+    pub records_dropped: AtomicU64,
 }
 
 pub struct Relay {
     config: RelayConfig,
+    /// What upstream has actually accepted, learned from its refusals.
+    ///
+    /// Without this, a receiver whose body limit is lower than `max_request_bytes`
+    /// costs a rejected request for every batch of every segment, forever — the first
+    /// run of this measured 45 refusals against 48 useful requests. A `413` is upstream
+    /// telling us its limit; remembering it turns a permanent tax into a one-off cost.
+    learned_ceiling: AtomicUsize,
     cursor_path: PathBuf,
     cursor: RwLock<Cursor>,
     pub stats: RelayStats,
@@ -119,6 +132,7 @@ impl Relay {
             config,
             cursor_path,
             cursor: RwLock::new(cursor),
+            learned_ceiling: AtomicUsize::new(usize::MAX),
             stats: RelayStats::default(),
         }
     }
@@ -200,6 +214,11 @@ impl Relay {
             segments_delivered: self.stats.segments_delivered.load(Ordering::Relaxed),
             records_delivered: self.stats.records_delivered.load(Ordering::Relaxed),
             failures: self.stats.failures.load(Ordering::Relaxed),
+            records_dropped: self.stats.records_dropped.load(Ordering::Relaxed),
+            learned_request_ceiling: match self.learned_ceiling.load(Ordering::Relaxed) {
+                usize::MAX => None,
+                ceiling => Some(ceiling),
+            },
             delivered_through,
         }
     }
@@ -294,42 +313,135 @@ impl Relay {
     }
 
     /// Read one segment, encode it, and post it. Returns the record count.
+    /// Read one segment and post it, in as many requests as it takes.
+    ///
+    /// **One request per segment does not work**, and the defaults make that certain:
+    /// `storage.max_segment_bytes` is 256 MiB while a receiving telemetryd's
+    /// `server.max_body_bytes` is 16 MiB, and the OTLP encoding of a segment is larger
+    /// than the Parquet it came from. The first sealed segment would be refused, the
+    /// cursor would never advance, and the relay would retry it forever while the
+    /// backlog grew until the disk budget started throwing telemetry away. Measured,
+    /// not reasoned: 712 KB against a 50 KB ceiling produced twelve failures, zero
+    /// deliveries, and a backlog that never drained.
     fn deliver(&self, store: &Store, signal: Signal, id: &str) -> Result<u64> {
-        let (path, body, count) = match signal {
+        match signal {
             Signal::Logs => {
                 let records = read_segment(store.logs().segments(), id, |segment| {
                     segment.read::<telemetryd_store::LogSchema>()
                 })?;
-                let count = records.len() as u64;
-                ("/v1/logs", otlp_encode::encode_logs(&records), count)
+                self.post_batched("/v1/logs", &records, otlp_encode::encode_logs)
             }
             Signal::Traces => {
                 let records = read_segment(store.traces().segments(), id, |segment| {
                     segment.read::<telemetryd_store::SpanSchema>()
                 })?;
-                let count = records.len() as u64;
-                ("/v1/traces", otlp_encode::encode_spans(&records), count)
+                self.post_batched("/v1/traces", &records, otlp_encode::encode_spans)
             }
             Signal::Metrics => {
                 let records = read_segment(store.metrics().segments(), id, |segment| {
                     segment.read::<telemetryd_store::MetricSchema>()
                 })?;
-                let count = records.len() as u64;
-                ("/v1/metrics", otlp_encode::encode_metrics(&records), count)
+                self.post_batched("/v1/metrics", &records, otlp_encode::encode_metrics)
             }
-        };
+        }
+    }
 
-        if count == 0 {
-            // Nothing to send, but the cursor must still move or an empty segment
-            // blocks every one behind it forever.
+    /// Split `records` into requests that fit, and post each. Returns the count sent.
+    ///
+    /// Splitting is by *encoded* size rather than an estimate, and a batch that comes
+    /// out too large is halved and reconsidered — which terminates, because a batch of
+    /// one cannot be halved again.
+    fn post_batched<T, F>(&self, path: &str, records: &[T], encode: F) -> Result<u64>
+    where
+        F: Fn(&[T]) -> serde_json::Value + Copy,
+    {
+        if records.is_empty() {
+            // The cursor must still advance, or an empty segment blocks every one
+            // behind it forever.
             return Ok(0);
         }
 
-        self.post(path, &body)?;
-        Ok(count)
+        let ceiling = self.request_ceiling();
+        let mut sent = 0u64;
+        let mut queue: Vec<&[T]> = vec![records];
+
+        while let Some(batch) = queue.pop() {
+            let body = encode(batch);
+            let encoded = serde_json::to_string(&body).map_err(|e| {
+                telemetryd_core::Error::RelayDelivery(format!("serialising the payload: {e}"))
+            })?;
+
+            if encoded.len() > ceiling && batch.len() > 1 {
+                let (left, right) = batch.split_at(batch.len() / 2);
+                // Right first, so popping keeps the original order on the wire. Order
+                // is not required by any receiver, but out-of-order delivery makes a
+                // packet capture much harder to read than it needs to be.
+                queue.push(right);
+                queue.push(left);
+                continue;
+            }
+
+            if encoded.len() > ceiling {
+                // One record that cannot be split and cannot fit. Skipping loses it;
+                // not skipping loses everything behind it, permanently. `max_log_line_bytes`
+                // makes this all but unreachable, so it is a last resort that must be
+                // loud rather than a case to design around.
+                tracing::error!(
+                    path,
+                    bytes = encoded.len(),
+                    ceiling,
+                    "a single record does not fit in one request and was dropped rather \
+                     than block delivery of everything behind it"
+                );
+                self.stats.records_dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
+            match self.post(path, &encoded) {
+                Ok(()) => sent += batch.len() as u64,
+                Err(error) if is_too_large(&error) && batch.len() > 1 => {
+                    self.learn_ceiling(encoded.len());
+                    // The receiver's limit is tighter than ours. Halve and retry
+                    // rather than wedge: guessing their configuration is not something
+                    // we can do, but responding to their answer is.
+                    tracing::warn!(
+                        path,
+                        bytes = encoded.len(),
+                        "upstream refused the batch as too large; splitting and retrying"
+                    );
+                    let (left, right) = batch.split_at(batch.len() / 2);
+                    queue.push(right);
+                    queue.push(left);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Ok(sent)
     }
 
-    fn post(&self, path: &str, body: &serde_json::Value) -> Result<()> {
+    fn request_ceiling(&self) -> usize {
+        let configured =
+            usize::try_from(self.config.max_request_bytes.as_u64()).unwrap_or(usize::MAX);
+        configured.min(self.learned_ceiling.load(Ordering::Relaxed))
+    }
+
+    /// Remember that upstream refused `bytes` as too large.
+    ///
+    /// Deliberately not persisted. A receiver's limit is theirs to change, and a
+    /// restart is the natural moment to find out it went up.
+    ///
+    /// The floor is small on purpose. A first attempt used 64 KiB and it was worse than
+    /// no floor: against a receiver limited to 50 KiB the learned ceiling could never
+    /// get below it, so every batch was refused once and split, forever. A floor that
+    /// stops convergence is not a floor.
+    fn learn_ceiling(&self, bytes: usize) {
+        const FLOOR: usize = 8 * 1024;
+        let ceiling = (bytes / 2).max(FLOOR);
+        self.learned_ceiling.fetch_min(ceiling, Ordering::Relaxed);
+    }
+
+    fn post(&self, path: &str, encoded: &str) -> Result<()> {
         let url = format!("{}{path}", self.config.upstream.trim_end_matches('/'));
         let token = self.config.token.resolve()?;
 
@@ -344,11 +456,8 @@ impl Relay {
             request = request.header("authorization", &format!("Bearer {token}"));
         }
 
-        let encoded = serde_json::to_string(body).map_err(|e| {
-            telemetryd_core::Error::RelayDelivery(format!("serialising the payload: {e}"))
-        })?;
         let mut response = request
-            .send(&encoded)
+            .send(encoded)
             .map_err(|e| telemetryd_core::Error::RelayDelivery(format!("posting to {url}: {e}")))?;
 
         let status = response.status().as_u16();
@@ -370,6 +479,15 @@ impl Relay {
             "{url} answered {status}: {detail}"
         )))
     }
+}
+
+/// Whether upstream refused because the request was too big.
+///
+/// Matched on the message rather than a typed error because that is what crossing an
+/// HTTP boundary leaves us: the status code is the only structured thing either side
+/// agreed on, and it is in the text.
+fn is_too_large(error: &telemetryd_core::Error) -> bool {
+    matches!(error, telemetryd_core::Error::RelayDelivery(detail) if detail.contains("answered 413"))
 }
 
 /// Find a segment by id and read it, or say which one went missing.

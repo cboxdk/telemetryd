@@ -82,6 +82,7 @@ trust_client_identity = false        # take `app` from the payload instead of th
 when_full             = "drop_oldest"  # drop_oldest | reject, when undelivered data fills the budget
 interval              = "30s"        # how often to look for sealed segments to ship
 max_queue_share       = 0.5          # most of limits.ingest_queue_depth one client may hold; 1.0 = off
+max_request_bytes     = "4MiB"       # segments are split into requests this size; a 413 halves and retries
 
 # One entry per client application. The token identifies it; the app is stamped onto
 # every record it sends, replacing whatever the payload claimed.
