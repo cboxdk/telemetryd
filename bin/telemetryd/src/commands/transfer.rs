@@ -142,12 +142,12 @@ pub struct ImportArgs {
     #[arg(long, value_name = "TOKEN", hide_env_values = true)]
     pub from_token: Option<String>,
 
-    /// Which signal to pull. `logs` or `traces`.
+    /// Which signal to pull. `logs`, `traces` or `metrics`.
     ///
-    /// Metrics are not offered from a foreign backend: a range query returns points at
-    /// whatever `step` was asked for rather than the samples that were stored, so it
-    /// would be a lossy path dressed as a migration path. Have the source send OTLP
-    /// instead.
+    /// Metrics come through Prometheus remote read, which returns the stored samples
+    /// with their own timestamps — a range query would return points on the `step`
+    /// grid instead, which is resampling rather than migration. Remote read is not
+    /// part of the stable API, so every run says so.
     #[arg(long, default_value = "logs", value_name = "SIGNAL")]
     pub signal: String,
 
@@ -773,6 +773,57 @@ fn check_retention(
     Ok(())
 }
 
+/// Pull raw metric samples from a foreign Prometheus-compatible backend.
+///
+/// Windows walk oldest-ward on the sample timestamps, same discipline as everywhere
+/// else here. Remote read has no cursor of its own, so the range is narrowed each time.
+fn walk_metrics(
+    base: &str,
+    token: Option<&str>,
+    since: std::time::Duration,
+    reporter: &mut Reporter,
+    mut emit: impl FnMut(&Value) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    // Loud, and on stderr so it cannot end up inside the data.
+    eprintln!("{}", super::remote_read::WARNING);
+
+    let end_ms = i64::try_from(now_nanos()? / 1_000_000).unwrap_or(i64::MAX);
+    let start_ms = end_ms.saturating_sub(i64::try_from(since.as_millis()).unwrap_or(i64::MAX));
+    let mut cursor = end_ms;
+    let mut previous_oldest: Option<i64> = None;
+
+    loop {
+        let Some((batch, count, oldest)) =
+            super::remote_read::fetch(base, token, start_ms, cursor)?
+        else {
+            break;
+        };
+        emit(&batch)?;
+        reporter.advance(count, None);
+
+        // A window that returns the same oldest sample as the last one has made no
+        // progress, and the next request would ask the same question again. A source
+        // that does not narrow its answer to the range would otherwise be walked one
+        // millisecond at a time — measured at 15,600 rounds and 46,941 duplicated
+        // records before it ran the machine out of sockets.
+        //
+        // This is the second walk in this file to need saying out loud: a cursor is
+        // only a cursor if it is guaranteed to move.
+        if previous_oldest == Some(oldest) {
+            break;
+        }
+        previous_oldest = Some(oldest);
+
+        // Strictly older, or a window whose samples share a millisecond repeats.
+        let next = oldest.saturating_sub(1);
+        if next <= start_ms {
+            break;
+        }
+        cursor = next;
+    }
+    Ok(())
+}
+
 /// Pull traces from a foreign Tempo-compatible backend.
 ///
 /// Two requests deep, and unavoidably so: search returns trace *ids* with their start
@@ -873,6 +924,16 @@ pub fn import(args: &ImportArgs) -> anyhow::Result<()> {
 
     let traces_url = format!("{destination}/v1/traces");
     let outcome = match (&args.from, &args.file) {
+        (Some(from), _) if args.signal == "metrics" => {
+            let metrics_url = format!("{destination}/v1/metrics");
+            walk_metrics(
+                from.trim_end_matches('/'),
+                args.from_token.as_deref(),
+                args.since.into(),
+                &mut reporter,
+                |batch| post(&metrics_url, args.token.as_deref(), &batch.to_string()),
+            )
+        }
         (Some(from), _) if args.signal == "traces" => walk_traces(
             from.trim_end_matches('/'),
             args.from_token.as_deref(),

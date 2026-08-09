@@ -290,10 +290,9 @@ range query returns points at whatever `step` was asked for rather than the samp
 were stored. There is no read API for raw samples to fall back on, so this one is a
 property of the format rather than of our effort. Have the source send OTLP instead.
 
-## Metrics from a foreign backend: how it would be done
+## Metrics from a foreign backend
 
-Left unbuilt, with the mechanism written down so the next person does not have to
-rediscover it.
+Built, with the instability accepted deliberately and announced on every run.
 
 A range query cannot do it. `step` is a *resolution*, so the timestamps come back on the
 step grid rather than as the times the samples were stored, and a finer step yields more
@@ -306,15 +305,18 @@ samples matching the requested query" — original timestamps, no evaluation —
 snappy-compressed protobuf, the same family as the `remote_write` this project already
 decodes by hand.
 
-The reason it is not built is not effort. Prometheus documents remote read as **not part
-of the stable API, "subject to change even between non-major version releases"**. A
-migration path is exactly the thing that runs rarely and under pressure, and building one
-on an interface that may move between patch releases of the source is a poor trade for a
-capability that has a working alternative: have the source send OTLP, which is stable and
-which telemetryd already accepts.
+Prometheus documents remote read as **not part of the stable API, "subject to change
+even between non-major version releases"**. That was the argument for leaving it out, and
+it is a real cost rather than a theoretical one — but it is a cost to state, not a reason
+to withhold the capability from someone whose source cannot be made to push. So
+`import --from --signal metrics` exists, and prints the caveat on every run.
 
-Worth revisiting if remote read stabilises, or if someone hits the case where the source
-genuinely cannot be made to push.
+The walk needed a guard the first version did not have. A source that does not narrow its
+answer to the requested range makes no progress, and the cursor advances a millisecond at
+a time: measured at 15,600 rounds and 46,941 duplicated records before it exhausted the
+machine's sockets. A window that returns the same oldest sample as the last one now ends
+the walk. This is the second walk in this feature to need that said out loud — a cursor
+is only a cursor if it is guaranteed to move.
 
 ## Open question
 

@@ -114,9 +114,20 @@ Traces cost N+1 requests per window — search enumerates the window, then each 
 fetched for its spans — so this is much slower than the native path. Correct, though,
 which is what matters when the source is not a telemetryd.
 
-**Metrics cannot be pulled from a foreign backend.** A range query returns points at
-whatever `step` you ask for rather than the samples that were stored, so it would be a
-lossy path dressed as a migration path. Have the source send OTLP to telemetryd instead.
+**Metrics come through remote read**, not a range query:
+
+```bash
+telemetryd import --from https://prometheus.internal --signal metrics --since 24h
+```
+
+A range query would return points on the `step` grid rather than the samples that were
+stored — shrinking the step gives more points from the same samples, not more fidelity.
+Remote read returns the stored samples with their own timestamps.
+
+It prints a warning every run, and means it: Prometheus documents remote read as outside
+its stable API, "subject to change even between non-major version releases". If a source
+upgrade breaks this, have it send OTLP to telemetryd instead — that path is stable and
+already works.
 
 An export file names its signal in every line, so `import --file` routes each line to the
 right endpoint by content. A file holding all three just works, and pointing a traces

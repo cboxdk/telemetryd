@@ -19,6 +19,7 @@ path = "src/main.rs"
 [dependencies]
 mimalloc = { workspace = true }
 telemetryd-core.workspace = true
+telemetryd-ingest.workspace = true
 telemetryd-store.workspace = true
 telemetryd-server.workspace = true
 
@@ -32,6 +33,7 @@ bytesize.workspace = true
 humantime.workspace = true
 time.workspace = true
 ureq.workspace = true
+snap.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
