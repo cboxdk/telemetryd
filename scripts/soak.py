@@ -907,6 +907,43 @@ class Upstream:
                         out.append(record.get("body", {}).get("stringValue", ""))
         return out
 
+    def spans(self) -> int:
+        return sum(
+            len(scope.get("spans", []))
+            for payload in self.received
+            for resource in payload.get("resourceSpans", [])
+            for scope in resource.get("scopeSpans", [])
+        )
+
+    def span_statuses(self) -> set[int]:
+        return {
+            span.get("status", {}).get("code", 0)
+            for payload in self.received
+            for resource in payload.get("resourceSpans", [])
+            for scope in resource.get("scopeSpans", [])
+            for span in scope.get("spans", [])
+        }
+
+    def sum_temporalities(self) -> set[int]:
+        """0 is AGGREGATION_TEMPORALITY_UNSPECIFIED, which the proto forbids."""
+        return {
+            metric["sum"].get("aggregationTemporality", 0)
+            for payload in self.received
+            for resource in payload.get("resourceMetrics", [])
+            for scope in resource.get("scopeMetrics", [])
+            for metric in scope.get("metrics", [])
+            if "sum" in metric
+        }
+
+    def metric_names(self) -> set[str]:
+        return {
+            metric.get("name", "")
+            for payload in self.received
+            for resource in payload.get("resourceMetrics", [])
+            for scope in resource.get("scopeMetrics", [])
+            for metric in scope.get("metrics", [])
+        }
+
     def apps(self) -> set[str]:
         out = set()
         for payload in self.received:
@@ -952,6 +989,43 @@ def admin_metrics() -> str:
         return ""
 
 
+def relay_traces(claimed_app: str, token: str) -> int:
+    payload = {"resourceSpans": [{
+        "resource": {"attributes": [
+            {"key": "app", "value": {"stringValue": claimed_app}},
+            {"key": "service.name", "value": {"stringValue": claimed_app}},
+        ]},
+        "scopeSpans": [{"spans": [{
+            "traceId": TRACE_ID,
+            "spanId": "eee19b7ec3c1b174",
+            "name": "POST /charge",
+            "kind": 2,
+            "startTimeUnixNano": str(NOW),
+            "endTimeUnixNano": str(NOW + 1_000_000),
+            "status": {"code": 2, "message": "card declined"},
+            "attributes": [{"key": "http.method", "value": {"stringValue": "POST"}}],
+        }]}],
+    }]}
+    return with_token("/v1/traces", token, payload)
+
+
+def relay_metrics(claimed_app: str, token: str) -> int:
+    payload = {"resourceMetrics": [{
+        "resource": {"attributes": [
+            {"key": "app", "value": {"stringValue": claimed_app}},
+        ]},
+        "scopeMetrics": [{"metrics": [{
+            "name": "charges_total",
+            "sum": {
+                "isMonotonic": True,
+                "aggregationTemporality": 2,
+                "dataPoints": [{"timeUnixNano": str(NOW), "asDouble": 7.0}],
+            },
+        }]}],
+    }]}
+    return with_token("/v1/metrics", token, payload)
+
+
 def check_relay(binary: str) -> None:
     """Forwarding, and the identity stamp that is the point of it."""
     print("\n=== relay mode ===")
@@ -987,6 +1061,14 @@ def check_relay(binary: str) -> None:
 
         status = relay_logs(400, "payments", "mobile-secret")
         check("a registered client can write", status == 200, f"HTTP {status}")
+
+        # Relay mode claims all three signals, and `deliver` has a branch for each.
+        # Only the logs branch had ever run against a real upstream.
+        traces = relay_traces("payments", "mobile-secret")
+        metrics = relay_metrics("payments", "mobile-secret")
+        check("traces and metrics are accepted too",
+              traces == 200 and metrics == 200,
+              f"traces={traces} metrics={metrics}")
 
         # Stored under the credential's identity, not the payload's claim. This is the
         # whole security argument: everything downstream is keyed on this label.
@@ -1025,6 +1107,22 @@ def check_relay(binary: str) -> None:
               len(delivered) >= 400, f"{len(delivered)} of 400 lines")
         check("upstream sees the stamped identity, never the claimed one",
               upstream.apps() == {"mobile"}, f"{upstream.apps() or 'nothing'}")
+
+        # The other two branches of `deliver`, end to end: encoded from a sealed
+        # segment, posted, and accepted by something that decodes OTLP.
+        deadline = time.time() + 45
+        while time.time() < deadline and not (upstream.spans() and upstream.metric_names()):
+            time.sleep(1)
+        check("spans reach upstream", upstream.spans() >= 1, f"{upstream.spans()} spans")
+        check("metrics reach upstream", "charges_total" in upstream.metric_names(),
+              f"{sorted(upstream.metric_names()) or 'nothing'}")
+        # The proto: "UNSPECIFIED is the default AggregationTemporality, it MUST not
+        # be used." A strict receiver may reject the whole payload over it.
+        check("a forwarded counter names its temporality",
+              upstream.sum_temporalities() == {2},
+              f"{upstream.sum_temporalities() or 'no sums'}")
+        check("a span keeps its status through the round trip",
+              upstream.span_statuses() == {2}, f"{upstream.span_statuses() or 'none'}")
 
         # Visible, or an operator is reading log files to find out how far behind the
         # shipper is. Checked before the restart: these are "since start" counters, and

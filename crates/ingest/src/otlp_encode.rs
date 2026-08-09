@@ -244,11 +244,18 @@ fn series_attributes(series: &Labels) -> Value {
 /// whole segment's samples grouped in memory to do it — and the shipper's whole design
 /// is to stream a segment rather than assemble one.
 ///
-/// **Counters go out as non-monotonic sums with no aggregation temporality.** We do not
-/// store either fact: `remote_write` carries no type at all, so the kind is often a
-/// guess already. Claiming `AGGREGATION_TEMPORALITY_CUMULATIVE` on a sample whose
-/// provenance we do not know would be inventing a property, and a receiver that acts on
-/// it computes wrong rates.
+/// **Counters go out as cumulative monotonic sums**, and that is an inference the
+/// format forces rather than a fact we stored.
+///
+/// An earlier version emitted `AGGREGATION_TEMPORALITY_UNSPECIFIED` on the grounds that
+/// we do not record which one a sample was. The proto forbids it — *"UNSPECIFIED is the
+/// default AggregationTemporality, it MUST not be used"* — so that was not caution, it
+/// was emitting a message a strict receiver may reject outright. Losing the data beats
+/// nothing; a possibly-wrong temporality does not.
+///
+/// Cumulative is the inference to make. Prometheus `remote_write`, which is where most
+/// of these come from, is cumulative by definition, and delta sums are the rare case in
+/// OTLP. Stated here because it is a choice, not a recording.
 #[must_use]
 pub fn encode_metrics(samples: &[MetricSample]) -> Value {
     let resources: Vec<Value> = group(samples, |sample| &sample.series)
@@ -266,7 +273,9 @@ pub fn encode_metrics(samples: &[MetricSample]) -> Value {
                         MetricKind::Counter => json!({"sum": {
                             "dataPoints": [point],
                             "isMonotonic": true,
-                            "aggregationTemporality": 0,
+                            // 2 = AGGREGATION_TEMPORALITY_CUMULATIVE. Never 0: the
+                            // proto says UNSPECIFIED MUST NOT be used.
+                            "aggregationTemporality": 2,
                         }}),
                         _ => json!({"gauge": {"dataPoints": [point]}}),
                     };
@@ -439,6 +448,13 @@ mod tests {
         let metric = &encoded["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0];
         assert_eq!(metric["name"].as_str(), Some("http_requests_total"));
         assert!(metric.get("sum").is_some(), "a counter is a sum");
+        // The proto: "UNSPECIFIED is the default AggregationTemporality, it MUST not
+        // be used." Emitting 0 is emitting a message a strict receiver may reject.
+        assert_eq!(
+            metric["sum"]["aggregationTemporality"].as_i64(),
+            Some(2),
+            "a sum must name a temporality, and cumulative is the one to infer"
+        );
 
         let attrs = metric["sum"]["dataPoints"][0]["attributes"]
             .as_array()
