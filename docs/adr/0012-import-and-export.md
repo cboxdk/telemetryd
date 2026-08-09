@@ -260,21 +260,29 @@ content: `level` came back as `unknown`, because ingest derives it from `severit
 and the exporter carried no severity at all. Counting is not comparing, and a test that
 only counts would have passed.
 
-**Traces and metrics needed a different mechanism, not more effort.** This ADR built
-everything on the query APIs, and for logs that was right. For the other two it was not,
-and the first release said so rather than shipping something lossy: a trace search
-interface answers "which traces match this" and not "every trace in this window", so an
-exporter built on one returns a subset while looking complete; a metric range query
-returns points at whatever `step` was asked for rather than the samples that were stored.
+**Two paths, and one of the reasons given for them was wrong.**
 
-Neither problem is solvable at the client. Both dissolve by not going through a query
-language: `GET /api/v1/export` reads records and hands them to the encoder relay mode
-already uses. That is new API surface, which this ADR set out to avoid — and avoiding it
-would have meant either shipping a lossy export or shipping none.
+`GET /api/v1/export` reads records and hands them to the encoder relay mode already
+uses, so what comes out is what was stored. That is new API surface this ADR set out to
+avoid, and it earns it on fidelity alone: nothing passes through a query language, so
+nothing is re-derived from a rendering of itself. It is the right default against
+telemetryd.
 
-The cost is that the native path only works against telemetryd. The query path stays for
-everyone else's data, which is what the migration-in story needs, so the two together
-cover more than either would alone.
+The justification originally given for it was not. Two releases claimed that "a trace
+search API answers which traces match this, not every trace in this window", and used
+that to explain why traces could not be imported from a foreign backend. **It is false.**
+Search without a query enumerates the window — that is what Tempo does, and what
+telemetryd copied. Checked only after someone asked whether the claim was really true.
+
+So trace import from a foreign backend is built: search enumerates, and each id is
+fetched for its spans. It costs N+1 requests per window and is far slower than logs,
+which is a reason to prefer the native path and not a reason to pretend the option did
+not exist.
+
+**Metrics stay logs-and-traces only from a foreign backend, and that limit is real.** A
+range query returns points at whatever `step` was asked for rather than the samples that
+were stored. There is no read API for raw samples to fall back on, so this one is a
+property of the format rather than of our effort. Have the source send OTLP instead.
 
 ## Open question
 

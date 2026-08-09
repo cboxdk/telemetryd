@@ -1434,6 +1434,43 @@ def check_export_import(binary: str) -> None:
               "levels, timestamps, bodies and metadata all match" if after == before
               else "content differs")
 
+        # Traces from a "foreign" backend — the source is a telemetryd here, which is
+        # exactly what a Tempo-compatible one looks like from the client's side.
+        #
+        # The assertion that matters is that it *terminates*. The first version walked
+        # by time, and because search takes seconds a window ending at the oldest
+        # trace's second still contained that trace: 44 traces became 8,008 records in
+        # 182 requests before it ran the machine out of sockets.
+        traces = {"resourceSpans": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "checkout"}}]},
+            "scopeSpans": [{"spans": [
+                {"traceId": f"{i:032x}", "spanId": f"{i:016x}", "name": "POST /charge",
+                 "kind": 2, "startTimeUnixNano": str(NOW - i * 2 * SECOND),
+                 "endTimeUnixNano": str(NOW - i * 2 * SECOND + 5000),
+                 "status": {"code": 2, "message": "declined"}}
+                for i in range(1, 30)]}]}]}
+        check("the source accepted traces", with_token("/v1/traces", None, traces) == 200)
+        time.sleep(1)
+
+        pulled = subprocess.run(
+            [binary, "import", "--from", BASE, "--signal", "traces", "--since", "2h",
+             "--url", f"http://127.0.0.1:{dest_port}", "--progress", "none"],
+            capture_output=True, text=True, timeout=120, check=False)
+        check("traces pull from a read API and the walk terminates",
+              pulled.returncode == 0, pulled.stderr.strip()[:160] or f"exit {pulled.returncode}")
+        time.sleep(1)
+
+        def trace_count(port: str | int) -> int:
+            url = (f"http://127.0.0.1:{port}/api/search"
+                   f"?start={(NOW - 7200 * SECOND) // SECOND}"
+                   f"&end={(NOW + 60 * SECOND) // SECOND}&limit=1000")
+            with urllib.request.urlopen(url, timeout=60) as response:
+                return len(json.loads(response.read()).get("traces", []))
+
+        check("every trace arrived", trace_count(dest_port) == trace_count(PORT),
+              f"{trace_count(dest_port)} of {trace_count(PORT)}")
+
         # Refusing beats an import that appears to work and silently produces nothing.
         refused = subprocess.run(
             [binary, "import", "--file", dump, "--url", f"http://127.0.0.1:{dest_port}",

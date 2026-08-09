@@ -124,6 +124,15 @@ pub struct ImportArgs {
     #[arg(long, value_name = "TOKEN", hide_env_values = true)]
     pub from_token: Option<String>,
 
+    /// Which signal to pull. `logs` or `traces`.
+    ///
+    /// Metrics are not offered from a foreign backend: a range query returns points at
+    /// whatever `step` was asked for rather than the samples that were stored, so it
+    /// would be a lossy path dressed as a migration path. Have the source send OTLP
+    /// instead.
+    #[arg(long, default_value = "logs", value_name = "SIGNAL")]
+    pub signal: String,
+
     /// The instance to write into.
     #[arg(long, default_value = "http://127.0.0.1:4319", value_name = "URL")]
     pub url: String,
@@ -710,6 +719,95 @@ fn check_retention(
     Ok(())
 }
 
+/// Pull traces from a foreign Tempo-compatible backend.
+///
+/// Two requests deep, and unavoidably so: search returns trace *ids* with their start
+/// times, and the spans come from fetching each id. That is N+1 requests per window and
+/// slower than logs by a wide margin — but it is correct, and correct is what was
+/// missing.
+///
+/// This exists because the reason given for leaving it out was wrong. "A trace search
+/// API answers which traces match, not every trace in a window" was written into an ADR
+/// and two release notes as justification, and it is false: search without a query
+/// enumerates the window, which is exactly what Tempo does and what telemetryd copied.
+fn walk_traces(
+    base: &str,
+    token: Option<&str>,
+    since: std::time::Duration,
+    reporter: &mut Reporter,
+    mut emit: impl FnMut(&Value) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let end_nanos = now_nanos()?;
+    let start_nanos = end_nanos.saturating_sub(since.as_nanos());
+    let start_s = start_nanos / 1_000_000_000;
+    let mut cursor_s = end_nanos.div_ceil(1_000_000_000);
+
+    // Trace ids already taken, because the cursor cannot be time.
+    //
+    // Search takes *seconds*, so a window ending at the oldest trace's second still
+    // contains that trace — the first version rounded the end up "so a trace on the
+    // boundary is not lost", and turned the walk into a loop that re-fetched the same
+    // 44 traces 182 times. Rounding down instead would lose every trace sharing that
+    // second. Ids are the only thing precise enough to make progress on.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    loop {
+        let url = format!("{base}/api/search?start={start_s}&end={cursor_s}&limit={WINDOW_LIMIT}");
+        let found = get(&url, token)?;
+        let traces = found
+            .get("traces")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if traces.is_empty() {
+            break;
+        }
+
+        let mut oldest_s = u128::MAX;
+        let mut fresh = 0u64;
+        let mut spans = 0u64;
+
+        for summary in &traces {
+            let Some(id) = summary.get("traceID").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(started) = summary.get("startTimeUnixNano").and_then(|v| {
+                v.as_str()
+                    .and_then(|s| s.parse::<u128>().ok())
+                    .or_else(|| v.as_u64().map(u128::from))
+            }) {
+                oldest_s = oldest_s.min(started / 1_000_000_000);
+            }
+            if !seen.insert(id.to_owned()) {
+                continue;
+            }
+            fresh += 1;
+
+            let trace = get(&format!("{base}/api/traces/{id}"), token)?;
+            let Some(batches) = trace.get("batches").cloned() else {
+                continue;
+            };
+            let batch = serde_json::json!({"resourceSpans": batches});
+            spans += count_any(&batch);
+            emit(&batch)?;
+        }
+        reporter.advance(spans, None);
+
+        // A window that produced nothing new is the end of the walk: either the range
+        // is exhausted or every trace in it is already taken.
+        if fresh == 0 {
+            break;
+        }
+        if oldest_s == u128::MAX || oldest_s <= start_s {
+            break;
+        }
+        // Keep the oldest second in range — traces sharing it may not all have fitted
+        // under `limit` — and let the id set stop the repeat.
+        cursor_s = oldest_s;
+    }
+    Ok(())
+}
+
 pub fn import(args: &ImportArgs) -> anyhow::Result<()> {
     let destination = args.url.trim_end_matches('/');
     let logs_url = format!("{destination}/v1/logs");
@@ -719,7 +817,15 @@ pub fn import(args: &ImportArgs) -> anyhow::Result<()> {
         check_retention(destination, args.token.as_deref(), args.since.into())?;
     }
 
+    let traces_url = format!("{destination}/v1/traces");
     let outcome = match (&args.from, &args.file) {
+        (Some(from), _) if args.signal == "traces" => walk_traces(
+            from.trim_end_matches('/'),
+            args.from_token.as_deref(),
+            args.since.into(),
+            &mut reporter,
+            |batch| post(&traces_url, args.token.as_deref(), &batch.to_string()),
+        ),
         (Some(from), _) => walk(
             from.trim_end_matches('/'),
             &args.query,

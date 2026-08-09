@@ -85,14 +85,23 @@ telemetryd export --signal metrics --since 24h > metrics.ndjson
 There are two paths underneath, and which one runs depends on what you asked for.
 
 **Against telemetryd**, export reads records straight from the store and encodes them —
-no query language in the middle, so what comes out is what was stored. This is the only
-way traces work at all: a trace search API answers "which traces match this", not "every
-trace in this window", so an exporter built on one returns a subset while looking
-complete. It is also the only way metrics keep their stored samples rather than points
-resampled at whatever `step` was asked for.
+no query language in the middle, so what comes out is what was stored, and it is one
+request per window rather than one per trace.
 
-**Against a foreign backend**, or when you pass a `--query` to take a subset, export goes
-through the Loki-compatible API instead. That works anywhere but is logs only.
+**Against a foreign backend**, or when you pass a `--query` to take a subset, it goes
+through the read APIs instead:
+
+```bash
+telemetryd import --from https://tempo.internal --signal traces --since 6h
+```
+
+Traces cost N+1 requests per window — search enumerates the window, then each id is
+fetched for its spans — so this is much slower than the native path. Correct, though,
+which is what matters when the source is not a telemetryd.
+
+**Metrics cannot be pulled from a foreign backend.** A range query returns points at
+whatever `step` you ask for rather than the samples that were stored, so it would be a
+lossy path dressed as a migration path. Have the source send OTLP to telemetryd instead.
 
 An export file names its signal in every line, so `import --file` routes each line to the
 right endpoint by content. A file holding all three just works, and pointing a traces
