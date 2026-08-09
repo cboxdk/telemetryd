@@ -84,20 +84,26 @@ The consequence worth noticing: because telemetryd serves those same APIs, **one
 importer also copies from another telemetryd**. Migration in, migration out, and
 instance-to-instance are one code path, not three.
 
-### telemetryd never writes to a foreign store
+### Never write to a store you were only asked to read from
 
-Export produces a file. It does not push to a remote backend, and there is no
-`--to <url>`.
+The first version of this section said something broader and wrong: that telemetryd
+never writes to a foreign store, so export would produce a file and there would be no
+`--to <url>`. It borrowed the desktop app's posture — *"This app never writes to a
+connected store"* — and over-applied it.
 
-This is not timidity, it is the same posture the desktop app already commits to in
-`config/telemetry-desktop.php` — *"This app never writes to a connected store"* — a
-claim asserted in its tests rather than merely configured. A tool that reads your
-production observability store is a tool you can point at production without a
-meeting. One that writes to it is not. Keeping that true is worth more than the
-convenience of a `--to` flag, and a file plus one `curl` is not a hardship.
+**Relay mode had been posting OTLP to a remote since the day it shipped.** The rule as
+stated was already false in our own code, and nobody noticed until someone asked why
+export could not do the same thing relay does.
 
-Import writes only to the local instance. That does not breach the posture: the local
-store is the destination, never the connection.
+The rule that survives is narrower and still worth keeping: never write into a store you
+were only asked to *read* from. That is what protects a connection someone configured
+for querying production. A destination named on the command line is not that — it is the
+operator saying where their data should go.
+
+So `export --to <url>` exists, and it is the full-fidelity path between two instances:
+records read through `/api/v1/export` rather than re-derived from a query language, all
+three signals, no file in between. `import --from` remains the direction that works
+against a foreign backend, through the read APIs, which cannot carry metrics.
 
 ## Progress
 

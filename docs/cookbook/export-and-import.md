@@ -15,6 +15,21 @@ Neither command reads the other side's storage. Both work through the Loki API
 telemetryd serves and the OTLP endpoint it accepts, so the same pair covers moving to a
 new instance, pulling production onto a laptop, and leaving telemetryd altogether.
 
+## Moving between two instances
+
+```bash
+telemetryd export --url http://old:4319 --to http://new:4319 --signal logs
+telemetryd export --url http://old:4319 --to http://new:4319 --signal traces
+telemetryd export --url http://old:4319 --to http://new:4319 --signal metrics
+```
+
+No file in between, and the highest fidelity available: records are read through
+telemetryd's own export endpoint rather than re-derived from a query language, so all
+three signals come across as they were stored.
+
+This is the direction to use when both ends are telemetryd. `import --from` is for when
+the source is not.
+
 ## Pulling an incident onto your machine
 
 The case this gets used for weekly. Point `--from` at production and write into a local

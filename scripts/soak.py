@@ -1434,6 +1434,18 @@ def check_export_import(binary: str) -> None:
               "levels, timestamps, bodies and metadata all match" if after == before
               else "content differs")
 
+        # The direct path between two instances: no file, all three signals, records
+        # read rather than re-derived. ADR-012 refused to offer this on the grounds
+        # that telemetryd never writes to a foreign store — while relay mode had been
+        # posting OTLP upstream since it shipped.
+        direct = subprocess.run(
+            [binary, "export", "--url", BASE, "--signal", "metrics", "--since", "1h",
+             "--to", f"http://127.0.0.1:{dest_port}", "--progress", "none"],
+            capture_output=True, text=True, timeout=180, check=False)
+        check("export --to posts straight to another instance",
+              direct.returncode == 0,
+              direct.stderr.strip()[:160] or f"exit {direct.returncode}")
+
         # Traces from a "foreign" backend — the source is a telemetryd here, which is
         # exactly what a Tempo-compatible one looks like from the client's side.
         #

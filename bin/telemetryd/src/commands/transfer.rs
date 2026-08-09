@@ -97,8 +97,26 @@ pub struct ExportArgs {
     pub signal: String,
 
     /// Where to write. `-` or omitted is stdout.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "to")]
     pub output: Option<String>,
+
+    /// Post straight to another instance instead of writing a file.
+    ///
+    /// The full-fidelity path between two telemetryds: records are read through
+    /// `/api/v1/export` rather than re-derived from a query language, and all three
+    /// signals come across. `import --from` is the other direction and goes through the
+    /// read APIs, which cannot carry metrics.
+    #[arg(long, value_name = "URL", conflicts_with = "output")]
+    pub to: Option<String>,
+
+    /// Ingest token for `--to`.
+    #[arg(
+        long,
+        env = "TELEMETRYD_AUTH_INGEST_TOKEN",
+        value_name = "TOKEN",
+        hide_env_values = true
+    )]
+    pub to_token: Option<String>,
 
     #[arg(long, value_enum, default_value_t = Progress::Auto)]
     pub progress: Progress,
@@ -606,6 +624,42 @@ fn count_any(batch: &Value) -> u64 {
 pub fn export(args: &ExportArgs) -> anyhow::Result<()> {
     let base = args.url.trim_end_matches('/');
     let mut reporter = Reporter::new(args.progress);
+
+    // Posting to a destination is the same walk with a different sink — which is the
+    // whole point, and the reason an earlier version of this refused to offer it was
+    // not a good one. ADR-012 said telemetryd never writes to a foreign store; relay
+    // mode has been posting OTLP upstream since it shipped. The rule that survives is
+    // narrower: never write to a store you were only asked to read from. A destination
+    // named on the command line is not that.
+    if let Some(destination) = &args.to {
+        let destination = destination.trim_end_matches('/').to_owned();
+        let token = args.to_token.clone();
+        let mut emit = |line: &str| -> anyhow::Result<()> {
+            let batch: Value = serde_json::from_str(line).context("parsing the export")?;
+            let Some(endpoint) = endpoint_for(&batch) else {
+                bail!("the export produced something that is not an OTLP request");
+            };
+            post(&format!("{destination}{endpoint}"), token.as_deref(), line)
+        };
+        let outcome = walk_native(
+            base,
+            &args.signal,
+            args.token.as_deref(),
+            args.since.into(),
+            &mut reporter,
+            &mut emit,
+        );
+        return match outcome {
+            Ok(()) => {
+                reporter.finish(None);
+                Ok(())
+            }
+            Err(error) => {
+                reporter.finish(Some(&error.to_string()));
+                Err(error)
+            }
+        };
+    }
 
     let mut sink: Box<dyn Write> = match args.output.as_deref() {
         None | Some("-") => Box::new(std::io::BufWriter::new(std::io::stdout().lock())),
