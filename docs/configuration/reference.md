@@ -81,6 +81,7 @@ ingest_queue_depth      = 8192       # backpressure: full queue → 429 with Ret
 trust_client_identity = false        # take `app` from the payload instead of the credential
 when_full             = "drop_oldest"  # drop_oldest | reject, when undelivered data fills the budget
 interval              = "30s"        # how often to look for sealed segments to ship
+max_queue_share       = 0.5          # most of limits.ingest_queue_depth one client may hold; 1.0 = off
 
 # One entry per client application. The token identifies it; the app is stamped onto
 # every record it sends, replacing whatever the payload claimed.

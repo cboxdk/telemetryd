@@ -98,7 +98,7 @@ pub async fn otlp_logs(
     // Bound concurrent ingest. A rejected request is a signal the producer can act on
     // — back off, batch harder — where an accepted one that queues behind a hundred
     // others is the unbounded buffering `limits.ingest_queue_depth` exists to prevent.
-    let Some(_slot) = state.ingest_slot() else {
+    let Some(_slot) = state.ingest_slot_for(identity.as_ref().map(|i| i.app.as_str())) else {
         state.metrics.incr(
             "telemetryd_ingest_rejected_total",
             &[("signal", "logs"), ("reason", "queue_full")],
@@ -206,7 +206,7 @@ pub async fn otlp_traces(
     // Bound concurrent ingest. A rejected request is a signal the producer can act on
     // — back off, batch harder — where an accepted one that queues behind a hundred
     // others is the unbounded buffering `limits.ingest_queue_depth` exists to prevent.
-    let Some(_slot) = state.ingest_slot() else {
+    let Some(_slot) = state.ingest_slot_for(identity.as_ref().map(|i| i.app.as_str())) else {
         state.metrics.incr(
             "telemetryd_ingest_rejected_total",
             &[("signal", "traces"), ("reason", "queue_full")],
@@ -290,7 +290,7 @@ pub async fn otlp_metrics(
     // Bound concurrent ingest. A rejected request is a signal the producer can act on
     // — back off, batch harder — where an accepted one that queues behind a hundred
     // others is the unbounded buffering `limits.ingest_queue_depth` exists to prevent.
-    let Some(_slot) = state.ingest_slot() else {
+    let Some(_slot) = state.ingest_slot_for(identity.as_ref().map(|i| i.app.as_str())) else {
         state.metrics.incr(
             "telemetryd_ingest_rejected_total",
             &[("signal", "metrics"), ("reason", "queue_full")],
@@ -342,7 +342,7 @@ pub async fn remote_write(
     // Bound concurrent ingest. A rejected request is a signal the producer can act on
     // — back off, batch harder — where an accepted one that queues behind a hundred
     // others is the unbounded buffering `limits.ingest_queue_depth` exists to prevent.
-    let Some(_slot) = state.ingest_slot() else {
+    let Some(_slot) = state.ingest_slot_for(identity.as_ref().map(|i| i.app.as_str())) else {
         state.metrics.incr(
             "telemetryd_ingest_rejected_total",
             &[("signal", "metrics"), ("reason", "queue_full")],

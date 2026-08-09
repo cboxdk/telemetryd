@@ -72,6 +72,30 @@ The trade is that delivery is **at-least-once**. A response lost after upstream
 committed means the segment is sent again, and telemetryd has no deduplication, so
 upstream sees duplicates. Losing data is the worse failure.
 
+## One client cannot starve the others
+
+`limits.ingest_queue_depth` is global. Without anything else, one client can fill it
+and every other client gets `429` — which is exactly what a retry loop shipped to a
+fleet does, through a mechanism working as designed.
+
+```toml
+[relay]
+max_queue_share = 0.5   # the default
+```
+
+No client may hold more than that fraction of the queue at once, so the rest always
+have room. Set `1.0` to turn it off.
+
+It is a **share** rather than a requests-per-second limit on purpose. The identity here
+is the application, not the device: a million phones present one credential, so a rate
+ceiling would have to be guessed against fleet size and would throttle the whole fleet
+to contain one bad version of it. A share needs no such number and scales with the queue
+depth on its own.
+
+Refusals are counted as `telemetryd_ingest_rejected_total{reason="client_share"}`. Some
+is normal for a busy client; a lot means that client wants more of the queue than it is
+allowed, and the queue may simply be too small.
+
 ## When the disk fills
 
 Retention will not delete what has not been forwarded — that would lose telemetry

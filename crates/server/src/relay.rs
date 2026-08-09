@@ -66,6 +66,8 @@ pub struct RelayStatus {
     pub upstream: String,
     pub trust_client_identity: bool,
     pub when_full: &'static str,
+    /// The most of the ingest queue one client may hold. `1.0` means the cap is off.
+    pub max_queue_share: f64,
     /// Sealed segments not yet accepted upstream, by signal.
     pub pending: BTreeMap<String, usize>,
     pub segments_delivered: u64,
@@ -188,6 +190,7 @@ impl Relay {
         RelayStatus {
             upstream: self.config.upstream.clone(),
             trust_client_identity: self.config.trust_client_identity,
+            max_queue_share: self.config.max_queue_share,
             when_full: if self.drops_when_full() {
                 "drop_oldest"
             } else {

@@ -50,6 +50,10 @@ pub struct AppState {
     pub relay_clients: Arc<telemetryd_core::ClientTokens>,
     /// Forwarding upstream. `None` unless `relay.upstream` is set.
     pub relay: Option<Arc<crate::relay::Relay>>,
+    /// Ingest requests in flight per client. Only ever holds clients with an active
+    /// request, so it is bounded by the queue depth.
+    in_flight: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+    queue_depth: usize,
     tail: broadcast::Sender<Arc<LogRecord>>,
 }
 
@@ -58,8 +62,56 @@ impl AppState {
     ///
     /// The permit is held for the whole handler, blocking work included, so this
     /// bounds concurrent *work* rather than concurrent parsing.
-    pub fn ingest_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        Arc::clone(&self.ingest_permits).try_acquire_owned().ok()
+    pub fn ingest_slot(&self) -> Option<IngestSlot> {
+        self.ingest_slot_for(None)
+    }
+
+    /// As [`Self::ingest_slot`], but also bounding one client's share of the queue.
+    ///
+    /// The global depth alone lets a single client fill it and hand every other client
+    /// a `429` — a retry loop shipped to a fleet does precisely that, through a
+    /// mechanism working exactly as designed. `relay.max_queue_share` caps how much of
+    /// the queue any one identity holds, so the rest always have room.
+    ///
+    /// The map of active clients cannot grow without bound, and not by construction of
+    /// its own: an entry exists only while that client has a request in flight, and
+    /// there can never be more of those than there are permits.
+    pub fn ingest_slot_for(&self, identity: Option<&str>) -> Option<IngestSlot> {
+        let permit = Arc::clone(&self.ingest_permits).try_acquire_owned().ok()?;
+
+        let Some(app) = identity.filter(|_| self.config.relay.is_enabled()) else {
+            return Some(IngestSlot {
+                _permit: permit,
+                app: None,
+                in_flight: Arc::clone(&self.in_flight),
+            });
+        };
+
+        let ceiling = self.config.relay.per_client_slots(self.queue_depth);
+        {
+            let mut in_flight = self
+                .in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let held = in_flight.entry(app.to_owned()).or_insert(0);
+            if *held >= ceiling {
+                if *held == 0 {
+                    in_flight.remove(app);
+                }
+                self.metrics.incr(
+                    "telemetryd_ingest_rejected_total",
+                    &[("signal", "any"), ("reason", "client_share")],
+                );
+                return None;
+            }
+            *held += 1;
+        }
+
+        Some(IngestSlot {
+            _permit: permit,
+            app: Some(app.to_owned()),
+            in_flight: Arc::clone(&self.in_flight),
+        })
     }
 
     pub fn new(config: Arc<Config>, store: Arc<Store>) -> Result<Self> {
@@ -96,6 +148,8 @@ impl AppState {
             oidc,
             relay_clients,
             relay,
+            in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            queue_depth,
             tail,
         })
     }
@@ -123,5 +177,67 @@ impl AppState {
 
     pub fn tail_subscribers(&self) -> usize {
         self.tail.receiver_count()
+    }
+}
+
+/// A claimed ingest slot. Releases the global permit and the client's share on drop,
+/// including when the handler returns early or panics — the alternative is a counter
+/// that only ever goes up and a client locked out of its own quota forever.
+#[derive(Debug)]
+pub struct IngestSlot {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    app: Option<String>,
+    in_flight: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+}
+
+impl Drop for IngestSlot {
+    fn drop(&mut self) {
+        let Some(app) = &self.app else {
+            return;
+        };
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(held) = in_flight.get_mut(app) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                in_flight.remove(app);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use telemetryd_core::config::RelayConfig;
+
+    /// The number that decides whether one client can lock the others out.
+    #[test]
+    fn a_share_never_rounds_down_to_refusing_everything() {
+        let mut config = RelayConfig {
+            upstream: "https://central.example.com".to_owned(),
+            ..RelayConfig::default()
+        };
+
+        assert_eq!(config.per_client_slots(8192), 4096, "the default is half");
+
+        // A share small enough to round to zero must still allow one request, or the
+        // cap stops being a cap and becomes an outage.
+        config.max_queue_share = 0.0001;
+        assert_eq!(config.per_client_slots(100), 1);
+        config.max_queue_share = 0.0;
+        assert_eq!(config.per_client_slots(100), 1);
+
+        // And a negative one, which no validator should have to catch.
+        config.max_queue_share = -1.0;
+        assert_eq!(config.per_client_slots(100), 1);
+
+        // 1.0 is "off": one client may hold the whole queue, as it could before.
+        config.max_queue_share = 1.0;
+        assert_eq!(config.per_client_slots(100), 100);
+        config.max_queue_share = 2.0;
+        assert_eq!(config.per_client_slots(100), 100);
     }
 }

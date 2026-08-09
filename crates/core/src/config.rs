@@ -163,7 +163,7 @@ pub enum WhenFull {
 ///
 /// Unset means telemetryd stores what it receives and sends nothing onward, which is
 /// what it has always done.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RelayConfig {
     /// Base URL of the instance that receives what this one accepts. Empty = off.
@@ -181,11 +181,60 @@ pub struct RelayConfig {
     /// How often to look for sealed segments to ship.
     #[serde(with = "humantime_serde")]
     pub interval: Duration,
+    /// The most of the ingest queue any one client may hold at once, as a fraction.
+    ///
+    /// `limits.ingest_queue_depth` is global, so without this one client can fill it
+    /// and every other client gets `429` — a bad app version shipped to a fleet does
+    /// exactly that, through a mechanism working as designed.
+    ///
+    /// A *share* rather than a request rate, because the identity here is the
+    /// application and not the device: a million phones present one credential, so a
+    /// requests-per-second ceiling would have to be guessed against fleet size and
+    /// would throttle the whole fleet. A share needs no such number and scales with
+    /// `ingest_queue_depth` on its own.
+    ///
+    /// `1.0` disables it. Below `1.0`, no client can lock the others out.
+    pub max_queue_share: f64,
     /// Per-client ingest credentials, each bound to an app name.
     pub client: Vec<RelayClient>,
 }
 
+impl Default for RelayConfig {
+    /// Spelled out rather than derived. `Default` would give a zero queue share —
+    /// which rounds to one in-flight request per client — and a zero interval, and
+    /// both would then need a second, hidden default at the point of use.
+    fn default() -> Self {
+        Self {
+            upstream: String::new(),
+            token: Secret::default(),
+            trust_client_identity: false,
+            when_full: WhenFull::default(),
+            interval: Duration::from_secs(30),
+            max_queue_share: 0.5,
+            client: Vec::new(),
+        }
+    }
+}
+
 impl RelayConfig {
+    /// In-flight requests one client may hold, given the global queue depth.
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    pub fn per_client_slots(&self, queue_depth: usize) -> usize {
+        if self.max_queue_share >= 1.0 {
+            return queue_depth;
+        }
+        // At least one, always: a share small enough to round to zero would refuse
+        // every request rather than merely bounding one client's share of them.
+        ((queue_depth as f64) * self.max_queue_share.max(0.0))
+            .floor()
+            .max(1.0) as usize
+    }
+
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         !self.upstream.trim().is_empty()

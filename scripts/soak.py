@@ -353,6 +353,7 @@ def main() -> int:
     check_oidc(binary)
     check_oidc_survives_a_missing_provider(binary)
     check_relay(binary)
+    check_relay_fair_share(binary)
 
     print("\n" + "=" * 52)
     if failures:
@@ -1079,6 +1080,75 @@ def check_relay(binary: str) -> None:
               after.get("delivered_through", {}).get("logs") == delivered_through,
               f"{after.get('delivered_through', {}).get('logs') or 'absent'} "
               f"(was {delivered_through})")
+    finally:
+        stop(proc)
+        upstream.server.shutdown()
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def check_relay_fair_share(binary: str) -> None:
+    """One noisy client must not be able to lock the others out.
+
+    `limits.ingest_queue_depth` is global, so a retry loop shipped to a fleet fills it
+    and every other client gets 429 through a mechanism working exactly as designed.
+    The queue is deliberately tiny here so the contention is real rather than simulated.
+    """
+    print("\n=== relay: one client cannot starve another ===")
+    upstream = Upstream()
+    data_dir = tempfile.mkdtemp(prefix="telemetryd-soak-share-")
+    config = os.path.join(data_dir, "telemetryd.toml")
+    with open(config, "w", encoding="utf-8") as handle:
+        handle.write(
+            "[limits]\ningest_queue_depth = 4\n"
+            f"[relay]\nupstream = \"{upstream.url}\"\ninterval = \"60s\"\n"
+            "max_queue_share = 0.5\n"
+            "[[relay.client]]\napp = \"noisy\"\ntoken = \"noisy-secret\"\n"
+            "[[relay.client]]\napp = \"quiet\"\ntoken = \"quiet-secret\"\n"
+        )
+
+    proc = subprocess.Popen(
+        [binary, "serve", "--config", config, "--listen", f"127.0.0.1:{PORT}",
+         "--data-dir", data_dir],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ},
+    )
+    try:
+        for _ in range(240):
+            try:
+                if request("/healthz")[0] == 200:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.25)
+
+        noisy_codes: list[int] = []
+        quiet_codes: list[int] = []
+        stop_flag = threading.Event()
+
+        def flood() -> None:
+            while not stop_flag.is_set():
+                noisy_codes.append(relay_logs(600, "noisy", "noisy-secret"))
+
+        floods = [threading.Thread(target=flood, daemon=True) for _ in range(12)]
+        for thread in floods:
+            thread.start()
+
+        time.sleep(1.0)
+        for _ in range(12):
+            quiet_codes.append(relay_logs(1, "quiet", "quiet-secret"))
+            time.sleep(0.1)
+
+        stop_flag.set()
+        for thread in floods:
+            thread.join(timeout=20)
+
+        refused = noisy_codes.count(429)
+        check("the noisy client is capped at its share", refused > 0,
+              f"{refused} of {len(noisy_codes)} refused")
+        # The actual promise. Two of four slots are reserved from `noisy` by the
+        # share, so `quiet` always has somewhere to go.
+        check("the quiet client is never refused",
+              quiet_codes and all(code == 200 for code in quiet_codes),
+              f"{sorted(set(quiet_codes))}")
     finally:
         stop(proc)
         upstream.server.shutdown()

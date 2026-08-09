@@ -152,12 +152,21 @@ deliberately does not carry. A shipper that retries after a timeout it cannot
 distinguish from a success will re-send. Stated here rather than discovered in a
 dashboard showing double the traffic.
 
-**Per-credential rate limiting does not exist.** `limits.ingest_queue_depth` is global:
-it sheds load, but it cannot tell one client from another. Against trusted writers that
-is fine. Against a fleet, one bad app version — a retry loop shipped to a million
-devices — starves every other client through a mechanism that is working exactly as
-designed. A relay exposed to untrusted clients needs a per-credential bound, and this
-is the largest genuinely new piece of work in this ADR.
+**One client could starve the others — since fixed, and not the way this ADR expected.**
+`limits.ingest_queue_depth` is global: it sheds load but cannot tell one client from
+another, so a retry loop shipped to a fleet takes the whole queue.
+
+This ADR called for a per-credential *rate* limit and called it the largest piece of
+work here. Building it showed the shape was wrong. The identity is the **application**,
+not the device — a million phones present one credential — so a requests-per-second
+ceiling would have to be guessed against fleet size, and would throttle the entire fleet
+to contain one bad version of it.
+
+`relay.max_queue_share` caps how much of the queue any one identity holds at once
+instead. It needs no guessed number, it scales with `ingest_queue_depth` on its own, and
+the map of active clients is bounded by construction: an entry exists only while that
+client has a request in flight, and there can never be more of those than there are
+permits.
 
 **Internet exposure changes the TLS posture.** ADR-004 recommends terminating TLS at a
 reverse proxy. A relay taking mobile traffic is internet-facing by definition, so for
