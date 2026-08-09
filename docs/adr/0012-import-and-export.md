@@ -6,7 +6,7 @@ description: "Portability in both directions, why it goes through query APIs rat
 
 # ADR-012: Import and export
 
-- **Status:** **Accepted. Logs built; traces and metrics deliberately not.**
+- **Status:** **Accepted and built, for all three signals.**
 - **Date:** 2026-08-08
 - **Builds on:** [ADR-005](0005-compatibility-audit.md), [ADR-004](0004-auth-and-network-binding.md)
 
@@ -260,15 +260,21 @@ content: `level` came back as `unknown`, because ingest derives it from `severit
 and the exporter carried no severity at all. Counting is not comparing, and a test that
 only counts would have passed.
 
-**Traces and metrics are not exported.** The reason is not effort, it is that the
-question does not have an honest answer through a query API. A trace search interface
-answers "which traces match this" and not "every trace in this window", so an exporter
-built on it returns a subset while looking like it returned everything. Metrics come
-back resampled at whatever `step` was asked for rather than as the samples that were
-stored — the ADR already said so, and shipping it anyway would make a lossy path look
-like a migration path.
+**Traces and metrics needed a different mechanism, not more effort.** This ADR built
+everything on the query APIs, and for logs that was right. For the other two it was not,
+and the first release said so rather than shipping something lossy: a trace search
+interface answers "which traces match this" and not "every trace in this window", so an
+exporter built on one returns a subset while looking complete; a metric range query
+returns points at whatever `step` was asked for rather than the samples that were stored.
 
-The whole data directory remains the way to move everything at once, and it always was.
+Neither problem is solvable at the client. Both dissolve by not going through a query
+language: `GET /api/v1/export` reads records and hands them to the encoder relay mode
+already uses. That is new API surface, which this ADR set out to avoid — and avoiding it
+would have meant either shipping a lossy export or shipping none.
+
+The cost is that the native path only works against telemetryd. The query path stays for
+everyone else's data, which is what the migration-in story needs, so the two together
+cover more than either would alone.
 
 ## Open question
 

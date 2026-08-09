@@ -75,15 +75,25 @@ The `json` form ends with a `done` or `failed` event, and both carry
 `high_water_nanos` — the oldest record reached. A transfer that dies at 60% tells you
 exactly where to start again.
 
-## What this does and does not carry
+## All three signals
 
-Logs come back identical: timestamps, bodies, severity, stream labels and per-record
-attributes all survive, and that round trip is asserted against a running pair of
-instances rather than asserted in prose.
+```bash
+telemetryd export --signal traces  --since 24h > traces.ndjson
+telemetryd export --signal metrics --since 24h > metrics.ndjson
+```
 
-**Traces and metrics are not exported yet.** Not an oversight — a trace API is a search
-interface rather than an enumeration one, so "every trace in this window" is not a
-question it answers, and metrics come back resampled at whatever `step` you ask for
-rather than as the samples that were stored. Both deserve to be built deliberately
-instead of shipped as something that quietly returns a subset. Until then the whole data
-directory is still the way to move everything at once — see the backup guide.
+There are two paths underneath, and which one runs depends on what you asked for.
+
+**Against telemetryd**, export reads records straight from the store and encodes them —
+no query language in the middle, so what comes out is what was stored. This is the only
+way traces work at all: a trace search API answers "which traces match this", not "every
+trace in this window", so an exporter built on one returns a subset while looking
+complete. It is also the only way metrics keep their stored samples rather than points
+resampled at whatever `step` was asked for.
+
+**Against a foreign backend**, or when you pass a `--query` to take a subset, export goes
+through the Loki-compatible API instead. That works anywhere but is logs only.
+
+An export file names its signal in every line, so `import --file` routes each line to the
+right endpoint by content. A file holding all three just works, and pointing a traces
+file at the wrong flag is not a mistake you can make.

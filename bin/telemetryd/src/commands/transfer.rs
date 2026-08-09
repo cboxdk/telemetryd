@@ -30,6 +30,9 @@ use serde_json::Value;
 /// Entries per request. Well under any sensible server-side cap, and small enough that
 /// one window's worth is a reasonable unit of progress.
 const WINDOW_LIMIT: usize = 5_000;
+/// The selector that means "everything". Anything else is a subset the caller asked
+/// for, which only the query path can express.
+const DEFAULT_SELECTOR: &str = r#"{app=~".+"}"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Progress {
@@ -83,6 +86,15 @@ pub struct ExportArgs {
         hide_env_values = true
     )]
     pub token: Option<String>,
+
+    /// Which signal. `logs`, `traces` or `metrics`.
+    ///
+    /// Anything but `logs` uses telemetryd's own export endpoint, which reads records
+    /// rather than re-deriving them from a query language — full fidelity, and the only
+    /// way to enumerate traces at all. It therefore needs the source to *be* a
+    /// telemetryd; `logs` also works against any Loki-compatible backend.
+    #[arg(long, default_value = "logs", value_name = "SIGNAL")]
+    pub signal: String,
 
     /// Where to write. `-` or omitted is stdout.
     #[arg(long, value_name = "PATH")]
@@ -446,6 +458,142 @@ fn walk(
     Ok(())
 }
 
+/// Walk telemetryd's own export endpoint, which returns records rather than a
+/// rendering of them.
+///
+/// The cursor is the newest timestamp returned, advanced by one nanosecond — the same
+/// discipline as the Loki walk and for the same reason: records arrive while you page,
+/// so an offset would shift underneath you.
+fn walk_native(
+    base: &str,
+    signal: &str,
+    token: Option<&str>,
+    since: std::time::Duration,
+    reporter: &mut Reporter,
+    emit: &mut dyn FnMut(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let end = now_nanos()?;
+    let mut cursor = end.saturating_sub(since.as_nanos());
+
+    loop {
+        let url = format!("{base}/api/v1/export?signal={signal}&start={cursor}&end={end}");
+        let body = get_text(&url, token)?;
+        if body.trim().is_empty() {
+            break;
+        }
+
+        let mut newest = 0u64;
+        let mut records = 0u64;
+        for line in body.lines().filter(|l| !l.trim().is_empty()) {
+            let batch: Value = serde_json::from_str(line).context("parsing the export")?;
+            newest = newest.max(newest_nanos(&batch));
+            records += count_any(&batch);
+            emit(line)?;
+        }
+        reporter.advance(records, Some(newest));
+
+        if newest == 0 {
+            break;
+        }
+        let next = u128::from(newest).saturating_add(1);
+        if next >= end {
+            break;
+        }
+        cursor = next;
+    }
+    Ok(())
+}
+
+fn get_text(url: &str, token: Option<&str>) -> anyhow::Result<String> {
+    let mut request = ureq::get(url).header("user-agent", super::status::user_agent());
+    if let Some(token) = token {
+        request = request.header("authorization", &format!("Bearer {token}"));
+    }
+    let mut response = request
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()
+        .with_context(|| format!("could not reach {url}"))?;
+    let status = response.status().as_u16();
+    let body = response.body_mut().read_to_string()?;
+    if status != 200 {
+        let detail: String = body.trim().chars().take(400).collect();
+        bail!("{url} answered {status}: {detail}");
+    }
+    Ok(body)
+}
+
+/// The newest `timeUnixNano` anywhere in an OTLP batch, across all three shapes.
+fn newest_nanos(batch: &Value) -> u64 {
+    fn walk(value: &Value, newest: &mut u64) {
+        match value {
+            Value::Object(map) => {
+                for (key, inner) in map {
+                    if matches!(key.as_str(), "timeUnixNano" | "endTimeUnixNano")
+                        && let Some(nanos) = inner.as_str().and_then(|s| s.parse::<u64>().ok())
+                    {
+                        *newest = (*newest).max(nanos);
+                    }
+                    walk(inner, newest);
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| walk(item, newest)),
+            _ => {}
+        }
+    }
+    let mut newest = 0;
+    walk(batch, &mut newest);
+    newest
+}
+
+/// Which ingest endpoint a batch belongs to, decided by its envelope.
+///
+/// An export file names its signal in every line, so routing by content rather than by
+/// a flag means a traces file cannot be posted to the logs endpoint by getting the
+/// invocation wrong — and a file holding more than one signal just works.
+fn endpoint_for(batch: &Value) -> Option<&'static str> {
+    if batch.get("resourceLogs").is_some() {
+        Some("/v1/logs")
+    } else if batch.get("resourceSpans").is_some() {
+        Some("/v1/traces")
+    } else if batch.get("resourceMetrics").is_some() {
+        Some("/v1/metrics")
+    } else {
+        None
+    }
+}
+
+/// Records in a batch, whichever signal it holds.
+fn count_any(batch: &Value) -> u64 {
+    let logs = count_records(batch);
+    let spans: u64 = batch
+        .get("resourceSpans")
+        .and_then(Value::as_array)
+        .map_or(0, |resources| {
+            resources
+                .iter()
+                .filter_map(|r| r.get("scopeSpans").and_then(Value::as_array))
+                .flatten()
+                .filter_map(|s| s.get("spans").and_then(Value::as_array))
+                .map(|s| s.len() as u64)
+                .sum()
+        });
+    let points: u64 = batch
+        .get("resourceMetrics")
+        .and_then(Value::as_array)
+        .map_or(0, |resources| {
+            resources
+                .iter()
+                .filter_map(|r| r.get("scopeMetrics").and_then(Value::as_array))
+                .flatten()
+                .filter_map(|s| s.get("metrics").and_then(Value::as_array))
+                .map(|m| m.len() as u64)
+                .sum()
+        });
+    logs + spans + points
+}
+
 pub fn export(args: &ExportArgs) -> anyhow::Result<()> {
     let base = args.url.trim_end_matches('/');
     let mut reporter = Reporter::new(args.progress);
@@ -457,18 +605,32 @@ pub fn export(args: &ExportArgs) -> anyhow::Result<()> {
         )),
     };
 
-    let outcome = walk(
-        base,
-        &args.query,
-        args.token.as_deref(),
-        args.since.into(),
-        &mut reporter,
-        |batch| {
-            // One request-shaped object per line. NDJSON streams, survives being cut in
-            // half, and every tool on the machine can read it.
-            writeln!(sink, "{batch}").context("writing the export")
-        },
-    );
+    let outcome = if args.signal == "logs" && args.query != DEFAULT_SELECTOR {
+        // A selector means the caller wants a subset, and only the query path can
+        // answer that.
+        walk(
+            base,
+            &args.query,
+            args.token.as_deref(),
+            args.since.into(),
+            &mut reporter,
+            |batch| {
+                // One request-shaped object per line. NDJSON streams, survives being
+                // cut in half, and every tool on the machine can read it.
+                writeln!(sink, "{batch}").context("writing the export")
+            },
+        )
+    } else {
+        let mut emit = |line: &str| writeln!(sink, "{line}").context("writing the export");
+        walk_native(
+            base,
+            &args.signal,
+            args.token.as_deref(),
+            args.since.into(),
+            &mut reporter,
+            &mut emit,
+        )
+    };
 
     sink.flush().ok();
     match outcome {
@@ -566,7 +728,7 @@ pub fn import(args: &ImportArgs) -> anyhow::Result<()> {
             &mut reporter,
             |batch| post(&logs_url, args.token.as_deref(), &batch.to_string()),
         ),
-        (None, Some(path)) => import_file(path, &logs_url, args.token.as_deref(), &mut reporter),
+        (None, Some(path)) => import_file(path, destination, args.token.as_deref(), &mut reporter),
         (None, None) => bail!("import needs --from <url> or --file <path>"),
     };
 
@@ -588,7 +750,7 @@ pub fn import(args: &ImportArgs) -> anyhow::Result<()> {
 /// and NDJSON exists precisely so it does not have to.
 fn import_file(
     path: &str,
-    logs_url: &str,
+    destination: &str,
     token: Option<&str>,
     reporter: &mut Reporter,
 ) -> anyhow::Result<()> {
@@ -609,8 +771,15 @@ fn import_file(
         }
         let batch: Value = serde_json::from_str(&line)
             .with_context(|| format!("{path} line {} is not JSON", number + 1))?;
-        let count = count_records(&batch);
-        post(logs_url, token, &line)?;
+        let Some(endpoint) = endpoint_for(&batch) else {
+            bail!(
+                "{path} line {} is not an OTLP request — expected resourceLogs, \
+                 resourceSpans or resourceMetrics",
+                number + 1
+            );
+        };
+        let count = count_any(&batch);
+        post(&format!("{destination}{endpoint}"), token, &line)?;
         reporter.advance(count, None);
     }
     Ok(())
@@ -655,6 +824,25 @@ mod tests {
             );
         }
         assert_eq!(severity_number("nonsense"), 0);
+    }
+
+    /// Routing by content, so a traces file cannot land on the logs endpoint because
+    /// someone typed the wrong flag.
+    #[test]
+    fn a_batch_is_routed_by_what_it_holds() {
+        assert_eq!(
+            endpoint_for(&serde_json::json!({"resourceLogs": []})),
+            Some("/v1/logs")
+        );
+        assert_eq!(
+            endpoint_for(&serde_json::json!({"resourceSpans": []})),
+            Some("/v1/traces")
+        );
+        assert_eq!(
+            endpoint_for(&serde_json::json!({"resourceMetrics": []})),
+            Some("/v1/metrics")
+        );
+        assert_eq!(endpoint_for(&serde_json::json!({"nonsense": []})), None);
     }
 
     #[test]

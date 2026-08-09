@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod error;
+pub mod export;
 pub mod ingest;
 pub mod loki;
 pub mod maintenance;
@@ -67,6 +68,9 @@ pub fn router(state: AppState) -> Router {
         .route("/loki/api/v1/labels", get(loki::labels))
         .route("/loki/api/v1/label/{name}/values", get(loki::label_values))
         .route("/loki/api/v1/series", get(loki::series))
+        // Full-fidelity export, straight from the store rather than through a query
+        // language (ADR-012). Behind the query token: it returns telemetry.
+        .route("/api/v1/export", get(export::export))
         .route("/loki/api/v1/tail", get(loki::tail))
         // Tempo-compatible read APIs (M2).
         .route("/api/traces/{trace_id}", get(tempo::trace))

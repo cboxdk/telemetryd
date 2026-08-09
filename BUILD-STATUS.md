@@ -83,9 +83,10 @@ upstream confirms; retention will not delete what has not been forwarded, and
 **Export and import.** `telemetryd export` writes a time range as OTLP NDJSON;
 `telemetryd import` reads one back, from a file or straight from another instance's
 Loki API. Neither reads the other side's storage, so the same pair covers migrating in,
-migrating out, and pulling an incident window onto a laptop. Logs round trip identically,
-asserted against a running pair rather than in prose. Traces and metrics are deliberately
-not exported (ADR-012).
+migrating out, and pulling an incident window onto a laptop. All three signals round trip, asserted against a
+running pair rather than in prose. Against telemetryd, export reads records directly
+through `/api/v1/export`, so nothing passes through a query language; against a foreign
+backend it uses the Loki API, which is logs only (ADR-012).
 
 **Operations.** `telemetryd query` runs a LogQL query from the shell — for debugging
 over SSH when the UI is the thing you cannot reach, and for getting data out as JSON
