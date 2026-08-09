@@ -290,6 +290,32 @@ range query returns points at whatever `step` was asked for rather than the samp
 were stored. There is no read API for raw samples to fall back on, so this one is a
 property of the format rather than of our effort. Have the source send OTLP instead.
 
+## Metrics from a foreign backend: how it would be done
+
+Left unbuilt, with the mechanism written down so the next person does not have to
+rediscover it.
+
+A range query cannot do it. `step` is a *resolution*, so the timestamps come back on the
+step grid rather than as the times the samples were stored, and a finer step yields more
+points from the same underlying samples — repetition and shifted timestamps dressed as
+fidelity. Shrinking the step and paginating is the obvious idea and it makes the output
+worse, not better.
+
+**`/api/v1/read` is the mechanism.** Prometheus' remote read returns "a list of raw
+samples matching the requested query" — original timestamps, no evaluation — as
+snappy-compressed protobuf, the same family as the `remote_write` this project already
+decodes by hand.
+
+The reason it is not built is not effort. Prometheus documents remote read as **not part
+of the stable API, "subject to change even between non-major version releases"**. A
+migration path is exactly the thing that runs rarely and under pressure, and building one
+on an interface that may move between patch releases of the source is a poor trade for a
+capability that has a working alternative: have the source send OTLP, which is stable and
+which telemetryd already accepts.
+
+Worth revisiting if remote read stabilises, or if someone hits the case where the source
+genuinely cannot be made to push.
+
 ## Open question
 
 Whether import should accept `--label name=value` to stamp provenance onto everything
