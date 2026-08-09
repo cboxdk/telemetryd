@@ -66,3 +66,9 @@ name = "otlp_metrics"
 path = "fuzz_targets/otlp_metrics.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "remote_read"
+path = "fuzz_targets/remote_read.rs"
+test = false
+doc = false

@@ -152,13 +152,16 @@ directory that only exists after a run, and a target triple ASAN cannot use — 
 "fuzzing runs nightly" was true of the schedule and false of the outcome. Worth stating
 plainly: the value arrived the moment it actually ran, not when it was written.
 
-Eight targets cover every parser that reads
-untrusted bytes: the three query languages, **all three** OTLP JSON decoders, the
-hand-rolled `remote_write` protobuf, and body decompression.
+Nine targets cover every parser that reads bytes
+off a wire: the three query languages, **all three** OTLP JSON decoders, both hand-rolled
+protobuf paths — `remote_write` inbound and remote read outbound — and body
+decompression.
 
 The count used to say six and the sentence said "OTLP JSON" as though it were one
 decoder. There are three, and only logs was covered — so the claim was nearly true,
-which in a document like this is the same as false. A clean sixty seconds proves very little, so making a merge
+which in a document like this is the same as false. The remote-read decoder was added
+later still: it was written into the CLI, where no fuzzer can reach it, and moving it
+into a library crate was most of the reason for moving it at all. A clean sixty seconds proves very little, so making a merge
 wait on one would trade real signal for the appearance of it.
 
 ## Load, measured on the target platform

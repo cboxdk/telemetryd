@@ -22,6 +22,7 @@ pub mod otlp;
 pub mod otlp_encode;
 pub mod otlp_metrics;
 pub mod protobuf;
+pub mod remote_read;
 pub mod remote_write;
 pub mod traces;
 
