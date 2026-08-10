@@ -326,11 +326,11 @@ Not gaps. These are decisions:
 
 ## Where the reasoning lives
 
-`docs/adr/` holds eight decision records. Two are worth reading before changing
+In the doc comment of the module that carries it. Two are worth reading before changing
 anything:
 
-- **The compatibility subset** is derived from the client's source, not the
-  upstream API references. Four requirements the published specs do not imply; two were
-  already costing correctness.
-- **Query performance**, with before-and-after measurements and an honest
-  account of where a general analytical engine stays ahead.
+- **`COMPATIBILITY.md`** — the supported subset is derived from the client's own
+  connector source, not from the upstream API references. Four requirements the
+  published specs do not imply; two were already costing correctness.
+- **`crates/query/`** — what knowing the queries in advance buys, with before-and-after
+  measurements and an honest account of where a general analytical engine stays ahead.
