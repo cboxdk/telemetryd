@@ -33,6 +33,19 @@ jobs:
         with:
           tool: cargo-fuzz
 
+      # The corpus is what fuzzing accumulates, and without this every night threw it
+      # away: each run began from a handful of hand-written seeds and re-explored from
+      # zero. Five minutes on top of ten thousand known-interesting inputs finds things
+      # five minutes from scratch never reaches.
+      #
+      # A unique key per run so each one saves, with a prefix restore so it picks up the
+      # newest. GitHub evicts by age and size on its own; these corpora are a few MB.
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
       - name: fuzz ${{ matrix.target }}
         run: |
           SECONDS_PER_TARGET=$(( ${{ github.event.inputs.minutes || 5 }} * 60 ))
@@ -55,6 +68,17 @@ jobs:
           cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} \
             fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} \
             -- -max_total_time="${SECONDS_PER_TARGET}" -print_final_stats=1
+
+      # Minimise before it is cached. A corpus grows with inputs that reach no new
+      # code, and carrying them costs every future run time it could spend exploring.
+      # Failure here is not worth failing the job over: a large corpus is a slower one,
+      # not a broken one.
+      - name: minimise the corpus
+        if: always()
+        continue-on-error: true
+        run: |
+          cargo +nightly fuzz cmin --target x86_64-unknown-linux-gnu ${{ matrix.target }} \
+            fuzz/corpus/${{ matrix.target }}
 
       # A crashing input is the whole product of a run. Keep it, or the next person
       # has to rediscover it.
