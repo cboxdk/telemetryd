@@ -1,0 +1,9 @@
+# The build context is `docker/`, and it should contain nothing but the Dockerfile, the
+# files it copies, and the binary `scripts/docker-context.py` puts there. Anything else
+# would be a cache-busting surprise or, worse, something shipped by accident.
+*
+!Dockerfile
+!entrypoint.sh
+!cbox-init.yaml
+!telemetryd-linux-amd64
+!telemetryd-linux-arm64

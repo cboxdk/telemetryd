@@ -110,6 +110,20 @@ level; anything else that changed in the file is refused by name rather than ign
 (and signature verification, once a signed release exists), Homebrew formula, `.deb`, deterministic CycloneDX SBOM with a
 CI drift check.
 
+**A container that starts with nothing set.** `ghcr.io/cboxdk/telemetryd`, multi-arch,
+with `cbox-init` as PID 1 so SIGTERM reaches telemetryd and the WAL is flushed rather
+than the container being killed mid-write. The image copies the *same* musl artifact the
+release workflow soak-tests and signs, after verifying it against the published
+`SHA256SUMS` — building a second binary for the image would ship one nothing had checked.
+
+The interesting part is authentication. A container binds `0.0.0.0`, which telemetryd
+refuses to do unauthenticated, so a zero-config image has to either fail to start or
+default to `insecure` — both wrong. Instead it generates tokens on first start, persists
+them beside the data, and prints them once; supplying your own skips it entirely.
+Verified by running the built image: healthy in 2s, the generated token accepted, an
+unauthenticated write refused with `401`, a clean exit 0 through `cbox-init`, and data
+plus tokens intact across a restart.
+
 **Release signing — exercised.** `SHA256SUMS` is signed by the release workflow's own
 OIDC identity, keyless, with no private key to store or rotate. The release job
 verifies its own signature before publishing, and `install.sh` verifies it when
@@ -233,6 +247,12 @@ against the broken version rather than assumed to work.
 ## Known gaps
 
 Named rather than left to be discovered.
+
+**`[[relay.client]]` cannot be set from the environment.** Every other configuration
+key can, which is what lets a container run with no file at all. That one is a list of
+tables with no flat spelling that is not worse than a mounted file — and its values are
+credentials, which is where they belong anyway. Named because "every key except one" is
+the kind of thing that should not be discovered.
 
 **No hosted apt repository.** Deliberate — running one means running signing
 infrastructure and keeping it available. `dpkg -i` from a release asset is documented

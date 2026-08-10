@@ -11,7 +11,16 @@ telemetryd starts with no configuration at all. Everything below has a default;
 
 **Precedence:** defaults → `telemetryd.toml` → environment → CLI flags.
 **Env naming:** `TELEMETRYD_<SECTION>_<KEY>`, e.g. `storage.data_dir` →
-`TELEMETRYD_STORAGE_DATA_DIR`.
+`TELEMETRYD_STORAGE_DATA_DIR`. Nested sections keep the same shape, so
+`auth.oidc.issuer` is `TELEMETRYD_AUTH_OIDC_ISSUER`. Every scalar key is covered,
+which is what makes a container configurable with no file at all — see
+[Docker](../getting-started/docker.md).
+
+The one exception is `[[relay.client]]`, a list of tables with no sensible flat
+spelling. Mount a config file for it; its values are credentials, so that is where they
+belong. The variable names are a table rather than a mechanical transformation, so a
+misspelled `TELEMETRYD_*` variable is a startup error instead of a setting that silently
+does nothing.
 
 Durations are humantime strings (`500ms`, `30s`, `7d`). Sizes are byte strings
 (`64MiB`, `10GiB`). Unknown keys are a startup error. See [ADR-003](../adr/0003-configuration-model.md).

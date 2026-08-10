@@ -1,0 +1,26 @@
+# cbox-init supervises one process here, not several.
+#
+# In the PHP base images it manages php-fpm, queue workers and log tailers together.
+# telemetryd is a single static binary, so what this buys is narrower and still worth
+# having: a correct PID 1 that forwards SIGTERM instead of letting Docker kill -9 the
+# container, reaps anything orphaned, and gives every Cbox container the same shutdown
+# and inspection surface.
+#
+# The shutdown timeout matters more than it looks. telemetryd flushes its WAL and seals
+# the open segment on SIGTERM; cutting that short turns a clean stop into a crash
+# recovery on the next boot. `server.shutdown_grace` governs draining in-flight
+# requests, so this is deliberately the larger of the two.
+version: "1.0"
+
+global:
+  shutdown_timeout: 45
+  log_format: json
+
+processes:
+  telemetryd:
+    enabled: true
+    command: ["/usr/local/bin/telemetryd", "serve"]
+    # `always`: a store that stops accepting telemetry is invisible precisely when
+    # something is wrong. A genuinely broken configuration still fails fast, because
+    # telemetryd validates before it binds and exits non-zero on a bad config.
+    restart: always

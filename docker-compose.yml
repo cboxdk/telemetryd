@@ -1,0 +1,43 @@
+# A working telemetryd for local development.
+#
+#   docker compose up -d
+#   docker compose logs telemetryd     # the generated tokens are printed once, here
+#
+# Nothing else is required. The image starts with defaults, generates its own tokens on
+# first run, and keeps its data in a named volume so a restart does not lose it.
+#
+# Point an OTLP exporter at http://localhost:4319 and query the same port with the Loki,
+# Tempo and Prometheus APIs.
+
+services:
+  telemetryd:
+    image: ghcr.io/cboxdk/telemetryd:latest
+    restart: unless-stopped
+    ports:
+      - "4319:4319"
+    volumes:
+      - telemetryd-data:/var/lib/telemetryd
+    environment:
+      # Everything below is optional — shown because these are the knobs worth knowing.
+      # Any config key works as TELEMETRYD_<SECTION>_<KEY>; the environment beats a
+      # mounted telemetryd.toml, and a CLI flag beats the environment.
+
+      # A laptop does not need seven days of history, and a small disk is the real bound.
+      TELEMETRYD_RETENTION_LOGS: "24h"
+      TELEMETRYD_RETENTION_TRACES: "24h"
+      TELEMETRYD_RETENTION_METRICS: "72h"
+      TELEMETRYD_STORAGE_DISK_BUDGET: "2GiB"
+
+      # Seal often so queries see recent data promptly. The production default of 1h is
+      # right for a server and wrong for a feedback loop you are watching.
+      TELEMETRYD_STORAGE_SEGMENT_DURATION: "1m"
+
+      # Uncomment to skip the generated tokens and run wide open. Only ever do this on
+      # a machine where the port is not reachable from anywhere else.
+      # TELEMETRYD_SERVER_INSECURE: "true"
+
+      # Uncomment to accept Cbox ID tokens instead of (or alongside) static ones.
+      # TELEMETRYD_AUTH_OIDC_ISSUER: "https://acme.cboxid.com"
+
+volumes:
+  telemetryd-data:

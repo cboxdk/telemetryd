@@ -1,0 +1,125 @@
+# Publish the container image.
+#
+# Triggered by `workflow_run` rather than `release: published`, for the same reason
+# formula.yml is: a release created by GITHUB_TOKEN does not raise events that start
+# other workflows, so keying off the release would produce a job that never runs. It
+# also has to wait for the release to exist, because it builds from the *published*
+# assets and their SHA256SUMS — starting earlier would 404.
+name: docker
+
+on:
+  workflow_run:
+    workflows: ["release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build, e.g. v0.21.0"
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+  # Keyless signing, matching how the release binaries are signed.
+  id-token: write
+
+jobs:
+  publish:
+    # `conclusion` rather than just the event: a failed release must not be packaged.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: work out which tag to build
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.event.workflow_run.head_branch }}"
+          fi
+          case "$TAG" in
+            v*) ;;
+            *) echo "::error::'$TAG' is not a release tag; nothing to publish"; exit 1 ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # Fails loudly on a checksum mismatch, so a tampered or half-uploaded asset
+      # cannot become an image.
+      - name: assemble the build context from the published release
+        run: python3 scripts/docker-context.py release "${{ steps.tag.outputs.tag }}"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./docker
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.version }}
+            ghcr.io/${{ github.repository }}:latest
+          labels: |
+            org.opencontainers.image.title=telemetryd
+            org.opencontainers.image.version=${{ steps.tag.outputs.version }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=Apache-2.0
+          provenance: true
+          sbom: true
+
+      # The image is only useful if it starts, and every check here is one that has
+      # actually been got wrong before: a binary for the wrong architecture, an
+      # entrypoint that cannot write its token file, a healthcheck pointing at a port
+      # nothing listens on.
+      - name: the published image has to actually run
+        run: |
+          set -eu
+          IMAGE="ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.version }}"
+          docker run -d --name smoke -p 4319:4319 "$IMAGE"
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:4319/healthz >/dev/null 2>&1; then
+              echo "healthy after ${i}s"; break
+            fi
+            [ "$i" = "30" ] && { docker logs smoke; exit 1; }
+            sleep 1
+          done
+
+          # The generated token must be usable, not merely printed.
+          TOKEN="$(docker logs smoke 2>&1 | awk '/ingest \(write telemetry\)/ {print $NF}')"
+          [ -n "$TOKEN" ] || { echo "::error::no ingest token was generated"; docker logs smoke; exit 1; }
+          curl -fsS -XPOST http://127.0.0.1:4319/v1/logs \
+            -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+            -d '{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"smoke"}}]},"scopeLogs":[{"logRecords":[{"timeUnixNano":"1","body":{"stringValue":"hello"}}]}]}]}' \
+            >/dev/null
+
+          # Unauthenticated writes must still be refused — the generated token is only
+          # worth anything if the absence of one is a 401.
+          CODE="$(curl -s -o /dev/null -w '%{http_code}' -XPOST http://127.0.0.1:4319/v1/logs \
+            -H 'content-type: application/json' -d '{}')"
+          [ "$CODE" = "401" ] || { echo "::error::unauthenticated write got $CODE, expected 401"; exit 1; }
+
+          # SIGTERM must reach telemetryd through cbox-init and produce a clean stop —
+          # if it does not, every restart becomes a crash recovery.
+          docker stop -t 45 smoke >/dev/null
+          docker logs smoke 2>&1 | tail -20
+          docker inspect -f '{{.State.ExitCode}}' smoke | grep -qx 0 \
+            || { echo "::error::the container did not shut down cleanly"; exit 1; }
+
+      - uses: sigstore/cosign-installer@v3
+      - name: sign the image
+        run: |
+          cosign sign --yes \
+            "ghcr.io/${{ github.repository }}@${{ steps.push.outputs.digest }}"

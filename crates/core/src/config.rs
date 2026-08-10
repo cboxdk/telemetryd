@@ -707,6 +707,37 @@ const ENV_KEYS: &[(&str, &str)] = &[
         "TELEMETRYD_INGEST_TRUNCATE_OVERSIZED_BODIES",
         "ingest.truncate_oversized_bodies",
     ),
+    // Cbox ID / OIDC. Absent until now, which meant the one deployment shape that
+    // most needs env-only configuration — a container — could not turn SSO on at all
+    // without baking a file into the image.
+    ("TELEMETRYD_AUTH_OIDC_ISSUER", "auth.oidc.issuer"),
+    ("TELEMETRYD_AUTH_OIDC_AUDIENCE", "auth.oidc.audience"),
+    ("TELEMETRYD_AUTH_OIDC_JWKS_URL", "auth.oidc.jwks_url"),
+    ("TELEMETRYD_AUTH_OIDC_SCOPE_CLAIM", "auth.oidc.scope_claim"),
+    ("TELEMETRYD_AUTH_OIDC_SCOPE_WRITE", "auth.oidc.scope_write"),
+    ("TELEMETRYD_AUTH_OIDC_SCOPE_READ", "auth.oidc.scope_read"),
+    ("TELEMETRYD_AUTH_OIDC_SCOPE_ADMIN", "auth.oidc.scope_admin"),
+    (
+        "TELEMETRYD_AUTH_OIDC_REFRESH_INTERVAL",
+        "auth.oidc.refresh_interval",
+    ),
+    ("TELEMETRYD_AUTH_OIDC_CLOCK_SKEW", "auth.oidc.clock_skew"),
+    // Relay. `relay.client` is deliberately absent: it is a list of tables, and the
+    // compact string encodings that would fit an env var are all worse than a mounted
+    // file for something whose values are credentials anyway.
+    ("TELEMETRYD_RELAY_UPSTREAM", "relay.upstream"),
+    ("TELEMETRYD_RELAY_TOKEN", "relay.token"),
+    (
+        "TELEMETRYD_RELAY_TRUST_CLIENT_IDENTITY",
+        "relay.trust_client_identity",
+    ),
+    ("TELEMETRYD_RELAY_WHEN_FULL", "relay.when_full"),
+    ("TELEMETRYD_RELAY_INTERVAL", "relay.interval"),
+    (
+        "TELEMETRYD_RELAY_MAX_REQUEST_BYTES",
+        "relay.max_request_bytes",
+    ),
+    ("TELEMETRYD_RELAY_MAX_QUEUE_SHARE", "relay.max_queue_share"),
     ("TELEMETRYD_LOG_LEVEL", "log.level"),
     ("TELEMETRYD_LOG_FORMAT", "log.format"),
 ];

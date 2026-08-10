@@ -10,3 +10,7 @@
 /fuzz/artifacts
 /fuzz/target
 /fuzz/Cargo.lock
+
+# Assembled into the Docker build context by scripts/docker-context.py.
+# A release artifact, never a source file — 40 MB of binary does not belong in git.
+docker/telemetryd-linux-*

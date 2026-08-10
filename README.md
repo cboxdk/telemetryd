@@ -34,6 +34,18 @@ That is the whole setup. It listens on `127.0.0.1:4319`, stores data in
 `./telemetryd-data` (or your platform data directory), keeps 7 days of logs and traces
 and 30 days of metrics, and stays under a 10 GiB disk budget.
 
+Or as a container, with the same amount of configuration:
+
+```bash
+docker run -d -p 4319:4319 -v telemetryd-data:/var/lib/telemetryd \
+  ghcr.io/cboxdk/telemetryd:latest
+```
+
+A container binds `0.0.0.0`, which telemetryd refuses to do unauthenticated, so the
+image generates tokens on first start and prints them once — `docker logs` has them.
+Every setting is an environment variable, so nothing needs a file. See
+[Docker](docs/getting-started/docker.md).
+
 ```bash
 telemetryd status
 ```
