@@ -77,6 +77,21 @@ jobs:
 
       # The SBOM is committed, so this is a real drift check: it fails exactly when a
       # dependency changed and the manifest was not regenerated.
+      # The formula carries its own version stanza, deliberately, so the tap cannot
+      # describe a build that never existed. The cost is that a release bump has two
+      # places to change, and missing one is silent until the publish job refuses —
+      # after the release is already tagged and out. Which is exactly what happened
+      # with 0.21.0. Caught here instead, before the tag.
+      - name: the Homebrew formula matches the crate version
+        run: |
+          CRATE="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          FORMULA="$(grep -m1 '^  version "' packaging/telemetryd.rb | cut -d'"' -f2)"
+          if [ "$CRATE" != "$FORMULA" ]; then
+            echo "::error::packaging/telemetryd.rb says $FORMULA but Cargo.toml says $CRATE; bump both or the tap serves a stale formula"
+            exit 1
+          fi
+          echo "both say $CRATE"
+
       - name: SBOM is not stale
         run: python3 scripts/generate-sbom.py --check
 
