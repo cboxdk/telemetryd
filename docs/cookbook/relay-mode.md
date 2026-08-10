@@ -167,6 +167,24 @@ The two that mean data was lost live under `retention` rather than here:
 `dropped_undelivered` and `blocked_by_undelivered`. Neither should ever be non-zero on a
 healthy relay.
 
+## Retention is not lowered for you
+
+`retention.logs` means seven days on a relay exactly as it does anywhere else — a
+default that changed underneath `relay.upstream` would make the same setting mean two
+things.
+
+On an edge box you will usually want less, and it is worth setting explicitly:
+
+```toml
+[retention]
+logs = "12h"
+```
+
+Note that this is not what protects the disk. Undelivered segments are held back from
+the reaper whatever the window says, so `storage.disk_budget` together with
+`relay.when_full` is the real bound — a ceiling in bytes, which is what a small disk
+actually has.
+
 ## The relay is still queryable
 
 It is the same binary, so the last few hours are sitting right there, answerable through

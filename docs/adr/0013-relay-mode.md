@@ -249,9 +249,24 @@ the binding was bought to provide. It now refuses such tokens instead. Validatin
 proofs — and thereby *accepting* bound tokens — is work relay mode should do, and is
 the strongest available answer to the credential problem this ADR opens with.
 
-## Open questions
+## Retention defaults in relay mode: unchanged
 
-**Whether relay mode should also lower the retention defaults.** A relay is a waypoint
-rather than a store, and keeping seven days of everything on an edge box is probably not
-what anyone wants. But a relay that is also the local debugging surface wants *some*
-history, and the right number is a guess until someone runs one.
+A relay is a waypoint rather than a store, so keeping seven days of everything on an
+edge box looks wasteful, and lowering the defaults when `relay.upstream` is set is the
+obvious move.
+
+**It is the wrong one, because it makes a setting mean different things depending on
+another setting.** `retention.logs = 7d` should be seven days whether or not this
+instance forwards anything. A default that silently changes underneath a second,
+unrelated switch is how "why is my data gone" happens, and the operator who most needs
+to trust that number is the one running an edge box they cannot easily inspect.
+
+Two things also make the saving smaller than it looks. Undelivered segments are held
+back from the reaper regardless of the window, so retention does not govern the path
+that matters. And `storage.disk_budget` with `relay.when_full` is the real bound on an
+edge box — a ceiling in bytes, which is what a small disk actually has, rather than a
+window in days.
+
+So: unchanged, and the guide says plainly that a relay operator will usually want to
+lower them by hand. The ADR's own note said the right number was a guess until someone
+ran one; guessing it into a default was the part worth declining.
