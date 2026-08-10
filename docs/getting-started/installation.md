@@ -105,7 +105,7 @@ Needs Rust 1.89+ and nothing else — there are no C dependencies in the tree.
 telemetryd version
 ```
 
-Prints the version, the storage format version, the milestone, and **the build target**
+Prints the version, the storage format version, and **the build target**
 — which is the first question in any "it works on my machine" report about a static
 binary.
 

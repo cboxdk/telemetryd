@@ -1,7 +1,7 @@
 //! Retention: time-based expiry and disk-budget enforcement.
 //!
 //! Both work by deleting whole segments — there are no row-level deletes and no
-//! tombstones (ADR-001). That is why the budget is a *soft ceiling with a hard alarm*
+//! tombstones. That is why the budget is a *soft ceiling with a hard alarm*
 //! rather than a hard cap: usage can overshoot by up to one segment before the reaper
 //! catches it, and pretending otherwise would be a lie in the documentation.
 //!

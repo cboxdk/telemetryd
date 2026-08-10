@@ -1,7 +1,7 @@
 //! Data directory layout, format versioning, and the single-writer lock.
 //!
 //! The layout is deliberately inspectable — a user should be able to `ls` their way
-//! around it and `rm -rf` a segment without a recovery tool. See ADR-001.
+//! around it and `rm -rf` a segment without a recovery tool.
 //!
 //! ```text
 //! telemetryd-data/

@@ -1,6 +1,6 @@
 //! Terminating TLS ourselves, for the deployments that have nowhere to put a proxy.
 //!
-//! [ADR-004](../../docs/adr/0004-auth-and-network-binding.md) said to terminate at a
+//! The rule used to be: terminate at a
 //! reverse proxy, and for a public edge that is still the better answer: anything
 //! internet-facing already has an ingress holding certificates for several services.
 //! What that reasoning missed is the *internal* case — a relay on a private network, a

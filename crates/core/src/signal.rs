@@ -1,7 +1,7 @@
 //! The four telemetry signals telemetryd stores.
 //!
 //! Logs, traces and events share identical storage machinery and differ only in their
-//! Arrow schema (ADR-001); metrics use the separate chunk store. The distinction shows
+//! Arrow schema; metrics use the separate chunk store. The distinction shows
 //! up here as [`Signal::uses_record_store`].
 
 use std::fmt;

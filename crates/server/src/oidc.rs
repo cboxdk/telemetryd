@@ -5,7 +5,7 @@
 //! the thing you open when something is broken, so an identity provider that must be
 //! reachable to read your logs is a dependency in exactly the wrong direction. Keys are
 //! cached; a provider that goes down stops new tokens being *issued* while every token
-//! already in hand keeps working. See [ADR-011](../../docs/adr/0011-cbox-id-integration.md).
+//! already in hand keeps working.
 //!
 //! # The algorithm is never taken from the token
 //!

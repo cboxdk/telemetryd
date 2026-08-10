@@ -25,7 +25,7 @@ pub struct Config {
     pub limits: LimitsConfig,
     pub ingest: IngestConfig,
     pub log: LogConfig,
-    /// Forwarding to a central instance (ADR-013). Off unless `upstream` is set.
+    /// Forwarding to a central instance. Off unless `upstream` is set.
     #[serde(default)]
     pub relay: RelayConfig,
     /// Who telemetryd trusts when it dials out.
@@ -115,7 +115,7 @@ impl ServerTlsConfig {
 
 /// Trust for outbound connections — the OIDC key fetch, relay shipping, transfer.
 ///
-/// Inbound TLS is still terminated by a reverse proxy (ADR-004); this is only about
+/// Inbound TLS is still terminated by a reverse proxy; this is only about
 /// connections telemetryd makes.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
@@ -124,7 +124,7 @@ pub struct TlsConfig {
     ///
     /// Empty uses the roots compiled into the binary, which is right for the public
     /// internet. Set it when the issuer or the relay upstream is behind a private CA —
-    /// the case ADR-013 describes, where the upstream is internal infrastructure.
+    /// the case relay mode is built for, where the upstream is internal infrastructure.
     ///
     /// **It replaces the built-in roots rather than adding to them.** Trusting exactly
     /// the authority that signs your internal hosts is tighter than trusting it *and*
@@ -180,7 +180,7 @@ impl Default for IngestConfig {
 pub struct ServerConfig {
     /// One port serves ingest, query and the UI-facing APIs.
     pub listen: SocketAddr,
-    /// Permit a non-loopback bind with no token configured. See ADR-004.
+    /// Permit a non-loopback bind with no token configured.
     pub insecure: bool,
     /// Terminate TLS here rather than at a proxy. Unset = plain HTTP.
     #[serde(default)]
@@ -224,7 +224,7 @@ pub struct AuthConfig {
     /// existed, so adding the role breaks no deployment. Setting it is opting into
     /// the tighter split.
     pub admin_token: TokenSpecs,
-    /// Accept Cbox ID access tokens alongside the static ones (ADR-011).
+    /// Accept Cbox ID access tokens alongside the static ones.
     ///
     /// Unset means static tokens only, which is a complete answer for one team on one
     /// host. Setting an issuer turns it on.
@@ -235,7 +235,7 @@ pub struct AuthConfig {
 /// One client application allowed to write through a relay.
 ///
 /// The token identifies the app; the app is not taken from the payload. That is the
-/// whole point — see [ADR-013](../../../docs/adr/0013-relay-mode.md).
+/// whole point.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RelayClient {
@@ -387,7 +387,7 @@ pub struct OidcConfig {
     /// A configured URL rather than fetching the discovery document, deliberately: the
     /// document exists to tell a client a path it cannot guess, and if you already know
     /// the path, reading it costs a second network dependency and a second thing to be
-    /// down (ADR-011).
+    /// down.
     pub jwks_url: String,
 
     /// The claim carrying granted scopes.
@@ -477,7 +477,7 @@ pub struct StorageConfig {
     pub disk_budget: ByteSize,
     pub segment_duration: DurationSetting,
     /// Seal a segment early if its buffer exceeds this, so memory is a configured
-    /// number rather than a function of traffic (ADR-001 D4).
+    /// number rather than a function of traffic.
     pub max_segment_bytes: ByteSize,
     pub wal_sync: WalSync,
     #[serde(with = "humantime_serde")]
@@ -554,7 +554,7 @@ mod optional_path {
 }
 
 impl StorageConfig {
-    /// Resolution order, per ADR-003:
+    /// Resolution order:
     /// 1. an explicit `data_dir`
     /// 2. `./telemetryd-data` **if it already exists** — so a developer who ran once in
     ///    a project directory keeps hitting the same store
@@ -602,7 +602,7 @@ pub struct RetentionConfig {
     pub logs: DurationSetting,
     pub traces: DurationSetting,
     /// Longer than the rest by default: metrics cost ~1.3 bytes/sample, and
-    /// week-over-week comparison is most of what dashboards are for. See ADR-001 D3.
+    /// week-over-week comparison is most of what dashboards are for.
     pub metrics: DurationSetting,
 }
 

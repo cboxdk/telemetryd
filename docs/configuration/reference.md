@@ -23,7 +23,7 @@ misspelled `TELEMETRYD_*` variable is a startup error instead of a setting that 
 does nothing.
 
 Durations are humantime strings (`500ms`, `30s`, `7d`). Sizes are byte strings
-(`64MiB`, `10GiB`). Unknown keys are a startup error. See [ADR-003](../adr/0003-configuration-model.md).
+(`64MiB`, `10GiB`). Unknown keys are a startup error.
 
 ## Full schema with defaults
 
@@ -46,7 +46,7 @@ admin_token  = []                    # guards /status and /metrics
 [auth.oidc]
 # Accept OIDC access tokens alongside the static ones. Unset = static only.
 # Tokens are validated locally against the issuer's published keys; telemetryd
-# never asks the provider about a token. See ADR-011.
+# never asks the provider about a token.
 issuer           = ""                # https:// (or loopback); the only required key
 audience         = ""                # "" = accept the issuer's own value
 jwks_url         = ""                # "" = {issuer}/.well-known/jwks.json
@@ -65,7 +65,7 @@ self_signed = ""                     # or: the hostnames to generate a certifica
 
 [tls]
 # Trust for connections telemetryd *makes* — the OIDC key fetch, relay shipping,
-# transfer. Inbound TLS is still a reverse proxy's job (ADR-004).
+# transfer. Inbound TLS is still a reverse proxy's job.
 ca_file = ""                         # "" = the roots compiled into the binary
 
 [storage]
@@ -81,7 +81,7 @@ query_parallelism = 1                # threads per query; 1 = off (default), 0 =
 [retention]
 logs    = "7d"
 traces  = "7d"
-metrics = "30d"                      # cheaper per unit time — see ADR-001 D3
+metrics = "30d"                      # cheaper per unit time — D3
 
 [limits]
 # Exceeding any of these rejects the record and increments a labelled
@@ -97,7 +97,7 @@ ingest_queue_depth      = 8192       # backpressure: full queue → 429 with Ret
 
 [relay]
 # Forward what this instance accepts to a central one, as a safe front door for
-# clients you do not trust (ADR-013). Unset = store locally and send nothing on.
+# clients you do not trust. Unset = store locally and send nothing on.
 # upstream  = "https://telemetry.internal"   # https, or loopback for testing
 # token     = "file:/run/secrets/upstream"   # the credential clients must never hold
 trust_client_identity = false        # take `app` from the payload instead of the credential
@@ -212,7 +212,7 @@ having to interpret a missing metric.
 
 `tls.ca_file` takes a PEM bundle and is what you set when the issuer or the relay
 upstream is behind an internal authority — the deployment
-[ADR-013](../adr/0013-relay-mode.md) describes, where the upstream is your own
+relay mode is built for, where the upstream is your own
 infrastructure rather than a public host.
 
 ```toml
@@ -244,7 +244,7 @@ most containers.
 3. `$XDG_DATA_HOME/telemetryd` — on macOS `~/Library/Application Support/telemetryd`
 
 The resolved path is logged at startup and reported by `/status`. Rationale in
-[ADR-003](../adr/0003-configuration-model.md).
+
 
 ## Config file discovery
 

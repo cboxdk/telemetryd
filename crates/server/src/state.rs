@@ -46,7 +46,7 @@ pub struct AppState {
     ingest_permits: Arc<Semaphore>,
     /// Cbox ID token validation. Disabled unless an issuer is configured.
     pub oidc: Arc<crate::oidc::Oidc>,
-    /// Relay client credentials, each carrying the app it is allowed to be (ADR-013).
+    /// Relay client credentials, each carrying the app it is allowed to be.
     pub relay_clients: Arc<telemetryd_core::ClientTokens>,
     /// Forwarding upstream. `None` unless `relay.upstream` is set.
     pub relay: Option<Arc<crate::relay::Relay>>,

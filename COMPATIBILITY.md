@@ -9,7 +9,7 @@ Not from the upstream API references. Every requirement below was read out of
 `cboxdk/laravel-telemetry-ui`'s connector source — `LokiSource`, `TempoSource`,
 `PrometheusSource` and the three query compilers — because **the subset the UI actually
 calls is the specification**, and it differs from the published APIs in ways that
-matter. The audit is recorded in [ADR-005](docs/adr/0005-compatibility-audit.md), along
+matter. The audit is recorded alongside this document, along
 with the four places our first guess was wrong.
 
 Each row below is covered by a contract test. Where a requirement came from reading the
@@ -41,7 +41,7 @@ supported grammar would have produced "syntax error" and sent you hunting for a 
 that is not there.
 
 Endpoints that are contracted but not yet built return `501` with
-`code: "not_implemented"` and the milestone they land in — never a `404`, which would
+`code: "not_implemented"` — never a `404`, which would
 read as a wrong URL.
 
 ## Authentication
@@ -51,8 +51,7 @@ shared token across all three connectors (`TELEMETRY_UI_TOKEN`). Point all three
 same telemetryd base URL and set `auth.query_token` to that value.
 
 `X-Scope-OrgID` is sent when a tenant is configured. telemetryd **ignores** it: it is
-single-tenant, and the `app` label is a query namespace rather than a security boundary
-(see [ADR-004](docs/adr/0004-auth-and-network-binding.md)).
+single-tenant, and the `app` label is a query namespace rather than a security boundary.
 
 ---
 
@@ -60,10 +59,10 @@ single-tenant, and the `app` label is a query namespace rather than a security b
 
 | Endpoint | Format | Status |
 |---|---|---|
-| `POST /v1/logs` | OTLP/HTTP JSON | **M1 — done** |
-| `POST /v1/traces` | OTLP/HTTP JSON | M2 |
-| `POST /v1/metrics` | OTLP/HTTP JSON | M3 |
-| `POST /api/v1/write` | Prometheus `remote_write` (snappy + protobuf) | M3 |
+| `POST /v1/logs` | OTLP/HTTP JSON | **done** |
+| `POST /v1/traces` | OTLP/HTTP JSON | done |
+| `POST /v1/metrics` | OTLP/HTTP JSON | done |
+| `POST /api/v1/write` | Prometheus `remote_write` (snappy + protobuf) | done |
 
 **OTLP/HTTP JSON is first-class.** `cboxdk/laravel-telemetry` emits JSON — no protobuf,
 no C extension on the client path. A protobuf `Content-Type` is refused with a named
@@ -107,7 +106,7 @@ rest and reports the refusal through OTLP's own `partialSuccess` field.
 
 ---
 
-## Loki — M1, done
+## Loki
 
 | Endpoint | Used by | Notes |
 |---|---|---|
@@ -156,7 +155,7 @@ default, `{service_name=~".+"}`, satisfies this.
 
 ---
 
-## Tempo — M2
+## Tempo
 
 | Endpoint | Used by | Notes |
 |---|---|---|
@@ -196,7 +195,7 @@ spelling, `.service.name` still reaches the `service_name` label.
 
 ---
 
-## Prometheus — M3
+## Prometheus
 
 | Endpoint | Used by | Notes |
 |---|---|---|

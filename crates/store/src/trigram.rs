@@ -10,7 +10,7 @@
 //! pattern is present" is a *necessary* condition, and its negation — any trigram
 //! missing — is a sound reason to skip the segment without reading it.
 //!
-//! Why this exists at all: ADR-001 D1 set a falsifiable trigger for building a text
+//! Why this exists at all: there was a falsifiable trigger for building a text
 //! index, and measurement fired it by a factor of a hundred. A line filter matching
 //! nothing costs about ten seconds per gigabyte scanned, because nothing fills the
 //! collector, so no segment can be skipped and every body has to be decompressed.

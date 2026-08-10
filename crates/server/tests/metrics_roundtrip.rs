@@ -1,7 +1,7 @@
 //! The M3 acceptance test: metrics in (both ways), Prometheus query API out.
 //!
 //! Endpoint shapes, units and the probe order come from `PrometheusSource` in
-//! `laravel-telemetry-ui` (ADR-005): seconds not nanoseconds, values as strings, and
+//! `laravel-telemetry-ui`: seconds not nanoseconds, values as strings, and
 //! `/api/v1/status/buildinfo` first.
 
 // Test fixtures build wire payloads from small literal numbers; the casts are exact

@@ -16,7 +16,7 @@ ship one 2.6 MB binary instead of a stack of services to operate. If you outgrow
 node, you have outgrown telemetryd, and we would rather say so than pretend
 otherwise.
 
-> **Status: M5 — feature complete.** All three signals go in as OTLP/HTTP JSON (plus
+> **Status: feature complete.** All three signals go in as OTLP/HTTP JSON (plus
 > Prometheus `remote_write`), land in Parquet segments, and come back out through the
 > Loki, Tempo and Prometheus query APIs — with live tail, and retention enforcing both
 > time and a disk budget. Nothing in the contract answers `501`.
@@ -84,18 +84,10 @@ Full documentation is in [docs/](docs/index.md) — start with the
 
 ## Design
 
-Seven decision records cover the reasoning, including where the original plan was
-wrong:
-
-| ADR | Subject |
-|-----|---------|
-| [ADR-001](docs/adr/0001-storage-architecture.md) | Storage architecture — WAL, segments, the two engines, and four proposed deviations from the original plan |
-| [ADR-002](docs/adr/0002-workspace-layout.md) | Workspace layout |
-| [ADR-003](docs/adr/0003-configuration-model.md) | Configuration model and layering |
-| [ADR-004](docs/adr/0004-auth-and-network-binding.md) | Auth, network binding, and what is deliberately out of scope |
-| [ADR-005](docs/adr/0005-compatibility-audit.md) | Why the compatibility subset is derived from the client, not the upstream spec |
-| [ADR-006](docs/adr/0006-query-performance-architecture.md) | Query performance: what knowing the queries in advance buys, and where a general engine stays ahead |
-| [ADR-007](docs/adr/0007-metrics-reuse-the-record-store.md) | Why metrics reuse the record store instead of the bespoke chunk store ADR-001 planned |
+The reasoning lives next to the code it explains: why a decision was made, and where the
+first attempt was wrong, are in the doc comments of the module that carries it. What is
+built, what is not, and what is deliberately absent is in
+[BUILD-STATUS.md](BUILD-STATUS.md).
 
 API contract: [COMPATIBILITY.md](COMPATIBILITY.md) — derived from `laravel-telemetry-ui`'s
 actual connector source, not from the upstream API references.
@@ -159,8 +151,7 @@ guide](docs/cookbook/single-sign-on.md).
   `server.tls.cert_file` and `key_file` — but it does not obtain or renew certificates.
   Bring one from your CA, from certbot, or from whatever issues them where you run. A
   proxy in front remains a fine answer at a public edge, where one usually exists
-  already; the built-in path is for internal deployments that have nowhere to put one
-  (ADR-004).
+  already; the built-in path is for internal deployments that have nowhere to put one.
 - **Per-app tokens.** The `app` label is a namespace, not a security boundary.
 - **mTLS, user accounts.** Out of frame for a single-team tool.
 
@@ -191,17 +182,6 @@ error, rather than dropping data quietly.
 | `/status` | query token | Disk usage vs budget, WAL stats, recovery events, limits, retention. |
 | `/metrics` | query token | Prometheus exposition of telemetryd's own metrics. |
 
-## Milestones
-
-| | Scope | Status |
-|---|---|---|
-| **M0** | Workspace, config, data dir, WAL, HTTP surface, self-observability, CI | **done** |
-| **M1** | OTLP JSON logs → Parquet segments → Loki `query_range`, labels, series, live tail; retention reaper | **done** |
-| **M2** | OTLP traces → Tempo trace-by-id, TraceQL search, tags; query performance architecture | **done** |
-| **M3** | Prometheus `remote_write` + OTLP metrics → PromQL subset, Prometheus query APIs | **done** |
-| **M4** | `COMPATIBILITY.md` frozen and contract-tested, derived from the client's source ([ADR-005](docs/adr/0005-compatibility-audit.md)) | **done** |
-| **M5** | Install script, brew tap, `.deb`, `service install`, SBOM, docs | **done** |
-
 ## Development
 
 ```bash
@@ -219,7 +199,7 @@ cargo test -p telemetryd-store --test scale --release   # asserts the asymptotic
 Performance is held in place from two directions: benchmarks measure the constants,
 and `tests/scale.rs` asserts the asymptotics as *segment-open counts* rather than
 wall-clock times — so they mean something on a shared CI runner. See
-[ADR-006](docs/adr/0006-query-performance-architecture.md).
+
 
 CI additionally cross-compiles all four release targets
 (`{x86_64,aarch64}-unknown-linux-musl`, `{x86_64,aarch64}-apple-darwin`) and asserts

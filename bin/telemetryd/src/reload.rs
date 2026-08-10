@@ -1,6 +1,6 @@
 //! Re-reading configuration on `SIGHUP`.
 //!
-//! [ADR-003](../../docs/adr/0003-configuration-model.md) originally declined reload,
+//! Reload was originally declined,
 //! on the grounds that a fast-starting process with a durable log makes restarting
 //! cheap. That reasoning holds for most settings and does not hold for the ones people
 //! actually need to change in a hurry: a disk filling at three in the morning is

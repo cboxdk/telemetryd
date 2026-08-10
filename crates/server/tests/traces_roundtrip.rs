@@ -1,7 +1,7 @@
 //! The M2 acceptance test: OTLP/HTTP JSON traces in, Tempo query API out.
 //!
 //! Endpoint shapes and parameter units come from `TempoSource` in
-//! `laravel-telemetry-ui` (ADR-005), not from the upstream docs — notably `q` carrying
+//! `laravel-telemetry-ui`, not from the upstream docs — notably `q` carrying
 //! TraceQL, and tag values on the v2 path.
 
 #![allow(clippy::unwrap_used)]

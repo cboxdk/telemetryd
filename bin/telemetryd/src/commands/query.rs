@@ -72,7 +72,7 @@ pub fn run(args: &QueryArgs) -> anyhow::Result<()> {
     if base.starts_with("https://") {
         bail!(
             "`telemetryd query` speaks plain HTTP only.\n\
-             telemetryd does not terminate TLS (see ADR-004) — query the instance \
+             telemetryd does not terminate TLS — query the instance \
              directly, e.g. --url http://127.0.0.1:4319."
         );
     }

@@ -37,7 +37,7 @@ that is down stops new tokens being issued without stopping you reading the tele
 that would explain why. The signing algorithm is taken from the key the token's `kid`
 selects, never from the token itself, which is what closes `alg: none` and
 RS256-verified-as-HS256 confusion. `iss`, `aud` and `exp` are all required. See
-[ADR-011](docs/adr/0011-cbox-id-integration.md).
+
 
 Setting an issuer guards **every** surface, including any whose static token is
 deliberately empty — an empty token means "unguarded" only while nothing else guards

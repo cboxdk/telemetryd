@@ -5,8 +5,8 @@
 //! For most of this project's life `ureq` was declared `default-features = false`,
 //! with a comment saying plain HTTP only — correct in M0, when it was the CLI's client
 //! talking to localhost. Three things were then built on the same client that talk to
-//! the outside world: the OIDC key fetch ([ADR-011]), relay shipping ([ADR-013]), and
-//! transfer's remote read and write ([ADR-012]).
+//! the outside world: the OIDC key fetch, relay shipping, and transfer's remote read
+//! and write.
 //!
 //! None of them could work. `Cargo.lock` carried no TLS crate at all, so every https
 //! request failed with "TLS required, but transport is unsecured" — while
@@ -48,9 +48,6 @@
 //! Enabling the feature is not on its own sufficient — `TlsConfig::default()` hardcodes
 //! `RootCerts::WebPki` — so the choice is made explicitly below.
 //!
-//! [ADR-011]: ../../docs/adr/0011-cbox-id-integration.md
-//! [ADR-012]: ../../docs/adr/0012-import-and-export.md
-//! [ADR-013]: ../../docs/adr/0013-relay-mode.md
 
 use std::sync::OnceLock;
 

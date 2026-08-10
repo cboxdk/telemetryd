@@ -54,7 +54,7 @@ lives in `server` and can change without touching the domain.
 
 `server` is separate from the binary so the router can be driven in-process by contract
 tests, with no socket and no argument parsing. That is why the test suite runs in
-seconds. See [ADR-002](../adr/0002-workspace-layout.md).
+seconds.
 
 ## Deliberate absences
 

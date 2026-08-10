@@ -30,7 +30,6 @@ impl IntoResponse for ApiError {
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::LimitExceeded { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Error::Overloaded => StatusCode::TOO_MANY_REQUESTS,
-            Error::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
 
             // Everything else is ours to fix.
             Error::Config(_)
@@ -47,10 +46,7 @@ impl IntoResponse for ApiError {
             | Error::RelayDelivery(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
-        // Log genuine faults only. A 501 is a 5xx by status but a deliberate,
-        // documented state of an early build — logging it at ERROR would train
-        // operators to ignore the level that matters.
-        if status.is_server_error() && !matches!(self.0, Error::NotImplemented { .. }) {
+        if status.is_server_error() {
             tracing::error!(error = %self.0, code = self.0.code(), "request failed");
         }
 

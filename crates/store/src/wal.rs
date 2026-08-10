@@ -1,7 +1,7 @@
 //! Segmented write-ahead log.
 //!
 //! The WAL is the durability boundary for ingest and nothing more — it is not a
-//! replication log and not a query source beyond crash replay (ADR-001).
+//! replication log and not a query source beyond crash replay.
 //!
 //! # Frame format
 //!

@@ -28,12 +28,11 @@ pub async fn healthz() -> Response {
 #[derive(Debug, Serialize)]
 pub struct StatusResponse {
     pub version: &'static str,
-    pub milestone: &'static str,
     pub storage_format_version: u32,
     pub started_at: String,
     pub uptime_seconds: f64,
     pub listen: String,
-    /// True when the operator bypassed the ADR-004 bind check. Surfaced here so
+    /// True when the operator bypassed the exposed-bind check. Surfaced here so
     /// "is this instance exposed without auth?" is answerable from a dashboard.
     pub insecure: bool,
     /// `off`, `certificate` or `self-signed`.
@@ -109,7 +108,6 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse
 
     Ok(Json(StatusResponse {
         version: VERSION,
-        milestone: crate::MILESTONE,
         storage_format_version: telemetryd_core::STORAGE_FORMAT_VERSION,
         started_at,
         uptime_seconds: state.uptime_seconds(),

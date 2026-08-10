@@ -16,7 +16,7 @@ That is a working instance. No configuration file, no flags.
 ## The first thing it prints is a set of tokens
 
 telemetryd refuses to listen on an address reachable from outside the machine with no
-authentication configured ([ADR-004](../adr/0004-auth-and-network-binding.md)), and a
+authentication configured, and a
 container binds `0.0.0.0` by definition. The two obvious ways to make a zero-config
 image are both bad: fail to start, or default to `insecure` and serve everyone's
 telemetry to anyone who can reach the port.

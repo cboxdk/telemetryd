@@ -3,19 +3,6 @@
 The living record of what is built, what is not, and what is deliberately absent. Kept
 current so scope and gaps are always auditable without reading the source.
 
-Last updated at **M5**, plus the authentication work that followed it.
-
-## Milestones
-
-| | Scope | Status |
-|---|---|---|
-| M0 | Workspace, config, data dir, WAL, HTTP surface, self-observability, CI | **done** |
-| M1 | OTLP JSON logs → Parquet segments → Loki APIs, live tail, retention | **done** |
-| M2 | OTLP traces → Tempo APIs, TraceQL subset; query performance architecture | **done** |
-| M3 | `remote_write` + OTLP metrics → PromQL subset, Prometheus APIs | **done** |
-| M4 | Compatibility audit and contract tests | **done** — brought forward to after M1 (ADR-005) |
-| M5 | Packaging, SBOM, docs, release CI | **done** |
-
 ## What works
 
 **Ingest.** OTLP/HTTP JSON for logs, traces and metrics; Prometheus `remote_write`
@@ -64,7 +51,7 @@ queries answered from metadata with no file I/O.
 static bearer token, with rotation via a list and indirection through a file or
 environment variable. OIDC access tokens are accepted alongside them, validated
 locally against the issuer's published key set so that an identity provider being down
-never stops you reading your telemetry (ADR-011). The algorithm comes from the key the
+never stops you reading your telemetry. The algorithm comes from the key the
 `kid` selects, never from the token. Scopes are not a hierarchy: admin does not imply
 read.
 
@@ -84,7 +71,7 @@ behaviour change, not a default.
 
 **Relay mode.** telemetryd can stand in front of a central instance and decide who each
 client is from its credential rather than from its payload — the point of it for mobile
-fleets, where the credential lives in a binary anyone can open (ADR-013). Sealed
+fleets, where the credential lives in a binary anyone can open. Sealed
 segments are forwarded in arrival order behind a durable cursor that advances only after
 upstream confirms; retention will not delete what has not been forwarded, and
 `relay.when_full` decides between losing the oldest unsent data and refusing new writes.
@@ -96,7 +83,7 @@ migrating out, and pulling an incident window onto a laptop. All three signals r
 running pair rather than in prose. Against telemetryd, export reads records directly
 through `/api/v1/export`, so nothing passes through a query language; against a foreign backend it
 uses the read APIs, which cover logs and traces — metrics cannot be pulled that way,
-because a range query returns resampled points rather than stored samples (ADR-012).
+because a range query returns resampled points rather than stored samples.
 
 **Operations.** `telemetryd query` runs a LogQL query from the shell — for debugging
 over SSH when the UI is the thing you cannot reach, and for getting data out as JSON
@@ -235,12 +222,12 @@ writers no request exceeded three times the median, because the Parquet write ha
 outside the buffer lock. Smaller `max_segment_bytes` trades throughput for smoother
 latency: at 8 MiB every request seals.
 
-Ingest gave up 13% when the trigram index landed (ADR-010): it is paid on every write
+Ingest gave up 13% when the trigram index landed: it is paid on every write
 whether or not anyone searches, and it buys a substring query going from 98 seconds to
 0.2 over a full store.
 
 Three things had to be true for the throughput numbers, and none of them were a month
-ago: the allocator (ADR-009), the buffer no longer being scanned under the append lock,
+ago: the allocator, the buffer no longer being scanned under the append lock,
 and `max_segment_bytes` meaning what it says. Each is guarded by a test that was checked
 against the broken version rather than assumed to work.
 
@@ -266,7 +253,7 @@ instead.
 
 **Attribute maps are still per-row JSON.** They are genuinely high cardinality, so
 interning does not obviously apply. Only paid for rows that survive filtering, so it no
-longer dominates a query (ADR-006).
+longer dominates a query.
 
 **Segment count does not need compacting.** Listed as a gap from reasoning — segments
 accumulate and are never merged — and then measured, which said otherwise. Over a
@@ -284,14 +271,14 @@ per segment, and merging segments would not reduce a byte of it. Compaction woul
 work that buys nothing measurable.
 
 **Substring search prunes, but not equally well for every pattern.** A per-segment
-trigram index (ADR-010) skips segments that cannot contain a `|=` filter's text. A term
+trigram index skips segments that cannot contain a `|=` filter's text. A term
 present nowhere went from 3.9 s to 6 ms over 405 MB — 98 s to 0.2 s extrapolated to a
 full 10 GiB store. A pattern built entirely from *common* trigrams still prunes poorly:
 searching one specific order number costs about 3 s over the same store, because its
 digit trigrams appear in most segments. Bounding the time range remains the answer
 there.
 
-**Queries are single-threaded by default** (ADR-008, ADR-009). Parallel scanning is
+**Queries are single-threaded by default**. Parallel scanning is
 opt-in via `storage.query_parallelism` and worth about 7% on an unbounded scan; it is
 not worth three cores by default on a box that is also ingesting. Limited queries never
 use it at all — their speed comes from a cutoff that tightens as it goes, which is a
@@ -299,11 +286,11 @@ sequential dependency, and splitting it measured 60% slower.
 
 ## Deliberately absent
 
-Not gaps. These are decisions, each with an ADR:
+Not gaps. These are decisions:
 
-- **Inbound TLS** — terminate at a reverse proxy (ADR-004). *Outbound* TLS is built: the key fetch, relay shipping and transfer all verify against roots compiled into the binary, or the host's store with the `platform-verifier` feature. See ADR-004's amendment for why that distinction was a defect before it was a decision.
-- **Multi-tenancy** — `app` is a query namespace, not a security boundary (ADR-004)
-- **Clustering, replication, object-store tiering** — single node is the design (ADR-001)
+- **Inbound TLS** — terminate at a reverse proxy. *Outbound* TLS is built: the key fetch, relay shipping and transfer all verify against roots compiled into the binary, or the host's store with the `platform-verifier` feature. That distinction was a defect before it was a decision.
+- **Multi-tenancy** — `app` is a query namespace, not a security boundary
+- **Clustering, replication, object-store tiering** — single node is the design
 - **Plugins, relabelling rules, write-path transformations** — shape data in the
   instrumentation
 - **OTLP/gRPC** — JSON is first-class because that is what the client emits
@@ -315,15 +302,15 @@ Not gaps. These are decisions, each with an ADR:
   does not go and fetch. A `[[scrape]]` config section existed, complete with
   validation and documentation, and was read by nothing; it has been removed rather
   than left to look like a feature
-- **A bespoke metric chunk store** — superseded by ADR-007, with the cost stated
+- **A bespoke metric chunk store** — superseded by reusing the record store, with the cost stated
 
 ## Where the reasoning lives
 
 `docs/adr/` holds eight decision records. Two are worth reading before changing
 anything:
 
-- **ADR-005** — the compatibility subset is derived from the client's source, not the
+- **The compatibility subset** is derived from the client's source, not the
   upstream API references. Four requirements the published specs do not imply; two were
   already costing correctness.
-- **ADR-006** — query performance, with before-and-after measurements and an honest
+- **Query performance**, with before-and-after measurements and an honest
   account of where a general analytical engine stays ahead.

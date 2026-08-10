@@ -95,7 +95,7 @@ pub fn run(config_file: Option<&Path>, data_dir: Option<&Path>) -> anyhow::Resul
 }
 
 /// Say plainly whether this configuration would expose telemetry to the network.
-/// Everything here is already enforced at startup by ADR-004; restating it means an
+/// Everything here is already enforced at startup; restating it means an
 /// operator does not have to infer it from a listen address and two token fields.
 fn print_security_posture(config: &Config) {
     let exposed = !config.server.listen.ip().is_loopback();

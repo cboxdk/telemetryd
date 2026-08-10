@@ -1,4 +1,4 @@
-//! Secret handling for the static bearer tokens described in ADR-004.
+//! Secret handling for the static bearer tokens guarding each surface.
 //!
 //! The invariant this module exists to enforce: **a token value can never reach a log
 //! line, an error message, `/status`, or `telemetryd validate` output.** That is done
@@ -176,7 +176,7 @@ impl TokenSet {
     }
 }
 
-/// Ingest credentials that each carry a fixed identity (ADR-013).
+/// Ingest credentials that each carry a fixed identity.
 ///
 /// A relay decides what a client *is* from the credential it presented, so the lookup
 /// answers "which app" rather than "was this valid at all".

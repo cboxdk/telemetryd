@@ -2,7 +2,7 @@
 //!
 //! Reuses every piece of the record store — WAL, buffering, sealing, manifest,
 //! pruning, retention. Only the columns differ, which is what the [`RecordSchema`]
-//! trait exists for (ADR-001).
+//! trait exists for.
 
 use std::sync::Arc;
 

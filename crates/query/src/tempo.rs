@@ -1,6 +1,6 @@
 //! The Tempo-compatible query API.
 //!
-//! Shapes match what `TempoSource` in `laravel-telemetry-ui` parses (ADR-005), which
+//! Shapes match what `TempoSource` in `laravel-telemetry-ui` parses, which
 //! differs from a naive reading of the Tempo docs in two ways that matter: search is
 //! driven by TraceQL through `q`, and tag values come from the **v2** path.
 //!

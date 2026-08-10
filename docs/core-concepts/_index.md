@@ -11,5 +11,5 @@ description: "How telemetryd is put together, and why each piece is shaped the w
 - [Storage](storage.md) — WAL, segments, retention, and what survives a crash
 - [Query performance](performance.md) — what knowing the queries in advance buys
 
-The [decision records](../adr/_index.md) carry the reasoning in full, including the
-places the original plan turned out to be wrong.
+The doc comments on each module carry the reasoning in full, including the places the
+original plan turned out to be wrong.

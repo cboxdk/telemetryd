@@ -1,4 +1,4 @@
-//! Bearer token middleware for the ingest and query surfaces (ADR-004).
+//! Bearer token middleware for the ingest and query surfaces.
 //!
 //! Two independent token sets, because the trust boundaries genuinely differ: app
 //! servers push, humans and the UI read. An unset token set leaves that surface open,

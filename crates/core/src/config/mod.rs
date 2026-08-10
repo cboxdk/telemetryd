@@ -1,5 +1,5 @@
 //! Configuration schema and the defaults → file → env → flags layering described in
-//! ADR-003.
+//! precedence.
 //!
 //! The load-bearing property here is that **the empty configuration is a valid
 //! configuration**: every field has a default, so `telemetryd serve` with no file, no
@@ -218,7 +218,7 @@ impl Config {
         // otherwise is a server that quietly keeps speaking plain HTTP.
         self.validate_server_tls()?;
 
-        // ADR-004: fail closed on an exposed bind.
+        // Fail closed on an exposed bind.
         let exposed = !self.server.listen.ip().is_loopback();
         let unauthenticated = self.auth.ingest_token.is_empty() && self.auth.query_token.is_empty();
         if exposed && unauthenticated && !self.server.insecure {
@@ -352,7 +352,7 @@ fn exposed_bind_message(listen: SocketAddr) -> String {
         format!("       TELEMETRYD_AUTH_QUERY_TOKEN={}", suggest_token()),
         String::new(),
         "  2. Bind to loopback and put a reverse proxy in front, which is also".to_owned(),
-        "     how you get TLS (telemetryd does not terminate TLS — see ADR-004):".to_owned(),
+        "     how you get TLS, if telemetryd is not terminating it:".to_owned(),
         format!("       --listen 127.0.0.1:{}", listen.port()),
         String::new(),
         "  3. Accept the risk explicitly, e.g. on a trusted private network:".to_owned(),

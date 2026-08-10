@@ -1,4 +1,4 @@
-//! Forwarding sealed segments to a central instance (ADR-013).
+//! Forwarding sealed segments to a central instance.
 //!
 //! # The cursor is over segments, not time
 //!
@@ -21,7 +21,7 @@
 //! Delivery is therefore **at-least-once**: a response lost after upstream committed
 //! means the segment is sent again. telemetryd has no dedup anywhere, so upstream sees
 //! duplicates. That is the honest trade against losing data, and it is stated in
-//! ADR-013 rather than discovered in a dashboard showing twice the traffic.
+//! stated here rather than discovered in a dashboard showing twice the traffic.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

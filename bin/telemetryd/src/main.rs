@@ -3,7 +3,7 @@
 //!
 //! This crate is deliberately thin: argument parsing, configuration resolution,
 //! logging setup and process lifecycle. Everything else lives in the library crates
-//! so it can be tested without a socket or a shell (ADR-002).
+//! so it can be tested without a socket or a shell.
 
 // The workspace enables `unreachable_pub` for the library crates, where it catches a
 // real mistake. A binary has no external consumers, so here it only argues about

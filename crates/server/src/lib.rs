@@ -2,7 +2,7 @@
 //!
 //! The router is the composition root, and it is built independently of any listening
 //! socket so contract tests can drive it in-process with `tower::ServiceExt::oneshot`
-//! (ADR-002).
+//!.
 
 pub mod auth;
 pub mod error;
@@ -36,11 +36,6 @@ use tower_http::trace::TraceLayer;
 pub use state::AppState;
 pub use tls::Bound;
 
-/// The milestone this build implements, reported by `/status`. Keeping it in the
-/// binary means a user can always tell which slice of the contract they have — and
-/// from M5 that is all of it: nothing in `COMPATIBILITY.md` answers `501`.
-pub const MILESTONE: &str = "M5";
-
 /// Build the complete router.
 pub fn router(state: AppState) -> Router {
     let max_body =
@@ -71,7 +66,7 @@ pub fn router(state: AppState) -> Router {
         .route("/loki/api/v1/label/{name}/values", get(loki::label_values))
         .route("/loki/api/v1/series", get(loki::series))
         // Full-fidelity export, straight from the store rather than through a query
-        // language (ADR-012). Behind the query token: it returns telemetry.
+        // language. Behind the query token: it returns telemetry.
         .route("/api/v1/export", get(export::export))
         .route("/loki/api/v1/tail", get(loki::tail))
         // Tempo-compatible read APIs (M2).
@@ -79,11 +74,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/search", get(tempo::search))
         .route("/api/search/tags", get(tempo::tags))
         .route("/api/v2/search/tags", get(tempo::tags))
-        // The UI calls the v2 path; v1 is kept for older clients (ADR-005).
+        // The UI calls the v2 path; v1 is kept for older clients.
         .route("/api/v2/search/tag/{name}/values", get(tempo::tag_values))
         .route("/api/search/tag/{name}/values", get(tempo::tag_values))
         // Prometheus-compatible read APIs (M3). `buildinfo` is the UI's primary probe;
-        // without it every connection check shows a degraded backend (ADR-005).
+        // without it every connection check shows a degraded backend.
         .route("/api/v1/status/buildinfo", get(prometheus::build_info))
         .route(
             "/api/v1/query",
@@ -205,21 +200,20 @@ pub async fn serve(config: Arc<Config>, store: Arc<Store>) -> Result<()> {
         scheme = if config.server.tls.is_enabled() { "https" } else { "http" },
         data_dir = %store.data_dir().root().display(),
         version = telemetryd_core::VERSION,
-        milestone = MILESTONE,
         "telemetryd is serving"
     );
     if config.server.insecure {
         tracing::warn!(
             listen = %local,
             "running with --insecure: this instance accepts unauthenticated requests \
-             from the network (see ADR-004)"
+             from the network"
         );
     }
 
     // Fetch the key set before serving, so the first request does not pay for it —
     // but do not *require* it. An identity provider that is down must not stop
     // telemetryd starting: static tokens keep working, and the refresh loop recovers
-    // when it returns. Failing closed here would be the coupling ADR-011 exists to
+    // when it returns. Failing closed here would be the coupling this design exists to
     // avoid, in its worst form.
     if state.oidc.is_enabled() {
         let oidc = Arc::clone(&state.oidc);

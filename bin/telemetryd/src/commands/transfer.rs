@@ -1,4 +1,4 @@
-//! Moving a time range in or out, as OTLP (ADR-012).
+//! Moving a time range in or out, as OTLP.
 //!
 //! Export and import are the same engine pointed at different ends. Both read a range
 //! from a Loki-compatible API and turn it into OTLP requests; export writes them to a
@@ -672,7 +672,7 @@ pub fn export(args: &ExportArgs) -> anyhow::Result<()> {
 
     // Posting to a destination is the same walk with a different sink — which is the
     // whole point, and the reason an earlier version of this refused to offer it was
-    // not a good one. ADR-012 said telemetryd never writes to a foreign store; relay
+    // not a good one. The rule used to be that telemetryd never writes to a foreign store; relay
     // mode has been posting OTLP upstream since it shipped. The rule that survives is
     // narrower: never write to a store you were only asked to read from. A destination
     // named on the command line is not that.

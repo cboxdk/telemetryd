@@ -1,6 +1,6 @@
 //! The Prometheus-compatible query API.
 //!
-//! Shapes and units follow `PrometheusSource` (ADR-005): `start`/`end`/`time` are
+//! Shapes and units follow `PrometheusSource`: `start`/`end`/`time` are
 //! **seconds**, values are `[unix_seconds_as_number, "value_as_string"]`, and
 //! `/api/v1/status/buildinfo` exists because the UI probes it first and shows a
 //! degraded backend without it.

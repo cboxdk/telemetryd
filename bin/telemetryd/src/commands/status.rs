@@ -30,12 +30,12 @@ pub struct StatusArgs {
 pub fn run(args: &StatusArgs) -> anyhow::Result<()> {
     let url = format!("{}/status", args.url.trim_end_matches('/'));
 
-    // Plain HTTP only, deliberately: v1 terminates TLS at a reverse proxy (ADR-004),
+    // Plain HTTP only, deliberately: v1 terminates TLS at a reverse proxy,
     // and keeping a TLS stack out of the binary is what keeps the musl builds a
     // straightforward static link.
     // This used to refuse https outright, on the grounds that telemetryd does not
-    // terminate TLS (ADR-004). That confused the server with the client: the server
-    // still does not, but ADR-004 *recommends* a TLS-terminating proxy in front, and
+    // terminate TLS. That confused the server with the client: the server
+    // still need not, but a TLS-terminating proxy in front is *recommended*, and
     // refusing to talk to one made the recommended deployment unqueryable.
     let mut request = ureq::get(&url).header("user-agent", user_agent());
     if let Some(token) = &args.token {
@@ -98,9 +98,8 @@ fn print_summary(status: &Value) {
     };
 
     crate::out::outln!(
-        "telemetryd {} ({}), up {}",
+        "telemetryd {}, up {}",
         text("/version"),
-        text("/milestone"),
         humantime::format_duration(std::time::Duration::from_secs(
             number("/uptime_seconds").max(0.0) as u64
         ))

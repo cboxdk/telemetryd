@@ -1,6 +1,6 @@
 //! telemetryd's storage engine.
 //!
-//! Two engines, one lifecycle (ADR-001). The record store handles logs, spans and
+//! Two engines, one lifecycle. The record store handles logs, spans and
 //! events — identical machinery, different Arrow schema. Metrics get their own chunk
 //! store in M3. Both register in one retention pass, so the disk budget means the same
 //! thing everywhere.
@@ -288,7 +288,7 @@ impl Store {
         self.run_retention_protecting(retention::Undelivered::default())
     }
 
-    /// Reap while holding back segments a relay has not forwarded yet (ADR-013).
+    /// Reap while holding back segments a relay has not forwarded yet.
     ///
     /// The store does not know what a relay is, and should not: it is handed the ids
     /// to protect. That keeps delivery policy in the layer that owns delivery, and

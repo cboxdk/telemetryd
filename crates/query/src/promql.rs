@@ -1,6 +1,6 @@
 //! The PromQL subset: parsing and lowering.
 //!
-//! Scoped to what `laravel-telemetry-ui`'s `PromqlCompiler` emits (ADR-005). That list
+//! Scoped to what `laravel-telemetry-ui`'s `PromqlCompiler` emits. That list
 //! is larger than our first guess, and notably includes the counter-increase form:
 //!
 //! ```text

@@ -1,7 +1,7 @@
 //! The TraceQL subset.
 //!
 //! Scoped precisely to what `laravel-telemetry-ui`'s `TraceqlCompiler` emits
-//! (ADR-005): a single spanset of `&&`-joined conditions, optionally followed by
+//!: a single spanset of `&&`-joined conditions, optionally followed by
 //! `| select(...)`.
 //!
 //! ```text

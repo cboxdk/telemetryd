@@ -1,7 +1,7 @@
 //! The contract a signal must satisfy to use the record store.
 //!
 //! Logs, spans and events share identical storage machinery and differ only in their
-//! Arrow schema (ADR-001). This trait is that difference, and nothing else — so the
+//! Arrow schema. This trait is that difference, and nothing else — so the
 //! WAL, buffering, sealing, manifest, catalogue, pruning and retention are written
 //! once and M2's traces reuse them rather than growing a parallel copy.
 

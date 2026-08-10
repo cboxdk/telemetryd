@@ -53,6 +53,6 @@ that matters — anything speaking them works within the documented subset.
 **Scrape its self-metrics.** `/metrics` is Prometheus exposition; `/status` is JSON with
 disk usage, retention activity, per-signal counts and recovery events.
 
-**Fork it.** MIT, roughly ten thousand lines, no C dependencies. The
-[decision records](../adr/_index.md) explain why each piece is the way it is, including
-where the original plan turned out to be wrong.
+**Fork it.** MIT, roughly ten thousand lines, no C dependencies. The doc comments
+explain why each piece is the way it is, including where the original plan turned out
+to be wrong.

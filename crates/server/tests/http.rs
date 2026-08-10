@@ -1,7 +1,7 @@
 //! In-process tests against the composed router.
 //!
 //! No socket is bound and no CLI is involved — the router is the composition root
-//! (ADR-002), which keeps these fast enough to run on every commit and makes them the
+//!, which keeps these fast enough to run on every commit and makes them the
 //! natural home for the M4 contract tests.
 
 #![allow(clippy::unwrap_used)]
@@ -119,7 +119,6 @@ async fn status_reports_the_shape_operators_and_the_cli_depend_on() {
 
     let json: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(json["milestone"], "M5");
     assert_eq!(json["storage_format_version"], 1);
     assert_eq!(json["insecure"], false);
     assert_eq!(json["auth"]["ingest"], "disabled");
@@ -270,7 +269,7 @@ async fn token_rotation_accepts_both_old_and_new() {
 
 #[tokio::test]
 async fn every_contracted_endpoint_is_implemented() {
-    // Nothing in the contract answers 501 any more. If a future milestone registers a
+    // Nothing in the contract answers 501 any more. If a future build registers a
     // placeholder, this catches it rather than letting it ship silently.
     let harness = Harness::new(|_| {});
 

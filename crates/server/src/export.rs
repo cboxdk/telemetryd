@@ -1,6 +1,6 @@
 //! `GET /api/v1/export` — a time range as OTLP NDJSON, straight from the store.
 //!
-//! [ADR-012](../../docs/adr/0012-import-and-export.md) built export on top of the Loki
+//! Export was first built on top of the Loki
 //! API, and for logs that works: telemetryd serves the API it reads, so one path covers
 //! its own data and a foreign backend's. For traces and metrics it does not, and the
 //! ADR said so rather than shipping something lossy:

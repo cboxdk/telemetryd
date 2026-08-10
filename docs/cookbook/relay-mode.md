@@ -193,8 +193,7 @@ going to the central store and filtering for one device.
 
 ## TLS is not optional here
 
-telemetryd speaks plain HTTP unless told otherwise
-([ADR-004](../adr/0004-auth-and-network-binding.md)). Everywhere else that is a
+telemetryd speaks plain HTTP unless told otherwise. Everywhere else that is a
 recommendation; a relay taking traffic from phones is internet-facing by definition, so
 here it is a requirement — terminate at a proxy in front, or in telemetryd itself with
 `server.tls.cert_file` and `key_file`. Use a certificate the phones' TLS stacks already

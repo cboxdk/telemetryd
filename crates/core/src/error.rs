@@ -57,15 +57,6 @@ pub enum Error {
         hint: Option<String>,
     },
 
-    /// A route that exists in the contract but is not built yet in this milestone.
-    /// Distinct from a 404 on purpose — pointing a client at an early build should
-    /// say "not yet", not "wrong URL".
-    #[error("{endpoint} is not implemented in this build (planned for {milestone})")]
-    NotImplemented {
-        endpoint: &'static str,
-        milestone: &'static str,
-    },
-
     #[error("{limit} exceeded: {detail}")]
     LimitExceeded { limit: &'static str, detail: String },
 
@@ -134,7 +125,6 @@ impl Error {
             Self::BadRequest(_) => "bad_request",
             Self::NotFound(_) => "not_found",
             Self::Unsupported { .. } => "unsupported_feature",
-            Self::NotImplemented { .. } => "not_implemented",
             Self::LimitExceeded { .. } => "limit_exceeded",
             Self::Overloaded => "overloaded",
             Self::StorageVersionMismatch { .. } => "storage_version_mismatch",
@@ -152,14 +142,6 @@ impl Error {
             Self::Unsupported { feature, hint } => (
                 Some(feature.clone()),
                 hint.clone(),
-                Some(crate::COMPATIBILITY_DOC),
-            ),
-            Self::NotImplemented {
-                endpoint,
-                milestone,
-            } => (
-                Some((*endpoint).to_owned()),
-                Some(format!("this endpoint lands in milestone {milestone}")),
                 Some(crate::COMPATIBILITY_DOC),
             ),
             _ => (None, None, None),

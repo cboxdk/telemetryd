@@ -49,7 +49,6 @@ Anything outside the subset returns a structured error naming the feature.
 | [Configuration](configuration/_index.md) | Every option, with defaults |
 | [Extension points](extension-points/_index.md) | What you can change, and how |
 | [Security](security/_index.md) | Threat model, hardening, honest scope |
-| [Decision records](adr/_index.md) | Why it is built the way it is |
 
 ## Scope
 

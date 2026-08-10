@@ -4,7 +4,7 @@
 //! A segment is one directory, written to `tmp/` and moved into place with
 //! `rename(2)`, so a segment is either completely visible or not visible — there is no
 //! partially-published state a reader can observe. Retention deletes whole
-//! directories; there are no tombstones and no row-level deletes (ADR-001).
+//! directories; there are no tombstones and no row-level deletes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};

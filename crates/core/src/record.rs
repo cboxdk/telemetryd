@@ -256,7 +256,7 @@ impl LogRecord {
     }
 }
 
-/// The label carrying tenancy. Per ADR-004 this is a query namespace, not a security
+/// The label carrying tenancy. It is a query namespace, not a security
 /// boundary.
 pub const APP_LABEL: &str = "app";
 /// The normalised severity label.

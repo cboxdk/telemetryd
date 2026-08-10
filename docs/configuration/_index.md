@@ -22,5 +22,3 @@ telemetryd validate
 Type-checks, runs the cross-field rules, and prints every resolved value **with the
 layer it came from**. "Is this setting actually taking effect?" is the question a config
 check exists to answer, and a plain syntax check does not answer it.
-
-Reasoning in [ADR-003](../adr/0003-configuration-model.md).

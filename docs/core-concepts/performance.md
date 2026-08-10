@@ -9,7 +9,7 @@ description: "Why queries cost the size of the answer rather than the size of th
 The design goal is that a query costs the size of its **answer**, not the size of the
 **data**. Five mechanisms get there, and each follows from knowing the query shapes in
 advance. Full reasoning and measurements are in
-[ADR-006](../adr/0006-query-performance-architecture.md).
+
 
 ## What happens to a query
 

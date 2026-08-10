@@ -45,7 +45,7 @@ pub struct PartialSuccess {
 
 /// Overwrite what a client claimed to be with what its credential says it is.
 ///
-/// The security boundary of relay mode (ADR-013). `app` arrives in the payload, which
+/// The security boundary of relay mode. `app` arrives in the payload, which
 /// means the least trusted party picks it — fine when every writer is something you
 /// deployed, and not fine when the writer is a mobile binary anyone can extract a
 /// token from. Every alert, dashboard and retention rule downstream is keyed on this

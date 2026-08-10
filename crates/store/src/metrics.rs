@@ -1,7 +1,7 @@
 //! The Arrow/Parquet schema for metric samples.
 //!
 //! Three columns: the interned series id, a timestamp, and a float. The series
-//! dictionary the record store already maintains *is* the series index (ADR-007), so
+//! dictionary the record store already maintains *is* the series index, so
 //! label matching costs one evaluation per series rather than one per sample, and
 //! `/api/v1/labels` and `/api/v1/series` are answered from segment metadata alone.
 
