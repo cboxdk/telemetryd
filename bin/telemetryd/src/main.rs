@@ -10,6 +10,8 @@
 // `pub` vs `pub(crate)` on items nothing outside the crate can name either way.
 #![allow(unreachable_pub)]
 
+#[macro_use]
+mod out;
 mod commands;
 mod logging;
 mod reload;

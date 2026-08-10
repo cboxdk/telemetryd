@@ -72,9 +72,12 @@ pub fn run(args: &BenchArgs) -> anyhow::Result<()> {
         .context("opening the benchmark store")?,
     );
 
-    println!(
+    crate::out::outln!(
         "benchmarking for {} with {} writer(s), batches of {}, sealing at {}\n",
-        args.duration, args.writers, args.batch, args.segment_bytes
+        args.duration,
+        args.writers,
+        args.batch,
+        args.segment_bytes
     );
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -158,16 +161,16 @@ fn report(
     elapsed: f64,
     latencies: &[f64],
 ) {
-    println!("ingest");
-    println!("  records          {total:>12}");
-    println!("  rate             {:>12.0} /s", total as f64 / elapsed);
-    println!("  segments sealed  {:>12}", status.sealed_segments);
-    println!(
+    crate::out::outln!("ingest");
+    crate::out::outln!("  records          {total:>12}");
+    crate::out::outln!("  rate             {:>12.0} /s", total as f64 / elapsed);
+    crate::out::outln!("  segments sealed  {:>12}", status.sealed_segments);
+    crate::out::outln!(
         "  buffered         {:>12}  ({})",
         status.buffered_records,
         bytesize::ByteSize::b(status.buffered_bytes)
     );
-    println!(
+    crate::out::outln!(
         "  on disk          {:>12}  ({} per record)",
         bytesize::ByteSize::b(status.segment_bytes).to_string(),
         if status.segment_rows == 0 {
@@ -182,24 +185,24 @@ fn report(
 
     let mut samples = latencies.to_vec();
     if samples.is_empty() {
-        println!("\nno queries completed — try a longer --duration");
+        crate::out::outln!("\nno queries completed — try a longer --duration");
         return;
     }
     samples.sort_by(f64::total_cmp);
-    println!("\nquery, newest 100 for one app, while all of that was being written");
-    println!("  (writers run flat out with no pauses, which no real client does — treat");
-    println!("   these as the worst case, not the typical one)");
-    println!("  count            {:>12}", samples.len());
+    crate::out::outln!("\nquery, newest 100 for one app, while all of that was being written");
+    crate::out::outln!("  (writers run flat out with no pauses, which no real client does — treat");
+    crate::out::outln!("   these as the worst case, not the typical one)");
+    crate::out::outln!("  count            {:>12}", samples.len());
     for (label, value) in [
         ("p50", percentile(&samples, 50)),
         ("p95", percentile(&samples, 95)),
         ("p99", percentile(&samples, 99)),
         ("max", samples[samples.len() - 1]),
     ] {
-        println!("  {label}              {value:>12.1} ms");
+        crate::out::outln!("  {label}              {value:>12.1} ms");
     }
 
-    println!(
+    crate::out::outln!(
         "\nMemory is roughly 80 MB plus about 1.3x --segment-bytes; lower it if this \n\
          machine is tight, at the cost of more, smaller segments."
     );

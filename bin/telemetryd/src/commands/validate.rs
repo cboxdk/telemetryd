@@ -48,15 +48,15 @@ pub fn run(config_file: Option<&Path>, data_dir: Option<&Path>) -> anyhow::Resul
         .filter_map(|v| env_var_path(v))
         .collect();
 
-    println!("Configuration is valid.\n");
+    crate::out::outln!("Configuration is valid.\n");
 
     match &loaded.config_file {
-        Some(path) => println!("  config file  {}", path.display()),
-        None => println!("  config file  (none found — using defaults)"),
+        Some(path) => crate::out::outln!("  config file  {}", path.display()),
+        None => crate::out::outln!("  config file  (none found — using defaults)"),
     }
     let data_dir = loaded.config.storage.resolve_data_dir();
-    println!("  data dir     {}", data_dir.display());
-    println!(
+    crate::out::outln!("  data dir     {}", data_dir.display());
+    crate::out::outln!(
         "               {}",
         if data_dir.exists() {
             "exists"
@@ -64,7 +64,7 @@ pub fn run(config_file: Option<&Path>, data_dir: Option<&Path>) -> anyhow::Resul
             "will be created on first run"
         }
     );
-    println!();
+    crate::out::outln!();
 
     let width = resolved.keys().map(String::len).max().unwrap_or(0);
     for (path, value) in &resolved {
@@ -80,13 +80,13 @@ pub fn run(config_file: Option<&Path>, data_dir: Option<&Path>) -> anyhow::Resul
         } else {
             Origin::Default
         };
-        println!("  {path:<width$}  {value:<24}  ({})", origin.label());
+        crate::out::outln!("  {path:<width$}  {value:<24}  ({})", origin.label());
     }
 
     if !loaded.warnings.is_empty() {
-        println!("\nWarnings:");
+        crate::out::outln!("\nWarnings:");
         for warning in &loaded.warnings {
-            println!("  ! {warning}");
+            crate::out::outln!("  ! {warning}");
         }
     }
 
@@ -110,8 +110,8 @@ fn print_security_posture(config: &Config) {
         "token required"
     };
 
-    println!("\nSecurity:");
-    println!(
+    crate::out::outln!("\nSecurity:");
+    crate::out::outln!(
         "  listen       {} ({})",
         config.server.listen,
         if exposed {
@@ -120,17 +120,19 @@ fn print_security_posture(config: &Config) {
             "loopback only"
         }
     );
-    println!("  ingest       {ingest}");
-    println!("  query        {query}");
+    crate::out::outln!("  ingest       {ingest}");
+    crate::out::outln!("  query        {query}");
 
     if exposed && config.server.insecure {
-        println!(
+        crate::out::outln!(
             "\n  ! --insecure is set on a network-reachable address. Anyone who can reach\n  \
              ! {} can read and write your telemetry.",
             config.server.listen
         );
     } else if !exposed {
-        println!("\n  Loopback only: no token needed. Put a reverse proxy in front to expose it.");
+        crate::out::outln!(
+            "\n  Loopback only: no token needed. Put a reverse proxy in front to expose it."
+        );
     }
 }
 

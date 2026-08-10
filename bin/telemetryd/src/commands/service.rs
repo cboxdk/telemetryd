@@ -64,7 +64,7 @@ fn install() -> anyhow::Result<()> {
     }
 
     if path.exists() {
-        println!("replacing the existing unit at {}", path.display());
+        crate::out::outln!("replacing the existing unit at {}", path.display());
     }
 
     std::fs::write(&path, &unit).with_context(|| {
@@ -75,13 +75,13 @@ fn install() -> anyhow::Result<()> {
             manual_steps()
         )
     })?;
-    println!("wrote {}", path.display());
+    crate::out::outln!("wrote {}", path.display());
 
     enable(&path)?;
 
-    println!();
-    println!("telemetryd will start on boot and is starting now.");
-    println!("Check it with: telemetryd status");
+    crate::out::outln!();
+    crate::out::outln!("telemetryd will start on boot and is starting now.");
+    crate::out::outln!("Check it with: telemetryd status");
     Ok(())
 }
 
@@ -92,12 +92,12 @@ fn enable(path: &Path) -> anyhow::Result<()> {
         exec("launchctl", &["unload", &path.display().to_string()]).ok();
         exec("launchctl", &["load", "-w", &path.display().to_string()])
             .context("launchctl load failed")?;
-        println!("loaded the LaunchAgent");
+        crate::out::outln!("loaded the LaunchAgent");
     } else {
         exec("systemctl", &["daemon-reload"]).context("systemctl daemon-reload failed")?;
         exec("systemctl", &["enable", "--now", "telemetryd"])
             .context("systemctl enable --now telemetryd failed")?;
-        println!("enabled and started the systemd unit");
+        crate::out::outln!("enabled and started the systemd unit");
     }
     Ok(())
 }
@@ -112,9 +112,9 @@ fn uninstall() -> anyhow::Result<()> {
     }
 
     match std::fs::remove_file(&path) {
-        Ok(()) => println!("removed {}", path.display()),
+        Ok(()) => crate::out::outln!("removed {}", path.display()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!("no unit installed at {}", path.display());
+            crate::out::outln!("no unit installed at {}", path.display());
         }
         Err(e) => {
             bail!(
@@ -133,8 +133,10 @@ fn uninstall() -> anyhow::Result<()> {
     // The data directory is never touched. Removing a service should not delete the
     // telemetry it collected, and a flag that did would be one keystroke from a very
     // bad afternoon.
-    println!();
-    println!("The data directory was left alone. Remove it yourself if you want it gone.");
+    crate::out::outln!();
+    crate::out::outln!(
+        "The data directory was left alone. Remove it yourself if you want it gone."
+    );
     Ok(())
 }
 

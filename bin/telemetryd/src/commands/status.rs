@@ -63,7 +63,7 @@ pub fn run(args: &StatusArgs) -> anyhow::Result<()> {
     };
 
     if args.json {
-        println!("{body}");
+        crate::out::outln!("{body}");
         return Ok(());
     }
 
@@ -96,7 +96,7 @@ fn print_summary(status: &Value) {
             .unwrap_or(false)
     };
 
-    println!(
+    crate::out::outln!(
         "telemetryd {} ({}), up {}",
         text("/version"),
         text("/milestone"),
@@ -104,18 +104,18 @@ fn print_summary(status: &Value) {
             number("/uptime_seconds").max(0.0) as u64
         ))
     );
-    println!("  listen       {}", text("/listen"));
-    println!(
+    crate::out::outln!("  listen       {}", text("/listen"));
+    crate::out::outln!(
         "  auth         ingest: {}, query: {}",
         text("/auth/ingest"),
         text("/auth/query")
     );
-    println!("  data dir     {}", text("/storage/data_dir"));
+    crate::out::outln!("  data dir     {}", text("/storage/data_dir"));
 
     let used = number("/storage/disk_used_bytes") as u64;
     let budget = number("/storage/disk_budget_bytes") as u64;
     let ratio = number("/storage/disk_used_ratio") * 100.0;
-    println!(
+    crate::out::outln!(
         "  disk         {} of {} ({ratio:.1}%)",
         bytesize::ByteSize::b(used),
         bytesize::ByteSize::b(budget),
@@ -126,9 +126,9 @@ fn print_summary(status: &Value) {
         .or_else(|| status.pointer("/storage/wal"))
         .and_then(Value::as_object)
     {
-        println!("  wal");
+        crate::out::outln!("  wal");
         for (signal, stats) in wal {
-            println!(
+            crate::out::outln!(
                 "    {signal:<8}   {} records, {} segments",
                 stats
                     .get("appended_records")
@@ -165,9 +165,9 @@ fn print_summary(status: &Value) {
     }
 
     if !alerts.is_empty() {
-        println!("\nAttention:");
+        crate::out::outln!("\nAttention:");
         for alert in alerts {
-            println!("  ! {alert}");
+            crate::out::outln!("  ! {alert}");
         }
     }
 }

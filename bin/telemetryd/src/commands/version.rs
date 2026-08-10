@@ -1,12 +1,12 @@
 //! `telemetryd version`
 
 pub fn run() {
-    println!("telemetryd {}", telemetryd_core::VERSION);
-    println!(
+    crate::out::outln!("telemetryd {}", telemetryd_core::VERSION);
+    crate::out::outln!(
         "storage format v{}",
         telemetryd_core::STORAGE_FORMAT_VERSION
     );
-    println!("milestone {}", telemetryd_server::MILESTONE);
-    println!("target {}", env!("TELEMETRYD_TARGET"));
-    println!("compatibility {}", telemetryd_core::COMPATIBILITY_DOC);
+    crate::out::outln!("milestone {}", telemetryd_server::MILESTONE);
+    crate::out::outln!("target {}", env!("TELEMETRYD_TARGET"));
+    crate::out::outln!("compatibility {}", telemetryd_core::COMPATIBILITY_DOC);
 }

@@ -352,6 +352,7 @@ def main() -> int:
     check_damaged_segment(binary)
     check_oidc(binary)
     check_oidc_survives_a_missing_provider(binary)
+    check_pipes(binary)
     check_relay(binary)
     check_relay_fair_share(binary)
     check_relay_oversized_segments(binary)
@@ -1042,6 +1043,29 @@ def relay_metrics(claimed_app: str, token: str) -> int:
         }]}],
     }]}
     return with_token("/v1/metrics", token, payload)
+
+
+def check_pipes(binary: str) -> None:
+    """Every command has to survive its reader leaving.
+
+    `println!` panics on a closed pipe, and piping into `head` is an ordinary thing to
+    do — `telemetryd query … | head -20` used to answer with a panic and a backtrace.
+    The usual fix resets SIGPIPE, which needs `unsafe`, which this workspace forbids and
+    `forbid` cannot be locally overridden; so it is handled at every write instead, and
+    that is worth checking rather than trusting.
+    """
+    print("\n=== a closed pipe ===")
+    for name, argv in [
+        ("version", ["version"]),
+        ("validate", ["validate"]),
+    ]:
+        # Enough output to fill the pipe buffer after `head` has gone.
+        script = f"for i in $(seq 1 80); do {binary} {' '.join(argv)}; done | head -1"
+        result = subprocess.run(["sh", "-c", script], capture_output=True, text=True,
+                                timeout=180, check=False)
+        check(f"{name} stops rather than panicking",
+              "panicked" not in result.stderr and "Broken pipe" not in result.stderr,
+              result.stderr.strip().splitlines()[0] if result.stderr.strip() else "clean")
 
 
 def check_relay(binary: str) -> None:

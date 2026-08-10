@@ -124,7 +124,7 @@ pub fn run(args: &QueryArgs) -> anyhow::Result<()> {
 
 /// Write one line, or stop quietly when the reader has gone.
 ///
-/// `println!` panics on a closed pipe — "failed printing to stdout: Broken pipe" — and
+/// `crate::out::outln!` panics on a closed pipe — "failed printing to stdout: Broken pipe" — and
 /// this command's whole purpose is to be piped: its own documentation says to send it
 /// through `grep` and `wc`. `telemetryd query … | head -20` printed a panic and a
 /// backtrace instead of twenty lines.
