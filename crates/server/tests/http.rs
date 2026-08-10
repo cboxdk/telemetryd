@@ -148,6 +148,125 @@ async fn status_reports_the_shape_operators_and_the_cli_depend_on() {
     assert_eq!(json["retention"]["metrics"], "30days");
 }
 
+/// Every metric name is a contract with someone's dashboard.
+///
+/// The test above this one pins seven names by hand out of forty. The other
+/// thirty-three could be renamed or dropped and nothing would fail — the same gap
+/// `/status` had, on a surface where the consumer is an alert that will simply stop
+/// firing rather than error.
+///
+/// Deriving this list from `DESCRIPTORS` would prove only that the exporter matches its
+/// own declaration; removing a metric from both would still pass. So it is written out,
+/// and shortening it has to be a deliberate act.
+#[tokio::test]
+async fn the_exported_metric_names_cannot_change_by_accident() {
+    let harness = Harness::new(|_| {});
+    let (_, _, body) = harness.get("/metrics").await;
+
+    let mut exported: Vec<&str> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("# HELP "))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .collect();
+    exported.sort_unstable();
+    exported.dedup();
+
+    let expected = [
+        "telemetryd_app_bytes_estimate",
+        "telemetryd_app_rows",
+        "telemetryd_app_series",
+        "telemetryd_auth_failures_total",
+        "telemetryd_build_info",
+        "telemetryd_disk_budget_bytes",
+        "telemetryd_disk_used_bytes",
+        "telemetryd_http_requests_total",
+        "telemetryd_ingest_accepted_total",
+        "telemetryd_ingest_bodies_truncated_total",
+        "telemetryd_ingest_rejected_total",
+        "telemetryd_ingest_timestamps_rescaled_total",
+        "telemetryd_oidc_keys",
+        "telemetryd_query_segments_pruned_total",
+        "telemetryd_query_segments_scanned_total",
+        "telemetryd_records_appended_total",
+        "telemetryd_records_buffered",
+        "telemetryd_relay_failures_total",
+        "telemetryd_relay_identity_overridden_total",
+        "telemetryd_relay_pending_segments",
+        "telemetryd_relay_records_delivered_total",
+        "telemetryd_relay_segments_delivered_total",
+        "telemetryd_retention_deleted_total",
+        "telemetryd_segment_rows",
+        "telemetryd_segments",
+        "telemetryd_segments_sealed_total",
+        "telemetryd_segments_unreadable_total",
+        "telemetryd_series_active",
+        "telemetryd_series_limit",
+        "telemetryd_series_rejected_total",
+        "telemetryd_storage_over_budget",
+        "telemetryd_tail_connections_total",
+        "telemetryd_tail_disconnects_total",
+        "telemetryd_tail_dropped_total",
+        "telemetryd_tail_subscribers",
+        "telemetryd_uptime_seconds",
+        "telemetryd_wal_records_total",
+        "telemetryd_wal_segments",
+        "telemetryd_wal_truncations_total",
+        "telemetryd_wal_unsynced_records",
+    ];
+    assert_eq!(
+        exported, expected,
+        "the exported metric set changed. Adding one is a line here; removing or \
+         renaming one silently stops every alert and panel built on it."
+    );
+}
+
+/// `/status` is a contract, and it had none.
+///
+/// The query APIs are frozen in COMPATIBILITY.md and contract-tested against the
+/// client's own connector source. The *operational* surface — what dashboards, alerts
+/// and `telemetryd status` read — was asserted only field by field, so removing a field
+/// no test happened to mention passed silently. That is not hypothetical: `milestone`
+/// was removed in 0.25.0 and nothing failed, because the assertion that would have
+/// caught it was deleted in the same change as part of the removal.
+///
+/// Asserting the whole key set makes a removal deliberate. Adding one is a one-line
+/// edit here; taking one away is a decision someone has to write down.
+#[tokio::test]
+async fn the_status_key_set_cannot_change_by_accident() {
+    let harness = Harness::new(|_| {});
+    let (_, _, body) = harness.get("/status").await;
+    let json: Value = serde_json::from_str(&body).unwrap();
+
+    let mut keys: Vec<&str> = json
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+
+    // `relay` is absent unless relay mode is on, which is its own assertion elsewhere.
+    let expected = [
+        "apps",
+        "auth",
+        "insecure",
+        "limits",
+        "listen",
+        "retention",
+        "started_at",
+        "storage",
+        "storage_format_version",
+        "tls",
+        "uptime_seconds",
+        "version",
+    ];
+    assert_eq!(
+        keys, expected,
+        "the /status key set changed. If that was intended, update this list — and \
+         treat it as a breaking change for anything reading the field that went."
+    );
+}
+
 #[tokio::test]
 async fn status_never_contains_a_token_value() {
     let harness = Harness::new(|config| {

@@ -270,6 +270,13 @@ linearly — but the *data* grew sixteenfold too, so that is cost per byte scann
 per segment, and merging segments would not reduce a byte of it. Compaction would be
 work that buys nothing measurable.
 
+**The operational surface is pinned.** `/status`'s key set and every exported metric
+name are asserted as sets, not field by field. The query APIs were always frozen in
+COMPATIBILITY.md and contract-tested; the surface dashboards and alerts read was not, so
+removing a field no test happened to mention passed silently — which is exactly how
+`milestone` left in 0.25.0 without a single failure. Both assertions are
+mutation-verified: removing a field or a metric fails them, restoring it passes.
+
 **The text filter is sized from the trigrams a segment actually contains.** It used to
 be sized from row count times four, which the comment above it argued against in the
 same breath. Measured on real text, that was thirty times too large on repetitive logs
