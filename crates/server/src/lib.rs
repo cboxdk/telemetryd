@@ -17,6 +17,7 @@ pub mod relay;
 pub mod routes;
 pub mod state;
 pub mod tempo;
+pub mod tls;
 
 use std::sync::Arc;
 
@@ -33,6 +34,7 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 pub use state::AppState;
+pub use tls::Bound;
 
 /// The milestone this build implements, reported by `/status`. Keeping it in the
 /// binary means a user can always tell which slice of the contract they have — and
@@ -164,13 +166,31 @@ async fn record_request(State(state): State<AppState>, request: Request, next: N
 /// Bind the listener and serve until shutdown is signalled.
 pub async fn serve(config: Arc<Config>, store: Arc<Store>) -> Result<()> {
     let state = AppState::new(Arc::clone(&config), Arc::clone(&store))?;
-    let listener = tokio::net::TcpListener::bind(config.server.listen)
-        .await
-        .map_err(|e| telemetryd_core::Error::io(format!("binding {}", config.server.listen), e))?;
 
-    let local = listener.local_addr().unwrap_or(config.server.listen);
+    // Two listener types, one serving path. `Bound` exists so everything after this —
+    // the key fetch, the maintenance timers, the graceful drain — is identical whether
+    // or not we terminate TLS. A second copy of the shutdown logic is how one of them
+    // ends up subtly different.
+    let bound = if config.server.tls.is_enabled() {
+        let tls_config = tls::server_config(
+            config.server.tls.cert_file.trim(),
+            config.server.tls.key_file.trim(),
+        )?;
+        let listener = tls::TlsListener::bind(config.server.listen, tls_config).await?;
+        Bound::Tls(Box::new(listener))
+    } else {
+        let listener = tokio::net::TcpListener::bind(config.server.listen)
+            .await
+            .map_err(|e| {
+                telemetryd_core::Error::io(format!("binding {}", config.server.listen), e)
+            })?;
+        Bound::Plain(listener)
+    };
+
+    let local = bound.local_addr().unwrap_or(config.server.listen);
     tracing::info!(
         listen = %local,
+        scheme = if config.server.tls.is_enabled() { "https" } else { "http" },
         data_dir = %store.data_dir().root().display(),
         version = telemetryd_core::VERSION,
         milestone = MILESTONE,
@@ -234,7 +254,7 @@ pub async fn serve(config: Arc<Config>, store: Arc<Store>) -> Result<()> {
     // whole serve future in a timeout would have exited a healthy process after
     // `shutdown_grace` seconds of ordinary uptime.
     let (signalled, mut wait_for_signal) = tokio::sync::watch::channel(false);
-    let serving = axum::serve(listener, router(state)).with_graceful_shutdown(async move {
+    let serving = axum::serve(bound, router(state)).with_graceful_shutdown(async move {
         shutdown_signal().await;
         let _ = signalled.send(true);
     });

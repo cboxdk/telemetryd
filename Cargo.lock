@@ -1978,7 +1978,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2294,7 +2294,7 @@ checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
 
 [[package]]
 name = "telemetryd"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "bytesize",
@@ -2318,7 +2318,7 @@ dependencies = [
 
 [[package]]
 name = "telemetryd-core"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "bytesize",
  "directories",
@@ -2339,7 +2339,7 @@ dependencies = [
 
 [[package]]
 name = "telemetryd-ingest"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "bytesize",
  "flate2",
@@ -2355,7 +2355,7 @@ dependencies = [
 
 [[package]]
 name = "telemetryd-query"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "arrow",
  "proptest",
@@ -2369,7 +2369,7 @@ dependencies = [
 
 [[package]]
 name = "telemetryd-server"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "axum",
  "bytesize",
@@ -2378,6 +2378,7 @@ dependencies = [
  "http-body-util",
  "humantime",
  "jsonwebtoken",
+ "rustls",
  "serde",
  "serde_json",
  "snap",
@@ -2388,6 +2389,7 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tower",
  "tower-http",
@@ -2398,7 +2400,7 @@ dependencies = [
 
 [[package]]
 name = "telemetryd-store"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "arrow",
  "bytesize",
@@ -2550,6 +2552,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
+]
+
+[[package]]
+name = "tokio-rustls"
+version = "0.26.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
+dependencies = [
+ "rustls",
+ "tokio",
 ]
 
 [[package]]

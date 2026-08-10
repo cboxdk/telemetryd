@@ -41,6 +41,29 @@ pub struct Config {
     pub tls: TlsConfig,
 }
 
+/// Terminating TLS ourselves, for deployments with nowhere to put a proxy.
+///
+/// Unset means plain HTTP, which stays the default: anything at a public edge usually
+/// has an ingress already, and two TLS implementations in one path is a second place
+/// for policy to be wrong. Set it where there is no proxy and the traffic still
+/// deserves encrypting — an internal relay, a container talking to a container.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct ServerTlsConfig {
+    /// PEM certificate chain, leaf first.
+    pub cert_file: String,
+    /// PEM private key, unencrypted — telemetryd cannot prompt at startup.
+    pub key_file: String,
+}
+
+impl ServerTlsConfig {
+    /// Whether TLS termination is switched on.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        !self.cert_file.trim().is_empty() || !self.key_file.trim().is_empty()
+    }
+}
+
 /// Trust for outbound connections — the OIDC key fetch, relay shipping, transfer.
 ///
 /// Inbound TLS is still terminated by a reverse proxy (ADR-004); this is only about
@@ -109,6 +132,9 @@ pub struct ServerConfig {
     pub listen: SocketAddr,
     /// Permit a non-loopback bind with no token configured. See ADR-004.
     pub insecure: bool,
+    /// Terminate TLS here rather than at a proxy. Unset = plain HTTP.
+    #[serde(default)]
+    pub tls: ServerTlsConfig,
     pub max_body_bytes: ByteSize,
     #[serde(with = "humantime_serde")]
     pub request_timeout: Duration,
@@ -121,6 +147,7 @@ impl Default for ServerConfig {
         Self {
             listen: SocketAddr::from(([127, 0, 0, 1], 4319)),
             insecure: false,
+            tls: ServerTlsConfig::default(),
             max_body_bytes: ByteSize::mib(16),
             request_timeout: Duration::from_secs(30),
             shutdown_grace: Duration::from_secs(15),
@@ -762,6 +789,8 @@ const ENV_KEYS: &[(&str, &str)] = &[
         "relay.max_request_bytes",
     ),
     ("TELEMETRYD_RELAY_MAX_QUEUE_SHARE", "relay.max_queue_share"),
+    ("TELEMETRYD_SERVER_TLS_CERT_FILE", "server.tls.cert_file"),
+    ("TELEMETRYD_SERVER_TLS_KEY_FILE", "server.tls.key_file"),
     ("TELEMETRYD_TLS_CA_FILE", "tls.ca_file"),
     ("TELEMETRYD_LOG_LEVEL", "log.level"),
     ("TELEMETRYD_LOG_FORMAT", "log.format"),
@@ -925,6 +954,18 @@ impl Config {
     /// Cross-field rules. Run at load time rather than at first use, so a bad
     /// configuration fails at startup instead of at 3am on the first query.
     pub fn validate(&self) -> Result<()> {
+        // Half a TLS configuration is always a mistake, and the failure it causes
+        // otherwise is a server that quietly keeps speaking plain HTTP.
+        let tls = &self.server.tls;
+        if tls.is_enabled() && (tls.cert_file.trim().is_empty() || tls.key_file.trim().is_empty()) {
+            return Err(Error::Config(
+                "server.tls needs both cert_file and key_file. One without the other \
+                 would leave telemetryd serving plain HTTP while looking configured \
+                 for TLS."
+                    .to_owned(),
+            ));
+        }
+
         // ADR-004: fail closed on an exposed bind.
         let exposed = !self.server.listen.ip().is_loopback();
         let unauthenticated = self.auth.ingest_token.is_empty() && self.auth.query_token.is_empty();

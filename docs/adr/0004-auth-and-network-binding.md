@@ -147,7 +147,7 @@ suite now runs both across a genuine handshake against a private CA, and the OID
 asserts that removing the CA bundle *breaks* it — without that, a passing test would be
 equally consistent with trust never being applied.
 
-## Re-examined: still no inbound TLS, for a better reason than before
+## Re-examined, then reversed: telemetryd can terminate TLS
 
 **Date:** 2026-08-10, the same day as the amendment above.
 
@@ -162,12 +162,36 @@ certificate and key from disk, which is a small amount of code over the `rustls`
 compiled in for outbound, with no lifecycle to own — the operator's certbot or cloud
 renews, and configuration reload already exists.
 
-**Kept anyway, on different grounds.** Every deployment that is genuinely
-internet-facing already has something in front of it: an ingress, a load balancer, a
-proxy holding certificates for several services. Terminating TLS in telemetryd as well
-duplicates that, and buys a second place where cipher policy, protocol versions and key
-material have to be right — inside the process that holds all the telemetry. The
-binary stays one thing.
+**Kept at first, on different grounds:** every deployment that is genuinely
+internet-facing already has something in front of it — an ingress, a load balancer, a
+proxy holding certificates for several services — and terminating TLS here as well buys
+a second place where cipher policy, protocol versions and key material have to be right.
+
+**That reasoning is sound for a public edge and does not hold internally**, which is
+where the decision was reversed the same day. A relay on a private network, or a
+container talking to a container, frequently has no proxy and is not going to get one;
+"there is already an ingress" is then simply false, and the traffic still carries bearer
+tokens and every log line in clear. Internal is not a synonym for trusted.
+
+So `server.tls.cert_file` and `key_file` terminate TLS when set, and plain HTTP stays
+the default. It costs one dependency — `tokio-rustls` over the `rustls` already compiled
+in for outbound, with `default-features = false` so rustls' default `aws-lc-rs` provider
+does not drag a second cryptographic implementation into a binary that already has
+`ring`.
+
+**Bring a certificate; generating one is not the same thing.** A self-signed certificate
+the clients do not trust gives encryption without authentication — it stops passive
+capture, not an active attacker, which is the threat that motivates encrypting an
+internal network at all. The realistic outcome is `insecure_skip_verify` on every SDK,
+which looks secure and is not. So the supported configuration is a certificate from an
+authority the clients already trust, which pairs with `tls.ca_file` on the outbound
+side: one authority, both ends.
+
+The handshake does not run in the accept loop. `axum::serve::Listener::accept` returns a
+ready connection and cannot fail, so the obvious implementation handshakes inline — and
+one client that connects and then says nothing would stall every other client, before
+any request exists for a timeout layer to bound. Handshakes run in their own tasks with
+their own deadline.
 
 The corollary is that this is **practice, not prohibition**. Plain HTTP is genuinely
 fine on a laptop, on a private network, and between containers on one network; it is

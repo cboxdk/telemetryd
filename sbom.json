@@ -1,15 +1,15 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
-  "serialNumber": "urn:uuid:2bce0338-1c36-5411-b000-53e2f6f982c2",
+  "serialNumber": "urn:uuid:e7b42dc5-12bb-5c24-91c4-f0ae358b11bf",
   "version": 1,
   "metadata": {
     "component": {
       "type": "application",
-      "bom-ref": "pkg:cargo/telemetryd@0.22.1",
+      "bom-ref": "pkg:cargo/telemetryd@0.23.0",
       "name": "telemetryd",
-      "version": "0.22.1",
-      "purl": "pkg:cargo/telemetryd@0.22.1",
+      "version": "0.23.0",
+      "purl": "pkg:cargo/telemetryd@0.23.0",
       "description": "Single-binary, zero-config observability backend",
       "licenses": [
         {
@@ -5246,6 +5246,32 @@
         {
           "type": "vcs",
           "url": "https://github.com/tokio-rs/tokio"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/tokio-rustls@0.26.4",
+      "name": "tokio-rustls",
+      "version": "0.26.4",
+      "purl": "pkg:cargo/tokio-rustls@0.26.4",
+      "description": "Asynchronous TLS/SSL streams for Tokio using Rustls.",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        },
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rustls/tokio-rustls"
         }
       ]
     },

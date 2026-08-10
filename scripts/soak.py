@@ -356,6 +356,7 @@ def main() -> int:
     check_outbound_tls(binary)
     check_oidc_over_tls(binary)
     check_relay_over_tls(binary)
+    check_serving_tls(binary)
     check_pipes(binary)
     check_relay(binary)
     check_relay_fair_share(binary)
@@ -682,13 +683,22 @@ def tls_material() -> dict:
     def run(*args: str) -> None:
         subprocess.run(args, check=True, capture_output=True)
 
+    # The CA extensions are not decoration. Without basicConstraints and keyUsage a
+    # modern verifier refuses the chain — rustls happened to accept it, Python did not,
+    # and the difference is exactly the sort of thing that makes a test pass against one
+    # client and mislead about every other.
     run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-        "-keyout", ca_key, "-out", ca_pem, "-subj", "/CN=telemetryd soak CA")
+        "-keyout", ca_key, "-out", ca_pem, "-subj", "/CN=telemetryd soak CA",
+        "-addext", "basicConstraints=critical,CA:TRUE",
+        "-addext", "keyUsage=critical,keyCertSign,cRLSign")
     run("openssl", "req", "-newkey", "rsa:2048", "-nodes",
         "-keyout", key, "-out", csr, "-subj", "/CN=localhost")
     # A SAN is not optional: rustls rejects a certificate matched only on common name.
     with open(ext, "w", encoding="utf-8") as handle:
         handle.write("subjectAltName=DNS:localhost,IP:127.0.0.1\n")
+        handle.write("basicConstraints=critical,CA:FALSE\n")
+        handle.write("keyUsage=critical,digitalSignature,keyEncipherment\n")
+        handle.write("extendedKeyUsage=serverAuth\n")
     run("openssl", "x509", "-req", "-in", csr, "-CA", ca_pem, "-CAkey", ca_key,
         "-CAcreateserial", "-out", cert, "-days", "1", "-extfile", ext)
 
@@ -1287,6 +1297,83 @@ def check_relay_over_tls(binary: str) -> None:
             for attribute in resource.get("resource", {}).get("attributes", [])
         )
         check("what arrives upstream carries the credential's identity", stamped)
+    finally:
+        stop(proc)
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def check_serving_tls(binary: str) -> None:
+    """telemetryd terminating TLS itself, verified by a client that checks the chain.
+
+    The point is not that bytes are encrypted — a self-signed certificate nobody
+    verifies would achieve that and be worth much less. The point is that a client
+    which validates against the issuing CA connects, and one without it does not. That
+    second half is what makes this authentication rather than obfuscation, so it is
+    asserted rather than assumed.
+    """
+    print("\n=== serving TLS ===")
+    material = tls_material()
+    data_dir = tempfile.mkdtemp(prefix="telemetryd-soak-servetls-")
+    config = os.path.join(data_dir, "telemetryd.toml")
+    with open(config, "w", encoding="utf-8") as handle:
+        handle.write(
+            "[auth]\nadmin_token = [\"static-admin\"]\ningest_token = [\"ingest\"]\n"
+            f"[server.tls]\ncert_file = \"{material['cert']}\"\n"
+            f"key_file = \"{material['key']}\"\n"
+        )
+
+    proc = subprocess.Popen(
+        [binary, "serve", "--config", config, "--listen", f"127.0.0.1:{PORT}",
+         "--data-dir", data_dir],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ},
+    )
+    base = f"https://localhost:{PORT}"
+    try:
+        trusting = ssl.create_default_context(cafile=material["ca"])
+
+        def get(path: str, context: ssl.SSLContext) -> int:
+            request = urllib.request.Request(base + path)
+            with urllib.request.urlopen(request, timeout=10, context=context) as response:
+                return response.status
+
+        ready = False
+        for _ in range(240):
+            try:
+                if get("/healthz", trusting) == 200:
+                    ready = True
+                    break
+            except Exception:  # noqa: BLE001 — any failure here means "not up yet"
+                pass
+            time.sleep(0.25)
+        check("a client that trusts the CA gets a TLS connection", ready)
+
+        payload = json.dumps({"resourceLogs": [{"resource": {"attributes": [
+            {"key": "service.name", "value": {"stringValue": "soak"}}]},
+            "scopeLogs": [{"logRecords": [{
+                "timeUnixNano": str(NOW), "body": {"stringValue": "https"}}]}]}]}).encode()
+        request = urllib.request.Request(
+            base + "/v1/logs", data=payload,
+            headers={"content-type": "application/json", "authorization": "Bearer ingest"})
+        with urllib.request.urlopen(request, timeout=10, context=trusting) as response:
+            check("telemetry is accepted over https", response.status == 200)
+
+        # The half that makes it authentication: a client with the system trust store
+        # has never heard of this CA and must refuse.
+        refused = False
+        try:
+            get("/healthz", ssl.create_default_context())
+        except Exception:  # noqa: BLE001 — a verification failure is the pass condition
+            refused = True
+        check("a client that does not trust the CA is refused", refused)
+
+        # And the port no longer speaks plain HTTP, which is the mistake someone makes
+        # once after turning this on.
+        plaintext_failed = False
+        try:
+            urllib.request.urlopen(f"http://localhost:{PORT}/healthz", timeout=5)
+        except Exception:  # noqa: BLE001
+            plaintext_failed = True
+        check("plain HTTP to the TLS port does not work", plaintext_failed)
     finally:
         stop(proc)
         shutil.rmtree(data_dir, ignore_errors=True)

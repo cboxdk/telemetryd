@@ -57,6 +57,11 @@ scope_admin      = "telemetry:admin"
 refresh_interval = "1h"              # how often the key set is refetched
 clock_skew       = "1m"              # allowance on exp/nbf
 
+[server.tls]
+# Terminate TLS here rather than at a proxy. Unset = plain HTTP.
+cert_file = ""                       # PEM chain, leaf first
+key_file  = ""                       # PEM key, unencrypted
+
 [tls]
 # Trust for connections telemetryd *makes* — the OIDC key fetch, relay shipping,
 # transfer. Inbound TLS is still a reverse proxy's job (ADR-004).
@@ -127,6 +132,37 @@ before enabling it, and check with the tokens you expect people to hold.
 
 Static tokens are checked first and in constant time, so turning this on costs a purely
 static deployment nothing.
+
+## Serving HTTPS
+
+Unset, telemetryd speaks plain HTTP and something in front holds the certificate. That
+is still the right shape at a public edge, where an ingress already terminates TLS for
+several services. It is the wrong shape on an internal network with no proxy and nobody
+about to add one — and bearer tokens and log lines in clear are no better internally
+than externally.
+
+```toml
+[server.tls]
+cert_file = "/etc/telemetryd/tls/server.pem"   # chain, leaf first
+key_file  = "/etc/telemetryd/tls/server.key"   # unencrypted
+```
+
+Both or neither: half a TLS configuration would leave telemetryd serving plain HTTP
+while looking configured for it, so it is refused at startup. The key must be
+unencrypted, because there is nobody to prompt for a passphrase when a service manager
+starts the process.
+
+**Bring a certificate rather than generating one.** A self-signed certificate the
+clients do not trust gives you encryption without authentication: it stops passive
+capture and not an active attacker, which is the threat that motivates encrypting an
+internal network in the first place. In practice it ends with `insecure_skip_verify` on
+every SDK, which looks secure and is not. Issue from your internal CA — and point the
+clients at it. telemetryd's own outbound side does exactly that with
+[`tls.ca_file`](#trusting-a-private-ca), so a relay and its upstream can share one
+authority.
+
+Renewal is the issuer's job, not telemetryd's. Replace the files and restart; the
+certificate is read at startup.
 
 ## Trusting a private CA
 

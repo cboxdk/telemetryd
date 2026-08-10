@@ -155,12 +155,12 @@ guide](docs/cookbook/single-sign-on.md).
 
 **Deliberately out of scope in v1**, and stated rather than silently absent:
 
-- **Inbound TLS.** Terminate it at a reverse proxy — which anything internet-facing
-  already has, and duplicating it inside the process that holds all your telemetry buys
-  a second place for cipher and protocol policy to be wrong. Plain HTTP is fine on a
-  laptop, on a private network, and between containers; on a public address the bearer
-  token and every log line are readable in transit, so put a proxy in front. Re-examined
-  and kept deliberately (ADR-004). *Outbound* TLS is built and verified.
+- **Automatic certificate issuance.** telemetryd *can* terminate TLS — set
+  `server.tls.cert_file` and `key_file` — but it does not obtain or renew certificates.
+  Bring one from your CA, from certbot, or from whatever issues them where you run. A
+  proxy in front remains a fine answer at a public edge, where one usually exists
+  already; the built-in path is for internal deployments that have nowhere to put one
+  (ADR-004).
 - **Per-app tokens.** The `app` label is a namespace, not a security boundary.
 - **mTLS, user accounts.** Out of frame for a single-team tool.
 
