@@ -30,12 +30,34 @@ const READ_INDIRECTLY: &[(&str, &str)] = &[
     ("log", "the LogConfig struct is passed to logging::init"),
 ];
 
+/// Every source file of the configuration module, concatenated.
+///
+/// Reads the directory rather than one file: the schema lives in `schema.rs`, the
+/// environment table in `env.rs`, and loading in `mod.rs`. Naming them individually
+/// would mean a future split silently narrows what this test covers — which is the
+/// opposite of what a completeness test is for.
 fn config_source() -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../crates/core/src/config.rs")
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/core/src/config")
         .canonicalize()
-        .expect("config.rs should exist");
-    std::fs::read_to_string(path).expect("config.rs should be readable")
+        .expect("the config module directory should exist");
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+        .expect("the config module should be readable")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    assert!(
+        entries.len() >= 2,
+        "expected the configuration to be split across several files, found {}",
+        entries.len()
+    );
+    entries.sort();
+    entries
+        .into_iter()
+        .map(|path| std::fs::read_to_string(&path).expect("a config source should be readable"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Public fields of every `*Config` struct.
