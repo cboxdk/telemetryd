@@ -146,3 +146,33 @@ plain-HTTP loopback, which is allowed deliberately and is why none of them notic
 suite now runs both across a genuine handshake against a private CA, and the OIDC case
 asserts that removing the CA bundle *breaks* it — without that, a passing test would be
 equally consistent with trust never being applied.
+
+## Re-examined: still no inbound TLS, for a better reason than before
+
+**Date:** 2026-08-10, the same day as the amendment above.
+
+Having found that "no TLS" had quietly grown wrong for outbound traffic, the obvious
+next question was whether it was wrong for inbound too — the more so because the
+container shipped that day made an unencrypted public port the easiest thing to reach
+for, and said nothing about it.
+
+The original argument does not survive contact. "Shipping TLS means shipping
+certificate lifecycle management" is true of automatic issuance and false of reading a
+certificate and key from disk, which is a small amount of code over the `rustls` already
+compiled in for outbound, with no lifecycle to own — the operator's certbot or cloud
+renews, and configuration reload already exists.
+
+**Kept anyway, on different grounds.** Every deployment that is genuinely
+internet-facing already has something in front of it: an ingress, a load balancer, a
+proxy holding certificates for several services. Terminating TLS in telemetryd as well
+duplicates that, and buys a second place where cipher policy, protocol versions and key
+material have to be right — inside the process that holds all the telemetry. The
+binary stays one thing.
+
+The corollary is that this is **practice, not prohibition**. Plain HTTP is genuinely
+fine on a laptop, on a private network, and between containers on one network; it is
+poor practice on a public address, where the bearer token and every log line are
+readable in transit. That is the operator's call to make with the facts, so it is
+documented at each place someone might publish a port — and it is deliberately *not* a
+startup warning. A warning that fires on every correct containerised deployment is
+noise, and noise is how real warnings get ignored.

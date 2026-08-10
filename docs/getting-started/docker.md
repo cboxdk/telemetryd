@@ -45,6 +45,39 @@ Delete that file to get new ones.
 `TELEMETRYD_AUTH_*_TOKEN`, mounting a config file, or setting
 `TELEMETRYD_SERVER_INSECURE` skips the generation entirely.
 
+## The port is plaintext
+
+telemetryd terminates no TLS of its own ([ADR-004](../adr/0004-auth-and-network-binding.md)),
+and this image changes nothing about that — it binds `0.0.0.0:4319` speaking plain HTTP.
+
+That is fine in plenty of places and it is worth knowing which. On a laptop, on a
+private network, or between containers on the same Docker network, plain HTTP costs you
+nothing. What crosses the wire is different once the port is published to a public
+address: the generated token above is a bearer credential, and on an unencrypted
+connection it is readable by anything on the path — along with every log line and trace
+you send. Someone who reads it can write telemetry as you, and read yours.
+
+So it is a matter of practice rather than a hard stop: **terminate TLS in front when the
+port is reachable from the internet.** The `docker run` at the top of this page is the
+convenient thing, not the hardened thing, and it does not stop you doing either.
+
+Let a proxy hold the certificate:
+
+```yaml
+services:
+  telemetryd:
+    image: ghcr.io/cboxdk/telemetryd:latest
+    expose: ["4319"]          # reachable from the proxy, not from the host
+  caddy:
+    image: caddy:2
+    ports: ["443:443"]
+    # Caddyfile: telemetry.example.com { reverse_proxy telemetryd:4319 }
+```
+
+The relay cookbook puts it more strongly, and should: a relay taking mobile traffic is
+internet-facing by definition, so there it is not a matter of taste — see
+[relay mode](../cookbook/relay-mode.md).
+
 ## Configuring it
 
 Every configuration key is available as an environment variable, named

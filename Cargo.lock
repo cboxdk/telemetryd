@@ -2294,7 +2294,7 @@ checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
 
 [[package]]
 name = "telemetryd"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "anyhow",
  "bytesize",
@@ -2318,7 +2318,7 @@ dependencies = [
 
 [[package]]
 name = "telemetryd-core"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "bytesize",
  "directories",
@@ -2339,7 +2339,7 @@ dependencies = [
 
 [[package]]
 name = "telemetryd-ingest"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "bytesize",
  "flate2",
@@ -2355,7 +2355,7 @@ dependencies = [
 
 [[package]]
 name = "telemetryd-query"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "arrow",
  "proptest",
@@ -2369,7 +2369,7 @@ dependencies = [
 
 [[package]]
 name = "telemetryd-server"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "axum",
  "bytesize",
@@ -2398,7 +2398,7 @@ dependencies = [
 
 [[package]]
 name = "telemetryd-store"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "arrow",
  "bytesize",

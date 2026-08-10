@@ -14,7 +14,10 @@ services:
     image: ghcr.io/cboxdk/telemetryd:latest
     restart: unless-stopped
     ports:
-      - "4319:4319"
+      # Loopback, because this file is for local development. telemetryd speaks plain
+      # HTTP; on a laptop that costs nothing. Change this to "4319:4319" and put a
+      # TLS-terminating proxy in front if the port needs to be reachable from elsewhere.
+      - "127.0.0.1:4319:4319"
     volumes:
       - telemetryd-data:/var/lib/telemetryd
     environment:
