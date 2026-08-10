@@ -6,10 +6,10 @@
   "metadata": {
     "component": {
       "type": "application",
-      "bom-ref": "pkg:cargo/telemetryd@0.20.7",
+      "bom-ref": "pkg:cargo/telemetryd@0.20.8",
       "name": "telemetryd",
-      "version": "0.20.7",
-      "purl": "pkg:cargo/telemetryd@0.20.7",
+      "version": "0.20.8",
+      "purl": "pkg:cargo/telemetryd@0.20.8",
       "description": "Single-binary, zero-config observability backend",
       "licenses": [
         {
