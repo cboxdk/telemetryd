@@ -100,7 +100,13 @@ pub fn run(args: &QueryArgs) -> anyhow::Result<()> {
     // than as an error without one. The body is the useful part: an unsupported LogQL
     // construct names itself there, and inventing a vaguer message on top of it helps
     // nobody.
-    let body = match request.config().http_status_as_error(false).build().call() {
+    let body = match request
+        .config()
+        .tls_config(telemetryd_core::http::tls())
+        .http_status_as_error(false)
+        .build()
+        .call()
+    {
         Ok(mut response) => {
             let status = response.status().as_u16();
             let body = response.body_mut().read_to_string()?;

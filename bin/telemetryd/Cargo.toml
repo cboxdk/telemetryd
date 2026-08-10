@@ -9,6 +9,9 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 
+[features]
+platform-verifier = ["telemetryd-core/platform-verifier"]
+
 [lints]
 workspace = true
 

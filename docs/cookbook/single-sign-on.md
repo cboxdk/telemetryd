@@ -1,19 +1,20 @@
 ---
 title: "Single sign-on with Cbox ID"
 weight: 80
-description: "Accept Cbox ID access tokens, and why the identity provider going down does not take telemetryd with it."
+description: "Accept Cbox ID access tokens — or any other OIDC provider's — and why the identity provider going down does not take telemetryd with it."
 ---
 
 # Single sign-on with Cbox ID
 
 ```toml
 [auth.oidc]
-issuer = "https://id.example.com"
+issuer = "https://acme.cboxid.com"
 ```
 
 That is the whole configuration. telemetryd reads the signing keys from
-`https://id.example.com/.well-known/jwks.json`, caches them, and validates every
-presented token itself.
+`https://acme.cboxid.com/.well-known/jwks.json`, caches them, and validates every
+presented token itself. Hosted Cbox ID environments are one subdomain of `cboxid.com`
+per tenant; if you run Cbox ID yourself, use your own host.
 
 ## Getting a token
 
@@ -38,7 +39,7 @@ Rename them if they collide with something else on a shared issuer:
 
 ```toml
 [auth.oidc]
-issuer = "https://id.example.com"
+issuer = "https://acme.cboxid.com"
 scope_read = "acme:telemetry:read"
 ```
 
@@ -92,13 +93,58 @@ Set the audience, and Cbox ID will mint tokens bound to it:
 
 ```toml
 [auth.oidc]
-issuer = "https://id.example.com"
+issuer = "https://acme.cboxid.com"
 audience = "https://telemetry.example.com"
 ```
 
 Without it, telemetryd accepts the issuer's own value — which is what Cbox ID puts in
 `aud` when no resource was requested. With it, a token minted for another service on
 the same issuer cannot be replayed here.
+
+## Another provider than Cbox ID
+
+Nothing here is specific to Cbox ID — telemetryd validates a standards-shaped access
+token, so any OIDC provider that mints one will work. Two things are *not* universal,
+so they are settings rather than assumptions.
+
+**Where the keys live.** The default derives `{issuer}/.well-known/jwks.json`, which is
+a convention, not a rule. A provider's discovery document names the real location in its
+`jwks_uri`, and if it differs, say so:
+
+```bash
+curl -s https://<issuer>/.well-known/openid-configuration | jq -r .jwks_uri
+```
+
+```toml
+[auth.oidc]
+issuer   = "https://accounts.google.com"
+jwks_url = "https://www.googleapis.com/oauth2/v3/certs"   # nowhere near the issuer
+```
+
+**Which claim carries the scopes.** OAuth specifies `scope`, a space-separated string.
+Some providers use `scp` instead, and some send an array rather than a string —
+telemetryd accepts either shape, but it has to be told the name:
+
+```toml
+scope_claim = "scp"
+```
+
+Both are `https`-only for the same reason the issuer is: whoever answers that request
+decides which keys mint valid admin tokens. Loopback is exempt, for testing.
+
+### What "works" does and does not mean
+
+A provider working means telemetryd can verify its signatures and trust its issuer. It
+does **not** mean the provider can express *these* scopes. Google is the useful example:
+the key set above fetches fine, but a Google ID token carries no scope claim at all, so
+there is nothing to map `telemetry:read` onto. You would be authenticating a user and
+then granting them nothing.
+
+So the question to ask of a provider is not "can telemetryd read its keys" but "can I
+mint a token that carries a claim naming the access I want". A provider with
+configurable scopes or custom claims — Cbox ID, Entra, Auth0, Keycloak — can. A
+consumer sign-in provider generally cannot, and for those, static tokens remain the
+straightforward answer.
 
 ## What happens when Cbox ID is down
 
@@ -127,7 +173,7 @@ curl -sS -H "Authorization: Bearer $ADMIN_TOKEN" localhost:4319/status | jq .aut
 ```
 
 ```json
-{ "issuer": "https://id.example.com", "keys": 2, "keys_stale": false }
+{ "issuer": "https://acme.cboxid.com", "keys": 2, "keys_stale": false }
 ```
 
 **`keys: 0` is the thing to alert on.** It means every Cbox ID token is being refused

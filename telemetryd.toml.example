@@ -38,9 +38,16 @@ query_token  = []                    # Loki/Tempo/Prometheus reads, /status, /me
 # about a token, so an identity provider that is down does not stop you reading your
 # logs. Unset means static tokens only.
 # [auth.oidc]
-# issuer = "https://id.example.com"
+# issuer = "https://acme.cboxid.com"
 # audience = "https://telemetry.example.com"   # when several services share an issuer
 # scope_read = "telemetry:read"
+#
+# Any OIDC provider works, not only Cbox ID — but two things are not universal, so
+# they are settings rather than assumptions:
+# jwks_url    = ""        # "" derives {issuer}/.well-known/jwks.json; set it when the
+#                         # provider publishes elsewhere (its discovery document's
+#                         # `jwks_uri` says where)
+# scope_claim = "scope"   # the claim carrying granted scopes; some providers use "scp"
 
 # Stand in front of a central instance and decide who each client is from its
 # credential rather than from its payload. For mobile fleets, where the credential

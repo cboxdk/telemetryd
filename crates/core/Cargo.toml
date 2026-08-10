@@ -7,6 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Verify against the host's trust store instead of the roots compiled into the binary.
+# For deployments behind an internal CA; see crates/core/src/http.rs for why it is not
+# the default.
+platform-verifier = ["ureq/platform-verifier"]
+
 [lints]
 workspace = true
 
@@ -23,6 +29,7 @@ tracing.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 regex.workspace = true
+ureq.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

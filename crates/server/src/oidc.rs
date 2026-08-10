@@ -62,9 +62,6 @@ struct KeySet {
 /// Claims telemetryd reads. Everything else the token carries is ignored.
 #[derive(Debug, Deserialize)]
 struct Claims {
-    /// Space-separated, as OAuth specifies and Cbox ID emits.
-    #[serde(default)]
-    scope: String,
     #[serde(default)]
     sub: String,
     /// The application the token was issued to (RFC 9068). Cbox ID sets it on every
@@ -76,6 +73,26 @@ struct Claims {
     /// key, and a bearer alone is not supposed to be enough.
     #[serde(default)]
     cnf: Option<serde_json::Value>,
+    /// Everything else, so the scope claim can be named in configuration.
+    ///
+    /// `scope` is what OAuth specifies; Entra uses `scp`, and a provider may emit
+    /// either a space-separated string or an array. Reading it by name keeps all of
+    /// that out of the type.
+    #[serde(flatten)]
+    other: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl Claims {
+    /// The granted scopes, however this provider chose to say them.
+    fn scopes(&self, claim: &str) -> Vec<&str> {
+        match self.other.get(claim) {
+            Some(serde_json::Value::String(text)) => text.split(' ').collect(),
+            Some(serde_json::Value::Array(items)) => {
+                items.iter().filter_map(serde_json::Value::as_str).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
 }
 
 pub struct Oidc {
@@ -206,7 +223,12 @@ impl Oidc {
             return Err(Rejected::SenderConstrained);
         }
 
-        if data.claims.scope.split(' ').any(|scope| scope == wanted) {
+        if data
+            .claims
+            .scopes(&self.config.scope_claim)
+            .iter()
+            .any(|scope| scope == wanted)
+        {
             Ok(Authorized {
                 subject: data.claims.sub,
                 client_id: data.claims.client_id,
@@ -271,6 +293,21 @@ impl Oidc {
     }
 }
 
+/// Say where we looked and why, because the default is a guess about the provider.
+///
+/// The path is derived from the issuer unless `auth.oidc.jwks_url` is set, and not every
+/// provider puts it there — Google publishes at `https://www.googleapis.com/oauth2/v3/certs`,
+/// nowhere near its issuer. Without this the operator sees a fetch failure against a URL
+/// they never typed and no hint that it was ours to choose.
+fn unreachable_keys(url: &str, detail: &str) -> String {
+    format!(
+        "could not fetch the signing keys from {url}: {detail}\n\
+         That URL is derived from auth.oidc.issuer. If your provider publishes its key \
+         set elsewhere — its discovery document's `jwks_uri` says where — set \
+         auth.oidc.jwks_url to it."
+    )
+}
+
 /// Fetch the key set, with a bound on how long it may take and how much it may be.
 ///
 /// Every one of ureq's timeouts defaults to `None`, so without this an issuer that
@@ -287,11 +324,12 @@ fn fetch(url: &str) -> Result<String, String> {
 
     let mut response = ureq::get(url)
         .config()
+        .tls_config(telemetryd_core::http::tls())
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_global(Some(TOTAL_TIMEOUT))
         .build()
         .call()
-        .map_err(|e| format!("fetching {url}: {e}"))?;
+        .map_err(|e| unreachable_keys(url, &e.to_string()))?;
     response
         .body_mut()
         .with_config()
@@ -898,5 +936,36 @@ mod tests {
             started.elapsed() < Duration::from_millis(250),
             "the cooldown did not suppress the refresh"
         );
+    }
+
+    /// OAuth specifies `scope` as a space-separated string, and providers disagree:
+    /// some send an array instead. Reading only one shape means the other silently
+    /// grants nothing, which looks exactly like a permissions problem at the issuer.
+    #[test]
+    fn scopes_are_read_as_either_a_string_or_an_array() {
+        let from = |json: &str| -> Claims { serde_json::from_str(json).expect("parses") };
+
+        let text = from(r#"{"sub":"a","scope":"telemetry.write telemetry.read"}"#);
+        assert_eq!(
+            text.scopes("scope"),
+            vec!["telemetry.write", "telemetry.read"]
+        );
+
+        let list = from(r#"{"sub":"a","scope":["telemetry.write","telemetry.read"]}"#);
+        assert_eq!(
+            list.scopes("scope"),
+            vec!["telemetry.write", "telemetry.read"]
+        );
+    }
+
+    /// The claim name is configurable because it is not universal — Entra puts scopes
+    /// in `scp`. Looking in the wrong place must grant nothing rather than everything.
+    #[test]
+    fn the_scope_claim_is_the_one_configured() {
+        let claims: Claims =
+            serde_json::from_str(r#"{"sub":"a","scp":"telemetry.write"}"#).expect("parses");
+        assert_eq!(claims.scopes("scp"), vec!["telemetry.write"]);
+        assert!(claims.scopes("scope").is_empty());
+        assert!(claims.scopes("absent").is_empty());
     }
 }

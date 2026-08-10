@@ -352,6 +352,7 @@ def main() -> int:
     check_damaged_segment(binary)
     check_oidc(binary)
     check_oidc_survives_a_missing_provider(binary)
+    check_outbound_tls(binary)
     check_pipes(binary)
     check_relay(binary)
     check_relay_fair_share(binary)
@@ -1043,6 +1044,35 @@ def relay_metrics(claimed_app: str, token: str) -> int:
         }]}],
     }]}
     return with_token("/v1/metrics", token, payload)
+
+
+def check_outbound_tls(binary: str) -> None:
+    """The binary must actually be able to speak TLS.
+
+    This is the check that was missing. `ureq` was declared with no TLS backend, so
+    every https request failed with "TLS required, but transport is unsecured" — while
+    the configuration *demanded* https for `auth.oidc.issuer` and `relay.upstream`.
+    Cbox ID login and relay mode were both unreachable in any valid production setup,
+    and the whole suite stayed green because every test here points at loopback, where
+    plain HTTP is deliberately allowed.
+
+    No network needed to catch it: a closed local port distinguishes the two failures
+    on its own. With a TLS stack the connection is attempted and refused; without one
+    ureq gives up before opening a socket.
+    """
+    print("\n=== outbound TLS ===")
+    result = subprocess.run(
+        [binary, "import", "--from", "https://127.0.0.1:1", "--signal", "logs",
+         "--since", "5m"],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+    stderr = result.stderr
+    check("an https URL reaches the network layer",
+          "TLS required" not in stderr and "transport is unsecured" not in stderr,
+          stderr.strip().splitlines()[-1] if stderr.strip() else "no output")
+    check("a closed https port is refused, not rejected before dialling",
+          "Connection refused" in stderr or "connect" in stderr.lower(),
+          stderr.strip().splitlines()[-1] if stderr.strip() else "no output")
 
 
 def check_pipes(binary: str) -> None:

@@ -447,6 +447,7 @@ impl Relay {
 
         let mut request = ureq::post(&url)
             .config()
+            .tls_config(telemetryd_core::http::tls())
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_global(Some(TOTAL_TIMEOUT))
             .http_status_as_error(false)

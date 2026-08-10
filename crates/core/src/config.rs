@@ -276,6 +276,26 @@ pub struct OidcConfig {
     /// at another.
     pub audience: String,
 
+    /// Where the signing keys are published.
+    ///
+    /// Empty derives `{issuer}/.well-known/jwks.json`, which is where Cbox ID's
+    /// `KeyManager` puts them. **Not every provider agrees**: Google publishes at
+    /// `https://www.googleapis.com/oauth2/v3/certs`, nowhere near its issuer. Set this
+    /// when the provider's discovery document names something else.
+    ///
+    /// A configured URL rather than fetching the discovery document, deliberately: the
+    /// document exists to tell a client a path it cannot guess, and if you already know
+    /// the path, reading it costs a second network dependency and a second thing to be
+    /// down (ADR-011).
+    pub jwks_url: String,
+
+    /// The claim carrying granted scopes.
+    ///
+    /// `scope` is what OAuth specifies and what Cbox ID emits. Microsoft Entra uses
+    /// `scp`. Accepted as a space-separated string or as an array of strings, because
+    /// providers disagree about that too.
+    pub scope_claim: String,
+
     /// Scope that grants each role. A token may hold several.
     pub scope_write: String,
     pub scope_read: String,
@@ -298,6 +318,8 @@ impl Default for OidcConfig {
         Self {
             issuer: String::new(),
             audience: String::new(),
+            jwks_url: String::new(),
+            scope_claim: "scope".to_owned(),
             // Namespaced, so they cannot collide with another resource server's scopes
             // on a shared issuer.
             scope_write: "telemetry:write".to_owned(),
@@ -320,6 +342,9 @@ impl OidcConfig {
     /// Cbox ID publishes it at the well-known path its `KeyManager` documents.
     #[must_use]
     pub fn jwks_url(&self) -> String {
+        if !self.jwks_url.trim().is_empty() {
+            return self.jwks_url.trim().to_owned();
+        }
         format!(
             "{}/.well-known/jwks.json",
             self.issuer.trim_end_matches('/')
@@ -795,10 +820,7 @@ impl Config {
         }
 
         let upstream = self.relay.upstream.trim();
-        let loopback = upstream.starts_with("http://127.0.0.1")
-            || upstream.starts_with("http://[::1]")
-            || upstream.starts_with("http://localhost");
-        if !upstream.starts_with("https://") && !loopback {
+        if !upstream.starts_with("https://") && !is_loopback(upstream) {
             return Err(Error::Config(format!(
                 "relay.upstream must be https (got {upstream:?}). Everything this \
                  instance accepts is forwarded there, so plaintext exposes every \
@@ -890,16 +912,32 @@ impl Config {
             // Keys fetched over plaintext can be substituted in flight, and whoever
             // substitutes them mints their own admin tokens. Loopback is exempt
             // because that is how it is tested.
-            let loopback = issuer.starts_with("http://127.0.0.1")
-                || issuer.starts_with("http://localhost")
-                || issuer.starts_with("http://[::1]");
-            if !issuer.starts_with("https://") && !loopback {
+            if !issuer.starts_with("https://") && !is_loopback(issuer) {
                 return Err(Error::Config(format!(
                     "auth.oidc.issuer must be https (got {issuer:?}).\n\
                      telemetryd fetches the issuer's signing keys from it, so anyone \
                      able to answer that request over plaintext can mint tokens this \
                      instance will accept."
                 )));
+            }
+            // The same reasoning covers an explicit key URL. It is the *only* thing
+            // that decides which keys mint valid admin tokens, so it gets the same
+            // rule as the issuer it replaces rather than a weaker one.
+            let jwks = self.auth.oidc.jwks_url.trim();
+            if !jwks.is_empty() && !jwks.starts_with("https://") && !is_loopback(jwks) {
+                return Err(Error::Config(format!(
+                    "auth.oidc.jwks_url must be https (got {jwks:?}).\n\
+                     It replaces the path derived from the issuer, so anyone able to \
+                     answer that request over plaintext can mint tokens this instance \
+                     will accept."
+                )));
+            }
+            if self.auth.oidc.scope_claim.trim().is_empty() {
+                return Err(Error::Config(
+                    "auth.oidc.scope_claim must name a claim (the default is \"scope\"); \
+                     empty would match nothing and refuse every token"
+                        .to_owned(),
+                ));
             }
             for (name, scope) in [
                 ("scope_write", &self.auth.oidc.scope_write),
@@ -933,6 +971,14 @@ impl Config {
 
         Ok(())
     }
+}
+
+/// Loopback is exempt from the https rules: it is how the OIDC paths are tested, and
+/// a plaintext hop that never leaves the machine cannot be substituted in flight.
+fn is_loopback(url: &str) -> bool {
+    url.starts_with("http://127.0.0.1")
+        || url.starts_with("http://localhost")
+        || url.starts_with("http://[::1]")
 }
 
 /// The message an operator sees when they expose telemetryd without a token.
@@ -1308,5 +1354,62 @@ mod tests {
         );
         // And it should still suggest what was expected.
         assert!(error.contains("logs"), "{error}");
+    }
+
+    /// The key path is a guess about the provider unless it is stated, so the
+    /// configured value has to win. Google publishes nowhere near its issuer.
+    #[test]
+    fn a_configured_key_url_wins_over_the_derived_one() {
+        let mut oidc = OidcConfig {
+            issuer: "https://accounts.google.com".to_owned(),
+            ..OidcConfig::default()
+        };
+        assert_eq!(
+            oidc.jwks_url(),
+            "https://accounts.google.com/.well-known/jwks.json"
+        );
+        oidc.jwks_url = "https://www.googleapis.com/oauth2/v3/certs".to_owned();
+        assert_eq!(
+            oidc.jwks_url(),
+            "https://www.googleapis.com/oauth2/v3/certs"
+        );
+    }
+
+    /// An explicit key URL decides which keys mint admin tokens, so plaintext is
+    /// refused there for the same reason it is refused on the issuer.
+    #[test]
+    fn a_plaintext_key_url_is_refused() {
+        let config = |jwks: &str| -> Config {
+            toml::from_str(&format!(
+                "[auth]\nadmin_token = \"t\"\n[auth.oidc]\n\
+                 issuer = \"https://acme.cboxid.com\"\njwks_url = \"{jwks}\"\n"
+            ))
+            .expect("the fixture parses")
+        };
+
+        let error = config("http://keys.example.com/jwks.json")
+            .validate()
+            .expect_err("plaintext keys must be refused");
+        assert!(error.to_string().contains("jwks_url must be https"));
+
+        // Loopback stays usable, because that is how this path is tested.
+        config("http://127.0.0.1:9000/jwks.json")
+            .validate()
+            .expect("loopback keys are allowed");
+    }
+
+    /// Empty would match no claim at all and refuse every token — a silent lockout
+    /// that looks like a signature problem.
+    #[test]
+    fn an_empty_scope_claim_is_refused() {
+        let config: Config = toml::from_str(
+            "[auth]\nadmin_token = \"t\"\n[auth.oidc]\n\
+             issuer = \"https://acme.cboxid.com\"\nscope_claim = \"  \"\n",
+        )
+        .expect("the fixture parses");
+        let error = config
+            .validate()
+            .expect_err("an empty claim name must be refused");
+        assert!(error.to_string().contains("scope_claim"));
     }
 }

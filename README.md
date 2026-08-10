@@ -135,7 +135,7 @@ that is down never stops you reading the logs that would explain why:
 
 ```toml
 [auth.oidc]
-issuer = "https://id.example.com"
+issuer = "https://acme.cboxid.com"
 ```
 
 Scopes map to the same three roles. See the [single sign-on

@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+platform-verifier = ["telemetryd-core/platform-verifier"]
+
 [lints]
 workspace = true
 

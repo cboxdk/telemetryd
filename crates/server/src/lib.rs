@@ -195,12 +195,12 @@ pub async fn serve(config: Arc<Config>, store: Arc<Store>) -> Result<()> {
             Ok(Ok(keys)) => tracing::info!(
                 issuer = %config.auth.oidc.issuer,
                 keys,
-                "accepting Cbox ID tokens"
+                "accepting OIDC access tokens"
             ),
             Ok(Err(error)) => tracing::warn!(
                 issuer = %config.auth.oidc.issuer,
                 %error,
-                "could not load the Cbox ID key set at startup; Cbox ID tokens will be \
+                "could not load the OIDC key set at startup; those tokens will be \
                  refused until it can be fetched. Static tokens are unaffected."
             ),
             Err(error) => tracing::error!(%error, "the key fetch task panicked"),

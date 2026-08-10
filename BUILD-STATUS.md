@@ -62,11 +62,20 @@ queries answered from metadata with no file I/O.
 
 **Authentication.** Three surfaces — ingest, query, admin — each guarded by its own
 static bearer token, with rotation via a list and indirection through a file or
-environment variable. Cbox ID access tokens are accepted alongside them, validated
+environment variable. OIDC access tokens are accepted alongside them, validated
 locally against the issuer's published key set so that an identity provider being down
 never stops you reading your telemetry (ADR-011). The algorithm comes from the key the
 `kid` selects, never from the token. Scopes are not a hierarchy: admin does not imply
 read.
+
+Cbox ID is what this was built for, but nothing in it is specific to Cbox ID. Two
+things are not universal across providers, so they are settings: `jwks_url`, because
+`{issuer}/.well-known/jwks.json` is a convention rather than a rule, and `scope_claim`,
+because some providers use `scp` and some send an array where OAuth specifies a
+space-separated string. Verified against a real third-party key set, not only against
+the test issuer. What that does *not* buy is a provider with no scope claim at all —
+telemetryd can then verify who the caller is and still have nothing to authorise them
+with; the cookbook says which providers that rules out.
 
 The roles are also not a hierarchy of *convenience*: setting an OIDC issuer guards
 every surface, including any whose static token is deliberately empty. That is the safe
@@ -266,7 +275,7 @@ sequential dependency, and splitting it measured 60% slower.
 
 Not gaps. These are decisions, each with an ADR:
 
-- **TLS** — terminate at a reverse proxy (ADR-004)
+- **Inbound TLS** — terminate at a reverse proxy (ADR-004). *Outbound* TLS is built: the key fetch, relay shipping and transfer all verify against roots compiled into the binary, or the host's store with the `platform-verifier` feature. See ADR-004's amendment for why that distinction was a defect before it was a decision.
 - **Multi-tenancy** — `app` is a query namespace, not a security boundary (ADR-004)
 - **Clustering, replication, object-store tiering** — single node is the design (ADR-001)
 - **Plugins, relabelling rules, write-path transformations** — shape data in the

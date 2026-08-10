@@ -92,3 +92,41 @@ app names, series cardinality and volumes, which is more than we should hand out
 
 These limits are stated in the README's security section, because an unstated limit is
 indistinguishable from a bug.
+
+## Amendment: "no TLS" was about serving, and got read as about dialling
+
+**Date:** 2026-08-10. Amends the first bullet above.
+
+The rule stands for inbound traffic: telemetryd still does not terminate TLS, and a
+reverse proxy is still the answer. What was wrong was the reach of the phrase. The HTTP
+client was declared with no TLS backend at all, commented "plain HTTP only, no TLS
+stack (see ADR-004)" — accurate when its only job was reaching localhost from the CLI.
+
+Three later features gave that same client work on the public internet: the key fetch
+in [ADR-011](0011-cbox-id-integration.md), relay shipping in
+[ADR-013](0013-relay-mode.md), and transfer's remote read and write in
+[ADR-012](0012-import-and-export.md). None of them could work. Every https request
+failed with "TLS required, but transport is unsecured", while `Config::validate`
+*demanded* https for `auth.oidc.issuer` and `relay.upstream` — so the configuration
+required precisely what the client could not do, and both features were unreachable in
+any valid production setup.
+
+Nothing caught it because every test and soak run points at loopback, where plain HTTP
+is deliberately allowed. The suite was green against something the release never was.
+
+**So: outbound TLS, in one place.** `telemetryd_core::http::tls` is the only
+constructor, because trust configured per call site is one forgotten line away from two
+requests trusting different roots. It verifies against `webpki-roots` compiled into the
+binary, which behaves identically on all four targets — including static musl, where
+there is no system trust store for a platform verifier to read. The
+`platform-verifier` cargo feature switches to the host's store for deployments behind
+an internal CA; it is not the default because that store is empty in most containers.
+
+`telemetryd status` also stopped refusing https URLs. That refusal cited this ADR, and
+misread it the same way: the server does not terminate TLS, but this ADR *recommends* a
+proxy that does, and declining to talk to one made the recommended deployment
+unqueryable from our own CLI.
+
+The lesson is the one the section above already states, turned on itself: an unstated
+limit is indistinguishable from a bug, and this limit was stated in a place — a
+dependency comment — where no operator would ever read it.

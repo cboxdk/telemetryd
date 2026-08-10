@@ -35,11 +35,13 @@ query_token  = []                    # guards the Prometheus/Loki/Tempo read API
 admin_token  = []                    # guards /status and /metrics
 
 [auth.oidc]
-# Accept Cbox ID access tokens alongside the static ones. Unset = static only.
+# Accept OIDC access tokens alongside the static ones. Unset = static only.
 # Tokens are validated locally against the issuer's published keys; telemetryd
 # never asks the provider about a token. See ADR-011.
 issuer           = ""                # https:// (or loopback); the only required key
 audience         = ""                # "" = accept the issuer's own value
+jwks_url         = ""                # "" = {issuer}/.well-known/jwks.json
+scope_claim      = "scope"           # the claim carrying granted scopes
 scope_write      = "telemetry:write"
 scope_read       = "telemetry:read"
 scope_admin      = "telemetry:admin"

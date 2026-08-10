@@ -69,6 +69,7 @@ pub fn fetch(
 
     let mut response = request
         .config()
+        .tls_config(telemetryd_core::http::tls())
         .http_status_as_error(false)
         .build()
         .send(&payload[..])

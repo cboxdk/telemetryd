@@ -33,20 +33,21 @@ pub fn run(args: &StatusArgs) -> anyhow::Result<()> {
     // Plain HTTP only, deliberately: v1 terminates TLS at a reverse proxy (ADR-004),
     // and keeping a TLS stack out of the binary is what keeps the musl builds a
     // straightforward static link.
-    if url.starts_with("https://") {
-        bail!(
-            "`telemetryd status` speaks plain HTTP only.\n\
-             telemetryd does not terminate TLS (see ADR-004) — query the instance \
-             directly, e.g. --url http://127.0.0.1:4319, or curl the proxy yourself."
-        );
-    }
-
+    // This used to refuse https outright, on the grounds that telemetryd does not
+    // terminate TLS (ADR-004). That confused the server with the client: the server
+    // still does not, but ADR-004 *recommends* a TLS-terminating proxy in front, and
+    // refusing to talk to one made the recommended deployment unqueryable.
     let mut request = ureq::get(&url).header("user-agent", user_agent());
     if let Some(token) = &args.token {
         request = request.header("authorization", &format!("Bearer {token}"));
     }
 
-    let body = match request.call() {
+    let body = match request
+        .config()
+        .tls_config(telemetryd_core::http::tls())
+        .build()
+        .call()
+    {
         Ok(mut response) => response
             .body_mut()
             .read_to_string()

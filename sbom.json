@@ -1,15 +1,15 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
-  "serialNumber": "urn:uuid:eec7a5c6-68e2-5f00-934e-68713c21e241",
+  "serialNumber": "urn:uuid:2bce0338-1c36-5411-b000-53e2f6f982c2",
   "version": 1,
   "metadata": {
     "component": {
       "type": "application",
-      "bom-ref": "pkg:cargo/telemetryd@0.20.9",
+      "bom-ref": "pkg:cargo/telemetryd@0.21.0",
       "name": "telemetryd",
-      "version": "0.20.9",
-      "purl": "pkg:cargo/telemetryd@0.20.9",
+      "version": "0.21.0",
+      "purl": "pkg:cargo/telemetryd@0.21.0",
       "description": "Single-binary, zero-config observability backend",
       "licenses": [
         {
@@ -4220,6 +4220,84 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/rustls@0.23.43",
+      "name": "rustls",
+      "version": "0.23.43",
+      "purl": "pkg:cargo/rustls@0.23.43",
+      "description": "Rustls is a modern TLS library written in Rust.",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        },
+        {
+          "license": {
+            "id": "ISC"
+          }
+        },
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rustls/rustls"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/rustls-pki-types@1.15.1",
+      "name": "rustls-pki-types",
+      "version": "1.15.1",
+      "purl": "pkg:cargo/rustls-pki-types@1.15.1",
+      "description": "Shared types for the rustls PKI ecosystem",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        },
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rustls/pki-types"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/rustls-webpki@0.103.13",
+      "name": "rustls-webpki",
+      "version": "0.103.13",
+      "purl": "pkg:cargo/rustls-webpki@0.103.13",
+      "description": "Web PKI X.509 Certificate Verification.",
+      "licenses": [
+        {
+          "license": {
+            "id": "ISC"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rustls/webpki"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/rustversion@1.0.23",
       "name": "rustversion",
       "version": "1.0.23",
@@ -5976,6 +6054,27 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/webpki-roots@1.0.9",
+      "name": "webpki-roots",
+      "version": "1.0.9",
+      "purl": "pkg:cargo/webpki-roots@1.0.9",
+      "description": "Mozilla's CA root certificates for use with webpki",
+      "licenses": [
+        {
+          "license": {
+            "id": "CDLA-Permissive-2.0"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rustls/webpki-roots"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/windows-core@0.62.2",
       "name": "windows-core",
       "version": "0.62.2",
@@ -6553,6 +6652,32 @@
         {
           "type": "vcs",
           "url": "https://github.com/google/zerocopy"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/zeroize@1.9.0",
+      "name": "zeroize",
+      "version": "1.9.0",
+      "purl": "pkg:cargo/zeroize@1.9.0",
+      "description": "Securely clear secrets from memory with a simple trait built on stable Rust primitives which guarantee memory is zeroed using an operation will not be 'optimized away' by the compiler. Uses a portable pure Rust implementation that works everywhere, even WASM!",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        },
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/utils"
         }
       ]
     },

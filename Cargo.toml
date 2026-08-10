@@ -11,7 +11,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.20.9"
+version = "0.21.0"
 edition = "2024"
 rust-version = "1.89"
 license = "Apache-2.0"
@@ -23,11 +23,11 @@ authors = ["Cbox"]
 mimalloc = "0.1"
 # internal — versioned as well as pathed so the workspace stays publishable and
 # `cargo deny` can tell a deliberate internal edge from an unpinned third-party one
-telemetryd-core = { path = "crates/core", version = "0.20.9" }
-telemetryd-store = { path = "crates/store", version = "0.20.9" }
-telemetryd-ingest = { path = "crates/ingest", version = "0.20.9" }
-telemetryd-query = { path = "crates/query", version = "0.20.9" }
-telemetryd-server = { path = "crates/server", version = "0.20.9" }
+telemetryd-core = { path = "crates/core", version = "0.21.0" }
+telemetryd-store = { path = "crates/store", version = "0.21.0" }
+telemetryd-ingest = { path = "crates/ingest", version = "0.21.0" }
+telemetryd-query = { path = "crates/query", version = "0.21.0" }
+telemetryd-server = { path = "crates/server", version = "0.21.0" }
 
 # runtime + http
 tokio = { version = "1.53", features = ["rt-multi-thread", "net", "signal", "fs", "sync", "time", "macros", "io-util"] }
@@ -60,8 +60,11 @@ time = { version = "0.3", features = ["formatting", "macros"] }
 sha2 = "0.11"
 subtle = "2.6"
 
-# cli http client — plain HTTP only, no TLS stack (see ADR-004: v1 has no TLS)
-ureq = { version = "3", default-features = false }
+# Outbound HTTP: the OIDC key fetch, relay shipping and transfer all use it. `rustls`
+# brings webpki-roots and the `ring` provider jsonwebtoken already pulls in, so this
+# adds a TLS stack without adding a second crypto implementation. Trust is configured
+# in one place — telemetryd_core::http::tls.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 # Signature and claim verification for Cbox ID tokens (ADR-011). Exactly the code you
 # must not hand-roll: algorithm confusion and `alg: none` live here.
 jsonwebtoken = { version = "9", default-features = false }

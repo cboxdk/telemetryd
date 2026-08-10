@@ -25,6 +25,11 @@ allow = [
     # Permissive and OSI-approved, functionally MIT. Reached via `ring`, which
     # `jsonwebtoken` uses for signature verification (ADR-011).
     "ISC",
+    # `webpki-roots` — the Mozilla root certificate set compiled into the binary for
+    # outbound TLS (ADR-004's amendment). A data licence rather than a code one:
+    # permissive, no copyleft, no obligation beyond keeping the disclaimers. It covers
+    # the certificate data, not code we link against.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 

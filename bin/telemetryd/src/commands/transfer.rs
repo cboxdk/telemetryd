@@ -328,6 +328,7 @@ fn get(url: &str, token: Option<&str>) -> anyhow::Result<Value> {
     }
     let mut response = request
         .config()
+        .tls_config(telemetryd_core::http::tls())
         .http_status_as_error(false)
         .build()
         .call()
@@ -577,6 +578,7 @@ fn get_text(url: &str, token: Option<&str>) -> anyhow::Result<String> {
     }
     let mut response = request
         .config()
+        .tls_config(telemetryd_core::http::tls())
         .http_status_as_error(false)
         .build()
         .call()
@@ -754,6 +756,7 @@ pub fn export(args: &ExportArgs) -> anyhow::Result<()> {
 fn post(url: &str, token: Option<&str>, body: &str) -> anyhow::Result<()> {
     let mut request = ureq::post(url)
         .config()
+        .tls_config(telemetryd_core::http::tls())
         .http_status_as_error(false)
         .build()
         .header("content-type", "application/json");
