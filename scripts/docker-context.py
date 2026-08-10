@@ -54,9 +54,17 @@ def from_release(tag: str, arches: list[str]) -> None:
 
     for arch in arches:
         target = TARGETS[arch]
-        name = f"telemetryd-{tag}-{target}.tar.gz"
-        if name not in expected:
-            sys.exit(f"{name} is not in the release's SHA256SUMS — nothing to verify against")
+        # Found rather than constructed. The first version of this built the filename
+        # from the tag — `telemetryd-v0.21.0-<target>.tar.gz` — and the assets are named
+        # after the *version*, so the job failed on its first real release. SHA256SUMS
+        # already lists every published asset, so ask it instead of guessing, and a
+        # future rename cannot break this again.
+        matches = [name for name in expected
+                   if target in name and name.endswith(".tar.gz")]
+        if len(matches) != 1:
+            sys.exit(f"expected exactly one {target} archive in SHA256SUMS, found "
+                     f"{len(matches)}: {', '.join(sorted(matches)) or 'none'}")
+        name = matches[0]
 
         blob = fetch(f"{base}/{name}")
         actual = hashlib.sha256(blob).hexdigest()
@@ -66,13 +74,21 @@ def from_release(tag: str, arches: list[str]) -> None:
         archive = os.path.join(CONTEXT, name)
         with open(archive, "wb") as handle:
             handle.write(blob)
-        subprocess.run(["tar", "xzf", archive, "-C", CONTEXT], check=True)
+        # Extract into a scratch directory and find the binary wherever it sits, for the
+        # same reason: the archive's top-level directory name is not ours to predict.
+        staging = os.path.join(CONTEXT, f".staging-{arch}")
+        shutil.rmtree(staging, ignore_errors=True)
+        os.makedirs(staging)
+        subprocess.run(["tar", "xzf", archive, "-C", staging], check=True)
         os.remove(archive)
 
-        extracted = os.path.join(CONTEXT, f"telemetryd-{tag}-{target}", "telemetryd")
-        shutil.move(extracted, os.path.join(CONTEXT, f"telemetryd-linux-{arch}"))
-        shutil.rmtree(os.path.join(CONTEXT, f"telemetryd-{tag}-{target}"), ignore_errors=True)
-        print(f"  {arch}: verified against the release SHA256SUMS")
+        found = [os.path.join(root, "telemetryd")
+                 for root, _, files in os.walk(staging) if "telemetryd" in files]
+        if len(found) != 1:
+            sys.exit(f"{name}: expected one telemetryd binary, found {len(found)}")
+        shutil.move(found[0], os.path.join(CONTEXT, f"telemetryd-linux-{arch}"))
+        shutil.rmtree(staging, ignore_errors=True)
+        print(f"  {arch}: {name} verified against the release SHA256SUMS")
 
 
 def from_local(arches: list[str]) -> None:
