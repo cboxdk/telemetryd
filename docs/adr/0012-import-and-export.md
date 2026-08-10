@@ -318,12 +318,34 @@ machine's sockets. A window that returns the same oldest sample as the last one 
 the walk. This is the second walk in this feature to need that said out loud — a cursor
 is only a cursor if it is guaranteed to move.
 
-## Open question
+## Provenance labels on import: no
 
-Whether import should accept `--label name=value` to stamp provenance onto everything
-it brings in. It is clearly useful once a local store holds data from three
-connections, and `source="prod"` is the obvious way to tell them apart. It also cuts
-against [ADR-001](0001-storage-architecture.md)'s refusal of write-path
-transformations — "shape data in the instrumentation" is not advice you can follow
-about someone else's historical data. The exception is narrow and the alternative is
-worse, but it is a real exception and it is called out here rather than smuggled in.
+Whether `import` should accept `--label name=value` to stamp where data came from. It
+looked finely balanced when this ADR was written. It is not.
+
+**The case it was meant to serve is better served by a separate data directory.** The
+motivating picture was one local store holding data from three connections, with
+`source="prod"` to tell them apart. But import is not idempotent — telemetryd is
+append-only with no upsert — so the guide already tells you to import into a fresh
+directory, and the debugging workflow wants a throwaway store anyway. Provenance is then
+the directory, at no cost.
+
+**Where you genuinely want two sources side by side, the label already exists.**
+`deployment_environment` and `deployment_environment_name` are default stream labels. If
+the telemetry does not carry one, that is an instrumentation gap — which is precisely
+what [ADR-001](0001-storage-architecture.md) says to fix at the source rather than paper
+over at the boundary.
+
+**And it is not free.** `ingest.stream_labels` is documented as the cardinality
+contract; a label on every imported record multiplies streams by the number of sources.
+Paying that to avoid a second data directory is the wrong way round.
+
+**Relay mode's stamp is not a precedent for this**, though it looks like one. That
+replaces a label the *client* controls with an authenticated fact, because a client that
+picks its own `app` can impersonate any other. This would add a label for convenience.
+Same mechanism, different justification, and the justification is what the exception
+rested on.
+
+The narrow case this does not serve: telemetry that carries no environment, from a
+source nobody can change, that must be queried beside another in one store. That is
+real, and rare enough to reconsider on evidence rather than to design for now.

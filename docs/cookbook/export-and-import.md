@@ -45,7 +45,10 @@ production being reachable.
 
 **Import into a fresh data directory.** telemetryd is append-only with no deduplication,
 so importing an overlapping range twice stores the records twice. For the debugging case
-a throwaway directory is what you wanted anyway.
+a throwaway directory is what you wanted anyway — and it is also how you tell two sources
+apart, which is why there is no `--label` for stamping provenance. Where you do want them
+in one store, `deployment_environment` is already a stream label; if your telemetry does
+not carry one, that is worth fixing at the source rather than at the import.
 
 ## Retention will refuse before it deletes
 
