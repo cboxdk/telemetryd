@@ -97,8 +97,9 @@ indistinguishable from a bug.
 
 **Date:** 2026-08-10. Amends the first bullet above.
 
-The rule stands for inbound traffic: telemetryd still does not terminate TLS, and a
-reverse proxy is still the answer. What was wrong was the reach of the phrase. The HTTP
+The rule stood for inbound traffic when this amendment was written — and was reversed
+later the same day; see the section below. A reverse proxy remains the answer at a
+public edge. What was wrong was the reach of the phrase. The HTTP
 client was declared with no TLS backend at all, commented "plain HTTP only, no TLS
 stack (see ADR-004)" — accurate when its only job was reaching localhost from the CLI.
 

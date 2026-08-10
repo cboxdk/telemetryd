@@ -61,6 +61,20 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// not begun to serve.
 const READY_BACKLOG: usize = 64;
 
+/// How many handshakes may be in flight at once.
+///
+/// Without this, every accepted TCP connection spawns a task, and the handshake timeout
+/// bounds how *long* each one lives rather than how *many* there are — so an attacker
+/// opening connections faster than they complete gets one task, one rustls state
+/// machine and its buffers, per socket. That is a cheap denial of service against
+/// something this ADR now deliberately points at the internet.
+///
+/// Saturation blocks the accept loop instead, which pushes the queue back into the
+/// kernel where it belongs and is bounded by the listen backlog. The number is high
+/// enough that ordinary bursts never touch it: handshakes take milliseconds, so 256 in
+/// flight is thousands per second sustained.
+const CONCURRENT_HANDSHAKES: usize = 256;
+
 /// Build a rustls server configuration from a PEM certificate chain and key.
 ///
 /// The provider is named explicitly rather than taken from the process default. A
@@ -145,17 +159,32 @@ pub fn ensure_self_signed(dir: &std::path::Path, names: &[String]) -> Result<(Pa
         return Ok((cert_path, key_path));
     }
 
-    let generated = rcgen::generate_simple_self_signed(names.to_vec())
+    // rcgen defaults to 1975–4096, which is not a validity window so much as its
+    // absence: it makes a leaked key valid forever and trips clients that sanity-check
+    // the range. A decade is long enough that a certificate managed by hand does not
+    // become an annual outage, and bounded enough to be a real statement.
+    let mut params = rcgen::CertificateParams::new(names.to_vec())
+        .map_err(|e| Error::Config(format!("preparing a self-signed certificate: {e}")))?;
+    let now = time::OffsetDateTime::now_utc();
+    // An hour back, because a client whose clock is a little behind ours would
+    // otherwise reject a certificate generated seconds ago.
+    params.not_before = now - time::Duration::hours(1);
+    params.not_after = now + time::Duration::days(3653);
+
+    let signing_key = rcgen::KeyPair::generate()
+        .map_err(|e| Error::Config(format!("generating a key pair: {e}")))?;
+    let certificate = params
+        .self_signed(&signing_key)
         .map_err(|e| Error::Config(format!("generating a self-signed certificate: {e}")))?;
 
     std::fs::create_dir_all(dir)
         .map_err(|e| Error::io(format!("creating {}", dir.display()), e))?;
-    std::fs::write(&cert_path, generated.cert.pem())
+    std::fs::write(&cert_path, certificate.pem())
         .map_err(|e| Error::io(format!("writing {}", cert_path.display()), e))?;
     // The key is written before anything serves with it, and only the owner may read
     // it. A private key at 0644 next to the data directory is the kind of thing nobody
     // notices until it matters.
-    std::fs::write(&key_path, generated.signing_key.serialize_pem())
+    std::fs::write(&key_path, signing_key.serialize_pem())
         .map_err(|e| Error::io(format!("writing {}", key_path.display()), e))?;
     #[cfg(unix)]
     {
@@ -196,6 +225,7 @@ impl TlsListener {
 
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let (tx, ready) = mpsc::channel(READY_BACKLOG);
+        let handshakes = Arc::new(tokio::sync::Semaphore::new(CONCURRENT_HANDSHAKES));
 
         tokio::spawn(async move {
             loop {
@@ -211,9 +241,18 @@ impl TlsListener {
                     }
                 };
 
+                // Acquired *before* spawning, so saturation stops us accepting rather
+                // than letting the task count grow. `acquire_owned` cannot fail here:
+                // the semaphore lives as long as this loop and is never closed.
+                let Ok(permit) = Arc::clone(&handshakes).acquire_owned().await else {
+                    return;
+                };
+
                 let acceptor = acceptor.clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
+                    // Held for the whole handshake; dropped with the task.
+                    let _permit = permit;
                     let handshake =
                         tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream));
                     match handshake.await {

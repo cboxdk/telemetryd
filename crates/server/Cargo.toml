@@ -28,10 +28,10 @@ ureq.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rcgen.workspace = true
+time.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-time.workspace = true
 humantime.workspace = true
 
 [dev-dependencies]

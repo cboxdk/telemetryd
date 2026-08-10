@@ -33,9 +33,43 @@ location / {
 }
 ```
 
-telemetryd does not terminate TLS, on purpose: shipping TLS means shipping certificate
-lifecycle management, and it would put a TLS stack into a binary whose static-linking
-story is a product constraint.
+This is still the best shape at a public edge, where an ingress or load balancer
+already holds certificates for several services — not because telemetryd cannot do it,
+but because doing it twice means two places for cipher and protocol policy to be right.
+
+## Or: terminate TLS in telemetryd
+
+Where there is no proxy and none is coming — an internal network, one container talking
+to another — telemetryd can hold the certificate itself:
+
+```toml
+[server.tls]
+cert_file = "/etc/telemetryd/tls/server.pem"   # chain, leaf first
+key_file  = "/etc/telemetryd/tls/server.key"   # unencrypted
+```
+
+Use a certificate from an authority your clients already trust — your internal CA, if
+you have one — because that is what makes the connection authenticated as well as
+encrypted. telemetryd's outbound side trusts a private authority through
+[`tls.ca_file`](../configuration/reference.md#trusting-a-private-ca), so a relay and its
+upstream can share one.
+
+With nothing to hand, it will generate its own:
+
+```bash
+TELEMETRYD_SERVER_TLS_SELF_SIGNED=telemetry.internal telemetryd serve
+```
+
+That encrypts, which closes passive capture — a tap, a mirrored port, another host on
+the same network. It does not authenticate: clients cannot tell the certificate is
+yours, so they must be told to skip verification, and **that instruction outlives the
+certificate**. It tends to stay in client configuration after a real certificate is
+installed, leaving the deployment interceptable while looking encrypted. Better than
+plain HTTP, and not the destination.
+
+telemetryd does not obtain or renew certificates. Replace the files and restart. A
+generated one lasts ten years and is reused across restarts — delete `<data_dir>/tls/`
+to get a new one.
 
 ## Or: bind wide, with tokens
 

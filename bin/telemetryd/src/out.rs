@@ -39,7 +39,7 @@ fn exit_if_pipe_closed(error: &std::io::Error) {
     }
 }
 
-/// `println!`, but through [`line`].
+/// `println!`, but through [`line()`].
 macro_rules! outln {
     () => { $crate::out::line("") };
     ($($arg:tt)*) => { $crate::out::line(&format!($($arg)*)) };

@@ -45,12 +45,10 @@ Delete that file to get new ones.
 `TELEMETRYD_AUTH_*_TOKEN`, mounting a config file, or setting
 `TELEMETRYD_SERVER_INSECURE` skips the generation entirely.
 
-## The port is plaintext
+## The port is plaintext by default
 
-telemetryd terminates no TLS of its own ([ADR-004](../adr/0004-auth-and-network-binding.md)),
-and this image changes nothing about that — it binds `0.0.0.0:4319` speaking plain HTTP.
-
-That is fine in plenty of places and it is worth knowing which. On a laptop, on a
+The image binds `0.0.0.0:4319` speaking plain HTTP. That is fine in plenty of places and
+it is worth knowing which. On a laptop, on a
 private network, or between containers on the same Docker network, plain HTTP costs you
 nothing. What crosses the wire is different once the port is published to a public
 address: the generated token above is a bearer credential, and on an unencrypted
@@ -61,7 +59,19 @@ So it is a matter of practice rather than a hard stop: **terminate TLS in front 
 port is reachable from the internet.** The `docker run` at the top of this page is the
 convenient thing, not the hardened thing, and it does not stop you doing either.
 
-Let a proxy hold the certificate:
+The shortest fix is one environment variable — telemetryd will generate a certificate
+and serve HTTPS:
+
+```yaml
+    environment:
+      TELEMETRYD_SERVER_TLS_SELF_SIGNED: "telemetry.example.com"
+```
+
+That encrypts but cannot prove the server's identity, so clients must skip verification;
+see [expose it safely](../cookbook/expose-it-safely.md) for what that costs and for
+using a certificate your clients already trust.
+
+Or let a proxy hold the certificate, which is the better shape at a public edge:
 
 ```yaml
 services:

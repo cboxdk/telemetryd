@@ -191,10 +191,13 @@ It is the same binary, so the last few hours are sitting right there, answerable
 the same Loki, Tempo and Prometheus APIs. Debugging what a client sent does not mean
 going to the central store and filtering for one device.
 
-## Put TLS in front of it
+## TLS is not optional here
 
-telemetryd speaks plain HTTP and terminates no TLS ([ADR-004](../adr/0004-auth-and-network-binding.md)).
-Everywhere else that is a recommendation; a relay taking traffic from phones is
-internet-facing by definition, so here it is a requirement. `relay.upstream` must itself
+telemetryd speaks plain HTTP unless told otherwise
+([ADR-004](../adr/0004-auth-and-network-binding.md)). Everywhere else that is a
+recommendation; a relay taking traffic from phones is internet-facing by definition, so
+here it is a requirement — terminate at a proxy in front, or in telemetryd itself with
+`server.tls.cert_file` and `key_file`. Use a certificate the phones' TLS stacks already
+trust: a mobile client is the last place you want to be disabling verification. `relay.upstream` must itself
 be `https` — telemetryd refuses to start otherwise, because everything it accepts goes
 there, along with the upstream credential.

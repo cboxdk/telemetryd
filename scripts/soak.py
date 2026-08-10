@@ -1437,6 +1437,16 @@ def check_self_signed(binary: str) -> None:
         check("a restart reuses the certificate rather than minting a new one",
               first == second)
 
+        # rcgen's default window is 1975–4096, which is the absence of a validity
+        # period rather than a long one: it makes a leaked key valid forever and trips
+        # clients that sanity-check the range.
+        dates = subprocess.run(
+            ["openssl", "x509", "-in", cert, "-noout", "-dates"],
+            capture_output=True, text=True, check=True).stdout
+        sane = "1975" not in dates and "4096" not in dates
+        check("the certificate has a real validity window", sane,
+              dates.replace("\n", " ").strip())
+
         # It encrypts. It does not authenticate, and claiming otherwise in the docs
         # would be the dangerous part — so assert the honest half too.
         refused = False

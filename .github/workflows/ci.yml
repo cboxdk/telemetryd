@@ -53,7 +53,12 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-features
 
+      # `-D warnings` here, not just on clippy. Without it this step has never failed
+      # anything: a broken intra-doc link sat in `out.rs` through several releases while
+      # the gate looked as strict as the rest of CI.
       - name: cargo doc
+        env:
+          RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps --document-private-items
 
       # Runs the actual binary over HTTP: all three signals in, queried back out,
