@@ -74,7 +74,7 @@ file rather than a paste.
 to run by hand:
 
 ```bash
-python3 scripts/publish-formula.py v0.20.8
+python3 scripts/publish-formula.py v0.20.9
 ```
 
 That is deliberate. A missing tap update should not fail a release that is otherwise
