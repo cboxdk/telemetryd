@@ -27,6 +27,7 @@ import signal
 import socket
 import threading
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -353,6 +354,8 @@ def main() -> int:
     check_oidc(binary)
     check_oidc_survives_a_missing_provider(binary)
     check_outbound_tls(binary)
+    check_oidc_over_tls(binary)
+    check_relay_over_tls(binary)
     check_pipes(binary)
     check_relay(binary)
     check_relay_fair_share(binary)
@@ -648,10 +651,63 @@ def b64url(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
+# ---------------------------------------------------------------------------
+# Real TLS, because loopback HTTP is what hid the last one
+# ---------------------------------------------------------------------------
+
+_TLS_MATERIAL: dict | None = None
+
+
+def tls_material() -> dict:
+    """A private CA and a `localhost` server certificate signed by it.
+
+    Generated once per run and reused. This exists because every OIDC and relay test
+    in this file used to speak plain HTTP to loopback — which is exactly why nobody
+    noticed that the binary had no TLS stack at all, while the configuration
+    *required* https for both `auth.oidc.issuer` and `relay.upstream`. A green suite
+    against a shape no production deployment has is not evidence.
+    """
+    global _TLS_MATERIAL  # noqa: PLW0603
+    if _TLS_MATERIAL is not None:
+        return _TLS_MATERIAL
+
+    directory = tempfile.mkdtemp(prefix="telemetryd-soak-tls-")
+    ca_key = os.path.join(directory, "ca.key")
+    ca_pem = os.path.join(directory, "ca.pem")
+    key = os.path.join(directory, "server.key")
+    csr = os.path.join(directory, "server.csr")
+    cert = os.path.join(directory, "server.pem")
+    ext = os.path.join(directory, "server.ext")
+
+    def run(*args: str) -> None:
+        subprocess.run(args, check=True, capture_output=True)
+
+    run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+        "-keyout", ca_key, "-out", ca_pem, "-subj", "/CN=telemetryd soak CA")
+    run("openssl", "req", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", key, "-out", csr, "-subj", "/CN=localhost")
+    # A SAN is not optional: rustls rejects a certificate matched only on common name.
+    with open(ext, "w", encoding="utf-8") as handle:
+        handle.write("subjectAltName=DNS:localhost,IP:127.0.0.1\n")
+    run("openssl", "x509", "-req", "-in", csr, "-CA", ca_pem, "-CAkey", ca_key,
+        "-CAcreateserial", "-out", cert, "-days", "1", "-extfile", ext)
+
+    _TLS_MATERIAL = {"ca": ca_pem, "cert": cert, "key": key}
+    return _TLS_MATERIAL
+
+
+def wrap_tls(server: http.server.HTTPServer) -> None:
+    """Put a real TLS handshake in front of a stand-in server."""
+    material = tls_material()
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(material["cert"], material["key"])
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+
+
 class Issuer:
     """A stand-in Cbox ID: a key pair, a JWKS endpoint, and tokens signed with it."""
 
-    def __init__(self) -> None:
+    def __init__(self, tls: bool = False) -> None:
         _, self.n, self.e, self.d = der_integers(pathlib.Path(RSA_KEY_DER).read_bytes())[:4]
         self.size = (self.n.bit_length() + 7) // 8
         self.kid = "test-key-1"
@@ -661,7 +717,14 @@ class Issuer:
             "e": b64url(self.e.to_bytes((self.e.bit_length() + 7) // 8, "big")),
         }]}).encode()
         self.server = http.server.HTTPServer(("127.0.0.1", 0), self._handler())
-        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        port = self.server.server_address[1]
+        if tls:
+            wrap_tls(self.server)
+            # `localhost` rather than the address: the certificate carries it as a SAN,
+            # and a hostname is what a real issuer or upstream URL has.
+            self.url = f"https://localhost:{port}"
+        else:
+            self.url = f"http://127.0.0.1:{port}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def _handler(self):
@@ -875,7 +938,7 @@ def check_oidc_survives_a_missing_provider(binary: str) -> None:
 class Upstream:
     """A stand-in central instance. Can be told to fail, and remembers what arrived."""
 
-    def __init__(self, limit: int | None = None) -> None:
+    def __init__(self, limit: int | None = None, tls: bool = False) -> None:
         self.received: list[dict] = []
         self.failing = False
         # A body ceiling, as any real receiver has. `server.max_body_bytes` defaults to
@@ -884,7 +947,14 @@ class Upstream:
         self.limit = limit
         self.refused_too_large = 0
         self.server = http.server.HTTPServer(("127.0.0.1", 0), self._handler())
-        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        port = self.server.server_address[1]
+        if tls:
+            wrap_tls(self.server)
+            # `localhost` rather than the address: the certificate carries it as a SAN,
+            # and a hostname is what a real issuer or upstream URL has.
+            self.url = f"https://localhost:{port}"
+        else:
+            self.url = f"http://127.0.0.1:{port}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def _handler(self):
@@ -1073,6 +1143,153 @@ def check_outbound_tls(binary: str) -> None:
     check("a closed https port is refused, not rejected before dialling",
           "Connection refused" in stderr or "connect" in stderr.lower(),
           stderr.strip().splitlines()[-1] if stderr.strip() else "no output")
+
+
+def check_oidc_over_tls(binary: str) -> None:
+    """The whole path a real deployment uses: https, a real handshake, a real token.
+
+    Every other OIDC test here talks plain HTTP to loopback, which is allowed on
+    purpose and is precisely why nobody noticed the binary had no TLS stack while
+    `Config::validate` *demanded* https for the issuer. This runs the issuer behind a
+    genuine TLS handshake against a private CA, so the fetch, the verification and the
+    authorisation all happen the way they do in production.
+
+    The last check is the important one: the same configuration *without* the CA
+    bundle must fail. Without it this test would pass just as happily if trust were
+    not being applied at all.
+    """
+    print("\n=== OIDC over real TLS ===")
+    issuer = Issuer(tls=True)
+    material = tls_material()
+    data_dir = tempfile.mkdtemp(prefix="telemetryd-soak-oidc-tls-")
+    config = os.path.join(data_dir, "telemetryd.toml")
+
+    def write_config(ca_file: str | None) -> None:
+        with open(config, "w", encoding="utf-8") as handle:
+            handle.write("[auth]\nadmin_token = [\"static-admin\"]\n"
+                         f"[auth.oidc]\nissuer = \"{issuer.url}\"\n")
+            if ca_file:
+                handle.write(f"[tls]\nca_file = \"{ca_file}\"\n")
+
+    def serve() -> subprocess.Popen:
+        return subprocess.Popen(
+            [binary, "serve", "--config", config, "--listen", f"127.0.0.1:{PORT}",
+             "--data-dir", data_dir],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ})
+
+    write_config(material["ca"])
+    proc = serve()
+    try:
+        for _ in range(240):
+            try:
+                if request("/healthz")[0] == 200:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.25)
+
+        oidc = oidc_status("static-admin")
+        check("the key set is fetched over https", oidc.get("keys") == 1,
+              f"keys={oidc.get('keys', 'absent')}")
+
+        # End to end, not just the fetch: sign a token with the key that key set
+        # publishes and use it on the surface its scope names.
+        entry = {"resourceLogs": [{"resource": {"attributes": [
+            {"key": "service.name", "value": {"stringValue": "soak"}}]},
+            "scopeLogs": [{"logRecords": [{
+                "timeUnixNano": str(NOW), "body": {"stringValue": "tls"}}]}]}]}
+        check("a token from the https issuer is accepted",
+              with_token("/v1/logs", issuer.token("telemetry:write"), entry) == 200)
+        check("a token minted for another audience is still refused",
+              with_token("/loki/api/v1/labels",
+                         issuer.token("telemetry:read", audience="https://elsewhere")) == 401)
+    finally:
+        stop(proc)
+
+    # Now the part that makes the checks above mean something. Same issuer, same
+    # token, no CA bundle — the handshake must fail, so no keys load.
+    write_config(None)
+    proc = serve()
+    try:
+        for _ in range(240):
+            try:
+                if request("/healthz")[0] == 200:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.25)
+        oidc = oidc_status("static-admin")
+        check("without the CA bundle the handshake fails, so nothing is trusted",
+              oidc.get("keys") == 0,
+              f"keys={oidc.get('keys', 'absent')} — if this is 1, trust is not being applied")
+        check("and the instance still serves, rather than refusing to start",
+              request("/healthz")[0] == 200)
+    finally:
+        stop(proc)
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def check_relay_over_tls(binary: str) -> None:
+    """Relay shipping across a real TLS handshake.
+
+    `relay.upstream` must be https, and until today the shipper could not open an https
+    connection at all — so this configuration, the only one a real relay can have, had
+    never once run. Everything else in this file points the shipper at plain-HTTP
+    loopback, which is allowed for testing and proves nothing about the deployment
+    ADR-013 describes.
+    """
+    print("\n=== relay over real TLS ===")
+    upstream = Upstream(tls=True)
+    material = tls_material()
+    data_dir = tempfile.mkdtemp(prefix="telemetryd-soak-relay-tls-")
+    config = os.path.join(data_dir, "telemetryd.toml")
+    with open(config, "w", encoding="utf-8") as handle:
+        handle.write(
+            "[auth]\nadmin_token = [\"static-admin\"]\n"
+            "[storage]\nmax_segment_bytes = \"16KiB\"\nsegment_duration = \"2s\"\n"
+            f"[relay]\nupstream = \"{upstream.url}\"\ninterval = \"1s\"\n"
+            "[[relay.client]]\napp = \"mobile\"\ntoken = \"mobile-secret\"\n"
+            f"[tls]\nca_file = \"{material['ca']}\"\n"
+        )
+
+    proc = subprocess.Popen(
+        [binary, "serve", "--config", config, "--listen", f"127.0.0.1:{PORT}",
+         "--data-dir", data_dir],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ},
+    )
+    try:
+        for _ in range(240):
+            try:
+                if request("/healthz")[0] == 200:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.25)
+
+        check("the relay accepts writes", relay_logs(400, "payments", "mobile-secret") == 200)
+
+        deadline = time.time() + 60
+        delivered = 0
+        while time.time() < deadline:
+            delivered = sum(len(batch.get("resourceLogs", [])) for batch in upstream.received)
+            if delivered:
+                break
+            time.sleep(1)
+        check("segments are delivered over https", delivered > 0,
+              f"{delivered} batches arrived at the TLS upstream")
+
+        # The identity stamp is the point of relay mode, and it has to survive the
+        # transport rather than be a property of the plaintext path.
+        stamped = any(
+            attribute.get("value", {}).get("stringValue") == "mobile"
+            for batch in upstream.received
+            for resource in batch.get("resourceLogs", [])
+            for attribute in resource.get("resource", {}).get("attributes", [])
+        )
+        check("what arrives upstream carries the credential's identity", stamped)
+    finally:
+        stop(proc)
+        shutil.rmtree(data_dir, ignore_errors=True)
 
 
 def check_pipes(binary: str) -> None:

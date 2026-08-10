@@ -122,6 +122,16 @@ there is no system trust store for a platform verifier to read. The
 `platform-verifier` cargo feature switches to the host's store for deployments behind
 an internal CA; it is not the default because that store is empty in most containers.
 
+`tls.ca_file` came out of trying to test this. A soak case cannot use a publicly
+trusted certificate, and there was no way to point telemetryd at a private authority
+short of rebuilding with `platform-verifier` and installing a root into the host's
+store — which is also true of the deployment [ADR-013](0013-relay-mode.md) describes,
+where the upstream is internal infrastructure behind an internal CA. So the thing that
+made the feature testable was the thing that made it deployable. It replaces the
+built-in roots rather than adding to them, because an instance pointed at a private
+authority is usually talking only to internal hosts, and trusting that authority *and*
+every public CA is the surprising option.
+
 `telemetryd status` also stopped refusing https URLs. That refusal cited this ADR, and
 misread it the same way: the server does not terminate TLS, but this ADR *recommends* a
 proxy that does, and declining to talk to one made the recommended deployment
@@ -130,3 +140,9 @@ unqueryable from our own CLI.
 The lesson is the one the section above already states, turned on itself: an unstated
 limit is indistinguishable from a bug, and this limit was stated in a place — a
 dependency comment — where no operator would ever read it.
+
+The second lesson is about the tests. Every OIDC and relay case in the soak pointed at
+plain-HTTP loopback, which is allowed deliberately and is why none of them noticed. The
+suite now runs both across a genuine handshake against a private CA, and the OIDC case
+asserts that removing the CA bundle *breaks* it — without that, a passing test would be
+equally consistent with trust never being applied.

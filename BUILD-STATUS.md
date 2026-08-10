@@ -248,6 +248,12 @@ against the broken version rather than assumed to work.
 
 Named rather than left to be discovered.
 
+**Outbound TLS trusts one set of roots at a time.** `tls.ca_file` replaces the
+built-in roots rather than adding to them, so an instance that must reach both a public
+issuer and an internal upstream behind a private CA needs the public roots it wants
+concatenated into the same bundle. Deliberate — see the configuration reference — but
+it is a sharp edge worth knowing before you meet it.
+
 **`[[relay.client]]` cannot be set from the environment.** Every other configuration
 key can, which is what lets a container run with no file at all. That one is a list of
 tables with no flat spelling that is not worse than a mounted file — and its values are

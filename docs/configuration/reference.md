@@ -57,6 +57,11 @@ scope_admin      = "telemetry:admin"
 refresh_interval = "1h"              # how often the key set is refetched
 clock_skew       = "1m"              # allowance on exp/nbf
 
+[tls]
+# Trust for connections telemetryd *makes* — the OIDC key fetch, relay shipping,
+# transfer. Inbound TLS is still a reverse proxy's job (ADR-004).
+ca_file = ""                         # "" = the roots compiled into the binary
+
 [storage]
 data_dir          = ""               # "" = auto (see resolution order below)
 disk_budget       = "10GiB"          # hard cap across all signals; reaper enforces
@@ -122,6 +127,35 @@ before enabling it, and check with the tokens you expect people to hold.
 
 Static tokens are checked first and in constant time, so turning this on costs a purely
 static deployment nothing.
+
+## Trusting a private CA
+
+`tls.ca_file` takes a PEM bundle and is what you set when the issuer or the relay
+upstream is behind an internal authority — the deployment
+[ADR-013](../adr/0013-relay-mode.md) describes, where the upstream is your own
+infrastructure rather than a public host.
+
+```toml
+[tls]
+ca_file = "/etc/ssl/certs/internal-ca.pem"
+```
+
+**It replaces the built-in roots rather than adding to them.** Trusting exactly the
+authority that signs your internal hosts is tighter than trusting it *and* every public
+CA, and an instance configured this way is usually talking only to internal
+infrastructure. If you genuinely need both, the file is a bundle — concatenate the
+public roots you want alongside your own.
+
+A file that cannot be read, or that contains no certificates, stops startup. Falling
+back to the public roots would hand an operator who asked for a private CA the opposite
+of what they configured, which is worse than not starting.
+
+For CLI commands, which read no configuration file, the same value comes from
+`TELEMETRYD_TLS_CA_FILE`.
+
+The alternative is the `platform-verifier` build feature, which verifies against the
+host's own trust store instead. It is not the default because that store is empty in
+most containers.
 
 ## Data directory resolution
 

@@ -52,19 +52,81 @@
 //! [ADR-012]: ../../docs/adr/0012-import-and-export.md
 //! [ADR-013]: ../../docs/adr/0013-relay-mode.md
 
-use ureq::tls::{RootCerts, TlsConfig};
+use std::sync::OnceLock;
+
+use ureq::tls::{Certificate, RootCerts, TlsConfig};
+
+/// The environment variable a CLI run reads its trust from.
+///
+/// `serve` takes it from `tls.ca_file` in the configuration, which this variable also
+/// feeds through the usual precedence. `telemetryd import` and friends do not load a
+/// configuration file at all, so for them this is the whole story.
+pub const CA_FILE_ENV: &str = "TELEMETRYD_TLS_CA_FILE";
+
+/// Resolved once, because parsing a PEM bundle per request would be silly and because
+/// the answer must not differ between two requests in the same process.
+///
+/// A `OnceLock` rather than a parameter on [`tls`] is a deliberate trade. There are
+/// eight call sites; threading trust through all of them is eight chances to pass the
+/// wrong thing, and the failure would be silent — a request verifying against different
+/// roots than its neighbours. One process, one answer, set before anything dials.
+static TRUST: OnceLock<TlsConfig> = OnceLock::new();
+
+/// Point outbound TLS at a specific set of authorities. Call once, before serving.
+///
+/// Returns the error rather than logging it: this runs before the logger exists, and a
+/// CA file that cannot be read must stop startup rather than silently fall back to the
+/// public roots — falling back would mean an operator who asked for a private CA gets
+/// public trust instead, which is the opposite of what they configured.
+pub fn init_trust(ca_file: &str) -> Result<(), String> {
+    let config = build(Some(ca_file))?;
+    // Already set means someone called this twice; the first answer wins and that is
+    // worth knowing rather than papering over.
+    TRUST
+        .set(config)
+        .map_err(|_| "outbound TLS trust was already initialised".to_owned())
+}
 
 /// The TLS configuration every outbound request in telemetryd uses.
 ///
 /// Pass it to `.config().tls_config(tls())` when building a request.
 #[must_use]
 pub fn tls() -> TlsConfig {
-    let roots = if cfg!(feature = "platform-verifier") {
-        RootCerts::PlatformVerifier
-    } else {
-        RootCerts::WebPki
+    if let Some(config) = TRUST.get() {
+        return config.clone();
+    }
+    // Not initialised: a CLI run. Read the environment directly, and fall back to the
+    // built-in roots if it is unset or unreadable — a CLI command that cannot parse a
+    // bundle should say so when it fails to connect, not refuse to start.
+    let from_env = std::env::var(CA_FILE_ENV).unwrap_or_default();
+    let path = (!from_env.trim().is_empty()).then_some(from_env);
+    build(path.as_deref()).unwrap_or_else(|_| build(None).unwrap_or_default())
+}
+
+fn build(ca_file: Option<&str>) -> Result<TlsConfig, String> {
+    let roots = match ca_file.map(str::trim).filter(|path| !path.is_empty()) {
+        Some(path) => {
+            let pem = std::fs::read(path)
+                .map_err(|e| format!("could not read the CA bundle at {path}: {e}"))?;
+            let certs: Vec<Certificate<'static>> = ureq::tls::parse_pem(&pem)
+                .filter_map(|item| match item {
+                    Ok(ureq::tls::PemItem::Certificate(cert)) => Some(cert),
+                    _ => None,
+                })
+                .collect();
+            if certs.is_empty() {
+                return Err(format!(
+                    "{path} contains no certificates. tls.ca_file must be a PEM bundle \
+                     of certificate authorities; a key or an empty file would leave \
+                     nothing to verify against."
+                ));
+            }
+            RootCerts::Specific(std::sync::Arc::new(certs))
+        }
+        None if cfg!(feature = "platform-verifier") => RootCerts::PlatformVerifier,
+        None => RootCerts::WebPki,
     };
-    TlsConfig::builder().root_certs(roots).build()
+    Ok(TlsConfig::builder().root_certs(roots).build())
 }
 
 #[cfg(test)]
@@ -91,6 +153,39 @@ mod tests {
             assert!(matches!(roots.root_certs(), RootCerts::PlatformVerifier));
         } else {
             assert!(matches!(roots.root_certs(), RootCerts::WebPki));
+        }
+    }
+
+    /// A bundle that parses but contains no certificates is the dangerous case: it
+    /// would leave nothing to verify against, and silently accepting it would mean an
+    /// operator who configured a private CA gets no verification rather than more.
+    #[test]
+    fn a_bundle_with_no_certificates_is_refused() {
+        let dir = std::env::temp_dir().join("telemetryd-http-test");
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        let path = dir.join("empty.pem");
+        std::fs::write(
+            &path,
+            b"-----BEGIN PRIVATE KEY-----\nnope\n-----END PRIVATE KEY-----\n",
+        )
+        .expect("write");
+
+        let error = build(Some(path.to_str().expect("utf-8")))
+            .expect_err("a bundle with no certificates must be refused");
+        assert!(error.contains("no certificates"), "{error}");
+
+        let missing =
+            build(Some("/nonexistent/ca.pem")).expect_err("an unreadable bundle must be refused");
+        assert!(missing.contains("could not read"), "{missing}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Empty means "use the default", not "use a file called empty string".
+    #[test]
+    fn an_unset_bundle_falls_back_to_the_built_in_roots() {
+        for unset in [None, Some(""), Some("   ")] {
+            let config = build(unset).expect("an unset bundle is not an error");
+            assert!(!config.disable_verification());
         }
     }
 }

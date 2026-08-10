@@ -36,6 +36,30 @@ pub struct Config {
     /// Forwarding to a central instance (ADR-013). Off unless `upstream` is set.
     #[serde(default)]
     pub relay: RelayConfig,
+    /// Who telemetryd trusts when it dials out.
+    #[serde(default)]
+    pub tls: TlsConfig,
+}
+
+/// Trust for outbound connections — the OIDC key fetch, relay shipping, transfer.
+///
+/// Inbound TLS is still terminated by a reverse proxy (ADR-004); this is only about
+/// connections telemetryd makes.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct TlsConfig {
+    /// A PEM bundle of certificate authorities to trust instead of the built-in set.
+    ///
+    /// Empty uses the roots compiled into the binary, which is right for the public
+    /// internet. Set it when the issuer or the relay upstream is behind a private CA —
+    /// the case ADR-013 describes, where the upstream is internal infrastructure.
+    ///
+    /// **It replaces the built-in roots rather than adding to them.** Trusting exactly
+    /// the authority that signs your internal hosts is tighter than trusting it *and*
+    /// every public CA, and an instance configured this way is usually talking only to
+    /// internal infrastructure. If you genuinely need both, the file is a bundle:
+    /// concatenate the public roots you want alongside your own.
+    pub ca_file: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -738,6 +762,7 @@ const ENV_KEYS: &[(&str, &str)] = &[
         "relay.max_request_bytes",
     ),
     ("TELEMETRYD_RELAY_MAX_QUEUE_SHARE", "relay.max_queue_share"),
+    ("TELEMETRYD_TLS_CA_FILE", "tls.ca_file"),
     ("TELEMETRYD_LOG_LEVEL", "log.level"),
     ("TELEMETRYD_LOG_FORMAT", "log.format"),
 ];

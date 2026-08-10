@@ -60,6 +60,12 @@ query_token  = []                    # Loki/Tempo/Prometheus reads, /status, /me
 # app   = "mobile-ios"
 # token = "file:/run/secrets/mobile-ios"
 
+# Trust for connections telemetryd makes — the OIDC key fetch, relay shipping,
+# transfer. Set it when the issuer or the upstream is behind an internal authority;
+# it replaces the built-in roots rather than adding to them.
+# [tls]
+# ca_file = "/etc/ssl/certs/internal-ca.pem"
+
 [storage]
 # Empty = automatic: ./telemetryd-data if it already exists, else the platform data
 # directory. The resolved path is logged at startup and shown in /status.

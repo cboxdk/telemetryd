@@ -15,6 +15,14 @@ pub fn run(config_file: Option<&std::path::Path>, overrides: &Overrides) -> anyh
         tracing::info!(path = %path.display(), "loaded configuration file");
     }
 
+    // Before anything can dial out: the OIDC key fetch happens during startup, and a
+    // trust decision made after the first request would be no decision at all.
+    if !config_trust(&loaded.config).is_empty() {
+        let ca_file = config_trust(&loaded.config).to_owned();
+        telemetryd_core::http::init_trust(&ca_file).map_err(|e| anyhow::anyhow!(e))?;
+        tracing::info!(ca_file, "outbound TLS verifies against this bundle only");
+    }
+
     let config = Arc::new(loaded.config);
     let store = Arc::new(open_store(&config)?);
 
@@ -128,4 +136,10 @@ fn report_recovery(store: &Store) {
              write-ahead log were not durable and have been discarded"
         );
     }
+}
+
+/// The configured CA bundle, trimmed. Kept as a function so the empty-means-default
+/// rule lives in one place rather than at each caller.
+fn config_trust(config: &Config) -> &str {
+    config.tls.ca_file.trim()
 }
