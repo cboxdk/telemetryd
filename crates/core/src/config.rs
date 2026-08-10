@@ -54,13 +54,55 @@ pub struct ServerTlsConfig {
     pub cert_file: String,
     /// PEM private key, unencrypted — telemetryd cannot prompt at startup.
     pub key_file: String,
+    /// Generate a self-signed certificate for these names, if none exists yet.
+    ///
+    /// A comma-separated list of the hostnames clients will connect as, e.g.
+    /// `"telemetry.internal"`. Empty disables it. `localhost`, `127.0.0.1` and `::1`
+    /// are always included, so a local test needs no list of its own.
+    ///
+    /// It is the names rather than a plain on/off switch because a certificate valid
+    /// only for `localhost` is useless the moment a client connects by hostname — and
+    /// that failure arrives as an opaque verification error, long after the setting
+    /// that caused it.
+    ///
+    /// **This encrypts; it does not authenticate.** Clients have no way to know the
+    /// certificate is yours, so they must be told to skip verification — and that
+    /// setting outlives the certificate, leaving the deployment open to an active
+    /// attacker even after a real one is installed. Worth it against passive capture,
+    /// which is a real threat; not a substitute for an authority the clients trust.
+    pub self_signed: String,
 }
 
 impl ServerTlsConfig {
-    /// Whether TLS termination is switched on.
+    /// Whether TLS termination is switched on, by either route.
     #[must_use]
     pub fn is_enabled(&self) -> bool {
-        !self.cert_file.trim().is_empty() || !self.key_file.trim().is_empty()
+        !self.cert_file.trim().is_empty()
+            || !self.key_file.trim().is_empty()
+            || self.is_self_signed()
+    }
+
+    /// Whether telemetryd should generate its own certificate.
+    #[must_use]
+    pub fn is_self_signed(&self) -> bool {
+        !self.self_signed.trim().is_empty()
+    }
+
+    /// The names to put in the generated certificate, loopback included.
+    #[must_use]
+    pub fn self_signed_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .self_signed
+            .split(',')
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+            .collect();
+        for local in ["localhost", "127.0.0.1", "::1"] {
+            if !names.iter().any(|name| name == local) {
+                names.push(local.to_owned());
+            }
+        }
+        names
     }
 }
 
@@ -789,6 +831,10 @@ const ENV_KEYS: &[(&str, &str)] = &[
         "relay.max_request_bytes",
     ),
     ("TELEMETRYD_RELAY_MAX_QUEUE_SHARE", "relay.max_queue_share"),
+    (
+        "TELEMETRYD_SERVER_TLS_SELF_SIGNED",
+        "server.tls.self_signed",
+    ),
     ("TELEMETRYD_SERVER_TLS_CERT_FILE", "server.tls.cert_file"),
     ("TELEMETRYD_SERVER_TLS_KEY_FILE", "server.tls.key_file"),
     ("TELEMETRYD_TLS_CA_FILE", "tls.ca_file"),
@@ -951,20 +997,40 @@ impl Config {
         Ok(())
     }
 
+    /// TLS termination rules, kept out of `validate` so neither outgrows a reading.
+    fn validate_server_tls(&self) -> Result<()> {
+        let tls = &self.server.tls;
+        // Both routes at once is ambiguous, and guessing which one the operator meant
+        // is how an instance ends up serving a certificate nobody intended.
+        if tls.is_self_signed()
+            && (!tls.cert_file.trim().is_empty() || !tls.key_file.trim().is_empty())
+        {
+            return Err(Error::Config(
+                "server.tls.self_signed cannot be combined with cert_file or key_file. \
+             Use the certificate you have, or generate one — not both."
+                    .to_owned(),
+            ));
+        }
+        if !tls.is_self_signed()
+            && tls.is_enabled()
+            && (tls.cert_file.trim().is_empty() || tls.key_file.trim().is_empty())
+        {
+            return Err(Error::Config(
+                "server.tls needs both cert_file and key_file. One without the other \
+             would leave telemetryd serving plain HTTP while looking configured \
+             for TLS."
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Cross-field rules. Run at load time rather than at first use, so a bad
     /// configuration fails at startup instead of at 3am on the first query.
     pub fn validate(&self) -> Result<()> {
         // Half a TLS configuration is always a mistake, and the failure it causes
         // otherwise is a server that quietly keeps speaking plain HTTP.
-        let tls = &self.server.tls;
-        if tls.is_enabled() && (tls.cert_file.trim().is_empty() || tls.key_file.trim().is_empty()) {
-            return Err(Error::Config(
-                "server.tls needs both cert_file and key_file. One without the other \
-                 would leave telemetryd serving plain HTTP while looking configured \
-                 for TLS."
-                    .to_owned(),
-            ));
-        }
+        self.validate_server_tls()?;
 
         // ADR-004: fail closed on an exposed bind.
         let exposed = !self.server.listen.ip().is_loopback();

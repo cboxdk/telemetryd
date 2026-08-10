@@ -172,10 +172,18 @@ pub async fn serve(config: Arc<Config>, store: Arc<Store>) -> Result<()> {
     // or not we terminate TLS. A second copy of the shutdown logic is how one of them
     // ends up subtly different.
     let bound = if config.server.tls.is_enabled() {
-        let tls_config = tls::server_config(
-            config.server.tls.cert_file.trim(),
-            config.server.tls.key_file.trim(),
-        )?;
+        let (cert_file, key_file) = if config.server.tls.is_self_signed() {
+            let dir = store.data_dir().root().join("tls");
+            let (cert, key) =
+                tls::ensure_self_signed(&dir, &config.server.tls.self_signed_names())?;
+            (cert.display().to_string(), key.display().to_string())
+        } else {
+            (
+                config.server.tls.cert_file.trim().to_owned(),
+                config.server.tls.key_file.trim().to_owned(),
+            )
+        };
+        let tls_config = tls::server_config(&cert_file, &key_file)?;
         let listener = tls::TlsListener::bind(config.server.listen, tls_config).await?;
         Bound::Tls(Box::new(listener))
     } else {

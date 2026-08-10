@@ -65,6 +65,11 @@ query_token  = []                    # Loki/Tempo/Prometheus reads, /status, /me
 # [server.tls]
 # cert_file = "/etc/telemetryd/tls/server.pem"
 # key_file  = "/etc/telemetryd/tls/server.key"
+#
+# Or, with no CA to hand: generate one for these names into <data_dir>/tls on first
+# start. Encrypts, but cannot prove identity — clients must skip verification, and that
+# setting outlives the certificate. Good against passive capture; not the destination.
+# self_signed = "telemetry.internal"
 
 # Trust for connections telemetryd makes — the OIDC key fetch, relay shipping,
 # transfer. Set it when the issuer or the upstream is behind an internal authority;

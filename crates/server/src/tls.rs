@@ -38,6 +38,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -120,6 +121,58 @@ pub fn server_config(cert_file: &str, key_file: &str) -> Result<rustls::ServerCo
                  usable pair: {e}"
             ))
         })
+}
+
+/// Generate a certificate for `names` if one is not already stored, and return the
+/// paths to it.
+///
+/// Kept beside the data rather than in a temporary directory, so a restart does not
+/// hand clients a different certificate every time — which, for anything pinning or
+/// caching, looks exactly like an attack.
+///
+/// # What this is worth
+///
+/// Encryption, and not authentication. A client has no way to know the certificate is
+/// ours, so it has to be told to skip verification — and that instruction outlives this
+/// certificate, leaving the deployment open to an active attacker even after a real one
+/// is installed. Against passive capture, which is a real and common threat, it is a
+/// genuine improvement over plain HTTP. It is not a substitute for an authority the
+/// clients trust, and the log line said on generation says so.
+pub fn ensure_self_signed(dir: &std::path::Path, names: &[String]) -> Result<(PathBuf, PathBuf)> {
+    let cert_path = dir.join("self-signed.pem");
+    let key_path = dir.join("self-signed.key");
+    if cert_path.is_file() && key_path.is_file() {
+        return Ok((cert_path, key_path));
+    }
+
+    let generated = rcgen::generate_simple_self_signed(names.to_vec())
+        .map_err(|e| Error::Config(format!("generating a self-signed certificate: {e}")))?;
+
+    std::fs::create_dir_all(dir)
+        .map_err(|e| Error::io(format!("creating {}", dir.display()), e))?;
+    std::fs::write(&cert_path, generated.cert.pem())
+        .map_err(|e| Error::io(format!("writing {}", cert_path.display()), e))?;
+    // The key is written before anything serves with it, and only the owner may read
+    // it. A private key at 0644 next to the data directory is the kind of thing nobody
+    // notices until it matters.
+    std::fs::write(&key_path, generated.signing_key.serialize_pem())
+        .map_err(|e| Error::io(format!("writing {}", key_path.display()), e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| Error::io(format!("securing {}", key_path.display()), e))?;
+    }
+
+    tracing::warn!(
+        names = names.join(", "),
+        certificate = %cert_path.display(),
+        "generated a self-signed certificate. It encrypts the connection but cannot \
+         prove this server's identity, so clients must be told to skip verification — \
+         and that setting will outlive this certificate. Use one from an authority your \
+         clients already trust wherever you can."
+    );
+    Ok((cert_path, key_path))
 }
 
 /// A listener that hands `axum::serve` connections which have already handshaken.

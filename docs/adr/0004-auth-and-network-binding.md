@@ -179,13 +179,29 @@ in for outbound, with `default-features = false` so rustls' default `aws-lc-rs` 
 does not drag a second cryptographic implementation into a binary that already has
 `ring`.
 
-**Bring a certificate; generating one is not the same thing.** A self-signed certificate
-the clients do not trust gives encryption without authentication — it stops passive
-capture, not an active attacker, which is the threat that motivates encrypting an
-internal network at all. The realistic outcome is `insecure_skip_verify` on every SDK,
-which looks secure and is not. So the supported configuration is a certificate from an
-authority the clients already trust, which pairs with `tls.ca_file` on the outbound
-side: one authority, both ends.
+**Bring a certificate where you can.** One from an authority the clients already trust
+is the configuration that authenticates as well as encrypts, and it pairs with
+`tls.ca_file` on the outbound side: one authority, both ends.
+
+**And generate one where you cannot.** `server.tls.self_signed` takes the hostnames to
+issue for and writes a certificate into the data directory on first start. This was
+argued against initially and the argument was too strong: a self-signed certificate is
+*not* worse than plain HTTP. It closes passive capture — a tap, a mirrored port, another
+host on the same network — which is a real and common threat, and it leaves an active
+attacker exactly where plain HTTP already left them.
+
+What is true is the second-order cost. Clients must be told to skip verification, and
+that instruction outlives the certificate: it stays in configuration after a proper one
+is installed, leaving the deployment interceptable while looking encrypted. So it is
+documented as the answer while there is nothing better rather than as a destination, the
+log line on generation says as much, and it cannot be combined with an explicit
+certificate — telemetryd refuses rather than guessing.
+
+It is the hostnames rather than a boolean because a certificate valid only for
+`localhost` fails the moment a client connects by name, as an opaque verification error
+far from the setting that caused it. Regenerating on each start was also rejected:
+to anything that pins or caches, a server whose certificate changes every restart looks
+precisely like an attack.
 
 The handshake does not run in the accept loop. `axum::serve::Listener::accept` returns a
 ready connection and cannot fail, so the obvious implementation handshakes inline — and

@@ -11,7 +11,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.23.0"
+version = "0.24.0"
 edition = "2024"
 rust-version = "1.89"
 license = "Apache-2.0"
@@ -23,11 +23,11 @@ authors = ["Cbox"]
 mimalloc = "0.1"
 # internal — versioned as well as pathed so the workspace stays publishable and
 # `cargo deny` can tell a deliberate internal edge from an unpinned third-party one
-telemetryd-core = { path = "crates/core", version = "0.23.0" }
-telemetryd-store = { path = "crates/store", version = "0.23.0" }
-telemetryd-ingest = { path = "crates/ingest", version = "0.23.0" }
-telemetryd-query = { path = "crates/query", version = "0.23.0" }
-telemetryd-server = { path = "crates/server", version = "0.23.0" }
+telemetryd-core = { path = "crates/core", version = "0.24.0" }
+telemetryd-store = { path = "crates/store", version = "0.24.0" }
+telemetryd-ingest = { path = "crates/ingest", version = "0.24.0" }
+telemetryd-query = { path = "crates/query", version = "0.24.0" }
+telemetryd-server = { path = "crates/server", version = "0.24.0" }
 
 # runtime + http
 tokio = { version = "1.53", features = ["rt-multi-thread", "net", "signal", "fs", "sync", "time", "macros", "io-util"] }
@@ -71,6 +71,9 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 # jsonwebtoken and ureq. One provider, chosen explicitly.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+# Generating a self-signed certificate on first start. `ring` again, and explicitly:
+# rcgen's default is `aws_lc_rs`, which would undo the care taken above.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
 # Signature and claim verification for Cbox ID tokens (ADR-011). Exactly the code you
 # must not hand-roll: algorithm confusion and `alg: none` live here.
 jsonwebtoken = { version = "9", default-features = false }

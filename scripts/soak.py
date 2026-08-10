@@ -28,6 +28,7 @@ import socket
 import threading
 import shutil
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -357,6 +358,7 @@ def main() -> int:
     check_oidc_over_tls(binary)
     check_relay_over_tls(binary)
     check_serving_tls(binary)
+    check_self_signed(binary)
     check_pipes(binary)
     check_relay(binary)
     check_relay_fair_share(binary)
@@ -1374,6 +1376,77 @@ def check_serving_tls(binary: str) -> None:
         except Exception:  # noqa: BLE001
             plaintext_failed = True
         check("plain HTTP to the TLS port does not work", plaintext_failed)
+    finally:
+        stop(proc)
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def check_self_signed(binary: str) -> None:
+    """One environment variable, and the certificate must survive a restart.
+
+    Stability is the property worth testing. A server that mints a fresh certificate
+    on every start looks, to anything that pins or caches, exactly like an attacker —
+    and it would be the easy implementation, since generating is cheaper than checking
+    whether one already exists.
+    """
+    print("\n=== self-signed certificate ===")
+    data_dir = tempfile.mkdtemp(prefix="telemetryd-soak-selfsigned-")
+    env = {**os.environ,
+           "TELEMETRYD_AUTH_ADMIN_TOKEN": "static-admin",
+           "TELEMETRYD_AUTH_INGEST_TOKEN": "ingest",
+           "TELEMETRYD_SERVER_TLS_SELF_SIGNED": "telemetry.internal"}
+    base = f"https://localhost:{PORT}"
+    unverified = ssl.create_default_context()
+    unverified.check_hostname = False
+    unverified.verify_mode = ssl.CERT_NONE
+
+    def start() -> subprocess.Popen:
+        proc = subprocess.Popen(
+            [binary, "serve", "--listen", f"127.0.0.1:{PORT}", "--data-dir", data_dir],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        for _ in range(240):
+            try:
+                with urllib.request.urlopen(base + "/healthz", timeout=5,
+                                            context=unverified) as response:
+                    if response.status == 200:
+                        return proc
+            except Exception:  # noqa: BLE001 — not up yet
+                pass
+            time.sleep(0.25)
+        return proc
+
+    cert = os.path.join(data_dir, "tls", "self-signed.pem")
+    key = os.path.join(data_dir, "tls", "self-signed.key")
+    proc = start()
+    try:
+        check("one environment variable produces a working TLS server",
+              os.path.isfile(cert) and os.path.isfile(key))
+        # A private key readable by anyone on the box is the sort of thing nobody
+        # notices until it matters.
+        mode = stat.S_IMODE(os.stat(key).st_mode)
+        check("the generated key is readable only by its owner", mode == 0o600,
+              f"mode {mode:o}")
+
+        first = hashlib.sha256(pathlib.Path(cert).read_bytes()).hexdigest()
+    finally:
+        stop(proc)
+
+    proc = start()
+    try:
+        second = hashlib.sha256(pathlib.Path(cert).read_bytes()).hexdigest()
+        check("a restart reuses the certificate rather than minting a new one",
+              first == second)
+
+        # It encrypts. It does not authenticate, and claiming otherwise in the docs
+        # would be the dangerous part — so assert the honest half too.
+        refused = False
+        try:
+            urllib.request.urlopen(base + "/healthz", timeout=5,
+                                   context=ssl.create_default_context())
+        except Exception:  # noqa: BLE001 — verification failure is the pass condition
+            refused = True
+        check("a verifying client still refuses it, as a self-signed certificate should",
+              refused)
     finally:
         stop(proc)
         shutil.rmtree(data_dir, ignore_errors=True)

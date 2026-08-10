@@ -59,8 +59,9 @@ clock_skew       = "1m"              # allowance on exp/nbf
 
 [server.tls]
 # Terminate TLS here rather than at a proxy. Unset = plain HTTP.
-cert_file = ""                       # PEM chain, leaf first
-key_file  = ""                       # PEM key, unencrypted
+cert_file   = ""                     # PEM chain, leaf first
+key_file    = ""                     # PEM key, unencrypted
+self_signed = ""                     # or: the hostnames to generate a certificate for
 
 [tls]
 # Trust for connections telemetryd *makes* — the OIDC key fetch, relay shipping,
@@ -163,6 +164,35 @@ authority.
 
 Renewal is the issuer's job, not telemetryd's. Replace the files and restart; the
 certificate is read at startup.
+
+### Generating one, when you have no CA to hand
+
+```bash
+TELEMETRYD_SERVER_TLS_SELF_SIGNED=telemetry.internal telemetryd serve
+```
+
+One variable. It generates a certificate for those names into `<data_dir>/tls/` on
+first start, keeps the key at `0600`, and reuses it on every restart — a server that
+minted a fresh certificate each time would look, to anything that pins or caches, like
+an attacker.
+
+The value is the **names clients will connect as**, comma-separated, rather than a
+plain on/off switch: a certificate valid only for `localhost` is useless the moment a
+client uses a hostname, and that failure arrives as an opaque verification error long
+after the setting that caused it. `localhost`, `127.0.0.1` and `::1` are always
+included.
+
+**Be clear-eyed about what it buys.** It encrypts, so passive capture — a network tap, a
+mirrored port, another host on the same network — stops working, and that is a real
+threat worth closing. It does *not* authenticate: clients cannot tell the certificate is
+yours, so they must be configured to skip verification, and an active attacker who can
+intercept the connection is no worse off than with plain HTTP.
+
+The lasting cost is that instruction. `insecure_skip_verify` tends to stay in client
+configuration long after a proper certificate is installed, and then the deployment is
+still interceptable while looking encrypted. So this is the answer while you have
+nothing better, not the destination. It cannot be combined with `cert_file`/`key_file`;
+telemetryd refuses rather than guessing which you meant.
 
 ## Trusting a private CA
 
