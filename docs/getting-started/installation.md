@@ -117,3 +117,71 @@ everything linked into the binary.
 Not yet in place. Releases carry checksums, which protect against a corrupted download
 but not against a compromised release. Named here as a known gap rather than implied to
 be covered by an unsigned checksum file.
+\n
+## Hand this to an agent
+
+A self-contained brief. It names only commands and endpoints that exist, so an agent can
+execute it without reading the rest of this page — and without inventing the parts of the
+Loki and Prometheus APIs telemetryd deliberately does not implement.
+
+````markdown
+# Task: install telemetryd on this machine and prove it works
+
+telemetryd is a single statically linked binary. No runtime, no libc to match, no
+sidecar, no collector. Do not install a package manager, a container runtime, or an
+OpenTelemetry Collector — none is needed.
+
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cboxdk/telemetryd/main/install.sh | sh
+```
+
+The installer verifies the release checksum and refuses to install on a mismatch. On
+macOS, `brew install cboxdk/tap/telemetryd` is equivalent.
+
+## Run
+
+```bash
+telemetryd serve
+```
+
+That is the whole setup: no configuration file and no flags. It listens on
+`127.0.0.1:4319`, stores data in `./telemetryd-data` or the platform data directory,
+keeps 7 days of logs and traces and 30 days of metrics, and stays under a 10 GiB budget.
+
+**It will refuse to start if you bind a non-loopback address with no token configured.**
+That is deliberate, not a bug. Either keep it on loopback, or set
+`TELEMETRYD_AUTH_INGEST_TOKEN` and `TELEMETRYD_AUTH_QUERY_TOKEN`.
+
+## Prove it works — do all three
+
+1. `curl -fsS http://127.0.0.1:4319/healthz` returns `ok`.
+2. Send one record and read it back:
+
+```bash
+curl -X POST http://127.0.0.1:4319/v1/logs -H 'Content-Type: application/json' -d '{
+  "resourceLogs": [{"resource": {"attributes": [
+    {"key": "service.name", "value": {"stringValue": "smoke"}}]},
+    "scopeLogs": [{"logRecords": [{
+      "timeUnixNano": "'"$(date +%s)000000000"'",
+      "severityNumber": 17, "severityText": "ERROR",
+      "body": {"stringValue": "hello from the install check"}}]}]}]}'
+
+curl -G http://127.0.0.1:4319/loki/api/v1/query_range \
+  --data-urlencode 'query={app="smoke"} |= "hello"'
+```
+
+The query must return the line the send step created. If it returns an empty result,
+the write failed — check the response body of the POST rather than retrying.
+
+3. `telemetryd validate` prints every resolved setting and where it came from.
+
+## Do not
+
+- Do not add a reverse proxy or TLS unless the port must be reachable from another
+  machine. On loopback it buys nothing.
+- Do not write a configuration file to change defaults you have not measured a need
+  for. Every setting is also an environment variable, `TELEMETRYD_<SECTION>_<KEY>`.
+
+````

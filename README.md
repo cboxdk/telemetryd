@@ -89,6 +89,11 @@ first attempt was wrong, are in the doc comments of the module that carries it. 
 built, what is not, and what is deliberately absent is in
 [BUILD-STATUS.md](BUILD-STATUS.md).
 
+Pointing an AI agent at this? [llms.txt](llms.txt) is the short version, and the
+installation, sending-data and service pages each carry a copy-paste brief. The part
+worth reading first is which query constructs are refused — an agent that knows Loki and
+Prometheus will otherwise write valid expressions this does not run.
+
 API contract: [COMPATIBILITY.md](COMPATIBILITY.md) — derived from `laravel-telemetry-ui`'s
 actual connector source, not from the upstream API references.
 

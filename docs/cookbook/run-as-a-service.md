@@ -61,3 +61,55 @@ The unit sets `TELEMETRYD_STORAGE_DATA_DIR=/var/lib/telemetryd` and uses systemd
 ```bash
 telemetryd validate
 ```
+\n
+## Hand this to an agent
+
+A self-contained brief. It names only commands and endpoints that exist, so an agent can
+execute it without reading the rest of this page — and without inventing the parts of the
+Loki and Prometheus APIs telemetryd deliberately does not implement.
+
+````markdown
+# Task: run telemetryd as a managed service on this machine
+
+telemetryd generates its own service unit for the platform it is running on. Do not
+hand-write a systemd unit or a launchd plist — the generated one is hardened and
+matched to the binary's own paths.
+
+```bash
+telemetryd service print       # inspect the unit first
+sudo telemetryd service install
+```
+
+`install` writes and enables the unit. `uninstall` stops and removes it.
+
+## Before installing
+
+Decide the data directory and the tokens, because changing them later means editing the
+unit rather than a flag:
+
+```bash
+telemetryd validate            # shows every resolved value and its origin
+```
+
+If the service will listen on anything other than loopback, it needs
+`TELEMETRYD_AUTH_INGEST_TOKEN` and `TELEMETRYD_AUTH_QUERY_TOKEN` set, or it will refuse
+to start. That refusal is deliberate.
+
+## Confirm it is running
+
+```bash
+telemetryd status              # version, uptime, listen address, per-app usage
+curl -fsS http://127.0.0.1:4319/healthz
+```
+
+`/healthz` is unauthenticated by design and is the right target for a supervisor probe.
+`/status` and `/metrics` require the admin token when one is configured.
+
+## Changing configuration afterwards
+
+`SIGHUP` reloads retention, the disk budget and the log level in place. Anything else
+that changed in the file is **refused by name** rather than silently ignored, so a
+reload that prints a refusal means the process is still running the old value and needs
+a restart.
+
+````

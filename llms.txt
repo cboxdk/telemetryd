@@ -1,0 +1,86 @@
+# telemetryd
+
+> A single-binary observability backend. OTLP in; the Loki, Tempo and Prometheus query
+> APIs out. One process, one port, one data directory, no sidecars and no collector.
+> Written in Rust, MIT licensed, at github.com/cboxdk/telemetryd.
+
+Run it with `telemetryd serve` and no arguments. It listens on `127.0.0.1:4319`, stores
+data beside itself, keeps 7 days of logs and traces and 30 days of metrics, and stays
+under a 10 GiB disk budget. Every setting is also an environment variable named
+`TELEMETRYD_<SECTION>_<KEY>`; precedence is defaults, then `telemetryd.toml`, then the
+environment, then CLI flags.
+
+## The thing most likely to mislead you
+
+telemetryd serves the Loki, Tempo and Prometheus **APIs**, not those products. The
+supported query surface is derived from what its client actually calls, so it is a
+deliberate subset — writing a valid PromQL or LogQL expression is not enough for it to
+run here.
+
+Anything outside the subset is refused with HTTP 400 and a structured body naming the
+construct: `{"error":{"code":"unsupported_feature","feature":"PromQL function `topk`"}}`.
+The languages are parsed in full and then lowered, which is why the error can name the
+function rather than reporting a syntax error.
+
+Verified against a running instance:
+
+- **PromQL works** for selectors and label matchers, `rate`, `increase`,
+  `histogram_quantile`, `sum`, `avg`, `min`, `max`, `count`, `by (...)`, `without (...)`,
+  `offset`, and arithmetic on a series.
+- **PromQL is refused** for `topk`, `bottomk`, `quantile`, `stddev`, `irate`, `delta`,
+  `absent`, and comparison operators such as `> 5`.
+- **LogQL works** for stream selectors, `|=`, `!=`, `|~`, `| json` and `| logfmt`.
+- **LogQL is refused** for `| line_format` and for every metric query over log streams —
+  `rate`, `count_over_time`, `sum`. Use the Prometheus API for pre-aggregated metrics.
+- **TraceQL works** for `{}`, attribute equality, `duration > 100ms`, `status = error`,
+  `name = "..."`, and `&&` between conditions.
+- **TraceQL is refused** for `||` between conditions and for `| count() > 2`.
+
+Prefer a narrow time range on any query with a substring filter. A term that appears
+nowhere is skipped without reading a segment; a term whose trigrams are individually
+common — a numeric order id, say — cannot be, and the time bound is what saves the scan.
+
+## Sending data
+
+OTLP over HTTP with **JSON** encoding. There is no protobuf and no gRPC endpoint.
+
+- `POST /v1/logs`, `POST /v1/traces`, `POST /v1/metrics` — OTLP/HTTP JSON
+- `POST /api/v1/write` — Prometheus `remote_write` (snappy + protobuf)
+
+`gzip`, `deflate` and `zstd` request bodies are decompressed. Records are rejected
+individually and the reason is reported in OTLP's `partialSuccess` field, so a `200`
+does not mean everything was stored — read the body.
+
+The resource attribute `service.name` becomes the `app` label and severity becomes
+`level`. Every other attribute is stored but is not a stream label unless listed in
+`ingest.stream_labels`, which is the cardinality contract.
+
+## Authentication
+
+Three independent tokens guard three surfaces: `auth.ingest_token` for writes,
+`auth.query_token` for the read APIs, `auth.admin_token` for `/status` and `/metrics`.
+Send them as `Authorization: Bearer <token>`. OIDC access tokens are accepted alongside
+them when `auth.oidc.issuer` is set; scopes are not a hierarchy, so an admin scope does
+not grant reads.
+
+telemetryd refuses to start when bound to a non-loopback address with no token
+configured. That is deliberate and should not be worked around with `--insecure`.
+
+## Docs
+
+- [Quickstart](https://github.com/cboxdk/telemetryd/blob/main/docs/quickstart.md): install, run, send, query — in one read
+- [Installation](https://github.com/cboxdk/telemetryd/blob/main/docs/getting-started/installation.md): includes a copy-paste brief for an agent
+- [Sending data](https://github.com/cboxdk/telemetryd/blob/main/docs/getting-started/sending-data.md): endpoints, labels, and what a 200 does not mean
+- [Docker](https://github.com/cboxdk/telemetryd/blob/main/docs/getting-started/docker.md): the container, and the tokens it generates on first start
+- [Configuration reference](https://github.com/cboxdk/telemetryd/blob/main/docs/configuration/reference.md): every option with its default
+- [COMPATIBILITY.md](https://github.com/cboxdk/telemetryd/blob/main/COMPATIBILITY.md): the authoritative API subset, endpoint by endpoint
+- [BUILD-STATUS.md](https://github.com/cboxdk/telemetryd/blob/main/BUILD-STATUS.md): what is built, what is not, and what is deliberately absent
+- [Cookbook](https://github.com/cboxdk/telemetryd/blob/main/docs/cookbook/): task-shaped recipes — relay mode, single sign-on, export and import, exposing it safely
+
+## Do not
+
+- Do not add an OpenTelemetry Collector. Applications send OTLP straight to telemetryd.
+- Do not reach for a protobuf or gRPC OTLP exporter; neither is served.
+- Do not assume an unsupported query construct is a bug. Read the `feature` field.
+- Do not publish port 4319 to the internet in plain HTTP. Terminate TLS in front, or set
+  `server.tls.cert_file` and `key_file`.

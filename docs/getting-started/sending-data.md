@@ -112,3 +112,57 @@ streams without bound. See [`ingest.stream_labels`](../configuration/reference.m
 Per-record attributes keep the producer's own key spelling — `exception.type` stays
 `exception.type`, because a trace view should show what was sent. Queries reach them by
 either spelling.
+\n
+## Hand this to an agent
+
+A self-contained brief. It names only commands and endpoints that exist, so an agent can
+execute it without reading the rest of this page — and without inventing the parts of the
+Loki and Prometheus APIs telemetryd deliberately does not implement.
+
+````markdown
+# Task: send this application's telemetry to telemetryd
+
+telemetryd accepts **OTLP over HTTP with JSON encoding**. Configure the application's
+existing OpenTelemetry SDK to point at it. Do not add a collector, and do not use the
+protobuf or gRPC exporters — telemetryd serves neither.
+
+## Endpoints
+
+| Endpoint | Payload |
+|---|---|
+| `POST /v1/logs` | OTLP/HTTP JSON |
+| `POST /v1/traces` | OTLP/HTTP JSON |
+| `POST /v1/metrics` | OTLP/HTTP JSON |
+| `POST /api/v1/write` | Prometheus `remote_write` (snappy + protobuf) |
+
+Base URL is the instance, e.g. `http://127.0.0.1:4319`. If an ingest token is
+configured, send `Authorization: Bearer <token>`; without one the write returns `401`.
+
+`Content-Encoding: gzip`, `deflate` and `zstd` are accepted and decompressed.
+
+## What becomes queryable
+
+The resource attribute `service.name` becomes the `app` label, and severity becomes
+`level`. Those two are always present. Any other resource attribute is stored but is
+**not** a stream label unless it is listed in `ingest.stream_labels` — that list is the
+cardinality contract, so do not add anything that changes per request, per process or
+per deploy.
+
+## Verify, do not assume
+
+After wiring the exporter, send real traffic and confirm it arrives:
+
+```bash
+curl -G <base>/loki/api/v1/query_range --data-urlencode 'query={app="<service.name>"}'
+```
+
+A `200` from the exporter is not proof: telemetryd rejects **per record** and reports
+what it dropped in the OTLP `partialSuccess` field of the response body. Read it.
+
+## Do not
+
+- Do not batch above the instance's `server.max_body_bytes` (16 MiB by default); the
+  request is refused with `413` rather than truncated.
+- Do not retry a `400` unchanged. It names what was wrong in the response body.
+
+````
