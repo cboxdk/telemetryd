@@ -174,14 +174,18 @@ pub async fn serve(config: Arc<Config>, store: Arc<Store>) -> Result<()> {
     let bound = if config.server.tls.is_enabled() {
         let (cert_file, key_file) = if config.server.tls.is_self_signed() {
             let dir = store.data_dir().root().join("tls");
-            let (cert, key) =
-                tls::ensure_self_signed(&dir, &config.server.tls.self_signed_names())?;
-            (cert.display().to_string(), key.display().to_string())
+            tls::ensure_self_signed(&dir, &config.server.tls.self_signed_names())?
         } else {
-            (
-                config.server.tls.cert_file.trim().to_owned(),
-                config.server.tls.key_file.trim().to_owned(),
-            )
+            // Validation guarantees both are present together, so a missing one here
+            // would be a bug rather than a configuration mistake.
+            match (&config.server.tls.cert_file, &config.server.tls.key_file) {
+                (Some(cert), Some(key)) => (cert.clone(), key.clone()),
+                _ => {
+                    return Err(telemetryd_core::Error::Config(
+                        "server.tls is enabled without both cert_file and key_file".to_owned(),
+                    ));
+                }
+            }
         };
         let tls_config = tls::server_config(&cert_file, &key_file)?;
         let listener = tls::TlsListener::bind(config.server.listen, tls_config).await?;

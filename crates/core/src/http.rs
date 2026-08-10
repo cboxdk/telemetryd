@@ -78,7 +78,7 @@ static TRUST: OnceLock<TlsConfig> = OnceLock::new();
 /// CA file that cannot be read must stop startup rather than silently fall back to the
 /// public roots — falling back would mean an operator who asked for a private CA gets
 /// public trust instead, which is the opposite of what they configured.
-pub fn init_trust(ca_file: &str) -> Result<(), String> {
+pub fn init_trust(ca_file: &std::path::Path) -> Result<(), String> {
     let config = build(Some(ca_file))?;
     // Already set means someone called this twice; the first answer wins and that is
     // worth knowing rather than papering over.
@@ -99,15 +99,16 @@ pub fn tls() -> TlsConfig {
     // built-in roots if it is unset or unreadable — a CLI command that cannot parse a
     // bundle should say so when it fails to connect, not refuse to start.
     let from_env = std::env::var(CA_FILE_ENV).unwrap_or_default();
-    let path = (!from_env.trim().is_empty()).then_some(from_env);
+    let path = (!from_env.trim().is_empty()).then(|| std::path::PathBuf::from(from_env.trim()));
     build(path.as_deref()).unwrap_or_else(|_| build(None).unwrap_or_default())
 }
 
-fn build(ca_file: Option<&str>) -> Result<TlsConfig, String> {
-    let roots = match ca_file.map(str::trim).filter(|path| !path.is_empty()) {
+fn build(ca_file: Option<&std::path::Path>) -> Result<TlsConfig, String> {
+    let roots = match ca_file {
         Some(path) => {
+            let shown = path.display();
             let pem = std::fs::read(path)
-                .map_err(|e| format!("could not read the CA bundle at {path}: {e}"))?;
+                .map_err(|e| format!("could not read the CA bundle at {shown}: {e}"))?;
             let certs: Vec<Certificate<'static>> = ureq::tls::parse_pem(&pem)
                 .filter_map(|item| match item {
                     Ok(ureq::tls::PemItem::Certificate(cert)) => Some(cert),
@@ -116,7 +117,7 @@ fn build(ca_file: Option<&str>) -> Result<TlsConfig, String> {
                 .collect();
             if certs.is_empty() {
                 return Err(format!(
-                    "{path} contains no certificates. tls.ca_file must be a PEM bundle \
+                    "{shown} contains no certificates. tls.ca_file must be a PEM bundle \
                      of certificate authorities; a key or an empty file would leave \
                      nothing to verify against."
                 ));
@@ -170,12 +171,12 @@ mod tests {
         )
         .expect("write");
 
-        let error = build(Some(path.to_str().expect("utf-8")))
-            .expect_err("a bundle with no certificates must be refused");
+        let error =
+            build(Some(path.as_path())).expect_err("a bundle with no certificates must be refused");
         assert!(error.contains("no certificates"), "{error}");
 
-        let missing =
-            build(Some("/nonexistent/ca.pem")).expect_err("an unreadable bundle must be refused");
+        let missing = build(Some(std::path::Path::new("/nonexistent/ca.pem")))
+            .expect_err("an unreadable bundle must be refused");
         assert!(missing.contains("could not read"), "{missing}");
         let _ = std::fs::remove_file(&path);
     }
@@ -183,8 +184,8 @@ mod tests {
     /// Empty means "use the default", not "use a file called empty string".
     #[test]
     fn an_unset_bundle_falls_back_to_the_built_in_roots() {
-        for unset in [None, Some(""), Some("   ")] {
-            let config = build(unset).expect("an unset bundle is not an error");
+        {
+            let config = build(None).expect("an unset bundle is not an error");
             assert!(!config.disable_verification());
         }
     }

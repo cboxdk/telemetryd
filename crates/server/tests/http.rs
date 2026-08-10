@@ -363,10 +363,18 @@ async fn metrics_exposition_is_well_formed_prometheus_text() {
         );
     }
 
-    assert!(body.contains(&format!(
-        r#"telemetryd_build_info{{version="{}"}} 1"#,
-        env!("CARGO_PKG_VERSION")
-    )));
+    // Labels are sorted, so `tls` precedes `version`. The TLS posture rides on
+    // `build_info` rather than a gauge of its own because it describes the deployment
+    // rather than measuring anything — and `off` is a value rather than an absent
+    // series, so an alert can say "nothing should be serving plaintext" without having
+    // to guess what a missing series means.
+    assert!(
+        body.contains(&format!(
+            r#"telemetryd_build_info{{tls="off",version="{}"}} 1"#,
+            env!("CARGO_PKG_VERSION")
+        )),
+        "build_info must carry both the version and the TLS posture: {body}"
+    );
     assert!(body.contains(r#"telemetryd_segments{signal="logs"}"#));
 
     // Every non-comment line must parse as `name[{labels}] value`.

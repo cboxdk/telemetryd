@@ -51,9 +51,11 @@ pub struct Config {
 #[serde(deny_unknown_fields, default)]
 pub struct ServerTlsConfig {
     /// PEM certificate chain, leaf first.
-    pub cert_file: String,
+    #[serde(deserialize_with = "path_or_none")]
+    pub cert_file: Option<PathBuf>,
     /// PEM private key, unencrypted — telemetryd cannot prompt at startup.
-    pub key_file: String,
+    #[serde(deserialize_with = "path_or_none")]
+    pub key_file: Option<PathBuf>,
     /// Generate a self-signed certificate for these names, if none exists yet.
     ///
     /// A comma-separated list of the hostnames clients will connect as, e.g.
@@ -77,15 +79,28 @@ impl ServerTlsConfig {
     /// Whether TLS termination is switched on, by either route.
     #[must_use]
     pub fn is_enabled(&self) -> bool {
-        !self.cert_file.trim().is_empty()
-            || !self.key_file.trim().is_empty()
-            || self.is_self_signed()
+        self.cert_file.is_some() || self.key_file.is_some() || self.is_self_signed()
     }
 
     /// Whether telemetryd should generate its own certificate.
     #[must_use]
     pub fn is_self_signed(&self) -> bool {
         !self.self_signed.trim().is_empty()
+    }
+
+    /// How this instance terminates TLS, as one word for an operator or a label.
+    ///
+    /// Reported rather than inferred at each site: `/status` and `/metrics` answering
+    /// the same question differently is worse than neither answering it.
+    #[must_use]
+    pub fn posture(&self) -> &'static str {
+        if self.is_self_signed() {
+            "self-signed"
+        } else if self.is_enabled() {
+            "certificate"
+        } else {
+            "off"
+        }
     }
 
     /// The names to put in the generated certificate, loopback included.
@@ -124,7 +139,8 @@ pub struct TlsConfig {
     /// every public CA, and an instance configured this way is usually talking only to
     /// internal infrastructure. If you genuinely need both, the file is a bundle:
     /// concatenate the public roots you want alongside your own.
-    pub ca_file: String,
+    #[serde(deserialize_with = "path_or_none")]
+    pub ca_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1002,9 +1018,7 @@ impl Config {
         let tls = &self.server.tls;
         // Both routes at once is ambiguous, and guessing which one the operator meant
         // is how an instance ends up serving a certificate nobody intended.
-        if tls.is_self_signed()
-            && (!tls.cert_file.trim().is_empty() || !tls.key_file.trim().is_empty())
-        {
+        if tls.is_self_signed() && (tls.cert_file.is_some() || tls.key_file.is_some()) {
             return Err(Error::Config(
                 "server.tls.self_signed cannot be combined with cert_file or key_file. \
              Use the certificate you have, or generate one — not both."
@@ -1013,7 +1027,7 @@ impl Config {
         }
         if !tls.is_self_signed()
             && tls.is_enabled()
-            && (tls.cert_file.trim().is_empty() || tls.key_file.trim().is_empty())
+            && (tls.cert_file.is_none() || tls.key_file.is_none())
         {
             return Err(Error::Config(
                 "server.tls needs both cert_file and key_file. One without the other \
@@ -1134,6 +1148,24 @@ impl Config {
 
         Ok(())
     }
+}
+
+/// Deserialize a path, treating an empty string as "not set".
+///
+/// The schema documents every unset value as `""`, and the environment gives no way to
+/// express "absent" other than an empty string. Mapping that to `None` here means the
+/// question "is this configured" is answered by the type rather than by every call site
+/// remembering to trim and compare — which is how `data_dir` has always worked, and
+/// what the TLS paths should have done from the start.
+fn path_or_none<'de, D>(deserializer: D) -> std::result::Result<Option<PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(raw
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .map(PathBuf::from))
 }
 
 /// Loopback is exempt from the https rules: it is how the OIDC paths are tested, and

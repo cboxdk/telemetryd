@@ -36,6 +36,14 @@ pub struct StatusResponse {
     /// True when the operator bypassed the ADR-004 bind check. Surfaced here so
     /// "is this instance exposed without auth?" is answerable from a dashboard.
     pub insecure: bool,
+    /// `off`, `certificate` or `self-signed`.
+    ///
+    /// "Is this connection encrypted, and by what" was answerable only by reading the
+    /// configuration file on the box — which is exactly the thing you cannot do from a
+    /// dashboard, and exactly what you want to check across a fleet. `self-signed` is
+    /// distinguished from `certificate` because they are not the same promise: one
+    /// encrypts, the other also authenticates.
+    pub tls: &'static str,
     pub auth: AuthStatus,
     pub storage: StoreStatus,
     /// What each app holds, largest first. The answer to "who is filling my disk",
@@ -107,6 +115,7 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse
         uptime_seconds: state.uptime_seconds(),
         listen: config.server.listen.to_string(),
         insecure: config.server.insecure,
+        tls: config.server.tls.posture(),
         auth: AuthStatus {
             ingest: enabled(state.ingest_tokens.is_empty()),
             query: enabled(state.query_tokens.is_empty()),
@@ -266,7 +275,18 @@ fn push_per_signal_gauges(snapshot: &telemetryd_store::StoreStatus, samples: &mu
 fn gauges(state: &AppState) -> Result<Vec<Sample>, Error> {
     let snapshot = state.store.snapshot()?;
     let mut samples = vec![
-        Sample::new("telemetryd_build_info", &[("version", VERSION)], 1.0),
+        // TLS posture as a label rather than its own gauge: it is a property of the
+        // deployment, not a measurement, and `build_info` is where Prometheus expects
+        // to find those. `off` is a value rather than an absent series, so an alert can
+        // say "no instance should be serving plaintext" without guessing.
+        Sample::new(
+            "telemetryd_build_info",
+            &[
+                ("version", VERSION),
+                ("tls", state.config.server.tls.posture()),
+            ],
+            1.0,
+        ),
         Sample::new("telemetryd_uptime_seconds", &[], state.uptime_seconds()),
         Sample::new(
             "telemetryd_disk_budget_bytes",

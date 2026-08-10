@@ -80,11 +80,15 @@ const CONCURRENT_HANDSHAKES: usize = 256;
 /// The provider is named explicitly rather than taken from the process default. A
 /// default provider is installed by whichever crate gets there first, and "whichever
 /// crate gets there first" is not a property to hang a TLS configuration on.
-pub fn server_config(cert_file: &str, key_file: &str) -> Result<rustls::ServerConfig> {
+pub fn server_config(
+    cert_file: &std::path::Path,
+    key_file: &std::path::Path,
+) -> Result<rustls::ServerConfig> {
+    let (cert_shown, key_shown) = (cert_file.display(), key_file.display());
     let cert_pem = std::fs::read(cert_file)
-        .map_err(|e| Error::io(format!("reading server.tls.cert_file at {cert_file}"), e))?;
+        .map_err(|e| Error::io(format!("reading server.tls.cert_file at {cert_shown}"), e))?;
     let key_pem = std::fs::read(key_file)
-        .map_err(|e| Error::io(format!("reading server.tls.key_file at {key_file}"), e))?;
+        .map_err(|e| Error::io(format!("reading server.tls.key_file at {key_shown}"), e))?;
 
     let chain: Vec<rustls::pki_types::CertificateDer<'static>> = ureq::tls::parse_pem(&cert_pem)
         .filter_map(|item| match item {
@@ -96,14 +100,14 @@ pub fn server_config(cert_file: &str, key_file: &str) -> Result<rustls::ServerCo
         .collect();
     if chain.is_empty() {
         return Err(Error::Config(format!(
-            "{cert_file} contains no certificates. server.tls.cert_file must be a PEM \
+            "{cert_shown} contains no certificates. server.tls.cert_file must be a PEM \
              certificate chain, leaf first."
         )));
     }
 
     let key = ureq::tls::PrivateKey::from_pem(&key_pem).map_err(|e| {
         Error::Config(format!(
-            "{key_file} contains no usable private key: {e}. It must be a PEM key, \
+            "{key_shown} contains no usable private key: {e}. It must be a PEM key, \
              unencrypted — telemetryd cannot prompt for a passphrase at startup."
         ))
     })?;
@@ -131,7 +135,7 @@ pub fn server_config(cert_file: &str, key_file: &str) -> Result<rustls::ServerCo
         .with_single_cert(chain, key)
         .map_err(|e| {
             Error::Config(format!(
-                "the certificate and key in {cert_file} and {key_file} do not form a \
+                "the certificate and key in {cert_shown} and {key_shown} do not form a \
                  usable pair: {e}"
             ))
         })
@@ -459,15 +463,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let empty = dir.join("empty.pem");
         std::fs::write(&empty, b"not a certificate\n").unwrap();
-        let path = empty.to_str().unwrap();
-
-        let error = server_config("/nonexistent/cert.pem", path).unwrap_err();
+        let missing = std::path::Path::new("/nonexistent/cert.pem");
+        let error = server_config(missing, &empty).unwrap_err();
         assert!(
             error.to_string().contains("cert_file"),
             "the error must name the setting: {error}"
         );
 
-        let error = server_config(path, path).unwrap_err();
+        let error = server_config(&empty, &empty).unwrap_err();
         assert!(
             error.to_string().contains("no certificates"),
             "an empty chain must say so: {error}"

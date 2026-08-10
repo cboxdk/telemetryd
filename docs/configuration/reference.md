@@ -194,6 +194,20 @@ still interceptable while looking encrypted. So this is the answer while you hav
 nothing better, not the destination. It cannot be combined with `cert_file`/`key_file`;
 telemetryd refuses rather than guessing which you meant.
 
+## Checking what is on
+
+`/status` carries `"tls"` — `off`, `certificate` or `self-signed` — and the same value
+rides on the `telemetryd_build_info` metric as a label:
+
+```
+telemetryd_build_info{tls="self-signed",version="0.24.2"} 1
+```
+
+`self-signed` is reported separately from `certificate` because they are not the same
+promise: one encrypts, the other also authenticates. And `off` is a value rather than an
+absent series, so an alert can say "no instance should be serving plaintext" without
+having to interpret a missing metric.
+
 ## Trusting a private CA
 
 `tls.ca_file` takes a PEM bundle and is what you set when the issuer or the relay
