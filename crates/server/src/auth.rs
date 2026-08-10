@@ -171,6 +171,44 @@ async fn guard(
                 Err(reason) => {
                     // The reason is logged, never returned: a 401 that explains *why* is a
                     // hint to whoever is guessing.
+                    //
+                    // But two of these are not guesses, they are incompatible
+                    // configuration — and debug is the wrong level for something the
+                    // operator caused and must fix. A sender-constrained token means
+                    // DPoP is on at the issuer; a wrong media type usually means an id
+                    // token was sent instead of an access token. Both produce 401 on
+                    // *every* request with an empty body, which is close to
+                    // undiagnosable from the outside.
+                    //
+                    // Said once per process, because an attacker who can pick the
+                    // rejection reason must not be able to pick our log volume.
+                    match &reason {
+                        Rejected::SenderConstrained => {
+                            static SAID: std::sync::Once = std::sync::Once::new();
+                            SAID.call_once(|| {
+                                tracing::warn!(
+                                    "refusing a sender-constrained (DPoP) access token: \
+                                 telemetryd cannot validate the proof, and accepting it \
+                                 as a plain bearer would discard the binding. Issue \
+                                 bearer tokens for telemetryd, or see the single sign-on \
+                                 guide."
+                                );
+                            });
+                        }
+                        Rejected::WrongTokenType(found) => {
+                            static SAID: std::sync::Once = std::sync::Once::new();
+                            let found = found.clone();
+                            SAID.call_once(|| {
+                                tracing::warn!(
+                                    %found,
+                                    "refusing a token whose media type is not at+jwt \
+                                     (RFC 9068). An id token carries `JWT` and authorises \
+                                     nothing; send the access token instead."
+                                );
+                            });
+                        }
+                        _ => {}
+                    }
                     tracing::debug!(surface = surface.as_str(), ?reason, "token refused");
                     state.metrics.incr(
                         "telemetryd_auth_failures_total",

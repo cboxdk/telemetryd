@@ -51,6 +51,35 @@ The moment an issuer is set, the read API demands a valid token — and a
 If you were deliberately leaving a surface open, that stops being true here. It is the
 safe direction to fail in, but check it before rolling out, not after.
 
+## Bearer tokens, not DPoP
+
+Cbox ID can bind an access token to a key the client holds (DPoP, RFC 9449), putting the
+thumbprint in a `cnf` claim so a stolen token alone is useless.
+
+**telemetryd refuses those tokens.** It does not validate DPoP proofs, and accepting a
+bound token as an ordinary bearer would hand back exactly the property the binding was
+bought for — so it fails closed rather than quietly downgrading.
+
+If DPoP is on for the client you point at telemetryd, every request gets a `401` with an
+empty body, because a 401 that explains itself is a hint to whoever is guessing. The
+reason goes to the log instead, once, at `warn`:
+
+```
+refusing a sender-constrained (DPoP) access token: telemetryd cannot validate
+the proof, and accepting it as a plain bearer would discard the binding.
+```
+
+Issue plain bearer tokens for telemetryd. Validating the proofs is future work.
+
+## It must be an access token
+
+RFC 9068 gives access tokens the media type `at+jwt`, and Cbox ID sets it on every one
+it mints. An **id token** says `JWT`, is signed by the same key, and authorises nothing —
+so it is refused, with the same empty 401 and a `warn` line naming what arrived.
+
+A token with no `typ` at all is accepted; not every issuer sets one, and `aud` and
+`scope` still have to hold.
+
 ## Static tokens keep working
 
 Enabling this does not turn them off, and it should not: an app server pushing OTLP
@@ -104,6 +133,16 @@ curl -sS -H "Authorization: Bearer $ADMIN_TOKEN" localhost:4319/status | jq .aut
 **`keys: 0` is the thing to alert on.** It means every Cbox ID token is being refused
 because the key set never loaded, and no other field would tell you.
 `telemetryd_oidc_keys` carries the same number for a dashboard.
+
+## If you also run relay mode
+
+Relay mode stamps each record's `app` label from the credential rather than the payload,
+and for a Cbox ID token that comes from the **`client_id`** claim — the registered OAuth
+client, which the issuer reserves against being overwritten by enrichment hooks. `sub` is
+a *user*, which is not what an application name means.
+
+So the client each mobile app authenticates as is what its telemetry is labelled with.
+See the [relay guide](relay-mode.md).
 
 ## The issuer must be https
 
