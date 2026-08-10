@@ -51,19 +51,60 @@ pub struct TrigramIndex {
 }
 
 impl TrigramIndex {
+    /// Build from the trigrams actually present, rather than a guess from row count.
+    ///
+    /// The previous sizing was `records * 4`, which the comment above it argued against
+    /// in the same breath — and it was wrong in both directions, measured on real text:
+    ///
+    /// | corpus | distinct trigrams | needed | allocated |
+    /// |---|---|---|---|
+    /// | repetitive logs | 1,351 | 1.0 KiB | 29.3 KiB |
+    /// | varied logs | 24,231 | 17.7 KiB | 29.3 KiB |
+    /// | high entropy | 511,968 | 375 KiB | 29.3 KiB |
+    ///
+    /// Thirty times too large on repetitive data is only waste. Ten times too *small* on
+    /// high-entropy data — base64 payloads, stack traces full of hex, JSON with random
+    /// ids — is worse than waste: the filter saturates, answers "maybe" to everything,
+    /// and every query reads every segment while the sidecar still costs disk. Verified
+    /// against a running instance: a term guaranteed absent pruned 44 of 44 segments on
+    /// repetitive text and 0 of 2 on random text.
+    ///
+    /// The count is exact because sealing already holds every record in memory. The
+    /// transient `HashSet` is bounded by the trigram space rather than by the data.
     #[must_use]
-    pub fn with_capacity(expected_records: usize) -> Self {
-        // Distinct trigrams grow far more slowly than record count — natural text
-        // exhausts its alphabet quickly — so size against a saturating estimate rather
-        // than against rows, which would allocate megabytes for no benefit.
-        let expected_trigrams = expected_records.saturating_mul(4).clamp(1024, 300_000);
-        let bytes = (expected_trigrams * BITS_PER_TRIGRAM)
-            .div_ceil(8)
-            .clamp(MIN_BYTES, MAX_BYTES);
-        Self {
-            bits: vec![0; bytes],
-            hashes: HASHES,
+    pub fn build<'a>(texts: impl Iterator<Item = &'a str>) -> Option<Self> {
+        let mut distinct: std::collections::HashSet<[u8; 3]> = std::collections::HashSet::new();
+        for text in texts {
+            for trigram in trigrams(text) {
+                // `windows(3)` always yields three bytes.
+                if let Ok(three) = <[u8; 3]>::try_from(trigram) {
+                    distinct.insert(three);
+                }
+            }
         }
+        if distinct.is_empty() {
+            return None;
+        }
+
+        // Refuse rather than write one that cannot prune. A missing filter makes the
+        // caller scan, which is correct and free; a saturated filter makes the caller
+        // scan *and* charges for the privilege, while looking like an index.
+        let needed = (distinct.len() * BITS_PER_TRIGRAM).div_ceil(8);
+        if needed > MAX_BYTES {
+            return None;
+        }
+
+        let mut index = Self {
+            bits: vec![0; needed.max(MIN_BYTES)],
+            hashes: HASHES,
+        };
+        let bits = index.bits.len() * 8;
+        for trigram in distinct {
+            for position in positions(&trigram, HASHES, bits) {
+                index.bits[position / 8] |= 1 << (position % 8);
+            }
+        }
+        Some(index)
     }
 
     /// Index every three-byte window of `text`.
@@ -181,15 +222,12 @@ mod tests {
     #[test]
     fn an_indexed_substring_is_always_reported_as_present() {
         // The property the whole thing rests on: no false negatives, ever.
-        let mut index = TrigramIndex::with_capacity(64);
         let lines = [
             "payment attempt 42 for order 1042 took 42ms",
             "connection refused talking to stripe",
             "MyTimeoutError while charging card",
         ];
-        for line in lines {
-            index.insert(line);
-        }
+        let index = TrigramIndex::build(lines.iter().copied()).unwrap();
 
         for line in lines {
             for start in 0..line.len() {
@@ -209,17 +247,17 @@ mod tests {
     #[test]
     fn a_token_index_would_have_been_wrong_here() {
         // `TimeoutError` is a substring of `MyTimeoutError` but not a token of it.
-        let mut index = TrigramIndex::with_capacity(8);
-        index.insert("MyTimeoutError while charging card");
+        let index =
+            TrigramIndex::build(["MyTimeoutError while charging card"].into_iter()).unwrap();
         assert!(index.may_contain("TimeoutError"));
     }
 
     #[test]
     fn an_absent_pattern_is_usually_rejected() {
-        let mut index = TrigramIndex::with_capacity(256);
-        for i in 0..200 {
-            index.insert(&format!("order {i} processed in 42ms via stripe"));
-        }
+        let lines: Vec<String> = (0..200)
+            .map(|i| format!("order {i} processed in 42ms via stripe"))
+            .collect();
+        let index = TrigramIndex::build(lines.iter().map(String::as_str)).unwrap();
         // Not asserted as certain — it is a Bloom filter — but a pattern sharing no
         // trigrams with anything indexed should be rejected, and that is the case the
         // 98-second query hits.
@@ -229,7 +267,7 @@ mod tests {
 
     #[test]
     fn a_pattern_too_short_to_have_a_trigram_never_prunes() {
-        let index = TrigramIndex::with_capacity(8);
+        let index = TrigramIndex::build(["anything at all"].into_iter()).unwrap();
         for pattern in ["", "a", "ab"] {
             assert!(
                 index.may_contain(pattern),
@@ -251,10 +289,10 @@ mod tests {
     #[test]
     fn a_round_trip_preserves_every_answer() {
         let dir = tempfile::tempdir().unwrap();
-        let mut index = TrigramIndex::with_capacity(64);
-        for i in 0..50 {
-            index.insert(&format!("line {i} with some words in it"));
-        }
+        let lines: Vec<String> = (0..50)
+            .map(|i| format!("line {i} with some words in it"))
+            .collect();
+        let index = TrigramIndex::build(lines.iter().map(String::as_str)).unwrap();
         index.write(dir.path()).unwrap();
 
         let loaded = TrigramIndex::read(dir.path()).unwrap();
@@ -268,31 +306,45 @@ mod tests {
     }
 
     #[test]
-    fn saturation_is_reported() {
-        let empty = TrigramIndex::with_capacity(1024);
-        assert!(empty.saturation() < 0.01);
-
-        // Genuinely varied text, not the same phrase with a counter: what saturates a
-        // trigram filter is the number of *distinct* trigrams, and repeating a fixed
-        // sentence exhausts its alphabet almost immediately.
-        let mut full = TrigramIndex::with_capacity(1);
-        let alphabet: Vec<char> = ('a'..='z').chain('0'..='9').collect();
+    fn a_filter_that_could_not_prune_is_not_written_at_all() {
+        // What saturates a trigram filter is the number of *distinct* trigrams, so this
+        // is genuinely varied text rather than one phrase with a counter.
+        // Printable ASCII, not `a-z0-9`: a 36-character alphabet has only 46,656
+        // possible trigrams, which now sizes to a perfectly good 35 KiB filter — the
+        // improvement itself. Saturation needs the wider alphabet that base64 payloads
+        // and hex-laden stack traces actually produce.
         let mut seed = 1u64;
-        for _ in 0..20_000 {
-            let word: String = (0..12)
-                .map(|_| {
-                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-                    alphabet[(seed >> 33) as usize % alphabet.len()]
-                })
-                .collect();
-            full.insert(&word);
-        }
+        let alphabet: Vec<char> = (32u8..127).map(char::from).collect();
+        let lines: Vec<String> = (0..200_000)
+            .map(|_| {
+                (0..12)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                        alphabet[(seed >> 33) as usize % alphabet.len()]
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // The old sizing gave this a fixed allocation, which it saturated: every query
+        // then read every segment while the sidecar still cost disk. Refusing is the
+        // honest answer — the caller scans either way, and now pays nothing to be told.
         assert!(
-            full.saturation() > 0.9,
-            "expected a small filter to saturate, got {}",
-            full.saturation()
+            TrigramIndex::build(lines.iter().map(String::as_str)).is_none(),
+            "a corpus too varied to index must yield no filter rather than a useless one"
         );
-        // Saturated or not, it must still never produce a false negative.
-        assert!(full.may_contain("some quite varied text"));
+    }
+
+    #[test]
+    fn an_ordinary_corpus_leaves_the_filter_far_from_saturated() {
+        let lines: Vec<String> = (0..5_000)
+            .map(|i| format!("order {i} processed in 42ms via stripe"))
+            .collect();
+        let index = TrigramIndex::build(lines.iter().map(String::as_str)).unwrap();
+        assert!(
+            index.saturation() < 0.6,
+            "sized from the trigrams present, this should have headroom, got {}",
+            index.saturation()
+        );
     }
 }

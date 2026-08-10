@@ -270,6 +270,19 @@ linearly — but the *data* grew sixteenfold too, so that is cost per byte scann
 per segment, and merging segments would not reduce a byte of it. Compaction would be
 work that buys nothing measurable.
 
+**The text filter is sized from the trigrams a segment actually contains.** It used to
+be sized from row count times four, which the comment above it argued against in the
+same breath. Measured on real text, that was thirty times too large on repetitive logs
+and ten times too *small* on high-entropy ones — base64 payloads, hex-laden stack
+traces — where the filter saturated, answered "maybe" to everything, and left every
+query reading every segment while the sidecar still cost disk. Proven against a running
+instance: a term guaranteed absent pruned 44 of 44 segments on repetitive text and 0 of
+2 on random text. Sizing from the exact count took one corpus from 30,008 bytes of
+filter per segment to 1,156, and the whole store from 6.7 MB to 5.5 MB, with pruning
+unchanged. A segment too varied to index now gets no filter at all, because a filter
+that cannot prune is worse than none: the caller scans either way and now pays nothing
+to be told so.
+
 **Substring search prunes, but not equally well for every pattern.** A per-segment
 trigram index skips segments that cannot contain a `|=` filter's text. A term
 present nowhere went from 3.9 s to 6 ms over 405 MB — 98 s to 0.2 s extrapolated to a

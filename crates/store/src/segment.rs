@@ -568,18 +568,18 @@ fn build_sidecars<S: RecordSchema>(
 ) -> (LabelIndexBuilder, Option<Bloom>, Option<TrigramIndex>) {
     let mut index = LabelIndexBuilder::default();
     let mut bloom = S::exact_key(&records[0]).map(|_| Bloom::with_capacity(records.len()));
-    let mut text =
-        S::searchable_text(&records[0]).map(|_| TrigramIndex::with_capacity(records.len()));
 
     for record in records {
         index.observe(S::index_labels(record));
-        if let (Some(text), Some(body)) = (text.as_mut(), S::searchable_text(record)) {
-            text.insert(body);
-        }
         if let (Some(bloom), Some(key)) = (bloom.as_mut(), S::exact_key(record)) {
             bloom.insert(key);
         }
     }
+
+    // Built separately because its size depends on what the text turns out to contain,
+    // which is not known until every record has been seen. `build` returns `None` when
+    // there is nothing to index or when a filter could not prune anyway.
+    let text = TrigramIndex::build(records.iter().filter_map(S::searchable_text));
     (index, bloom, text)
 }
 
