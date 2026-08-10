@@ -144,6 +144,12 @@ against the exact artifact being published, before anything is uploaded.
 Plus: all four release targets cross-compile, and the musl builds are asserted to be
 statically linked.
 
+**The corpus survives the night.** Each run used to begin from a handful of committed
+seeds and re-explore from zero, which throws away the one thing fuzzing accumulates. It
+is cached per target now, and minimised before caching so it does not fill with inputs
+that reach no new code. Five minutes on top of ten thousand known-interesting inputs is
+not the same search as five minutes from nothing.
+
 **Fuzzing runs nightly, not on the merge gate.** It found a defect the first time it
 ever ran: eight bytes of snappy declaring 2.8 GB of output, which `/api/v1/write`
 allocated before decompressing anything. Three separate faults in the workflow had kept
