@@ -37,6 +37,22 @@ TARGETS = [
 ]
 
 
+def run_or_explain(command: list[str], what: str) -> None:
+    """Run a command, and on failure say what it printed rather than only what it was.
+
+    `subprocess.run(check=True, capture_output=True)` raises a `CalledProcessError` whose
+    message is the argument list. That is enough to see *which* command failed and
+    nothing about *why* — which is how a release publish failed in CI with a clone error
+    nobody could read, while the same script succeeded when run by hand. Whatever the
+    cause was, the log could not say.
+    """
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode == 0:
+        return
+    detail = (result.stderr or result.stdout or "").strip() or "no output"
+    sys.exit(f"{what} failed (exit {result.returncode}): {detail}")
+
+
 def checksums(tag: str) -> dict[str, str]:
     url = f"https://github.com/{REPO}/releases/download/{tag}/SHA256SUMS"
     with urllib.request.urlopen(url, timeout=60) as response:
@@ -106,16 +122,16 @@ def main() -> int:
         return 0
 
     with tempfile.TemporaryDirectory() as workspace:
-        subprocess.run(
+        run_or_explain(
             ["gh", "repo", "clone", TAP, workspace, "--", "--depth", "1"],
-            check=True,
-            capture_output=True,
+            f"cloning {TAP}",
         )
         formula_dir = Path(workspace) / "Formula"
         formula_dir.mkdir(exist_ok=True)
         (formula_dir / "telemetryd.rb").write_text(rendered, encoding="utf-8")
 
-        subprocess.run(["git", "add", "Formula/telemetryd.rb"], cwd=workspace, check=True)
+        run_or_explain(["git", "-C", workspace, "add", "Formula/telemetryd.rb"],
+                       "staging the formula")
         status = subprocess.run(
             ["git", "status", "--porcelain"], cwd=workspace, capture_output=True, text=True
         )
@@ -139,7 +155,11 @@ def main() -> int:
         )
         # `-u origin HEAD` rather than a bare push: a tap that has never been written
         # to has no upstream branch, and that is exactly the first time this runs.
-        subprocess.run(["git", "push", "-u", "origin", "HEAD"], cwd=workspace, check=True)
+        #
+        # This one matters most of the three: a push is what fails on a permission the
+        # App lost, or on a tap someone else wrote to first, and both say so on stderr.
+        run_or_explain(["git", "-C", workspace, "push", "-u", "origin", "HEAD"],
+                       f"pushing the formula to {TAP}")
 
     print(f"published telemetryd {version} to {TAP}")
     print(f"verify with: brew install {TAP.replace('homebrew-', '')}/telemetryd")
