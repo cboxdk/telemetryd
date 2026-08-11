@@ -359,6 +359,7 @@ def main() -> int:
     check_relay_over_tls(binary)
     check_serving_tls(binary)
     check_self_signed(binary)
+    check_memory_ceiling(binary)
     check_pipes(binary)
     check_relay(binary)
     check_relay_fair_share(binary)
@@ -1476,6 +1477,112 @@ def check_self_signed(binary: str) -> None:
             refused = True
         check("a verifying client still refuses it, as a self-signed certificate should",
               refused)
+    finally:
+        stop(proc)
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def resident_bytes(pid: int) -> int | None:
+    """Resident set size, or `None` where it cannot be read.
+
+    `/proc` on Linux, `ps` elsewhere. Returning `None` rather than guessing keeps the
+    caller honest: the number in `requirements.md` is scoped to musl, and a figure
+    measured with a different allocator is not evidence about it either way.
+    """
+    status = pathlib.Path(f"/proc/{pid}/status")
+    if status.is_file():
+        for line in status.read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) * 1024
+        return None
+    try:
+        out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)],
+                             capture_output=True, text=True, check=True).stdout.strip()
+        return int(out) * 1024 if out else None
+    except Exception:  # noqa: BLE001 — no RSS is a skip, not a failure
+        return None
+
+
+def check_memory_ceiling(binary: str) -> None:
+    """The sizing number people provision machines from.
+
+    `requirements.md` promises roughly 80 MB idle plus 1.3x `storage.max_segment_bytes`
+    under load — about 400 MB at the 256 MiB default. That number was measured once, by
+    hand, on musl, and then never again. It is also the claim that goes silently wrong:
+    a buffer that stops respecting its cap does not fail a test, it just makes the box
+    the operator sized from this page run out of memory.
+
+    Asserted only on Linux, which is where the claim is scoped and where CI builds and
+    soaks the musl binary. Elsewhere it measures and reports, because a figure from a
+    different allocator is not evidence about musl.
+    """
+    print("\n=== memory against the documented ceiling ===")
+    cap_mib = 64
+    data_dir = tempfile.mkdtemp(prefix="telemetryd-soak-mem-")
+    config = os.path.join(data_dir, "telemetryd.toml")
+    with open(config, "w", encoding="utf-8") as handle:
+        # No admin token: this binds loopback, and guarding `/status` here would only
+        # mean reading the buffer through an auth header the measurement does not need.
+        handle.write(
+            # A long window so nothing seals: the ceiling is about what the open buffer
+            # is allowed to hold, and sealing mid-measurement would hide exactly that.
+            f"[storage]\nmax_segment_bytes = \"{cap_mib}MiB\"\nsegment_duration = \"24h\"\n"
+        )
+
+    proc = subprocess.Popen(
+        [binary, "serve", "--config", config, "--listen", f"127.0.0.1:{PORT}",
+         "--data-dir", data_dir],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ},
+    )
+    try:
+        for _ in range(240):
+            try:
+                if request("/healthz")[0] == 200:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.25)
+
+        idle = resident_bytes(proc.pid)
+
+        # Fill the buffer towards the cap without sealing it.
+        line = "m" * 300
+        buffered = 0
+        for batch in range(240):
+            records = [{"timeUnixNano": str(NOW + (batch * 1000 + i) * 1_000_000),
+                        "body": {"stringValue": line}} for i in range(1000)]
+            request("/v1/logs", {"resourceLogs": [{"resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "mem"}}]},
+                "scopeLogs": [{"logRecords": records}]}]})
+            _, status = request("/status")
+            if isinstance(status, dict):
+                buffered = status["storage"]["logs"]["buffered_bytes"]
+                if buffered > cap_mib * 1024 * 1024 * 0.75:
+                    break
+
+        loaded = resident_bytes(proc.pid)
+        check("the buffer actually filled, so this measured something",
+              buffered > cap_mib * 1024 * 1024 * 0.5,
+              f"{buffered / 1048576:.0f} MiB buffered of a {cap_mib} MiB cap")
+
+        if loaded is None:
+            check("resident memory could be read", False, "no RSS available")
+            return
+
+        # The documented rule, with a quarter of headroom. Tight enough that a buffer
+        # which stops respecting its cap fails here — the defect this file already
+        # caught once — and loose enough not to flake on allocator noise.
+        predicted = 80 * 1024 * 1024 + int(1.3 * cap_mib * 1024 * 1024)
+        ceiling = 40 * 1024 * 1024
+        detail = (f"idle {(idle or 0) / 1048576:.0f} MB, loaded {loaded / 1048576:.0f} MB, "
+                  f"documented {predicted / 1048576:.0f} MB, ceiling {ceiling / 1048576:.0f} MB")
+
+        if sys.platform.startswith("linux"):
+            check("resident memory stays under the documented ceiling",
+                  loaded <= ceiling, detail)
+        else:
+            # Reported, not asserted: requirements.md scopes the figure to musl.
+            print(f"    note  not asserted on {sys.platform} — {detail}")
     finally:
         stop(proc)
         shutil.rmtree(data_dir, ignore_errors=True)

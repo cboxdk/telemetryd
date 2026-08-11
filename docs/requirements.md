@@ -16,7 +16,7 @@ dependencies — no libc to match, no JVM, no Python, no shared libraries.
 | Operating system | Linux (any distribution, musl-static) or macOS 11+ |
 | Architecture | `x86_64` or `aarch64` |
 | Disk | The configured budget, default 10 GiB, plus headroom |
-| Memory | ~80 MB idle, plus roughly 1.3x `storage.max_segment_bytes` under load — about 400 MB at the 256 MiB default. Measured on musl; see below |
+| Memory | ~16 MB idle, plus roughly 1.3x `storage.max_segment_bytes` under load — about 400 MB at the 256 MiB default, and measured at 380 MB. Measured on musl at three cap sizes; see below |
 | Network | One TCP port, default 4319 |
 
 **On memory.** The figure above is measured rather than estimated, driving the musl
@@ -28,6 +28,24 @@ cost of more, smaller segments.
 Prebuilt binaries are published for all four combinations:
 `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`,
 `aarch64-apple-darwin`.
+
+
+### Memory, measured
+
+On `x86_64`/`aarch64` musl, with the buffer filled to three quarters of the cap and
+nothing sealed:
+
+| `max_segment_bytes` | idle | under load | what the rule above predicts |
+|---|---|---|---|
+| 64 MiB | 16 MB | 169 MB | 163 MB |
+| 128 MiB | 16 MB | 247 MB | 246 MB |
+| 256 MiB (default) | 16 MB | 380 MB | 412 MB |
+
+The rule is deliberately the conservative one: it over-predicts at the default, which is
+the safe direction for someone sizing a box from this page. Idle is lower than the
+figure it used to quote — that number was a single hand measurement and is now three,
+taken by the soak, which asserts the ceiling on every release rather than trusting this
+table to stay true.
 
 ## Not required
 
