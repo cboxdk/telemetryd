@@ -49,6 +49,13 @@ retention costs little.
 }
 ```
 
+**`deleted_by_budget` is the field to watch, not `over_budget`.** They rarely show what
+the example above shows at the same moment: `over_budget` is true only in the window
+between crossing the ceiling and the reaper running, which is seconds. Afterwards it
+reads `false` while data is still being deleted on every pass — measured at
+`over_budget: false`, `disk_used_ratio: 0.98`, `deleted_by_budget: 7`. A dashboard
+built on `over_budget` will almost always look calm.
+
 `deleted_by_budget` above zero means data you asked to keep is being deleted. Either
 raise `disk_budget` or shorten retention — leaving it is choosing to silently lose the
 oldest data, which is at least a choice worth making on purpose.
