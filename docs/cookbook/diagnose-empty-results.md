@@ -39,11 +39,21 @@ nanoseconds. telemetryd detects and corrects it — the counter above tells you 
 happening — but a producer sending something outside any plausible range gets rejected,
 and the records land nowhere.
 
-Check what time range you actually have:
+Check what time range you actually have. `/status` is a single line of JSON, so pick
+the fields out rather than grepping around them:
 
 ```bash
-curl -s localhost:4319/status | grep -A3 oldest
+curl -s localhost:4319/status |
+  python3 -c 'import json,sys,datetime
+d = json.load(sys.stdin)["storage"]["logs"]
+for k in ("oldest_record_nanos", "newest_record_nanos"):
+    v = d[k]
+    print(k, datetime.datetime.fromtimestamp(v / 1e9).isoformat() if v else "none")'
 ```
+
+`none` for both means the signal is empty and you are back at step 1. A range that
+does not overlap the window you queried is the answer — and a range starting in 1970
+or in the far future is a producer sending the wrong unit, which is step 3.
 
 ## 4. The query does not match
 
