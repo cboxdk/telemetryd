@@ -88,7 +88,14 @@ jobs:
           mkdir -p "dist/$NAME"
 
           cp "target/${{ matrix.target }}/dist/telemetryd" "dist/$NAME/"
-          cp README.md LICENSE COMPATIBILITY.md SECURITY.md telemetryd.toml.example "dist/$NAME/"
+          # The whole documentation set travels with the binary. The README links to
+          # `docs/`, `BUILD-STATUS.md` and `llms.txt` relatively, so shipping it without
+          # them meant fourteen broken links in an artifact someone unpacks offline —
+          # and an agent pointed at an unpacked directory found a README promising pages
+          # that were not there. 190 KB of markdown against an 11 MB binary.
+          cp README.md LICENSE COMPATIBILITY.md SECURITY.md BUILD-STATUS.md llms.txt \
+             telemetryd.toml.example "dist/$NAME/"
+          cp -R docs "dist/$NAME/"
 
           tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
           echo "archive=dist/$NAME.tar.gz" >> "$GITHUB_OUTPUT"
