@@ -111,7 +111,7 @@ rest and reports the refusal through OTLP's own `partialSuccess` field.
 | Endpoint | Used by | Notes |
 |---|---|---|
 | `GET /loki/api/v1/labels` | `LokiSource::probe()`, label discovery | Must answer `{"status":"success"}` — the UI uses this to decide the URL *is* a log backend |
-| `GET /loki/api/v1/query_range` | `LokiSource::query()` | `query`, `start`/`end` in **nanoseconds**, `limit`, `direction=backward` |
+| `GET /loki/api/v1/query_range` | `LokiSource::query()` | `query`, `start`/`end` in **nanoseconds**, `limit`, `direction=backward`. `limit` defaults to 100 and is **clamped to 5,000** |
 | `GET /loki/api/v1/label/{name}/values` | `LokiSource::labelValues()` | optional `start`/`end` |
 | `GET /loki/api/v1/series` | — | Not used by the UI; implemented anyway, it is cheap and useful |
 | `GET /loki/api/v1/tail` | — | WebSocket live tail. **telemetryd's own feature**, not a UI requirement |
@@ -160,7 +160,7 @@ default, `{service_name=~".+"}`, satisfies this.
 | Endpoint | Used by | Notes |
 |---|---|---|
 | `GET /api/search/tags` | `TempoSource::probe()`, tag discovery | Must return `tagNames` (or `scopes`) — the UI's backend-recognition check |
-| `GET /api/search` | `TempoSource::search()` | `q` = **TraceQL**, `start`/`end` in **seconds**, `limit` |
+| `GET /api/search` | `TempoSource::search()` | `q` = **TraceQL**, `start`/`end` in **seconds**, `limit`, **clamped to 1,000** |
 | `GET /api/traces/{traceID}` | `TempoSource::trace()` | Returns `{"batches":[…]}` in OTLP `resourceSpans` shape |
 | `GET /api/v2/search/tag/{name}/values` | `TempoSource::tagValues()` | **v2**, with an optional `q` filter. Returns `{"tagValues":[{"type","value"}]}` |
 
@@ -228,6 +228,26 @@ Driven by what `PromqlCompiler` actually generates:
 the `or` form above (`on`/`ignoring`/`group_left`).
 
 ---
+
+## Result caps, and which ones tell you
+
+Three endpoints bound how much one request may return. Two of them do it silently,
+which is worth knowing before you conclude that data is missing:
+
+| Endpoint | Cap | Behaviour when exceeded |
+|---|---|---|
+| `GET /loki/api/v1/query_range` | `limit` clamped to **5,000** | silent — ask for more and you get 5,000 |
+| `GET /api/search` | `limit` clamped to **1,000** | silent |
+| `GET /api/v1/query_range` | **11,000** points per series | `400`, naming the number and telling you to widen `step` |
+
+The Prometheus one is the behaviour to copy and the other two match what the upstream
+APIs do, which is why they were left alone rather than made to error: a client that
+passes a large limit expecting the server to clamp is doing the normal thing.
+
+Page with the timestamp cursor rather than a larger limit — advance `start` past the
+newest record you received. `telemetryd query` does this for you, and
+`GET /api/v1/export` exists for bulk reads, where the ceiling is 200,000 records per
+request rather than 5,000.
 
 ## Non-API notes
 

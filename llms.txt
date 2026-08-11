@@ -36,6 +36,14 @@ Verified against a running instance:
   `name = "..."`, and `&&` between conditions.
 - **TraceQL is refused** for `||` between conditions and for `| count() > 2`.
 
+One request does not return everything. `GET /loki/api/v1/query_range` clamps `limit`
+to 5,000 and `GET /api/search` clamps it to 1,000 — **silently**, so asking for a
+million and receiving five thousand is the cap, not missing data. Page by advancing
+`start` past the newest record you received, or use `GET /api/v1/export`, which returns
+up to 200,000 records per request. The Prometheus range endpoint is the exception and
+refuses loudly: more than 11,000 points per series is a `400` telling you to widen
+`step`.
+
 Prefer a narrow time range on any query with a substring filter. A term that appears
 nowhere is skipped without reading a segment; a term whose trigrams are individually
 common — a numeric order id, say — cannot be, and the time bound is what saves the scan.
