@@ -1573,7 +1573,7 @@ def check_memory_ceiling(binary: str) -> None:
         # which stops respecting its cap fails here — the defect this file already
         # caught once — and loose enough not to flake on allocator noise.
         predicted = 80 * 1024 * 1024 + int(1.3 * cap_mib * 1024 * 1024)
-        ceiling = 40 * 1024 * 1024
+        ceiling = int(predicted * 1.25)
         detail = (f"idle {(idle or 0) / 1048576:.0f} MB, loaded {loaded / 1048576:.0f} MB, "
                   f"documented {predicted / 1048576:.0f} MB, ceiling {ceiling / 1048576:.0f} MB")
 
