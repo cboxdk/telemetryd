@@ -507,6 +507,25 @@ def check_reload(binary: str) -> None:
         # serving rather than exiting or reopening anything.
         check("the server survives an unreloadable change", request("/healthz")[0] == 200)
 
+        # The reaper read the new window from the store while `/status` kept reporting
+        # the configuration captured at startup, so a reload left the two disagreeing on
+        # the single field an operator checks when asking where their data went. Asserted
+        # against the *reported* value rather than the log line, because the log said the
+        # change had applied — which was true, and was not the bug.
+        write_config("2GiB", 'max_segment_bytes = "64MiB"\n[retention]\nlogs = "3d"\n')
+        proc.send_signal(signal.SIGHUP)
+        reported = None
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            _, body = request("/status")
+            if isinstance(body, dict):
+                reported = body.get("retention", {}).get("logs")
+                if reported == "3days":
+                    break
+            time.sleep(0.5)
+        check("/status reports the retention actually in force after a reload",
+              reported == "3days", f"reported {reported!r}, expected '3days'")
+
         # A broken file must leave the running configuration alone.
         with open(config_path, "w", encoding="utf-8") as handle:
             handle.write("this is not valid toml {{{")

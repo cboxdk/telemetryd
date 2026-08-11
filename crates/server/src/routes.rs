@@ -91,18 +91,23 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "unknown".to_owned());
 
+    // From the store, not from `state.config`. The configuration here is the one
+    // captured at startup and never replaced, so after a `SIGHUP` this reported the old
+    // window while the reaper enforced the new one — on the single field an operator
+    // reads when asking where their data went.
+    let (in_force, _) = state.store.retention_in_force();
     let retention = BTreeMap::from([
         (
             "logs",
-            humantime::format_duration(config.retention.logs.get()).to_string(),
+            humantime::format_duration(in_force.logs.get()).to_string(),
         ),
         (
             "traces",
-            humantime::format_duration(config.retention.traces.get()).to_string(),
+            humantime::format_duration(in_force.traces.get()).to_string(),
         ),
         (
             "metrics",
-            humantime::format_duration(config.retention.metrics.get()).to_string(),
+            humantime::format_duration(in_force.metrics.get()).to_string(),
         ),
     ]);
 

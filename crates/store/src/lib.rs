@@ -435,6 +435,19 @@ impl Store {
     /// Returns a description of what changed, for the operator to see in the log. An
     /// empty result means the reloaded configuration asked for nothing new, which is
     /// worth saying out loud — "reloaded" and "changed something" are different facts.
+    /// The retention windows and disk budget currently in force.
+    ///
+    /// The store is the authority: `apply_retention_policy` writes here on `SIGHUP`,
+    /// and the reaper reads here. `/status` used to report the configuration captured
+    /// at startup instead, so after any reload it told an operator the old window while
+    /// the reaper enforced the new one — on the one field people check when asking
+    /// where their data went.
+    #[must_use]
+    pub fn retention_in_force(&self) -> (RetentionConfig, u64) {
+        let policy = lock_read(&self.policy);
+        (policy.retention.clone(), policy.disk_budget)
+    }
+
     pub fn apply_retention_policy(&self, config: &Config) -> Vec<String> {
         let mut policy = lock_write(&self.policy);
         let mut changes = Vec::new();

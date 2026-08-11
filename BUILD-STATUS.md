@@ -270,6 +270,14 @@ linearly — but the *data* grew sixteenfold too, so that is cost per byte scann
 per segment, and merging segments would not reduce a byte of it. Compaction would be
 work that buys nothing measurable.
 
+**`/status` reports the retention actually in force.** It used to read the
+configuration captured at startup, which is never replaced, so after a `SIGHUP` the
+reaper enforced the new window while `/status` reported the old one — on the single
+field an operator reads when asking where their data went. The store holds the live
+policy and is now the source. Found by executing a documentation claim rather than
+reading it, and the soak asserts the reported value rather than the log line, because
+the log had always said the change applied. It had; that was not the bug.
+
 **The operational surface is pinned.** `/status`'s key set and every exported metric
 name are asserted as sets, not field by field. The query APIs were always frozen in
 COMPATIBILITY.md and contract-tested; the surface dashboards and alerts read was not, so
