@@ -117,10 +117,16 @@ verifies its own signature before publishing, and `install.sh` verifies it when
 `cosign` is present, pinning `--certificate-identity` — without which any valid
 Sigstore signature by anyone would pass.
 
-This entry used to say the path was written but unproven. It is proven now: v0.13.0's
-bundle was downloaded from the published release and verified against
-`refs/tags/v0.13.0` with the same command the documentation gives users, on a machine
-that had not built it.
+Proven on the current release rather than remembered from an old one. In a clean
+container, `curl … | sh` from the README detects the platform, downloads v0.26.7,
+reports `signature verified` then `checksum verified`, and installs a binary that runs.
+Without `cosign` on the box it falls back to the checksum and says so — *"verifying the
+checksum only, not who published it"* — rather than implying more than it did.
+
+The pin is load-bearing, which is the part worth testing rather than assuming: verifying
+the same bundle against a different identity fails, naming the subject it actually found.
+`install.sh` pins tighter than the documentation shows, to
+`release.yml@refs/tags/v<version>` rather than a pattern over the repository.
 
 ## Gates
 
