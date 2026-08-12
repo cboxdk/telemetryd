@@ -82,6 +82,9 @@ enum Command {
     /// Check a configuration and show where every value came from.
     Validate(ConfigArgs),
 
+    /// Write a configuration with generated tokens, ready for `service install`.
+    Init(commands::init::InitArgs),
+
     /// Generate and install a service unit for this machine.
     Service {
         #[command(subcommand)]
@@ -175,6 +178,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Validate(args) => {
             commands::validate::run(args.config.as_deref(), args.data_dir.as_deref())
         }
+        Command::Init(args) => commands::init::run(&args),
         Command::Service { action } => commands::service::run(&action),
         Command::Version => {
             commands::version::run();

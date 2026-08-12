@@ -40,11 +40,12 @@ brew install cboxdk/tap/telemetryd
 A `.deb` and the raw binaries are on the [releases page](https://github.com/cboxdk/telemetryd/releases),
 and there is a container image at `ghcr.io/cboxdk/telemetryd` — see [Docker](docs/getting-started/docker.md).
 
-To keep it running across reboots, telemetryd writes the service unit for the machine it
-is on — a hardened systemd unit on Linux, a launchd plist on macOS:
+On a server, write a configuration with generated tokens and install the service unit —
+a hardened systemd unit on Linux, a launchd plist on macOS:
 
 ```bash
-telemetryd service print       # read it first
+sudo telemetryd init           # config + one token per surface, printed once
+telemetryd service print       # read the unit before installing it
 sudo telemetryd service install
 ```
 

@@ -85,6 +85,13 @@ through `/api/v1/export`, so nothing passes through a query language; against a 
 uses the read APIs, which cover logs and traces — metrics cannot be pulled that way,
 because a range query returns resampled points rather than stored samples.
 
+**Getting to a running server.** `telemetryd init` writes a configuration with one
+generated token per surface, `0600` and referenced by path so the values stay out of the
+config and out of `ps`; `telemetryd service install` writes the unit that runs it. Those
+two compose on purpose — the unit's `ExecStart` names the file `init` creates, and
+before this the tool wrote a unit that could not start until somebody hand-wrote a
+config.
+
 **Operations.** `telemetryd query` runs a LogQL query from the shell — for debugging
 over SSH when the UI is the thing you cannot reach, and for getting data out as JSON
 lines. `telemetryd bench` measures what the machine can ingest and query, on a

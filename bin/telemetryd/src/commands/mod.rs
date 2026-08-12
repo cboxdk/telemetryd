@@ -1,4 +1,5 @@
 pub mod bench;
+pub mod init;
 pub mod query;
 pub mod remote_read;
 pub mod serve;

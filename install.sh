@@ -169,8 +169,8 @@ or choose somewhere you own:
     say ""
     # Named here because the alternative is that someone runs it in a terminal, closes
     # the terminal, and discovers a week later that they have a week of no telemetry.
-    say "To keep it running across reboots:"
-    say "  $BIN service print      # read the unit first"
+    say "On a server, give it tokens and run it as a service:"
+    say "  sudo $BIN init         # config + tokens, printed once"
     say "  sudo $BIN service install"
 }
 

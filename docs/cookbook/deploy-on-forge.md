@@ -25,41 +25,20 @@ It verifies the release checksum, and the signature too if `cosign` is on the bo
 
 ## 2. Write a configuration
 
-telemetryd runs with none, but a server deployment wants tokens — the service will be
-reachable through nginx, and the bind check that protects you on a laptop does not know
-that.
-
 ```bash
-sudo mkdir -p /etc/telemetryd
-sudo tee /etc/telemetryd/telemetryd.toml >/dev/null <<'TOML'
-[server]
-listen = "127.0.0.1:4319"
-
-[auth]
-# One per writer, so a leak is revoked on its own. `file:` keeps the value out of
-# this file and out of `ps`.
-ingest_token = ["file:/etc/telemetryd/ingest.token"]
-query_token  = ["file:/etc/telemetryd/query.token"]
-admin_token  = ["file:/etc/telemetryd/admin.token"]
-
-[retention]
-logs    = "14d"
-traces  = "14d"
-metrics = "90d"
-
-[storage]
-# Forge's default disk is 40–80 GB and the application needs most of it.
-disk_budget = "8GiB"
-TOML
-
-for name in ingest query admin; do
-  openssl rand -base64 24 | tr -d '\n' | sudo tee /etc/telemetryd/$name.token >/dev/null
-  sudo chmod 600 /etc/telemetryd/$name.token
-done
+sudo telemetryd init
 ```
 
-Check it before starting anything. `validate` prints every resolved value and where it
-came from, which is the fastest way to find a typo in a path:
+That writes `/etc/telemetryd/telemetryd.toml` with three generated tokens — one per
+surface, so a leaked write token does not open reads — and prints them once. The values
+live in `0600` files beside the config and are referenced by path, which keeps them out
+of the file people paste into issues and out of `ps`.
+
+Re-running is refused rather than silently rotating every token and locking out
+everything that holds one. `--force` if that is genuinely what you want.
+
+Edit the retention windows and the disk budget to suit the box — Forge's default disk is
+40–80 GB and the application needs most of it — then check what it resolved to:
 
 ```bash
 telemetryd validate
