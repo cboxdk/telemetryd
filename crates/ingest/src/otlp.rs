@@ -231,6 +231,40 @@ pub fn extend_attributes(target: &mut Labels, attributes: &[KeyValue]) {
     extend(target, attributes, false);
 }
 
+/// Keep the resource and scope attributes that did **not** become stream labels, as
+/// record attributes under the producer's own key spelling.
+///
+/// # The bug this fixes
+///
+/// Resource attributes were read only to build stream labels, and `ingest.stream_labels`
+/// promotes five names. Everything else — `k8s.pod.name`, `host.name`, `cloud.region`,
+/// `container.id`, every attribute a non-Laravel sender puts in `resource` — was
+/// discarded. Not stored and not a label: absent from the store, absent from
+/// `/api/v1/export`, and absent from `partialSuccess`, so nothing said it had happened.
+/// Measured by sending `k8s.pod.name` and finding zero occurrences of it anywhere.
+///
+/// The cardinality argument for keeping them out of *stream identity* is sound and is
+/// untouched. There was never an argument for deleting them, because record attributes
+/// have been stored all along at no cardinality cost — this is the same treatment.
+///
+/// # Two rules
+///
+/// A record attribute of the same name wins: it is the narrower scope, closest to the
+/// data, which is the precedence the rest of this decoder already uses.
+///
+/// A name already promoted to a stream label is skipped rather than duplicated. It is
+/// visible as a label, and storing it twice would inflate every record to say the same
+/// thing — but the comparison is against the *sanitised* name, since `service.version`
+/// is the label `service_version` and they are one attribute, not two.
+pub fn keep_unpromoted(target: &mut Labels, inherited: &Labels, stream: &Labels) {
+    for (name, value) in inherited.iter() {
+        if stream.get(&sanitize_label_name(name)).is_some() || target.get(name).is_some() {
+            continue;
+        }
+        target.insert(name.to_owned(), value.to_owned());
+    }
+}
+
 fn extend(target: &mut Labels, attributes: &[KeyValue], sanitize: bool) {
     for kv in attributes {
         if kv.key.is_empty() {

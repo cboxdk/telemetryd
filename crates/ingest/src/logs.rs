@@ -12,7 +12,7 @@ use telemetryd_core::{Labels, LogRecord, Severity};
 
 use crate::otlp::{
     AnyValue, FlexEnum, FlexU64, InstrumentationScope, KeyValue, Resource, extend_attributes,
-    extend_labels, normalize_id,
+    extend_labels, keep_unpromoted, normalize_id,
 };
 use crate::{Decoded, RejectReason, Rejection};
 
@@ -151,22 +151,31 @@ pub fn decode(
 
     for resource_logs in &data.resource_logs {
         let mut resource_labels = Labels::new();
+        // The same attributes twice, under two spellings: sanitised for the ones that
+        // become stream labels, verbatim for the ones that do not and are kept as record
+        // attributes. Rewriting `k8s.pod.name` to `k8s_pod_name` on the way into storage
+        // would show a key nobody sent, which is the reason record attributes have always
+        // been kept verbatim.
+        let mut resource_attributes = Labels::new();
         if let Some(resource) = &resource_logs.resource {
             extend_labels(&mut resource_labels, &resource.attributes);
+            extend_attributes(&mut resource_attributes, &resource.attributes);
         }
 
         for scope_logs in &resource_logs.scope_logs {
             let mut scope_labels = resource_labels.clone();
+            let mut scope_attributes = resource_attributes.clone();
             if let Some(scope) = &scope_logs.scope {
                 // Scope attributes are narrower than resource attributes, so they win.
                 extend_labels(&mut scope_labels, &scope.attributes);
+                extend_attributes(&mut scope_attributes, &scope.attributes);
                 if !scope.name.is_empty() {
                     scope_labels.insert("scope_name", scope.name.clone());
                 }
             }
 
             for record in &scope_logs.log_records {
-                match convert(record, &scope_labels, ctx, &mut decoded) {
+                match convert(record, &scope_labels, &scope_attributes, ctx, &mut decoded) {
                     Ok(converted) => decoded.records.push(converted),
                     Err(rejection) => decoded.rejections.push(rejection),
                 }
@@ -180,6 +189,7 @@ pub fn decode(
 fn convert(
     raw: &LogRecordJson,
     inherited: &Labels,
+    inherited_attributes: &Labels,
     ctx: DecodeContext<'_>,
     decoded: &mut Decoded<LogRecord>,
 ) -> Result<LogRecord, Rejection> {
@@ -235,6 +245,16 @@ fn convert(
     // kept under the producer's own key spelling.
     let mut attributes = Labels::new();
     extend_attributes(&mut attributes, &raw.attributes);
+
+    let stream = build_stream_labels(inherited, severity, ctx)?;
+
+    // Resource and scope attributes that no stream label claimed. Merged before the
+    // limit is checked rather than after: `max_attrs_per_record` bounds what is stored
+    // per record, and these are now stored per record. Counting only the producer's own
+    // attributes would make the limit describe something other than the width it is
+    // there to cap.
+    keep_unpromoted(&mut attributes, inherited_attributes, &stream);
+
     if attributes.len() > ctx.limits.max_attrs_per_record as usize {
         return Err(Rejection::new(
             RejectReason::TooManyAttributes,
@@ -245,8 +265,6 @@ fn convert(
             ),
         ));
     }
-
-    let stream = build_stream_labels(inherited, severity, ctx)?;
 
     Ok(LogRecord {
         timestamp_nanos,
@@ -416,6 +434,63 @@ mod tests {
         // host.id is per-instance. Promoting it would multiply streams on every
         // deploy, so it stays out of the stream by default.
         assert!(!record.stream.contains_key("host_id"));
+    }
+
+    #[test]
+    fn a_resource_attribute_no_label_claimed_is_kept_rather_than_dropped() {
+        // The bug: resource attributes were read only to build stream labels, and the
+        // five that `ingest.stream_labels` promotes were the five that survived.
+        // Everything a non-Laravel sender puts in `resource` — k8s, host, cloud,
+        // container — was discarded with no counter, no warning and no `partialSuccess`.
+        let decoded = decode_str(
+            r#"{"resourceLogs":[{"resource":{"attributes":[
+                 {"key":"service.name","value":{"stringValue":"third-party"}},
+                 {"key":"service.version","value":{"stringValue":"2.1.0"}},
+                 {"key":"k8s.pod.name","value":{"stringValue":"pod-7f"}},
+                 {"key":"host.name","value":{"stringValue":"box1"}}]},
+               "scopeLogs":[{"logRecords":[
+                 {"timeUnixNano":"1700000000000000000","severityNumber":9,
+                  "body":{"stringValue":"hello"},
+                  "attributes":[{"key":"order.id","value":{"stringValue":"A-99"}}]}]}]}]}"#,
+        );
+        let record = &decoded.records[0];
+
+        // Kept, and under the spelling the producer sent — not `k8s_pod_name`, which is
+        // a key nobody put on the wire.
+        assert_eq!(record.attributes.get("k8s.pod.name"), Some("pod-7f"));
+        assert_eq!(record.attributes.get("host.name"), Some("box1"));
+        // The producer's own record attributes are untouched.
+        assert_eq!(record.attributes.get("order.id"), Some("A-99"));
+
+        // Still not stream identity: that is the cardinality rule, and it is unchanged.
+        assert!(!record.stream.contains_key("k8s.pod.name"));
+        assert!(!record.stream.contains_key("k8s_pod_name"));
+
+        // A promoted attribute is not stored twice. `service.version` is the label
+        // `service_version`; they are one attribute under two spellings, not two.
+        assert_eq!(record.stream.get("service_version"), Some("2.1.0"));
+        assert!(record.attributes.get("service.version").is_none());
+        assert!(record.attributes.get("service.name").is_none());
+    }
+
+    #[test]
+    fn a_record_attribute_beats_the_resource_attribute_of_the_same_name() {
+        // Narrowest scope closest to the data, which is the precedence used for stream
+        // labels already. A resource-level default must not overwrite the value the
+        // record itself carried.
+        let decoded = decode_str(
+            r#"{"resourceLogs":[{"resource":{"attributes":[
+                 {"key":"service.name","value":{"stringValue":"app"}},
+                 {"key":"region","value":{"stringValue":"resource-level"}}]},
+               "scopeLogs":[{"logRecords":[
+                 {"timeUnixNano":"1700000000000000000","severityNumber":9,
+                  "body":{"stringValue":"hello"},
+                  "attributes":[{"key":"region","value":{"stringValue":"record-level"}}]}]}]}]}"#,
+        );
+        assert_eq!(
+            decoded.records[0].attributes.get("region"),
+            Some("record-level")
+        );
     }
 
     #[test]

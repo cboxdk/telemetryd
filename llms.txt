@@ -81,7 +81,14 @@ does not mean everything was stored — read the body.
 
 The resource attribute `service.name` becomes the `app` label and severity becomes
 `level`. Every other attribute is stored but is not a stream label unless listed in
-`ingest.stream_labels`, which is the cardinality contract.
+`ingest.stream_labels`, which is the cardinality contract. A resource attribute no label
+claimed — `k8s.pod.name`, `host.name`, `cloud.region` — is kept as a record attribute
+under the spelling you sent, so it is queryable and it survives export. A record
+attribute of the same name wins; a promoted one is not stored twice.
+
+Standard OpenTelemetry SDKs default to `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`.
+telemetryd serves JSON only and refuses protobuf with a named `unsupported_feature`, so
+set `http/json` on any sender that is not `cboxdk/laravel-telemetry`.
 
 ## Authentication
 

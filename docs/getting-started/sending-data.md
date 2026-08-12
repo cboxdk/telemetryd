@@ -148,6 +148,25 @@ The resource attribute `service.name` becomes the `app` label, and severity beco
 cardinality contract, so do not add anything that changes per request, per process or
 per deploy.
 
+Stored, in this case, means as a **record attribute** under the spelling you sent. A
+resource attribute no stream label claimed — `k8s.pod.name`, `host.name`,
+`cloud.region`, `container.id` — comes back in the third element of each Loki `values`
+entry alongside the record's own attributes, and in `/api/v1/export`:
+
+```json
+["1700000000000000000", "checkout failed", {
+  "order.id": "A-99", "k8s.pod.name": "pod-7f", "cloud.region": "eu-north-1"
+}]
+```
+
+Two rules where they meet. A record attribute of the same name wins, because it is
+closer to the data. And a name already promoted to a stream label is not stored twice —
+`service.version` is the label `service_version`, one attribute under two spellings.
+
+Before v0.35.0 those attributes were read only to build stream labels and then
+discarded, so anything outside the five promoted names never reached the store at all.
+If you are on an older build, that is why a pod name you know you sent cannot be found.
+
 ## Verify, do not assume
 
 After wiring the exporter, send real traffic and confirm it arrives:

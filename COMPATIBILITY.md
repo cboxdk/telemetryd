@@ -69,6 +69,27 @@ no C extension on the client path. A protobuf `Content-Type` is refused with a n
 `unsupported_feature` rather than a parse error full of binary. **OTLP/gRPC is out of
 scope for v1.**
 
+### Sending from something other than laravel-telemetry
+
+Everything below works from any OTLP producer, with one thing to change first.
+
+**Set `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`.** The official OpenTelemetry SDKs default
+to `http/protobuf`, so a stock exporter pointed at telemetryd is refused on every batch
+until this is set. The refusal names the encoding and nothing is stored in the meantime;
+it does not fail silently, but it does fail completely.
+
+**`service.name` is optional.** Without it the `app` label is `unknown` and the record is
+kept rather than dropped, because a log line with no service name is still a log line.
+
+**Resource attributes survive.** The five names in `ingest.stream_labels` become stream
+labels; every other resource and scope attribute is stored as a record attribute under
+the spelling it was sent with. So `k8s.pod.name`, `host.name` and `cloud.region` are
+queryable and appear in `/api/v1/export`, without adding to stream cardinality.
+
+One fidelity note for round trips: an attribute that arrived in `resource` comes back out
+of `/api/v1/export` on the record rather than nested under `resource`. The attribute and
+its value are preserved; its OTLP nesting is not.
+
 ### Content-Encoding
 
 | Value | Behaviour |

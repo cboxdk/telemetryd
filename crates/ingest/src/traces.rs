@@ -14,7 +14,7 @@ use telemetryd_core::span::{SpanEvent, SpanKind, SpanRecord, SpanStatus};
 use crate::logs::{DecodeContext, normalize_timestamp};
 use crate::otlp::{
     FlexEnum, FlexU64, InstrumentationScope, KeyValue, Resource, extend_attributes, extend_labels,
-    normalize_id,
+    keep_unpromoted, normalize_id,
 };
 use crate::{Decoded, RejectReason, Rejection};
 
@@ -86,21 +86,27 @@ pub fn decode(
 
     for resource_spans in &data.resource_spans {
         let mut resource_labels = Labels::new();
+        // Sanitised for stream labels, verbatim for everything else — see the logs
+        // decoder, which does the same for the same reason.
+        let mut resource_attributes = Labels::new();
         if let Some(resource) = &resource_spans.resource {
             extend_labels(&mut resource_labels, &resource.attributes);
+            extend_attributes(&mut resource_attributes, &resource.attributes);
         }
 
         for scope_spans in &resource_spans.scope_spans {
             let mut scope_labels = resource_labels.clone();
+            let mut scope_attributes = resource_attributes.clone();
             if let Some(scope) = &scope_spans.scope {
                 extend_labels(&mut scope_labels, &scope.attributes);
+                extend_attributes(&mut scope_attributes, &scope.attributes);
                 if !scope.name.is_empty() {
                     scope_labels.insert("scope_name", scope.name.clone());
                 }
             }
 
             for span in &scope_spans.spans {
-                match convert(span, &scope_labels, ctx, &mut decoded) {
+                match convert(span, &scope_labels, &scope_attributes, ctx, &mut decoded) {
                     Ok(record) => decoded.records.push(record),
                     Err(rejection) => decoded.rejections.push(rejection),
                 }
@@ -114,6 +120,7 @@ pub fn decode(
 fn convert(
     raw: &SpanJson,
     inherited: &Labels,
+    inherited_attributes: &Labels,
     ctx: DecodeContext<'_>,
     decoded: &mut Decoded<SpanRecord>,
 ) -> Result<SpanRecord, Rejection> {
@@ -167,6 +174,13 @@ fn convert(
 
     let mut attributes = Labels::new();
     extend_attributes(&mut attributes, &raw.attributes);
+
+    let stream = build_stream_labels(inherited, ctx)?;
+
+    // Resource and scope attributes no stream label claimed, counted against the same
+    // limit because they are stored in the same place. See `keep_unpromoted`.
+    keep_unpromoted(&mut attributes, inherited_attributes, &stream);
+
     if attributes.len() > ctx.limits.max_attrs_per_record as usize {
         return Err(Rejection::new(
             RejectReason::TooManyAttributes,
@@ -196,8 +210,6 @@ fn convert(
             }
         })
         .collect();
-
-    let stream = build_stream_labels(inherited, ctx)?;
 
     Ok(SpanRecord {
         trace_id,
