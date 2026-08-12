@@ -59,6 +59,31 @@ pub const DESCRIPTORS: &[Descriptor] = &[
         help: "Records rejected at ingest, by signal and reason — never a silent drop",
     },
     Descriptor {
+        name: "telemetryd_query_rejected_total",
+        kind: Kind::Counter,
+        help: "Read requests refused, by surface and reason — concurrency backpressure",
+    },
+    Descriptor {
+        name: "telemetryd_queries_in_flight",
+        kind: Kind::Gauge,
+        help: "Read requests running now, against limits.query_concurrency",
+    },
+    Descriptor {
+        name: "telemetryd_query_concurrency_limit",
+        kind: Kind::Gauge,
+        help: "Concurrent read requests allowed, after resolving 0 to a derived value",
+    },
+    Descriptor {
+        name: "telemetryd_exports_in_flight",
+        kind: Kind::Gauge,
+        help: "Exports running now, against limits.export_concurrency",
+    },
+    Descriptor {
+        name: "telemetryd_export_concurrency_limit",
+        kind: Kind::Gauge,
+        help: "Concurrent exports allowed, after resolving 0 to a derived value",
+    },
+    Descriptor {
         name: "telemetryd_disk_used_bytes",
         kind: Kind::Gauge,
         help: "Bytes on disk in the data directory, by subtree",

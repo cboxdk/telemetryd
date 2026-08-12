@@ -80,6 +80,10 @@ pub struct LimitsStatus {
     pub max_series_per_app: u64,
     pub max_log_line_bytes: u64,
     pub ingest_queue_depth: u32,
+    /// After `0` was resolved. An operator who set `0` cannot read the number in force
+    /// off the configuration file, and this is where they look instead.
+    pub query_concurrency: usize,
+    pub export_concurrency: usize,
 }
 
 /// Forbid every cache from keeping a response that describes this deployment.
@@ -162,6 +166,8 @@ pub async fn status(State(state): State<AppState>) -> Result<Response, ApiError>
                 max_series_per_app: config.limits.max_series_per_app,
                 max_log_line_bytes: config.limits.max_log_line_bytes.as_u64(),
                 ingest_queue_depth: config.limits.ingest_queue_depth,
+                query_concurrency: state.query_concurrency(),
+                export_concurrency: state.export_concurrency(),
             },
             relay: state.relay.as_ref().map(|relay| relay.status(&state.store)),
         })
@@ -440,6 +446,30 @@ fn gauges(state: &AppState) -> Result<Vec<Sample>, Error> {
         "telemetryd_tail_subscribers",
         &[],
         state.tail_subscribers() as f64,
+    ));
+
+    // Both halves of each pair, so an alert can be written as a ratio. In-flight alone
+    // says nothing without the ceiling, and the ceiling may have been derived rather than
+    // configured — which means nobody can read it off the config file.
+    samples.push(Sample::new(
+        "telemetryd_queries_in_flight",
+        &[],
+        state.queries_in_flight() as f64,
+    ));
+    samples.push(Sample::new(
+        "telemetryd_query_concurrency_limit",
+        &[],
+        state.query_concurrency() as f64,
+    ));
+    samples.push(Sample::new(
+        "telemetryd_exports_in_flight",
+        &[],
+        state.exports_in_flight() as f64,
+    ));
+    samples.push(Sample::new(
+        "telemetryd_export_concurrency_limit",
+        &[],
+        state.export_concurrency() as f64,
     ));
 
     Ok(samples)

@@ -80,9 +80,6 @@ pub fn router(state: AppState) -> Router {
         .route("/loki/api/v1/labels", get(loki::labels))
         .route("/loki/api/v1/label/{name}/values", get(loki::label_values))
         .route("/loki/api/v1/series", get(loki::series))
-        // Full-fidelity export, straight from the store rather than through a query
-        // language. Behind the query token: it returns telemetry.
-        .route("/api/v1/export", get(export::export))
         .route("/loki/api/v1/tail", get(loki::tail))
         // Tempo-compatible read APIs (M2).
         .route("/api/traces/{trace_id}", get(tempo::trace))
@@ -108,6 +105,25 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/series", get(prometheus::series))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            auth::limit_query_concurrency,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_query_token,
+        ));
+
+    // Full-fidelity export, straight from the store rather than through a query language.
+    // Behind the query token, because it returns telemetry — and behind a budget of its
+    // own, because one export holds roughly twenty-five times what a query does and
+    // sharing a number with dashboards would mean setting it wrong for both.
+    let export = Router::new()
+        .route("/api/v1/export", get(export::export))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::limit_export_concurrency,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             auth::require_query_token,
         ));
 
@@ -128,6 +144,7 @@ pub fn router(state: AppState) -> Router {
         .merge(admin)
         .merge(status)
         .merge(query)
+        .merge(export)
         .merge(ingest)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

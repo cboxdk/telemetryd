@@ -34,6 +34,10 @@ serde_json.workspace = true
 tracing.workspace = true
 humantime.workspace = true
 
+# Already linked: axum pulls it in for its own body types, and
+# tokio-tungstenite for the tail. Named here because `export` streams.
+futures-util.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 snap.workspace = true

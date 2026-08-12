@@ -114,6 +114,8 @@ max_label_value_bytes   = 2048
 max_log_line_bytes      = "256KiB"
 max_attrs_per_record    = 128
 ingest_queue_depth      = 8192       # backpressure: full queue → 429 with Retry-After
+query_concurrency       = 0          # reads at once; 0 = derive from the memory limit
+export_concurrency      = 0          # exports at once; 0 = derive (one costs ~25 queries)
 
 [relay]
 # Forward what this instance accepts to a central one, as a safe front door for
@@ -137,6 +139,41 @@ level  = "info"                      # trace | debug | info | warn | error
 format = "text"                      # text | json
 
 
+
+## The two read limits, and why `0` is the default
+
+`limits.query_concurrency` and `limits.export_concurrency` bound how many read requests
+run at once. Past them the answer is `429` with `Retry-After` — the same answer a full
+ingest queue gives, because it means the same thing.
+
+They exist because the read path had no backpressure at all while ingest has had it since
+`ingest_queue_depth`, and a read is not cheap. Measured against a 120,000-record store:
+
+| | per request | 32 at once | 256 at once |
+|---|---|---|---|
+| `query_range`, `limit=5000` | ~4 MB | 322 MB | 982 MB |
+| `/api/v1/export` | ~95 MB | 3.0 GB | — |
+
+Latency degraded gracefully throughout. **The failure mode is memory, not time**, which is
+why `server.request_timeout` never covered it and why the only accidental bound was
+tokio's blocking pool at 512 threads — a number nobody chose.
+
+`0` means "size it from the memory this process is allowed to use", read once at startup:
+the cgroup limit if there is one, then `MemTotal`, then a conservative assumption. The
+cgroup comes first because in a container the host's free memory is not the number that
+gets you killed.
+
+**It is resolved once, not continuously.** A controller reading live memory would be
+reacting after the allocation it needed to prevent, and it would misread this allocator:
+measured going from a 982 MB peak to 855 MB three seconds later, which a feedback loop
+reads as continuing pressure on an instance that is fine. A fixed number is also one you
+can put in an error message. The resolved values are on `/status` under `limits`, and
+exported as `telemetryd_query_concurrency_limit` and
+`telemetryd_export_concurrency_limit` beside their in-flight gauges.
+
+Exports are counted separately because one holds roughly twenty-five times what a query
+does. A single shared number would be either too tight for a dashboard or too loose for
+an export.
 
 ## What `auth.oidc.issuer` changes about the other keys
 
@@ -194,7 +231,7 @@ Security:
   ingest       token required
   query        token required
   admin        token required
-  identity     open on / and /status: telemetryd 0.36.0, storage format 1,
+  identity     open on / and /status: telemetryd 0.37.0, storage format 1,
                three signals. Never the deployment. Not a setting.
 ```
 

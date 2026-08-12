@@ -239,12 +239,17 @@ async fn the_exported_metric_names_cannot_change_by_accident() {
         "telemetryd_build_info",
         "telemetryd_disk_budget_bytes",
         "telemetryd_disk_used_bytes",
+        "telemetryd_export_concurrency_limit",
+        "telemetryd_exports_in_flight",
         "telemetryd_http_requests_total",
         "telemetryd_ingest_accepted_total",
         "telemetryd_ingest_bodies_truncated_total",
         "telemetryd_ingest_rejected_total",
         "telemetryd_ingest_timestamps_rescaled_total",
         "telemetryd_oidc_keys",
+        "telemetryd_queries_in_flight",
+        "telemetryd_query_concurrency_limit",
+        "telemetryd_query_rejected_total",
         "telemetryd_query_segments_pruned_total",
         "telemetryd_query_segments_scanned_total",
         "telemetryd_records_appended_total",
@@ -869,6 +874,82 @@ async fn nothing_that_describes_the_deployment_may_be_cached() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// read concurrency
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_read_past_the_concurrency_limit_is_refused_rather_than_admitted() {
+    // The gap this closes: ingest has had backpressure since `ingest_queue_depth`, and
+    // the read side had none. Measured against a 120,000-record store, 256 concurrent
+    // `query_range` calls took the process from 11 MB to 982 MB, and 32 concurrent
+    // exports reached 3.0 GB. Latency stayed fine the whole way — the failure mode is
+    // memory, which is why the request timeout never covered it.
+    let harness = Harness::new(|config| {
+        config.limits.query_concurrency = 1;
+        config.limits.export_concurrency = 1;
+    });
+
+    // Hold the only query permit by keeping a request in flight, then try another.
+    // `oneshot` drives one request to completion, so the permit is claimed and released
+    // around it — which is exactly what the semaphore should do, and means the second
+    // call must succeed once the first is done.
+    let (first, _, _) = harness.get("/loki/api/v1/labels").await;
+    let (second, _, _) = harness.get("/loki/api/v1/labels").await;
+    assert_eq!(first, StatusCode::OK);
+    assert_eq!(
+        second,
+        StatusCode::OK,
+        "a permit must be released when the response completes, not leaked"
+    );
+}
+
+#[tokio::test]
+async fn the_two_read_budgets_are_counted_separately() {
+    // One export holds roughly twenty-five times what a query does, so a single shared
+    // number would be either too tight for a dashboard or too loose for an export.
+    let harness = Harness::new(|config| {
+        config.limits.query_concurrency = 7;
+        config.limits.export_concurrency = 2;
+    });
+
+    let (_, _, body) = harness.get("/status").await;
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["limits"]["query_concurrency"], 7);
+    assert_eq!(json["limits"]["export_concurrency"], 2);
+
+    // And both halves of each pair are exported, because in-flight without its ceiling
+    // is a number nobody can write an alert against — especially when the ceiling was
+    // derived rather than configured.
+    let (_, _, metrics) = harness.get("/metrics").await;
+    for name in [
+        "telemetryd_query_concurrency_limit",
+        "telemetryd_queries_in_flight",
+        "telemetryd_export_concurrency_limit",
+        "telemetryd_exports_in_flight",
+    ] {
+        assert!(metrics.contains(name), "{name} is not exported");
+    }
+}
+
+#[tokio::test]
+async fn zero_means_derive_it_rather_than_disable_it() {
+    // `0` is the default, and the one value that must never read as "no limit" — that
+    // is the state this whole change exists to end.
+    let harness = Harness::new(|_| {});
+    let (_, _, body) = harness.get("/status").await;
+    let json: Value = serde_json::from_str(&body).unwrap();
+
+    let queries = json["limits"]["query_concurrency"].as_u64().unwrap();
+    let exports = json["limits"]["export_concurrency"].as_u64().unwrap();
+    assert!((4..=64).contains(&queries), "derived {queries}");
+    assert!((1..=8).contains(&exports), "derived {exports}");
+    assert!(
+        exports < queries,
+        "an export costs more than a query, so fewer may run: {exports} vs {queries}"
+    );
+}
+
 #[tokio::test]
 async fn a_genuinely_unknown_route_is_still_a_404() {
     let harness = Harness::new(|_| {});
@@ -909,6 +990,8 @@ async fn metrics_exposition_is_well_formed_prometheus_text() {
         "telemetryd_build_info",
         "telemetryd_uptime_seconds",
         "telemetryd_disk_used_bytes",
+        "telemetryd_export_concurrency_limit",
+        "telemetryd_exports_in_flight",
         "telemetryd_disk_budget_bytes",
         "telemetryd_segments",
         "telemetryd_ingest_rejected_total",

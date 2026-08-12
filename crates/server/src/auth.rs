@@ -111,6 +111,50 @@ pub async fn admin_token_or_identity(
     }
 }
 
+/// Hold a read slot for the length of the request, or refuse it.
+///
+/// A layer rather than a line in each handler: there are fourteen read routes, and the
+/// one that gets forgotten is the one that matters. The permit is moved into the response
+/// future, so it is released when the response is fully built — including when the
+/// handler returns early or panics.
+///
+/// The refusal is `429` with `Retry-After`, the same answer a full ingest queue gives,
+/// because it means the same thing: come back, this is not about your request.
+pub async fn limit_query_concurrency(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let Some(permit) = state.query_slot() else {
+        state.metrics.incr(
+            "telemetryd_query_rejected_total",
+            &[("surface", "query"), ("reason", "concurrency")],
+        );
+        return Err(telemetryd_core::Error::Overloaded.into());
+    };
+    let response = next.run(request).await;
+    drop(permit);
+    Ok(response)
+}
+
+/// The same, against the smaller budget one export is measured against.
+pub async fn limit_export_concurrency(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let Some(permit) = state.export_slot() else {
+        state.metrics.incr(
+            "telemetryd_query_rejected_total",
+            &[("surface", "export"), ("reason", "concurrency")],
+        );
+        return Err(telemetryd_core::Error::Overloaded.into());
+    };
+    let response = next.run(request).await;
+    drop(permit);
+    Ok(response)
+}
+
 pub async fn require_query_token(
     state: State<AppState>,
     request: Request,

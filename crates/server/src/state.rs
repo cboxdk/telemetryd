@@ -44,6 +44,14 @@ pub struct AppState {
     /// excess would be the unbounded buffering the setting exists to prevent, just
     /// moved somewhere less visible.
     ingest_permits: Arc<Semaphore>,
+    /// The read side's equivalent of `ingest_permits`, and separate from it: a burst of
+    /// dashboards must not be able to shut out writes, and a write burst must not close
+    /// the API you would use to look at it.
+    query_permits: Arc<Semaphore>,
+    /// Counted apart from queries because one export costs roughly twenty-five of them.
+    export_permits: Arc<Semaphore>,
+    query_concurrency: usize,
+    export_concurrency: usize,
     /// Cbox ID token validation. Disabled unless an issuer is configured.
     pub oidc: Arc<crate::oidc::Oidc>,
     /// Relay client credentials, each carrying the app it is allowed to be.
@@ -117,6 +125,12 @@ impl AppState {
     pub fn new(config: Arc<Config>, store: Arc<Store>) -> Result<Self> {
         let (tail, _) = broadcast::channel(TAIL_BUFFER);
         let queue_depth = usize::try_from(config.limits.ingest_queue_depth).unwrap_or(usize::MAX);
+        // Resolved once, here: `0` means "size it from the memory this process is allowed
+        // to use", and that answer must not change under the instance while it runs.
+        let query_concurrency =
+            usize::try_from(config.limits.resolved_query_concurrency()).unwrap_or(64);
+        let export_concurrency =
+            usize::try_from(config.limits.resolved_export_concurrency()).unwrap_or(4);
         let oidc = Arc::new(crate::oidc::Oidc::new(config.auth.oidc.clone()));
 
         let mut clients = Vec::with_capacity(config.relay.client.len());
@@ -145,6 +159,10 @@ impl AppState {
             started: Instant::now(),
             started_at: OffsetDateTime::now_utc(),
             ingest_permits: Arc::new(Semaphore::new(queue_depth)),
+            query_permits: Arc::new(Semaphore::new(query_concurrency)),
+            export_permits: Arc::new(Semaphore::new(export_concurrency)),
+            query_concurrency,
+            export_concurrency,
             oidc,
             relay_clients,
             relay,
@@ -152,6 +170,40 @@ impl AppState {
             queue_depth,
             tail,
         })
+    }
+
+    /// Claim a slot for a read request, or `None` when the instance is already running
+    /// as many as it is configured to.
+    ///
+    /// `try_acquire` rather than `acquire`: a caller that waits is a caller holding a
+    /// connection and its share of a proxy's worker while it does so, and a `429` with
+    /// `Retry-After` is a thing a client can act on. Same reasoning as the ingest side.
+    pub fn query_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.query_permits).try_acquire_owned().ok()
+    }
+
+    pub fn export_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.export_permits).try_acquire_owned().ok()
+    }
+
+    /// In force after `0` was resolved, for `/status` and `/metrics`.
+    pub fn query_concurrency(&self) -> usize {
+        self.query_concurrency
+    }
+
+    pub fn export_concurrency(&self) -> usize {
+        self.export_concurrency
+    }
+
+    /// How many of each are running right now.
+    pub fn queries_in_flight(&self) -> usize {
+        self.query_concurrency
+            .saturating_sub(self.query_permits.available_permits())
+    }
+
+    pub fn exports_in_flight(&self) -> usize {
+        self.export_concurrency
+            .saturating_sub(self.export_permits.available_permits())
     }
 
     pub fn uptime_seconds(&self) -> f64 {

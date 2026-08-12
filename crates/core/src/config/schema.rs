@@ -648,6 +648,32 @@ pub struct LimitsConfig {
     /// Backpressure threshold: a full queue returns 429 with `Retry-After` rather than
     /// buffering without bound.
     pub ingest_queue_depth: u32,
+
+    /// Read requests that may run at once. `0` sizes it from the memory this process is
+    /// allowed to use.
+    ///
+    /// # Why this exists
+    ///
+    /// Ingest has had backpressure since `ingest_queue_depth`; the read side had none at
+    /// all, and a query's cost is not small. Measured against a 120,000-record store: a
+    /// `query_range` returning 5,000 records costs about 4 MB while it runs, and 256 of
+    /// them concurrently took the process from 11 MB to 982 MB. Latency degraded
+    /// gracefully the whole way — the failure mode here is memory, not time, which is why
+    /// a request timeout does not cover it.
+    ///
+    /// The only accidental bound was tokio's blocking pool at 512 threads, which is not a
+    /// limit anybody chose.
+    pub query_concurrency: u32,
+
+    /// Exports that may run at once. Much smaller, because one is much larger.
+    ///
+    /// An export returns up to `MAX_LIMIT` records in a single response, and the store's
+    /// scan collects them before the first byte is written. Measured at roughly 95 MB per
+    /// concurrent request against a 120,000-record store — about 25 times a `query_range`
+    /// — and 32 at once reached 3.0 GB. Sharing one budget with ordinary queries would
+    /// mean picking a number that is either too tight for a dashboard or too loose for
+    /// this, so they are counted separately.
+    pub export_concurrency: u32,
 }
 
 impl Default for LimitsConfig {
@@ -661,8 +687,95 @@ impl Default for LimitsConfig {
             max_log_line_bytes: ByteSize::kib(256),
             max_attrs_per_record: 128,
             ingest_queue_depth: 8192,
+            query_concurrency: 0,
+            export_concurrency: 0,
         }
     }
+}
+
+/// Roughly what a read request holds while it runs, from the measurements in
+/// [`LimitsConfig::query_concurrency`] and [`LimitsConfig::export_concurrency`], rounded
+/// up. Deliberately pessimistic: over-estimating costs throughput on a busy instance,
+/// under-estimating costs the process.
+const QUERY_COST_BYTES: u64 = 8 * 1024 * 1024;
+const EXPORT_COST_BYTES: u64 = 160 * 1024 * 1024;
+
+/// Share of the memory limit these two may hold between them.
+///
+/// The rest is for the write path, whose own ceiling is `storage.max_segment_bytes`, and
+/// for the allocator, which does not hand pages back promptly — measured going from a
+/// 982 MB peak to 855 MB three seconds later. A controller reading live memory would
+/// have read that as continuing pressure, which is one of the reasons this is decided
+/// once at startup instead.
+const READ_BUDGET_FRACTION: u64 = 4;
+
+impl LimitsConfig {
+    /// The number of concurrent queries in force, resolving `0`.
+    pub fn resolved_query_concurrency(&self) -> u32 {
+        if self.query_concurrency != 0 {
+            return self.query_concurrency;
+        }
+        derive_concurrency(QUERY_COST_BYTES, 4, 64)
+    }
+
+    /// The number of concurrent exports in force, resolving `0`.
+    pub fn resolved_export_concurrency(&self) -> u32 {
+        if self.export_concurrency != 0 {
+            return self.export_concurrency;
+        }
+        derive_concurrency(EXPORT_COST_BYTES, 1, 8)
+    }
+}
+
+fn derive_concurrency(cost_bytes: u64, min: u32, max: u32) -> u32 {
+    let budget = memory_limit_bytes() / READ_BUDGET_FRACTION;
+    let derived = u32::try_from(budget / cost_bytes).unwrap_or(max);
+    derived.clamp(min, max)
+}
+
+/// What this process is actually allowed to use, read once.
+///
+/// The cgroup limit first, because in a container the host's free memory is not the
+/// number that gets you killed — and the container is a first-class way to run this. Then
+/// `MemTotal`. Then a conservative assumption, which is where macOS lands: reading
+/// `hw.memsize` needs `libc` or a subprocess, and a developer laptop is not the machine
+/// this protects.
+fn memory_limit_bytes() -> u64 {
+    const ASSUMED: u64 = 2 * 1024 * 1024 * 1024;
+
+    let read_number = |path: &str| -> Option<u64> {
+        std::fs::read_to_string(path)
+            .ok()?
+            .split_whitespace()
+            .find_map(|word| word.parse::<u64>().ok())
+    };
+
+    // cgroup v2 writes the literal `max` when unlimited, which parses to nothing and
+    // falls through — which is the behaviour we want.
+    for path in [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ] {
+        if let Some(limit) = read_number(path) {
+            // cgroup v1 spells "unlimited" as a number near u64::MAX rather than a word.
+            if limit > 0 && limit < u64::MAX / 2 {
+                return limit;
+            }
+        }
+    }
+
+    // `MemTotal:  16305892 kB` — the first number on that line, in kibibytes.
+    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo")
+        && let Some(line) = meminfo.lines().find(|line| line.starts_with("MemTotal:"))
+        && let Some(kib) = line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|v| v.parse::<u64>().ok())
+    {
+        return kib * 1024;
+    }
+
+    ASSUMED
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
