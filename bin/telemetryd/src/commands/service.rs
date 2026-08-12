@@ -409,6 +409,11 @@ Group={user}
 StateDirectory=telemetryd
 Environment=TELEMETRYD_STORAGE_DATA_DIR=/var/lib/telemetryd
 
+# Retention, the disk budget and the log level change in place on SIGHUP. Without
+# this line `systemctl reload` fails, and the obvious next move is `restart` — which
+# drains and replays the WAL to apply a number that never needed a restart.
+ExecReload=/bin/kill -HUP $MAINPID
+
 # SIGTERM triggers a graceful drain, then a final WAL flush. Give it room to
 # finish: killing it early costs the unsynced window.
 KillSignal=SIGTERM
@@ -596,6 +601,9 @@ mod tests {
             assert!(unit.contains("KillSignal=SIGTERM"));
             // A stop timeout shorter than the drain would cost the unsynced WAL window.
             assert!(unit.contains("TimeoutStopSec="));
+            // Without this, `systemctl reload` fails and the operator reaches for
+            // `restart` — a full drain and WAL replay to change a retention window.
+            assert!(unit.contains("ExecReload=/bin/kill -HUP $MAINPID"));
             assert!(unit.contains("ProtectSystem=strict"));
             assert!(unit.contains("NoNewPrivileges=true"));
         }

@@ -152,9 +152,24 @@ token, falling back to the query token when no admin token is set.
 
 ## Changing configuration afterwards
 
-`SIGHUP` reloads retention, the disk budget and the log level in place. Anything else
-that changed in the file is **refused by name** rather than silently ignored, so a
-reload that prints a refusal means the process is still running the old value and needs
-a restart.
+Edit `/etc/telemetryd/telemetryd.toml`, then:
+
+```bash
+sudo systemctl reload telemetryd     # Linux
+kill -HUP $(pgrep -f 'telemetryd serve')   # macOS: launchd has no reload verb
+journalctl -u telemetryd -n 5        # what actually changed
+```
+
+`SIGHUP` reloads retention, the disk budget and the log level in place — no restart,
+no drain, no WAL replay. Anything else that changed in the file is **refused by name**
+rather than silently ignored, so a reload that prints a refusal means the process is
+still running the old value and needs a restart.
+
+The log names the before and after, which is the confirmation worth reading:
+
+```
+configuration reloaded changes=["storage.disk_budget 10.0 GiB -> 100.0 GiB",
+                                "retention.logs 604800s -> 2592000s"]
+```
 
 ````

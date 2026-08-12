@@ -25,6 +25,26 @@ does nothing.
 Durations are humantime strings (`500ms`, `30s`, `7d`). Sizes are byte strings
 (`64MiB`, `10GiB`). Unknown keys are a startup error.
 
+**`GB` and `GiB` are not the same number.** `100GB` resolves to 93.1 GiB, `100GiB` to
+100.0 GiB, and `100G` is read as decimal like `GB`. Both spellings are accepted because
+both are meant sincerely — a disk sold as 100 GB really is decimal — but `init` writes
+`GiB` and `/status` reports in `GiB`, so pick one and let `telemetryd validate` show you
+what it became before you rely on it.
+
+## Changing it on a running instance
+
+`retention.*`, `storage.disk_budget` and `log.level` apply on `SIGHUP` with no restart:
+
+```bash
+sudo systemctl reload telemetryd     # the generated unit maps this to SIGHUP
+journalctl -u telemetryd -n 5
+```
+
+The log names each change as `old -> new`. Every other key that differs is **refused by
+name**, so a reload that prints a refusal means the process is still running the old
+value and a restart is what applies it. Silence about a key you changed would be the
+dangerous outcome, and it is the one case that cannot happen.
+
 ## Full schema with defaults
 
 ```toml
