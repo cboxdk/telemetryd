@@ -118,6 +118,22 @@ Not yet in place. Releases carry checksums, which protect against a corrupted do
 but not against a compromised release. Named here as a known gap rather than implied to
 be covered by an unsigned checksum file.
 \n
+## Is there a newer one?
+
+```bash
+telemetryd version --check
+```
+
+Prints what you are running, then asks GitHub for the newest release and says which of
+the two is ahead. It is the only code path in telemetryd that contacts anything outside
+your infrastructure, and it runs **only** when you ask — no background timer, no line in
+the server log, nothing on start-up. A binary whose pitch is that your telemetry stays
+put should not be phoning anywhere on its own.
+
+Being offline is not an error: the check says it could not reach the feed and the
+command still exits `0`, so putting it in a script does not make the script fail on a
+box without egress.
+
 ## Hand this to an agent
 
 A self-contained brief. It names only commands and endpoints that exist, so an agent can

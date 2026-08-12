@@ -92,7 +92,14 @@ enum Command {
     },
 
     /// Print version and build information.
-    Version,
+    Version {
+        /// Also ask GitHub whether a newer release exists.
+        ///
+        /// Never automatic: telemetryd contacts nothing on its own, and this is the
+        /// only code path that talks to anything outside your infrastructure.
+        #[arg(long)]
+        check: bool,
+    },
 
     /// Measure what this machine can ingest and query, for sizing.
     ///
@@ -180,8 +187,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Init(args) => commands::init::run(&args),
         Command::Service { action } => commands::service::run(&action),
-        Command::Version => {
-            commands::version::run();
+        Command::Version { check } => {
+            commands::version::run(check);
             Ok(())
         }
         Command::Bench(args) => commands::bench::run(&args),
