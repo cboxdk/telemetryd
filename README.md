@@ -24,6 +24,32 @@ otherwise.
 > [BUILD-STATUS.md](BUILD-STATUS.md) is the honest, current list of what works, what
 > the known gaps are, and what is deliberately absent.
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cboxdk/telemetryd/main/install.sh | sh
+```
+
+Detects the platform, verifies the release signature when `cosign` is present and the
+checksum always, and refuses to install on a mismatch. On macOS:
+
+```bash
+brew install cboxdk/tap/telemetryd
+```
+
+A `.deb` and the raw binaries are on the [releases page](https://github.com/cboxdk/telemetryd/releases),
+and there is a container image at `ghcr.io/cboxdk/telemetryd` — see [Docker](docs/getting-started/docker.md).
+
+To keep it running across reboots, telemetryd writes the service unit for the machine it
+is on — a hardened systemd unit on Linux, a launchd plist on macOS:
+
+```bash
+telemetryd service print       # read it first
+sudo telemetryd service install
+```
+
+Putting it on a server behind TLS is [a page of its own](docs/cookbook/deploy-on-forge.md).
+
 ## Quickstart
 
 ```bash

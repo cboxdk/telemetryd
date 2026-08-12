@@ -166,6 +166,12 @@ or choose somewhere you own:
     say "  $BIN serve"
     say ""
     say "It listens on 127.0.0.1:4319 and needs no configuration."
+    say ""
+    # Named here because the alternative is that someone runs it in a terminal, closes
+    # the terminal, and discovers a week later that they have a week of no telemetry.
+    say "To keep it running across reboots:"
+    say "  $BIN service print      # read the unit first"
+    say "  sudo $BIN service install"
 }
 
 main "$@"
