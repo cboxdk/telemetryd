@@ -19,8 +19,13 @@
 //!
 //! Nothing that describes *this deployment*: no uptime, no app names, no record counts,
 //! no disk usage, no retention windows, no listen address, no relay configuration. Those
-//! are on `/status`, behind the admin token, and the line between the two is identity
+//! are on `/status` **with the admin token**, and the line between the two is identity
 //! versus inventory rather than harmless versus sensitive.
+//!
+//! Since 0.34.0 the same [`Identity`] is also what `/status` answers a request that
+//! holds no admin credential, so a client that went looking for the operational document
+//! learns what it reached instead of only that it may not have it. Same four fields, one
+//! definition, two doors.
 //!
 //! # Why a table rather than prose
 //!
@@ -112,7 +117,7 @@ pub const SURFACES: &[Surface] = &[
             Route {
                 method: "GET",
                 paths: &["/status"],
-                note: "what this instance holds, per app",
+                note: "what this instance holds, per app — without a token, identity only",
             },
             Route {
                 method: "GET",
@@ -232,6 +237,11 @@ pub async fn index(headers: HeaderMap) -> Response {
 
 /// The identity a client needs before it holds a credential.
 ///
+/// Four fields, and every one of them is a fact about the *software*: it would read
+/// identically on every telemetryd of this build anywhere in the world. Nothing here
+/// varies with the deployment, which is what makes it safe to serve to a stranger — see
+/// [`crate::routes::status_identity`] for the field-by-field line.
+///
 /// # Why the version is here, on an open endpoint
 ///
 /// This page withheld it at first, on the reasoning that a version string on an
@@ -246,6 +256,12 @@ pub async fn index(headers: HeaderMap) -> Response {
 /// app names, record counts, disk usage, retention, the listen address, whether a relay
 /// is configured. Those are the facts an attacker cannot guess and an operator cares
 /// about. The product name, its version and the shape of its API are none of them.
+///
+/// # Why it is its own type
+///
+/// It is served from two places — `/` for a browser or a discovery client, and `/status`
+/// for a client that went looking for the operational document without a credential.
+/// One definition, so the two can never disagree about what telemetryd says it is.
 #[derive(Debug, serde::Serialize)]
 pub struct Identity {
     /// Constant. The field a client matches on to know what it is talking to.
@@ -253,7 +269,19 @@ pub struct Identity {
     pub version: &'static str,
     /// What a client must agree with to read this instance's data at all.
     pub storage_format_version: u32,
+    /// Which signals this build serves. A constant of the software: telemetryd does not
+    /// let an operator switch one off, so naming them says nothing about the deployment.
     pub signals: [&'static str; 3],
+}
+
+/// What `GET /` answers: the identity, plus the map of the API.
+///
+/// The map is flattened onto the identity rather than nested under it, so `/` and
+/// `/status` agree field-for-field on the four they share.
+#[derive(Debug, serde::Serialize)]
+pub struct IndexDocument {
+    #[serde(flatten)]
+    pub identity: Identity,
     pub surfaces: Vec<IdentitySurface>,
     pub docs: &'static str,
 }
@@ -273,14 +301,21 @@ pub struct IdentityRoute {
     pub note: &'static str,
 }
 
-/// Built from the same table the two human renderings use, so the contract test that
-/// walks it against the router covers this too.
+/// What telemetryd says it is, with nothing in it that varies between deployments.
 pub fn identity() -> Identity {
     Identity {
         product: "telemetryd",
         version: telemetryd_core::VERSION,
         storage_format_version: telemetryd_core::STORAGE_FORMAT_VERSION,
         signals: ["logs", "metrics", "traces"],
+    }
+}
+
+/// Built from the same table the two human renderings use, so the contract test that
+/// walks it against the router covers this too.
+pub fn index_document() -> IndexDocument {
+    IndexDocument {
+        identity: identity(),
         surfaces: SURFACES
             .iter()
             .map(|surface| IdentitySurface {
@@ -304,7 +339,7 @@ pub fn identity() -> Identity {
 fn json() -> String {
     // The document is a handful of static strings; a failure here is not reachable, and
     // an empty body would be a worse answer than the one thing that cannot go wrong.
-    serde_json::to_string_pretty(&identity()).unwrap_or_else(|_| "{}".to_owned())
+    serde_json::to_string_pretty(&index_document()).unwrap_or_else(|_| "{}".to_owned())
 }
 
 fn text() -> String {
@@ -468,13 +503,31 @@ mod tests {
 
         // Guarded surfaces name their credential; the open one says null rather than
         // the words "no token", so a client tests a field instead of parsing prose.
-        let guards: Vec<_> = identity
+        let guards: Vec<_> = index_document()
             .surfaces
             .iter()
             .map(|surface| surface.auth)
             .collect();
         assert!(guards.contains(&Some("admin token")), "{guards:?}");
         assert!(guards.contains(&None), "{guards:?}");
+    }
+
+    /// The index is the identity plus the API map, not a second copy of the identity.
+    ///
+    /// `#[serde(flatten)]` is what makes that true on the wire, and a flatten that got
+    /// removed would nest the four shared fields under `identity` — every client reading
+    /// `/` would break, and no other test would notice.
+    #[test]
+    fn the_index_carries_the_identity_at_the_top_level() {
+        let document = serde_json::to_value(index_document()).unwrap_or_default();
+        for field in ["product", "version", "storage_format_version", "signals"] {
+            assert!(
+                document.get(field).is_some(),
+                "the index no longer carries {field} at the top level: {document}"
+            );
+        }
+        assert!(document.get("identity").is_none(), "{document}");
+        assert!(document.get("surfaces").is_some(), "{document}");
     }
 
     #[test]

@@ -69,6 +69,31 @@ every surface, including any whose static token is deliberately empty. That is t
 direction, and it is documented in the configuration reference because it is a
 behaviour change, not a default.
 
+**Discovery, before anyone holds a credential.** `GET /` answers a browser with a page,
+a discovery client (`Accept: application/json`) with an identity document, and everything
+else with plain text. `GET /status` answers the *same* identity document to a caller with
+no admin token, and the full deployment picture — unchanged, field for field — to one
+that has it.
+
+The failure it closes was measured against a real deployment behind a proxy: `/healthz`
+said `ok`, and `/status`, `/api/v1/status/buildinfo`, `/api/search/tags` and
+`/loki/api/v1/labels` all said `401`. Anything can serve `ok`, and everything identifying
+sat behind the token the client was trying to work out whether it needed — so a client
+probed thirteen candidate URLs, got `401` from all of them, and reported "nothing
+answered at that address" about a telemetryd standing right there. Refusal and silence
+looked identical, and only one of them is worth prompting a person about.
+
+Four fields, all constants of the build: `product`, `version`, `storage_format_version`,
+`signals`. Nothing that varies with the deployment — no uptime, listen address, data
+directory, retention, counts, relay configuration or per-surface auth state — and a test
+asserts the absence of each by name rather than checking a snapshot. Publishing the
+version unauthenticated is a decision rather than a default, argued in the configuration
+reference; it is deliberately not a setting.
+
+The dual-mode branch on `/status` cannot fail open: the full document is only ever
+produced by the handler the auth guard runs *after* a token verifies, and every other
+path out of the guard — including any future one — lands on the identity.
+
 **Relay mode.** telemetryd can stand in front of a central instance and decide who each
 client is from its credential rather than from its payload — the point of it for mobile
 fleets, where the credential lives in a binary anyone can open. Sealed

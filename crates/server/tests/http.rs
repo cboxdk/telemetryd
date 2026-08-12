@@ -91,6 +91,66 @@ fn with_ingest_token(config: &mut Config) {
     config.auth.ingest_token = serde_json::from_str(r#""ingest-secret""#).unwrap();
 }
 
+/// Every field of `/status` that describes the *deployment* rather than the software.
+///
+/// Written out by name rather than derived, and asserted on individually rather than
+/// against a snapshot: a snapshot proves the body has not changed, which is a different
+/// claim from "this particular fact is not in it". Adding a field to `StatusResponse`
+/// without adding it here is the mistake this list exists to make loud, so the key-set
+/// test below asserts the two agree.
+const DEPLOYMENT_ONLY_FIELDS: &[&str] = &[
+    "apps",
+    "auth",
+    "insecure",
+    "limits",
+    "listen",
+    "relay",
+    "retention",
+    "started_at",
+    "storage",
+    "tls",
+    "uptime_seconds",
+];
+
+/// The document `/status` owes a caller that holds no admin credential: identity, and
+/// not one fact about where this instance runs.
+fn assert_is_identity_only(body: &str) {
+    let json: Value = serde_json::from_str(body).unwrap();
+
+    assert_eq!(json["product"], "telemetryd");
+    assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(json["storage_format_version"], 1);
+    assert_eq!(
+        json["signals"],
+        serde_json::json!(["logs", "metrics", "traces"])
+    );
+
+    // The point of the endpoint is what is *missing*, so each absence is its own
+    // assertion with its own name in the failure message. A single "the body did not
+    // change" check would pass a rename and fail a reordering — exactly backwards.
+    for field in DEPLOYMENT_ONLY_FIELDS {
+        assert!(
+            json.get(*field).is_none(),
+            "an unauthenticated /status disclosed {field}: {body}"
+        );
+    }
+
+    // And nothing beyond the four. A field added to the identity is a field served to
+    // the internet, which is a decision someone has to write down here first.
+    let mut keys: Vec<&str> = json
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["product", "signals", "storage_format_version", "version"],
+        "the open identity document grew a field"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // health
 // ---------------------------------------------------------------------------
@@ -267,6 +327,190 @@ async fn the_status_key_set_cannot_change_by_accident() {
     );
 }
 
+/// The failure this closes, measured against a real deployment behind a proxy.
+///
+/// `/healthz` answered `ok` and `/status`, `/api/v1/status/buildinfo`,
+/// `/api/search/tags` and `/loki/api/v1/labels` all answered `401`. Anything can serve
+/// `ok`, and everything identifying sat behind the token the client was trying to work
+/// out whether it needed — so a client probed thirteen candidate URLs, got `401` from
+/// every one, and reported "nothing answered at that address" about a telemetryd
+/// standing right there.
+#[tokio::test]
+async fn status_without_a_token_answers_with_identity_and_only_identity() {
+    let harness = Harness::new(|config| {
+        config.auth.admin_token = serde_json::from_str(r#""admin-secret""#).unwrap();
+        with_query_token(config);
+        with_ingest_token(config);
+    });
+
+    let (status, headers, body) = harness.get("/status").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a client with no credential must learn what it reached"
+    );
+
+    assert_is_identity_only(&body);
+
+    for secret in ["admin-secret", "query-secret", "ingest-secret"] {
+        assert!(
+            !body.contains(secret),
+            "the identity leaked a token: {body}"
+        );
+    }
+
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default()
+    };
+    assert!(header("content-type").starts_with("application/json"));
+
+    // One URL, two bodies, chosen by a request header. A shared cache that stored this
+    // one would be free to hand it back to an operator who did send a token.
+    assert_eq!(header("cache-control"), "no-store");
+    assert_eq!(header("vary"), "Authorization");
+}
+
+/// A wrong credential is not a better credential than none.
+#[tokio::test]
+async fn a_rejected_token_gets_the_same_identity_as_no_token_at_all() {
+    let harness = Harness::new(|config| {
+        config.auth.admin_token = serde_json::from_str(r#""admin-secret""#).unwrap();
+    });
+
+    let (status, _, body) = harness.get_with_token("/status", "not-the-token").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_is_identity_only(&body);
+}
+
+/// This is a widening, not a replacement.
+///
+/// Everything that was behind the admin token is still behind the admin token, and a
+/// client that holds one sees no change whatsoever.
+#[tokio::test]
+async fn an_authenticated_status_is_unchanged() {
+    let harness = Harness::new(|config| {
+        config.auth.admin_token = serde_json::from_str(r#""admin-secret""#).unwrap();
+    });
+
+    let (status, headers, body) = harness.get_with_token("/status", "admin-secret").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let json: Value = serde_json::from_str(&body).unwrap();
+    let mut keys: Vec<&str> = json
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "apps",
+            "auth",
+            "insecure",
+            "limits",
+            "listen",
+            "retention",
+            "started_at",
+            "storage",
+            "storage_format_version",
+            "tls",
+            "uptime_seconds",
+            "version",
+        ],
+        "the authenticated /status changed; it was supposed to be untouched"
+    );
+
+    // Nothing was bolted onto the authenticated document to make the open one work: no
+    // `product`, no `signals`, and no header the response did not carry before.
+    assert!(json.get("product").is_none(), "{body}");
+    assert!(json.get("signals").is_none(), "{body}");
+    assert!(
+        !headers.iter().any(|(name, _)| name == "vary"),
+        "the authenticated response grew a header: {headers:?}"
+    );
+}
+
+/// A field must not mean one thing to a stranger and another to an operator.
+#[tokio::test]
+async fn the_two_documents_agree_on_every_field_they_share() {
+    let harness = Harness::new(|config| {
+        config.auth.admin_token = serde_json::from_str(r#""admin-secret""#).unwrap();
+    });
+
+    let (_, _, open) = harness.get("/status").await;
+    let (_, _, full) = harness.get_with_token("/status", "admin-secret").await;
+    let open: Value = serde_json::from_str(&open).unwrap();
+    let full: Value = serde_json::from_str(&full).unwrap();
+
+    let shared: Vec<&str> = open
+        .as_object()
+        .unwrap()
+        .keys()
+        .filter(|key| full.get(key.as_str()).is_some())
+        .map(String::as_str)
+        .collect();
+    // Sorted: `serde_json::Value` holds its object as a `BTreeMap`.
+    assert_eq!(
+        shared,
+        ["storage_format_version", "version"],
+        "the overlap between the two documents changed"
+    );
+    for key in shared {
+        assert_eq!(open[key], full[key], "{key} disagrees between the two");
+    }
+}
+
+/// The exclusion list above has to keep covering the document it excludes from.
+///
+/// `DEPLOYMENT_ONLY_FIELDS` is written out by hand, which is what makes it a real
+/// assertion — and also what lets a new field on `StatusResponse` slip past it. This
+/// walks the authenticated document and fails if anything on it is unaccounted for, so
+/// adding a field is a line here rather than a silent hole in the test above.
+#[tokio::test]
+async fn every_authenticated_field_is_either_shared_or_named_as_withheld() {
+    let harness = Harness::new(|config| {
+        config.auth.admin_token = serde_json::from_str(r#""admin-secret""#).unwrap();
+        // Loopback is the allowed plaintext upstream, and nothing here ever ships.
+        config.relay.upstream = "http://127.0.0.1:4399".to_owned();
+        config.relay.token = serde_json::from_str(r#""upstream-secret""#).unwrap();
+    });
+
+    let (_, _, body) = harness.get_with_token("/status", "admin-secret").await;
+    let full: Value = serde_json::from_str(&body).unwrap();
+
+    // Relay mode is on, so `relay` is present here and its exclusion is exercised
+    // rather than merely listed.
+    assert!(
+        full.get("relay").is_some(),
+        "relay mode did not report: {body}"
+    );
+
+    let shared = ["version", "storage_format_version"];
+    for key in full.as_object().unwrap().keys() {
+        assert!(
+            shared.contains(&key.as_str()) || DEPLOYMENT_ONLY_FIELDS.contains(&key.as_str()),
+            "/status field `{key}` is neither shared with the open document nor listed \
+             in DEPLOYMENT_ONLY_FIELDS. Decide which it is: if it describes the \
+             software, share it; if it describes this deployment, name it there so the \
+             open document is asserted not to carry it."
+        );
+    }
+
+    let (_, _, open) = harness.get("/status").await;
+    assert_is_identity_only(&open);
+    assert!(
+        !open.contains("127.0.0.1:4399"),
+        "the open document named the relay upstream: {open}"
+    );
+    assert!(!open.contains("upstream-secret"), "{open}");
+}
+
 #[tokio::test]
 async fn status_never_contains_a_token_value() {
     let harness = Harness::new(|config| {
@@ -292,12 +536,10 @@ async fn status_never_contains_a_token_value() {
 async fn query_surface_rejects_missing_and_wrong_tokens() {
     let harness = Harness::new(with_query_token);
 
-    for path in [
-        "/status",
-        "/metrics",
-        "/api/v1/query",
-        "/loki/api/v1/labels",
-    ] {
+    // `/status` is not in this list: it answers a credential-less caller with identity
+    // rather than a refusal, which is its own test. What it must still refuse is the
+    // deployment picture, asserted there.
+    for path in ["/metrics", "/api/v1/query", "/loki/api/v1/labels"] {
         let (status, headers, body) = harness.get(path).await;
         assert_eq!(
             status,
@@ -338,7 +580,12 @@ async fn ingest_and_query_tokens_are_independent() {
     let (status, _, _) = harness.get_with_token("/v1/logs", "query-secret").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    let (status, _, _) = harness.get_with_token("/status", "ingest-secret").await;
+    // And the ingest token must not open the operational one. `/status` says so by
+    // answering identity instead of the deployment; `/metrics` says so with a 401.
+    let (status, _, body) = harness.get_with_token("/status", "ingest-secret").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_is_identity_only(&body);
+    let (status, _, _) = harness.get_with_token("/metrics", "ingest-secret").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     // Each opens its own.
@@ -353,12 +600,19 @@ async fn ingest_and_query_tokens_are_independent() {
 async fn an_unguarded_surface_stays_open_when_only_the_other_is_configured() {
     let harness = Harness::new(with_ingest_token);
 
-    let (status, _, _) = harness.get("/status").await;
+    let (status, _, body) = harness.get("/status").await;
     assert_eq!(
         status,
         StatusCode::OK,
         "query surface has no token, so it stays open"
     );
+    // Open means *open*, not reduced to identity. An instance with nothing guarding the
+    // operational surface answered the whole deployment picture to anyone before the
+    // identity document existed, and it still must — narrowing that would be this
+    // change failing closed on a deployment that never asked for a token.
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert!(json.get("storage").is_some(), "{body}");
+    assert!(json.get("uptime_seconds").is_some(), "{body}");
 
     let (status, _, _) = harness.get("/v1/logs").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -378,7 +632,11 @@ async fn token_rotation_accepts_both_old_and_new() {
             "{token} should be accepted during rotation"
         );
     }
-    let (status, _, _) = harness.get_with_token("/status", "retired-token").await;
+    // A token that has left the rotation buys nothing back: identity, like a stranger.
+    let (status, _, body) = harness.get_with_token("/status", "retired-token").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_is_identity_only(&body);
+    let (status, _, _) = harness.get_with_token("/metrics", "retired-token").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
@@ -953,13 +1211,19 @@ async fn the_admin_surface_is_separate_from_the_read_surface() {
         .await;
     assert_eq!(status, StatusCode::OK);
 
+    // A read-only token does not see the deployment. `/metrics` refuses it outright;
+    // `/status` answers, but with the identity every stranger gets.
+    let (status, _, _) = harness.get_with_token("/metrics", "read-token").await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "/metrics should not open to a read-only token"
+    );
+    let (status, _, body) = harness.get_with_token("/status", "read-token").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_is_identity_only(&body);
+
     for path in ["/status", "/metrics"] {
-        let (status, _, _) = harness.get_with_token(path, "read-token").await;
-        assert_eq!(
-            status,
-            StatusCode::UNAUTHORIZED,
-            "{path} should not open to a read-only token"
-        );
         let (status, _, _) = harness.get_with_token(path, "admin-token").await;
         assert_eq!(status, StatusCode::OK, "{path} should open to admin");
     }
@@ -984,10 +1248,10 @@ async fn without_an_admin_token_the_query_token_still_opens_status() {
             "{path} must stay reachable for deployments that never set an admin token"
         );
     }
-    let (status, _, _) = harness.get("/status").await;
-    assert_eq!(
-        status,
-        StatusCode::UNAUTHORIZED,
-        "and still not open to nobody"
-    );
+    // And the deployment picture is still not open to nobody.
+    let (status, _, body) = harness.get("/status").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_is_identity_only(&body);
+    let (status, _, _) = harness.get("/metrics").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

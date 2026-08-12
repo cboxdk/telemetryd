@@ -20,8 +20,18 @@ and the error names three fixes and generates a token to paste. This is the one 
 worth a long error message.
 
 **An unauthenticated network attacker.** With a token configured, every ingest and query
-surface requires it. `/healthz` is the only unauthenticated endpoint, and it exposes
-nothing.
+surface requires it, and so does everything on `/status` and `/metrics` that describes
+the deployment.
+
+Three answers are open by design, and between them they disclose four constants of the
+build and nothing else: `/healthz` returns `ok` and touches nothing; `/` returns the
+identity document and the route table; and `/status` returns the identity document to a
+caller that presents no admin credential — `product`, `version`,
+`storage_format_version`, `signals`. No uptime, listen address, data directory,
+retention, record or series counts, app names, relay configuration, or per-surface auth
+state. A test asserts the absence of each of those by name, and the branch that chooses
+between the two `/status` documents cannot fail open: the full one is only reachable
+through the handler the auth guard runs after a token verifies.
 
 **Timing attacks on the token.** Compared in constant time over a fixed-width hash.
 
@@ -63,6 +73,16 @@ Any ingest-token holder can write any `app` value.
 restriction.
 
 **Network eavesdropping.** telemetryd speaks plain HTTP. Terminate TLS at a proxy.
+
+**Fingerprinting the build.** `/` and `/status` publish the version to anyone who can
+reach the port, which turns "which build is this" into "which advisories apply". It is a
+decision, not an oversight, and it is not configurable — the full argument is in the
+[configuration reference](../configuration/reference.md). The short version: withholding
+it would prevent nothing, because `/healthz`, the route table, the `401` shape and
+behavioural differences between builds already identify it; and an identity a client
+cannot rely on receiving is one every client must keep guessing around, which is the
+problem the endpoint exists to remove. If your exposure makes that trade wrong, strip
+the field at the reverse proxy.
 
 **A malicious operator.** `--insecure` exists and disables the bind check. It warns
 loudly and is visible in `/status`, but it is not prevented.

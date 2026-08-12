@@ -873,21 +873,55 @@ def check_oidc(binary: str) -> None:
 
         surfaces = {
             "query": lambda t: with_token("/loki/api/v1/labels", t),
-            "status": lambda t: with_token("/status", t),
+            # `/metrics` rather than `/status` for the admin surface, because `/status`
+            # answers everyone: without an admin credential it returns the identity
+            # document instead of refusing, so its status code no longer says who got
+            # in. `/metrics` is the half of the admin surface that is still all
+            # deployment and no identity, and the check below covers `/status` on what
+            # it actually returns.
+            "admin": lambda t: with_token("/metrics", t),
             "ingest": lambda t: with_token("/v1/logs", t, entry),
         }
         # Not a hierarchy: admin does not imply read. Running a dashboard is not a
         # reason to be able to read anyone's log lines.
         expected = {
-            "telemetry:read":   {"query": 200, "status": 401, "ingest": 401},
-            "telemetry:admin":  {"query": 401, "status": 200, "ingest": 401},
-            "telemetry:write":  {"query": 401, "status": 401, "ingest": 200},
+            "telemetry:read":   {"query": 200, "admin": 401, "ingest": 401},
+            "telemetry:admin":  {"query": 401, "admin": 200, "ingest": 401},
+            "telemetry:write":  {"query": 401, "admin": 401, "ingest": 200},
         }
         for scope, wanted in expected.items():
             token = issuer.token(scope)
             got = {name: call(token) for name, call in surfaces.items()}
             check(f"{scope} opens exactly its own surface", got == wanted,
                   " ".join(f"{k}={v}" for k, v in got.items()))
+
+        # `/status` is the one endpoint that answers both callers, so it is checked on
+        # its body rather than its code. Every scope gets 200; only the admin one gets
+        # the deployment picture, and nobody unauthenticated gets a word of it.
+        def status_body(token: str | None) -> dict:
+            req = urllib.request.Request(BASE + "/status")
+            if token:
+                req.add_header("authorization", f"Bearer {token}")
+            try:
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    return response.status, json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                return error.code, {}
+
+        withheld = ("uptime_seconds", "started_at", "listen", "insecure", "tls",
+                    "auth", "storage", "apps", "retention", "limits", "relay")
+        for name, token in (("no token", None),
+                            ("a read-only scope", issuer.token("telemetry:read"))):
+            code, body = status_body(token)
+            leaked = [field for field in withheld if field in body]
+            check(f"/status tells {name} what this is and nothing more",
+                  code == 200 and body.get("product") == "telemetryd" and not leaked,
+                  f"code={code} leaked={leaked or 'nothing'}")
+
+        code, body = status_body(issuer.token("telemetry:admin"))
+        check("/status still gives the admin scope the whole deployment",
+              code == 200 and "storage" in body and "uptime_seconds" in body,
+              f"code={code} keys={sorted(body)[:4]}")
 
         refused = {
             "an expired token": issuer.token("telemetry:read", lifetime=-3600),

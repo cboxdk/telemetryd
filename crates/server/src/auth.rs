@@ -6,7 +6,7 @@
 
 use axum::extract::{Request, State};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use telemetryd_core::{Error, TokenSet};
 
 use crate::error::ApiError;
@@ -77,6 +77,38 @@ pub async fn require_admin_token(
         next,
     )
     .await
+}
+
+/// Guards `/status`, which answers everyone — but not with the same document.
+///
+/// A credential that satisfies [`require_admin_token`] gets the full deployment picture,
+/// byte for byte what it got before this existed. Anything else gets
+/// [`crate::routes::status_identity`]: what this software is, and nothing about where it
+/// runs.
+///
+/// # Why this branch cannot fail open
+///
+/// Making an endpoint dual-mode puts one `match` between "no credential" and everything,
+/// and that branch must never fail the wrong way. It cannot here, because the full
+/// document is not a branch at all: it is only ever produced by `next.run(request)` deep
+/// inside `guard`, which is reached solely after a token verified — or after `guard`
+/// established that nothing guards this surface, the pre-existing open case this does not
+/// touch. Every other path out of `guard`, including any future one, is an `Err`, and
+/// every `Err` lands on the identity. The default is the disclosing-nothing answer, and a
+/// mistake here loses the deployment picture rather than leaking it.
+pub async fn admin_token_or_identity(
+    state: State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match require_admin_token(state, request, next).await {
+        Ok(response) => response,
+        // Deliberately narrow. A refusal is the case this widens; a 500 from somewhere
+        // else must still read as a 500, not as a cheerful 200 that says the server is
+        // fine.
+        Err(ApiError(Error::Unauthorized)) => crate::routes::status_identity(),
+        Err(other) => other.into_response(),
+    }
 }
 
 pub async fn require_query_token(

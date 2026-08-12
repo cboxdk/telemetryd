@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use telemetryd_core::{Error, VERSION};
@@ -144,6 +144,62 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse
 
 fn enabled(is_empty: bool) -> &'static str {
     if is_empty { "disabled" } else { "enabled" }
+}
+
+/// `/status` for a caller that presented no admin credential: what this software is,
+/// and not one word about where it is running.
+///
+/// # The failure this closes
+///
+/// A client handed a bare URL cannot tell a telemetryd from anything else without a
+/// token. `/healthz` says something is alive but not what it is — anything can serve
+/// `ok` — and every identifying route answered `401`, including the token the client was
+/// trying to work out whether it needed. So it probed a dozen candidate URLs, got `401`
+/// from all of them, and reported "nothing answered at that address" about a telemetryd
+/// standing right there.
+///
+/// # What is in it, and what is deliberately not
+///
+/// [`crate::index::Identity`]: product, version, `storage_format_version`, signals. Every
+/// one of those reads identically on every telemetryd of this build, so an unauthenticated
+/// stranger learns nothing from them that they could not learn from the release notes.
+///
+/// Everything else on [`StatusResponse`] describes *this deployment* and stays behind the
+/// token: `uptime_seconds` and `started_at` (how long since the last restart is a hint
+/// about patch cadence, and about when a restart would be noticed), `listen` (an internal
+/// address, and often one a proxy exists to hide), `storage.data_dir` (a filesystem path
+/// on someone's box), `retention` and `limits` (what to send to make data fall off, or to
+/// hit a cap), `storage` and `apps` (record counts, series counts, disk share, and the
+/// names of the applications sending — the inventory of a business), `relay` (where this
+/// forwards to, i.e. the next host worth attacking), `insecure` and `tls` and `auth`
+/// (whether this instance is worth attacking *first*). None of those help a client decide
+/// whether it can talk to this server, which is the only question this document answers.
+///
+/// # The shape is the same as the authenticated one
+///
+/// `version` and `storage_format_version` are the fields both documents carry, and they
+/// are the same field: same name, same type, same meaning. A client does not parse two
+/// schemas — it parses one and finds fewer keys. The absence of `storage` is how it knows
+/// which it got.
+///
+/// # Cache headers
+///
+/// `no-store`, and `Vary: Authorization` behind it. The document is stable for the
+/// process's lifetime, so caching it is tempting and wrong: `/status` is one URL with two
+/// bodies chosen by a request header, and a shared cache that stored this one would be
+/// free to hand it back to an operator who did send a token. `Vary` is the correct fix
+/// and `no-store` is the one that works through intermediaries that ignore `Vary`; both
+/// are set because the thing being saved is a few hundred bytes on a call a client makes
+/// once. The other half of the trade is worse still — a cached identity survives a
+/// restart onto a new build, and a client would then compatibility-check against a
+/// version that is no longer running, which is precisely the mistake this endpoint exists
+/// to prevent.
+pub fn status_identity() -> Response {
+    let mut response = Json(crate::index::identity()).into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::VARY, HeaderValue::from_static("Authorization"));
+    response
 }
 
 pub async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {

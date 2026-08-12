@@ -134,6 +134,54 @@ before enabling it, and check with the tokens you expect people to hold.
 Static tokens are checked first and in constant time, so turning this on costs a purely
 static deployment nothing.
 
+## What an unauthenticated caller can see
+
+Two endpoints answer without a credential, and one of them names the build:
+
+| Endpoint | Without a token |
+|---|---|
+| `GET /healthz` | `ok` |
+| `GET /` | product, version, `storage_format_version`, signals, and the route table |
+| `GET /status` | product, version, `storage_format_version`, signals — nothing else |
+
+**There is no setting to turn this off, and that is a decision rather than an
+oversight.** The objection is real: publishing a version to anyone who can reach the port
+turns "which build is this" into "which advisories apply", and it is the reason to think
+about it rather than to just ship it. It was weighed and rejected on four grounds.
+
+- It would withhold nothing. `/healthz` already confirms something is listening, the
+  route table and the `401` shape are a fingerprint on their own, and behaviour differs
+  between builds in ways anyone determined enough to look up an advisory can measure. A
+  switch here buys an hour of an attacker's time and sells it as protection.
+- An optional protocol feature is not a protocol feature. The point of publishing
+  identity is that a client stops guessing; if any given instance might withhold it,
+  every client must keep the guessing path forever and nothing is actually removed.
+- Whoever flipped it would break their own tooling, and the failure would look like a
+  broken server rather than a chosen setting.
+- The knob would sit next to real ones and imply it was worth the same consideration.
+
+What that reasoning does **not** extend to is anything describing this deployment. Uptime,
+the listen address, the data directory, retention, record and series counts, app names,
+relay configuration, and which surfaces have auth enabled are all on `/status` behind the
+admin token, and they stay there. The line is identity versus inventory: an attacker can
+look up the first in a changelog and cannot guess the second.
+
+`telemetryd validate` states it, under `Security:`:
+
+```
+Security:
+  listen       0.0.0.0:4319 (reachable from the network)
+  ingest       token required
+  query        token required
+  admin        token required
+  identity     open on / and /status: telemetryd 0.34.0, storage format 1,
+               three signals. Never the deployment. Not a setting.
+```
+
+If your threat model genuinely requires the version withheld, strip it at the reverse
+proxy — that is the layer that already knows what your exposure is, and it can do it
+without every client of every other instance paying for it.
+
 ## Serving HTTPS
 
 Unset, telemetryd speaks plain HTTP and something in front holds the certificate. That

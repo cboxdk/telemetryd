@@ -256,16 +256,50 @@ Not part of any upstream API, and telemetryd's own.
 | Endpoint | Auth | Returns |
 |---|---|---|
 | `GET /` | none | `Accept: application/json` → an identity document; `text/html` → a page; otherwise plain text |
+| `GET /status` | none | the same identity document, and nothing else |
+| `GET /status` | admin token | the deployment picture — unchanged, see below |
 | `GET /healthz` | none | `ok` |
 
 The identity document is stable and safe to match on: `product` is the constant
 `"telemetryd"`, `storage_format_version` is what a client must agree with to read this
-instance's data, `signals` lists `logs`, `metrics` and `traces`, and `surfaces[].auth`
-names the credential each group of routes wants — `null` where none is needed.
+instance's data, and `signals` lists `logs`, `metrics` and `traces`. On `/` it carries
+two more fields — `surfaces[].auth`, naming the credential each group of routes wants
+(`null` where none is needed), and `docs`.
+
+```json
+{"product":"telemetryd","version":"0.34.0","storage_format_version":1,
+ "signals":["logs","metrics","traces"]}
+```
 
 It describes the product, never the deployment. App names, record counts, disk usage,
-retention windows, the listen address and relay configuration are on `/status`, behind
-the admin token.
+retention windows, the listen address, relay configuration and per-surface auth state
+are on `/status` **with** the admin token.
+
+### `/status` answers both callers, on one schema
+
+**Since 0.34.0.** Before it, every identifying route including `/status` answered `401`
+to a client with no credential, so a client could not tell a telemetryd that wants a
+token from a host with nothing on it, and reported the second about the first.
+
+- **With the admin token**: exactly what it has always returned, field for field. This
+  is a widening, not a replacement; an existing client sees no change.
+- **Without one, or with one that is refused**: the four identity fields, `200`.
+
+The two documents share `version` and `storage_format_version` — same name, same type,
+same meaning, so there is one schema to parse rather than two. **Tell them apart by the
+absence of `storage`, not by the status code**: both are `200`. A monitoring check that
+must confirm it authenticated should assert a field only the full document has.
+
+`Cache-Control: no-store` and `Vary: Authorization` on the identity response. One URL
+with two bodies chosen by a request header must not be cached by anything shared, and a
+cached identity would survive a restart onto a different build — a client would then
+check compatibility against a version that is no longer running.
+
+Version disclosure is deliberate and not configurable; the reasoning is in
+[the configuration reference](docs/configuration/reference.md).
+
+`/metrics` is unchanged: it still answers `401`, because a Prometheus exposition of
+telemetryd itself is all deployment and no identity.
 
 Every `401` carries `WWW-Authenticate: Bearer realm="telemetryd"`, so a refusal
 identifies the product too.

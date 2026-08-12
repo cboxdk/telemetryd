@@ -82,13 +82,32 @@ pub fn run(args: &StatusArgs) -> anyhow::Result<()> {
         ),
     };
 
+    let status: Value = serde_json::from_str(&body)
+        .with_context(|| format!("{url} did not return JSON — is that a telemetryd instance?"))?;
+
+    // Since 0.34.0 `/status` answers a caller with no admin credential rather than
+    // refusing it, with an identity document instead of the deployment picture. That is
+    // the right answer for a discovery client and the wrong one here: printing it would
+    // render a summary of question marks, which reads as a broken server rather than as
+    // a missing token. Detected by the absence of the deployment, not by the presence of
+    // `product` — a future field is not what decides this.
+    if status.get("storage").is_none() {
+        bail!(
+            "{url} answered with identity only, which means it did not accept an admin \
+             token.\n\
+             Pass --token, or set TELEMETRYD_AUTH_ADMIN_TOKEN.\n\
+             \n\
+             It guards /status and /metrics, which describe the deployment rather than \
+             the telemetry. An instance with no admin token configured accepts the \
+             query token here instead."
+        );
+    }
+
     if args.json {
         crate::out::outln!("{body}");
         return Ok(());
     }
 
-    let status: Value = serde_json::from_str(&body)
-        .with_context(|| format!("{url} did not return JSON — is that a telemetryd instance?"))?;
     print_summary(&status);
     Ok(())
 }

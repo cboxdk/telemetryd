@@ -16,9 +16,18 @@ environment, then CLI flags.
 is a page; otherwise plain text. Use it to confirm what is listening at an address before
 you hold a credential for it.
 
-It describes the product, never the deployment: no app names, no counts, no disk figures,
-no retention, no listen address. Those are on `/status`, behind the admin token. A `401`
-is also an identification rather than silence — every one carries
+`GET /status` needs no token either, and answers the same four identity fields to a
+caller that has none. Send the admin token to the same path and you get the deployment
+picture instead — unchanged from what it always returned. Both are `200`: tell them
+apart by the absence of `storage`, not by the status code. The identity response carries
+`Cache-Control: no-store` and `Vary: Authorization`, because one URL with two bodies
+chosen by a request header must not be cached by anything shared.
+
+Both describe the product, never the deployment: no app names, no counts, no disk
+figures, no retention, no listen address, no relay configuration, no per-surface auth
+state. Those need the admin token. Publishing the version to an unauthenticated caller
+is deliberate and is not configurable; the reasoning is in the configuration reference.
+A `401` is also an identification rather than silence — every one carries
 `WWW-Authenticate: Bearer realm="telemetryd"`.
 
 ## The thing most likely to mislead you

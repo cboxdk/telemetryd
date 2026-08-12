@@ -56,11 +56,22 @@ pub fn router(state: AppState) -> Router {
     // they sit behind the admin token — which falls back to the query token when
     // unset, exactly as they were guarded before the role existed.
     let admin = Router::new()
-        .route("/status", get(routes::status))
         .route("/metrics", get(routes::metrics))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_admin_token,
+        ));
+
+    // `/status` is the same admin surface with one addition: a caller it refuses gets
+    // told what it reached rather than only that it may not have it. The deployment
+    // picture still needs the admin token and is unchanged for everyone who holds one;
+    // everyone else gets the identity, which is four constants of the build. See
+    // `auth::admin_token_or_identity` for why that branch cannot fail the wrong way.
+    let status = Router::new()
+        .route("/status", get(routes::status))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::admin_token_or_identity,
         ));
 
     let query = Router::new()
@@ -115,6 +126,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(public)
         .merge(admin)
+        .merge(status)
         .merge(query)
         .merge(ingest)
         .layer(axum::middleware::from_fn_with_state(

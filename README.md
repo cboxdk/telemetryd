@@ -212,7 +212,7 @@ error, rather than dropping data quietly.
 |----------|------|---------|
 | `/` | always open | What this server is and which routes it answers — HTML for a browser, an identity document for `Accept: application/json`, plain text otherwise. Names the product, never the deployment. |
 | `/healthz` | always open | Liveness. Touches nothing, so it cannot fail for the wrong reason. |
-| `/status` | admin token | Disk usage vs budget, WAL stats, recovery events, limits, retention. Falls back to the query token when no admin token is set. |
+| `/status` | admin token | Disk usage vs budget, WAL stats, recovery events, limits, retention. Falls back to the query token when no admin token is set. **Without a token it answers the identity document instead of refusing**, so a client that only knows this path can still tell what it reached. Both are `200`; the absence of `storage` is how you tell them apart. |
 | `/metrics` | admin token | Prometheus exposition of telemetryd's own metrics. |
 
 ## Development

@@ -100,6 +100,27 @@ every start and shows as `insecure: true` in `/status`, so it cannot be forgotte
 silently. Reasonable on a trusted private network; never on anything reachable from the
 internet.
 
+## What stays open no matter what you configure
+
+Three answers need no credential, and it is worth knowing exactly what they are before
+you put this on an address the internet can reach:
+
+- `GET /healthz` — `ok`, and never anything else.
+- `GET /` — the identity document and the route table; a page in a browser.
+- `GET /status` — the identity document, when the caller sends no admin token. With one,
+  the deployment picture, unchanged.
+
+Identity is four constants of the build: `product`, `version`, `storage_format_version`,
+`signals`. Nothing that varies with the deployment is in any of them. That includes the
+version being published on purpose — the reasoning, and why it is not a setting, is under
+[what an unauthenticated caller can see](../configuration/reference.md#what-an-unauthenticated-caller-can-see).
+
+If your edge policy says a version must not leave the building, the proxy already
+terminating TLS is the place to enforce it — with `sub_filter` on the response body, or
+by returning a fixed document for `GET /` and for an unauthenticated `GET /status`. Know
+what it costs before you do: a client that cannot read a version goes back to probing a
+list of candidate URLs, which is exactly the behaviour these endpoints exist to remove.
+
 ## Verifying
 
 ```bash
@@ -107,4 +128,5 @@ telemetryd validate
 ```
 
 Prints the security posture in plain terms — whether the address is reachable from the
-network, and whether each surface requires a token.
+network, whether each surface requires a token, and what an unauthenticated caller is
+told about the build.

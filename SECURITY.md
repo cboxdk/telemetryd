@@ -26,6 +26,13 @@ logs a warning on every start and is reported as `insecure: true` in `/status`.
 list so a token can be rotated without a window where either the old or the new one is
 rejected.
 
+`/status` answers a caller with no admin token rather than refusing it, but only with
+what telemetryd *is* — product, version, storage format, signals — never with what this
+instance holds. See
+[the threat model](docs/security/threat-model.md) for the line between the two, and
+[the configuration reference](docs/configuration/reference.md) for why publishing the
+version unauthenticated is deliberate and not a setting.
+
 They are not a hierarchy. An admin token does not grant reads — operating an instance
 and reading the telemetry inside it are different privileges, and a dashboard scraping
 `/metrics` is not a reason to hand out everyone's log lines.

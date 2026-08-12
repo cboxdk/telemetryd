@@ -109,6 +109,19 @@ fn print_security_posture(config: &Config) {
     } else {
         "token required"
     };
+    // `/status` and `/metrics` fall back to the query token when no admin one is set,
+    // which is what guarded them before the role existed. Saying "open" here when the
+    // query token is what is actually holding them would be wrong in the direction that
+    // matters.
+    let admin = if config.auth.admin_token.is_empty() {
+        if config.auth.query_token.is_empty() {
+            "open"
+        } else {
+            "token required (falls back to the query token)"
+        }
+    } else {
+        "token required"
+    };
 
     crate::out::outln!("\nSecurity:");
     crate::out::outln!(
@@ -122,6 +135,21 @@ fn print_security_posture(config: &Config) {
     );
     crate::out::outln!("  ingest       {ingest}");
     crate::out::outln!("  query        {query}");
+    crate::out::outln!("  admin        {admin}");
+
+    // Not a setting, and said here precisely because it is not one.
+    //
+    // An operator reading this block is asking "what can someone who reaches this port
+    // without a credential learn". The three lines above answer it for telemetry; this
+    // answers it for the software itself, and leaving it out would mean the only place
+    // to find out is the source. It is deliberately not configurable — see
+    // docs/configuration/reference.md, "What an unauthenticated caller can see".
+    crate::out::outln!(
+        "  identity     open on / and /status: telemetryd {}, storage format {},",
+        telemetryd_core::VERSION,
+        telemetryd_core::STORAGE_FORMAT_VERSION,
+    );
+    crate::out::outln!("               three signals. Never the deployment. Not a setting.");
 
     if exposed && config.server.insecure {
         crate::out::outln!(

@@ -37,7 +37,7 @@ curl -s -H 'Accept: application/json' https://telemetry.example.com/
 ```json
 {
   "product": "telemetryd",
-  "version": "0.33.0",
+  "version": "0.34.0",
   "storage_format_version": 1,
   "signals": ["logs", "metrics", "traces"],
   "surfaces": [
@@ -58,6 +58,30 @@ parsing the words "no token".
 
 The document names no app, no count, no disk figure and no retention window. Those are
 `/status`, behind the admin token.
+
+### `/status` answers the same question
+
+Since 0.34.0 you get the first four fields from `/status` too, with no credential:
+
+```bash
+curl -s https://telemetry.example.com/status
+```
+
+```json
+{"product":"telemetryd","version":"0.34.0","storage_format_version":1,
+ "signals":["logs","metrics","traces"]}
+```
+
+Two doors, one document, because a client does not always get to choose which it walks
+through. Probing `/` is the right first call, but a client that already had `/status` in
+its list — and every operational client does — no longer has to be taught a second URL to
+stop reporting "nothing answered" about a server that is answering.
+
+Send the admin token to the same path and you get the deployment picture instead: same
+`version`, same `storage_format_version`, plus everything this instance holds. **The
+absence of `storage` is how a client knows which of the two it received.** A health check
+that must confirm it is authenticated should assert on `storage`, not on the status code —
+both are `200`.
 
 A guarded endpoint is a weaker but still real signal: every `401` from telemetryd
 carries `WWW-Authenticate: Bearer realm="telemetryd"`. Refusal is identification, not
