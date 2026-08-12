@@ -37,6 +37,36 @@ This is still the best shape at a public edge, where an ingress or load balancer
 already holds certificates for several services — not because telemetryd cannot do it,
 but because doing it twice means two places for cipher and protocol policy to be right.
 
+### Two things the proxy owns, and telemetryd does not
+
+**Rate limiting.** telemetryd has none, deliberately: a request limiter belongs where
+the client addresses are real rather than behind a proxy's rewrite, and a wrong limit in
+the storage process drops telemetry rather than shedding load. Three routes answer
+without a credential — `/`, `/healthz` and `/status`, which returns identity only to a
+caller without the admin token. All three are constant, small, and touch no storage, so
+there is nothing to amplify. But nothing throttles a token guess either, so put the
+limit at the edge:
+
+```nginx
+limit_req_zone $binary_remote_addr zone=telemetryd:10m rate=20r/s;
+
+location / {
+    limit_req zone=telemetryd burst=40 nodelay;
+    proxy_pass http://127.0.0.1:4319;
+    # …
+}
+```
+
+Size it above your ingest batch rate. A limiter that rejects real telemetry is worse
+than none, because the data is gone and the metric that would have told you is the one
+that was dropped.
+
+**Caching.** Do not add one in front of this. `/status` is one URL with two bodies chosen
+by the `Authorization` header, so both halves answer `Cache-Control: no-store` and
+`Vary: Authorization`, and `/metrics` does too. `proxy_ignore_headers Cache-Control` —
+which people set to make a static site cacheable — would let a proxy store the
+authenticated deployment picture and hand it to the next caller.
+
 ## Or: terminate TLS in telemetryd
 
 Where there is no proxy and none is coming — an internal network, one container talking

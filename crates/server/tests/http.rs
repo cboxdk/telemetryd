@@ -426,13 +426,22 @@ async fn an_authenticated_status_is_unchanged() {
         "the authenticated /status changed; it was supposed to be untouched"
     );
 
-    // Nothing was bolted onto the authenticated document to make the open one work: no
-    // `product`, no `signals`, and no header the response did not carry before.
+    // Nothing was bolted onto the authenticated document to make the open one work.
     assert!(json.get("product").is_none(), "{body}");
     assert!(json.get("signals").is_none(), "{body}");
+
+    // This test used to assert the authenticated response grew no headers at all, which
+    // pinned the wrong thing: the cache headers belong on *both* halves, and having them
+    // on only the open one was the defect. `Content-Type` is all that describes the body
+    // itself; caching is asserted by
+    // `nothing_that_describes_the_deployment_may_be_cached`.
+    let names: Vec<&str> = headers.iter().map(|(name, _)| name.as_str()).collect();
     assert!(
-        !headers.iter().any(|(name, _)| name == "vary"),
-        "the authenticated response grew a header: {headers:?}"
+        names.iter().all(|name| matches!(
+            *name,
+            "content-type" | "content-length" | "cache-control" | "vary"
+        )),
+        "the authenticated response grew an unexpected header: {names:?}"
     );
 }
 
@@ -812,6 +821,51 @@ async fn a_browser_gets_html() {
     // script from someone else's server on its own landing page.
     for external in ["<script", "src=\"http", "href=\"http://", "@import"] {
         assert!(!body.contains(external), "the index page loads {external}");
+    }
+}
+
+#[tokio::test]
+async fn nothing_that_describes_the_deployment_may_be_cached() {
+    // The asymmetry this closes: the identity half of `/status` declared `no-store` and
+    // `Vary`, and the authenticated half — app names, disk figures, the listen address —
+    // declared neither. That is the wrong half to protect. A stored identity is a stale
+    // version number; a stored deployment picture is handed to whoever asks next.
+    let harness = Harness::new(|config| {
+        config.auth.admin_token = serde_json::from_str(r#""admin-secret""#).unwrap();
+    });
+
+    let cases = [
+        ("/status", None),
+        ("/status", Some("admin-secret")),
+        ("/metrics", Some("admin-secret")),
+    ];
+
+    for (path, token) in cases {
+        let (status, headers, _) = match token {
+            Some(token) => harness.get_with_token(path, token).await,
+            None => harness.get(path).await,
+        };
+        assert_eq!(status, StatusCode::OK, "{path} with token={token:?}");
+
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            header("cache-control"),
+            "no-store",
+            "{path} with token={token:?} may be stored"
+        );
+        // `Vary` states *why* it depends on the request; `no-store` is what survives an
+        // intermediary that ignores `Vary`. Both, or neither is load-bearing.
+        assert_eq!(
+            header("vary"),
+            "Authorization",
+            "{path} with token={token:?} does not declare what it varies on"
+        );
     }
 }
 

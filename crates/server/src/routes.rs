@@ -82,7 +82,31 @@ pub struct LimitsStatus {
     pub ingest_queue_depth: u32,
 }
 
-pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>, ApiError> {
+/// Forbid every cache from keeping a response that describes this deployment.
+///
+/// `/status` is one URL with two bodies chosen by a request header, and `/metrics` is the
+/// same inventory in another encoding. Only the identity half declared this at first,
+/// which is the wrong half: a stored *identity* is a stale version number, while a stored
+/// *deployment picture* is app names, disk figures and a listen address handed to whoever
+/// asks next.
+///
+/// RFC 9111 §3.5 already stops a shared cache reusing a response to an `Authorization`ed
+/// request, so this is defence in depth rather than the only thing standing there. It
+/// covers the two gaps that leaves: a private cache, to which §3.5 does not apply, and a
+/// proxy told `proxy_ignore_headers Cache-Control` — which operators do set, reasoning
+/// about a static site and not about this.
+///
+/// `Vary` is the correct expression of "the body depends on the credential"; `no-store`
+/// is the one that survives an intermediary ignoring `Vary`. Both, because the response
+/// is a few hundred bytes on a call nobody makes in a loop.
+fn describes_this_deployment(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::VARY, HeaderValue::from_static("Authorization"));
+    response
+}
+
+pub async fn status(State(state): State<AppState>) -> Result<Response, ApiError> {
     let config = &state.config;
     let storage = state.store.snapshot()?;
 
@@ -111,35 +135,38 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse
         ),
     ]);
 
-    Ok(Json(StatusResponse {
-        version: VERSION,
-        storage_format_version: telemetryd_core::STORAGE_FORMAT_VERSION,
-        started_at,
-        uptime_seconds: state.uptime_seconds(),
-        listen: config.server.listen.to_string(),
-        insecure: config.server.insecure,
-        tls: config.server.tls.posture(),
-        auth: AuthStatus {
-            ingest: enabled(state.ingest_tokens.is_empty()),
-            query: enabled(state.query_tokens.is_empty()),
-            admin: enabled(state.admin_tokens.is_empty()),
-            oidc: state.oidc.is_enabled().then(|| OidcStatus {
-                issuer: config.auth.oidc.issuer.clone(),
-                keys: state.oidc.key_count(),
-                keys_stale: state.oidc.is_stale(),
-            }),
-        },
-        storage,
-        retention,
-        apps: state.store.app_usage(),
-        limits: LimitsStatus {
-            max_series: config.limits.max_series,
-            max_series_per_app: config.limits.max_series_per_app,
-            max_log_line_bytes: config.limits.max_log_line_bytes.as_u64(),
-            ingest_queue_depth: config.limits.ingest_queue_depth,
-        },
-        relay: state.relay.as_ref().map(|relay| relay.status(&state.store)),
-    }))
+    Ok(describes_this_deployment(
+        Json(StatusResponse {
+            version: VERSION,
+            storage_format_version: telemetryd_core::STORAGE_FORMAT_VERSION,
+            started_at,
+            uptime_seconds: state.uptime_seconds(),
+            listen: config.server.listen.to_string(),
+            insecure: config.server.insecure,
+            tls: config.server.tls.posture(),
+            auth: AuthStatus {
+                ingest: enabled(state.ingest_tokens.is_empty()),
+                query: enabled(state.query_tokens.is_empty()),
+                admin: enabled(state.admin_tokens.is_empty()),
+                oidc: state.oidc.is_enabled().then(|| OidcStatus {
+                    issuer: config.auth.oidc.issuer.clone(),
+                    keys: state.oidc.key_count(),
+                    keys_stale: state.oidc.is_stale(),
+                }),
+            },
+            storage,
+            retention,
+            apps: state.store.app_usage(),
+            limits: LimitsStatus {
+                max_series: config.limits.max_series,
+                max_series_per_app: config.limits.max_series_per_app,
+                max_log_line_bytes: config.limits.max_log_line_bytes.as_u64(),
+                ingest_queue_depth: config.limits.ingest_queue_depth,
+            },
+            relay: state.relay.as_ref().map(|relay| relay.status(&state.store)),
+        })
+        .into_response(),
+    ))
 }
 
 fn enabled(is_empty: bool) -> &'static str {
@@ -184,35 +211,29 @@ fn enabled(is_empty: bool) -> &'static str {
 ///
 /// # Cache headers
 ///
-/// `no-store`, and `Vary: Authorization` behind it. The document is stable for the
-/// process's lifetime, so caching it is tempting and wrong: `/status` is one URL with two
-/// bodies chosen by a request header, and a shared cache that stored this one would be
-/// free to hand it back to an operator who did send a token. `Vary` is the correct fix
-/// and `no-store` is the one that works through intermediaries that ignore `Vary`; both
-/// are set because the thing being saved is a few hundred bytes on a call a client makes
-/// once. The other half of the trade is worse still — a cached identity survives a
-/// restart onto a new build, and a client would then compatibility-check against a
-/// version that is no longer running, which is precisely the mistake this endpoint exists
-/// to prevent.
+/// Both halves of `/status` carry `no-store` and `Vary: Authorization`, stamped by one
+/// helper so neither can drift from the other. Caching this
+/// one is tempting because the document is stable for the process's lifetime, and wrong
+/// for a reason of its own: a cached identity survives a restart onto a new build, and a
+/// client would then compatibility-check against a version that is no longer running,
+/// which is precisely the mistake this endpoint exists to prevent.
 pub fn status_identity() -> Response {
-    let mut response = Json(crate::index::identity()).into_response();
-    let headers = response.headers_mut();
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    headers.insert(header::VARY, HeaderValue::from_static("Authorization"));
-    response
+    describes_this_deployment(Json(crate::index::identity()).into_response())
 }
 
 pub async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
     let body = state.metrics.render(&gauges(&state)?);
-    Ok((
-        StatusCode::OK,
-        [(
-            header::CONTENT_TYPE,
-            "text/plain; version=0.0.4; charset=utf-8",
-        )],
-        body,
-    )
-        .into_response())
+    Ok(describes_this_deployment(
+        (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
+            body,
+        )
+            .into_response(),
+    ))
 }
 
 /// Read live gauge values at scrape time. See [`crate::metrics::Metrics::render`] for
