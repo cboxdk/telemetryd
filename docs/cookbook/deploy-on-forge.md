@@ -54,7 +54,18 @@ telemetryd service print          # read it first
 sudo telemetryd service install
 ```
 
-The generated unit runs as a dedicated `telemetryd` user with `StateDirectory`,
+By default it runs as a dedicated `telemetryd` system user, created for you if it does
+not exist — least privilege, and it cannot read the application's files. On a Forge box
+where `forge` already owns everything and you would rather not add an account:
+
+```bash
+sudo telemetryd service install --user forge
+```
+
+A user you name yourself is never created. An unknown one is a typo, and inventing an
+account from a misspelling is worse than refusing.
+
+The generated unit runs as that user with `StateDirectory`,
 `ProtectSystem=strict`, `NoNewPrivileges` and `PrivateTmp`, and gives SIGTERM 30 seconds
 — telemetryd flushes its write-ahead log and seals the open segment on the way out, and
 cutting that short turns a clean stop into a crash recovery on the next boot.
@@ -64,11 +75,9 @@ sudo systemctl status telemetryd
 curl -fsS http://127.0.0.1:4319/healthz
 ```
 
-Then make the token available to the tokens' owner:
-
-```bash
-sudo chown telemetryd:telemetryd /etc/telemetryd/*.token
-```
+`install` also hands the token files `init` wrote to that account — they are `0600` and
+owned by whoever ran `init`, and the service is somebody else. That was a real failure
+before it was a step: the unit started, could not read its own tokens, and exited.
 
 ## 4. Put nginx in front of it
 
