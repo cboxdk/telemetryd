@@ -1,5 +1,6 @@
 pub mod bench;
 pub mod init;
+pub mod local_token;
 pub mod query;
 pub mod remote_read;
 pub mod serve;

@@ -92,7 +92,13 @@ pub fn run(args: &QueryArgs) -> anyhow::Result<()> {
     );
 
     let mut request = ureq::get(&url).header("user-agent", super::status::user_agent());
-    if let Some(token) = &args.token {
+    // Same as `status`: a local instance's token is in the configuration on this
+    // machine, and only a loopback target is ever given it.
+    let token = args
+        .token
+        .clone()
+        .or_else(|| super::local_token::find(&args.url, super::local_token::Surface::Query));
+    if let Some(token) = &token {
         request = request.header("authorization", &format!("Bearer {token}"));
     }
 

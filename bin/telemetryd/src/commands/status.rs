@@ -40,8 +40,16 @@ pub fn run(args: &StatusArgs) -> anyhow::Result<()> {
     // terminate TLS. That confused the server with the client: the server
     // still need not, but a TLS-terminating proxy in front is *recommended*, and
     // refusing to talk to one made the recommended deployment unqueryable.
+    // Nothing supplied, and the instance is on this machine: read the token out of the
+    // configuration sitting right there rather than asking someone to paste their own
+    // credential back at the tool that wrote it.
+    let token = args
+        .token
+        .clone()
+        .or_else(|| super::local_token::find(&args.url, super::local_token::Surface::Admin));
+
     let mut request = ureq::get(&url).header("user-agent", user_agent());
-    if let Some(token) = &args.token {
+    if let Some(token) = &token {
         request = request.header("authorization", &format!("Bearer {token}"));
     }
 

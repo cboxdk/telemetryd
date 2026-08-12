@@ -107,6 +107,23 @@ impl TokenSpecs {
         self.0.iter().all(Secret::is_empty)
     }
 
+    /// The first configured token, in plain text, for a client that has to send one.
+    ///
+    /// Deliberately separate from `resolve`, which returns hashes because the server
+    /// must never hold the plaintext longer than it takes to compare. This exists for
+    /// the CLI talking to a *local* instance: the configuration is right there with the
+    /// path to the token in it, and making an operator paste a credential they own is a
+    /// small indignity the tool can spare them.
+    ///
+    /// Callers are responsible for not sending the result anywhere but loopback.
+    pub fn first_value(&self) -> Option<String> {
+        self.0
+            .iter()
+            .filter(|secret| !secret.is_empty())
+            .find_map(|secret| secret.resolve().ok())
+            .filter(|value| !value.is_empty())
+    }
+
     /// Resolve every specification and pre-hash it for constant-time comparison.
     pub fn resolve(&self) -> Result<TokenSet> {
         let mut hashes = Vec::new();

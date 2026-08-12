@@ -30,7 +30,12 @@ telemetryd query '{level="error"}' --since 1h --limit 5000 --output json \
 ```
 
 It talks to a running instance, so it sees records still in the buffer and it obeys the
-configured tokens:
+configured tokens — but on the box where that instance runs it finds them itself, from
+the configuration already sitting there. No `--token` for a local query.
+
+That lookup is loopback-only, deliberately: a token read from *this* machine's
+configuration has no business being sent to `--url` pointing somewhere else. Against a
+remote instance you supply it, as before:
 
 ```bash
 export TELEMETRYD_AUTH_QUERY_TOKEN=…     # not --token: arguments show up in `ps`
