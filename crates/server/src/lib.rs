@@ -7,6 +7,7 @@
 pub mod auth;
 pub mod error;
 pub mod export;
+pub mod index;
 pub mod ingest;
 pub mod loki;
 pub mod maintenance;
@@ -42,9 +43,12 @@ pub fn router(state: AppState) -> Router {
         usize::try_from(state.config.server.max_body_bytes.as_u64()).unwrap_or(usize::MAX);
     let request_timeout = state.config.server.request_timeout;
 
-    // Unauthenticated: liveness only. It carries no telemetry and load balancers need
-    // it to work before anyone has configured a token.
-    let public = Router::new().route("/healthz", get(routes::healthz));
+    // Unauthenticated: liveness, and an index that says what this is. Neither carries
+    // telemetry, neither describes the deployment, and load balancers need `/healthz` to
+    // work before anyone has configured a token.
+    let public = Router::new()
+        .route("/", get(index::index))
+        .route("/healthz", get(routes::healthz));
 
     // `/status` and `/metrics` describe the deployment rather than the telemetry:
     // every app name, its series count, its share of the disk, whether the instance is

@@ -210,9 +210,10 @@ error, rather than dropping data quietly.
 
 | Endpoint | Auth | Purpose |
 |----------|------|---------|
+| `/` | always open | What this server is and which routes it answers. Names no version and no contents, because it is open. |
 | `/healthz` | always open | Liveness. Touches nothing, so it cannot fail for the wrong reason. |
-| `/status` | query token | Disk usage vs budget, WAL stats, recovery events, limits, retention. |
-| `/metrics` | query token | Prometheus exposition of telemetryd's own metrics. |
+| `/status` | admin token | Disk usage vs budget, WAL stats, recovery events, limits, retention. Falls back to the query token when no admin token is set. |
+| `/metrics` | admin token | Prometheus exposition of telemetryd's own metrics. |
 
 ## Development
 

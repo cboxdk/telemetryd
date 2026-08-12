@@ -426,6 +426,93 @@ async fn every_contracted_endpoint_is_implemented() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// the index
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_index_never_names_a_route_that_does_not_exist() {
+    // The whole justification for building `/` from a table rather than writing prose:
+    // an index that drifts from the router sends people to a 404 with confidence. This
+    // walks what the page renders against what the server actually answers.
+    let harness = Harness::new(|_| {});
+
+    for surface in telemetryd_server::index::SURFACES {
+        for route in surface.routes {
+            for path in route.paths {
+                let concrete = path
+                    .replace("{trace_id}", "abc123")
+                    .replace("{name}", "app");
+                let (status, _, _) = harness.get(&concrete).await;
+                // 401 and 405 both prove the route exists; only 404 means the index is
+                // pointing at nothing. `/api/traces/{id}` answers 404 for an unknown
+                // trace on an empty store, which is a real answer from a real route.
+                if !concrete.starts_with("/api/traces/") {
+                    assert_ne!(
+                        status,
+                        StatusCode::NOT_FOUND,
+                        "the index lists {path}, which is not routed"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_index_is_open_and_says_nothing_about_the_deployment() {
+    let harness = Harness::new(|config| {
+        with_query_token(config);
+        with_ingest_token(config);
+    });
+
+    let (status, headers, body) = harness.get("/").await;
+    assert_eq!(status, StatusCode::OK, "the index must not need a token");
+
+    // curl sends `*/*`; it should not receive markup.
+    let content_type = headers
+        .iter()
+        .find(|(name, _)| name == "content-type")
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default();
+    assert!(content_type.starts_with("text/plain"), "{content_type}");
+    assert!(body.contains("/loki/api/v1/query_range"), "{body}");
+
+    // Open endpoint, so nothing that describes this instance may appear on it.
+    assert!(!body.contains("query-secret"), "the index printed a token");
+    assert!(!body.contains("ingest-secret"), "the index printed a token");
+    assert!(
+        !body.contains(env!("CARGO_PKG_VERSION")),
+        "the index printed the version"
+    );
+}
+
+#[tokio::test]
+async fn a_browser_gets_html() {
+    let harness = Harness::new(|_| {});
+    let (status, headers, body) = harness
+        .request(
+            Request::get("/")
+                .header(header::ACCEPT, "text/html,application/xhtml+xml,*/*;q=0.8")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers
+            .iter()
+            .any(|(name, value)| name == "content-type" && value.starts_with("text/html"))
+    );
+    assert!(body.starts_with("<!doctype html>"), "{body}");
+    // Self-contained: an observability backend must not fetch a stylesheet, a font or a
+    // script from someone else's server on its own landing page.
+    for external in ["<script", "src=\"http", "href=\"http://", "@import"] {
+        assert!(!body.contains(external), "the index page loads {external}");
+    }
+}
+
 #[tokio::test]
 async fn a_genuinely_unknown_route_is_still_a_404() {
     let harness = Harness::new(|_| {});

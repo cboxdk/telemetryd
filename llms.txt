@@ -10,6 +10,10 @@ under a 10 GiB disk budget. Every setting is also an environment variable named
 `TELEMETRYD_<SECTION>_<KEY>`; precedence is defaults, then `telemetryd.toml`, then the
 environment, then CLI flags.
 
+`GET /` needs no token and returns a plain-text index of the routes below — useful for
+confirming at runtime that a host is telemetryd and not something else on the same port.
+It reports no version and nothing about the deployment; those need the admin token.
+
 ## The thing most likely to mislead you
 
 telemetryd serves the Loki, Tempo and Prometheus **APIs**, not those products. The
