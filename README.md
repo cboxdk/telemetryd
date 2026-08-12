@@ -1,11 +1,35 @@
 # telemetryd
 
-Single-binary, zero-config observability backend for the [cboxdk](https://github.com/cboxdk)
-Laravel ecosystem. Logs, traces and metrics in one directory, served back
-through the Loki, Tempo and Prometheus APIs that `laravel-telemetry-ui` already speaks.
+**Observability for Laravel that runs on one command — the same one on your laptop and
+on the server.**
 
-**Your telemetry never leaves your infrastructure: one binary, one port, one data
-directory, no sidecars.**
+```bash
+telemetryd serve
+```
+
+That is the whole setup. No configuration file, no collector to run alongside it, no
+decisions about storage backends or index tiers. Logs, traces and metrics go into one
+directory and come back out through the Loki, Tempo and Prometheus APIs that
+[`laravel-telemetry-ui`](https://github.com/cboxdk/laravel-telemetry-ui) already speaks,
+so [`laravel-telemetry`](https://github.com/cboxdk/laravel-telemetry) works against it
+without a line of change.
+
+Three things follow from that, and they are the reasons to pick it:
+
+**Local and production are the same program.** Not a lighter build for development and a
+real one for the server — one binary, one storage format, one query subset. What you
+reproduce on your laptop behaves the way it will behave in production, because it *is*
+production. Debugging against a stand-in that is almost the same is how you fix the wrong
+thing.
+
+**Your telemetry never leaves your infrastructure.** One binary, one port, one data
+directory, and nothing else to run. Nothing phones anywhere, including telemetryd's own
+landing page.
+
+**And it can leave whenever you want.** Every signal moves in and out as OTLP, and the
+read APIs are three standards rather than ours. If this stops being the right tool, point
+the UI at Loki and Prometheus and run one export command. The exit is designed in, not
+discovered later.
 
 telemetryd is scoped deliberately: one team, a handful of apps, one VPS or a dev
 laptop. It targets that case completely rather than scaling to a large fleet.
@@ -57,9 +81,10 @@ Putting it on a server behind TLS is [a page of its own](docs/cookbook/deploy-on
 telemetryd serve
 ```
 
-That is the whole setup. It listens on `127.0.0.1:4319`, stores data in
-`./telemetryd-data` (or your platform data directory), keeps 7 days of logs and traces
-and 30 days of metrics, and stays under a 10 GiB disk budget.
+It listens on `127.0.0.1:4319`, stores data in `./telemetryd-data` (or your platform data
+directory), keeps 7 days of logs and traces and 30 days of metrics, and stays under a
+10 GiB disk budget. Those defaults are the only difference between this and the server —
+the same binary, told different numbers.
 
 Or as a container, with the same amount of configuration:
 

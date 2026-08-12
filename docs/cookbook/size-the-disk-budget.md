@@ -35,6 +35,42 @@ Then multiply by your retention window and add headroom. Logs dominate by an ord
 magnitude on almost every deployment; metrics are cheap enough that their longer default
 retention costs little.
 
+### Size it for a bad day, not an average one
+
+This is the part that is easy to get wrong, because the arithmetic above quietly assumes
+tomorrow looks like today. It does not on the day you need this most.
+
+An incident is a log volume event. Errors arrive in bursts, stack traces are large, retry
+loops multiply every line, and debug logging often gets turned up while someone is
+looking. A budget sized to a typical day starts deleting **oldest-first** partway through
+exactly the window you are trying to reconstruct — so the hour before the incident, the
+part that explains it, is the first thing to go.
+
+The reaper is behaving correctly; the ceiling was set for the wrong day.
+
+So size from your worst observed hour rather than your mean, or from an estimate of it:
+
+```
+budget ≈ peak_hourly_bytes × 24 × retention_days × 1.3
+```
+
+The `1.3` is headroom for the segment being written and for compression varying with
+content — an incident's logs are repetitive and compress well, but a burst of distinct
+stack traces does not.
+
+Disk is the cheapest thing in this calculation. Going from 10 GiB to 100 GiB costs less
+than one incident where the history stopped an hour short, and the [reload
+path](run-as-a-service.md#changing-configuration-afterwards) means raising it later takes
+no restart:
+
+```bash
+sudo systemctl reload telemetryd
+```
+
+If you cannot give it that much room, shorten retention instead of accepting a budget
+that will be hit. A shorter window you actually keep is worth more than a longer one that
+gets eaten from the far end without telling you which day it stopped covering.
+
 ## When the two are fighting
 
 `/status` tells you directly:
