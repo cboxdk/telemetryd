@@ -25,6 +25,45 @@ And point the emitting side at the same place:
 TELEMETRY_OTLP_ENDPOINT=http://127.0.0.1:4319
 ```
 
+## Is there a telemetryd at this address?
+
+Ask before you hold a token. `GET /` is open, and with `Accept: application/json` it
+returns what the server is rather than what it holds:
+
+```bash
+curl -s -H 'Accept: application/json' https://telemetry.example.com/
+```
+
+```json
+{
+  "product": "telemetryd",
+  "version": "0.33.0",
+  "storage_format_version": 1,
+  "signals": ["logs", "metrics", "traces"],
+  "surfaces": [
+    { "title": "Read it back", "auth": "query token", "routes": [ … ] },
+    { "title": "Always open", "auth": null, "routes": [ … ] }
+  ],
+  "docs": "https://github.com/cboxdk/telemetryd/blob/main/docs/quickstart.md"
+}
+```
+
+This exists because a client that probes only guarded endpoints cannot tell a telemetryd
+that wants a token from an address with nothing behind it — both look like a refusal.
+Match on `product`; use `storage_format_version` to decide whether you can read its data
+at all; use `surfaces[].auth` to know which credential to ask a person for.
+
+`auth` is `null` for the surface that needs none, so a client tests a field rather than
+parsing the words "no token".
+
+The document names no app, no count, no disk figure and no retention window. Those are
+`/status`, behind the admin token.
+
+A guarded endpoint is a weaker but still real signal: every `401` from telemetryd
+carries `WWW-Authenticate: Bearer realm="telemetryd"`. Refusal is identification, not
+silence — treat it as "found it, need a credential" rather than moving on to the next
+candidate address.
+
 ## Checking the connection
 
 The UI probes each backend before using it, and each probe is a different endpoint:

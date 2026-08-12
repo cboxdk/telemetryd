@@ -478,12 +478,56 @@ async fn the_index_is_open_and_says_nothing_about_the_deployment() {
     assert!(content_type.starts_with("text/plain"), "{content_type}");
     assert!(body.contains("/loki/api/v1/query_range"), "{body}");
 
-    // Open endpoint, so nothing that describes this instance may appear on it.
+    // Open endpoint. It names the product, not the deployment.
     assert!(!body.contains("query-secret"), "the index printed a token");
     assert!(!body.contains("ingest-secret"), "the index printed a token");
+}
+
+#[tokio::test]
+async fn a_client_without_a_token_can_still_tell_this_is_telemetryd() {
+    // The failure this closes: pointed at a URL it has no credential for, a discovery
+    // client got 401 from every guarded route and reported "nothing answered" about a
+    // telemetryd that was answering perfectly well. Refusal and silence looked the same.
+    let harness = Harness::new(|config| {
+        with_query_token(config);
+        with_ingest_token(config);
+    });
+
+    let (status, headers, body) = harness
+        .request(
+            Request::get("/")
+                .header(header::ACCEPT, "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
     assert!(
-        !body.contains(env!("CARGO_PKG_VERSION")),
-        "the index printed the version"
+        headers
+            .iter()
+            .any(|(name, value)| name == "content-type" && value.starts_with("application/json"))
+    );
+
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["product"], "telemetryd");
+    assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(json["storage_format_version"], 1);
+    assert_eq!(
+        json["signals"],
+        serde_json::json!(["logs", "metrics", "traces"])
+    );
+
+    // Identity, not inventory: nothing here describes what this instance holds.
+    for forbidden in ["apps", "storage", "retention", "listen", "uptime_seconds"] {
+        assert!(
+            json.get(forbidden).is_none(),
+            "the open identity document exposed {forbidden}"
+        );
+    }
+    assert!(
+        !body.contains("query-secret"),
+        "the identity leaked a token"
     );
 }
 

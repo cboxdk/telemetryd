@@ -78,8 +78,42 @@ def check_links() -> list[str]:
     return problems
 
 
+def check_versions() -> list[str]:
+    """Catch a version string in the docs that the release left behind.
+
+    A worked example is worth more than a placeholder, so the docs quote real version
+    numbers — and a quoted number is a fact that goes stale on its own, silently, every
+    time the crate is bumped. This is the cheapest place to notice.
+    """
+    version = re.search(
+        r'^version = "([^"]+)"', (REPO / "Cargo.toml").read_text(), re.M
+    )
+    if not version:
+        return ["Cargo.toml has no workspace version to check the docs against"]
+    current = version.group(1)
+
+    problems = []
+    pattern = re.compile(r"\b\d+\.\d+\.\d+\b")
+    for md in sorted(list(DOCS.rglob("*.md")) + [REPO / "README.md", REPO / "llms.txt"]):
+        for number, line in (
+            (match.group(0), line)
+            for line in md.read_text().splitlines()
+            # Only lines presenting telemetryd's own version. A dependency's version, a
+            # Rust release or a port number is none of our business.
+            if '"version"' in line or "telemetryd 0." in line
+            for match in [pattern.search(line)]
+            if match
+        ):
+            if number != current:
+                rel = md.relative_to(REPO)
+                problems.append(f"{rel}: says version {number}, crate is {current}")
+    return problems
+
+
 def main() -> int:
-    problems = check_structure() + check_frontmatter() + check_links()
+    problems = (
+        check_structure() + check_frontmatter() + check_links() + check_versions()
+    )
 
     files = list(DOCS.rglob("*.md"))
     folders = [p for p in DOCS.rglob("*") if p.is_dir()]

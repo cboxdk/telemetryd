@@ -10,9 +10,16 @@ under a 10 GiB disk budget. Every setting is also an environment variable named
 `TELEMETRYD_<SECTION>_<KEY>`; precedence is defaults, then `telemetryd.toml`, then the
 environment, then CLI flags.
 
-`GET /` needs no token and returns a plain-text index of the routes below — useful for
-confirming at runtime that a host is telemetryd and not something else on the same port.
-It reports no version and nothing about the deployment; those need the admin token.
+`GET /` needs no token. With `Accept: application/json` it returns an identity document —
+`product` (always `"telemetryd"`), `version`, `storage_format_version`, `signals`, and
+`surfaces[].auth` naming the credential each group of routes wants. With `text/html` it
+is a page; otherwise plain text. Use it to confirm what is listening at an address before
+you hold a credential for it.
+
+It describes the product, never the deployment: no app names, no counts, no disk figures,
+no retention, no listen address. Those are on `/status`, behind the admin token. A `401`
+is also an identification rather than silence — every one carries
+`WWW-Authenticate: Bearer realm="telemetryd"`.
 
 ## The thing most likely to mislead you
 

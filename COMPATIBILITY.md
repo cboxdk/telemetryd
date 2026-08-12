@@ -249,6 +249,27 @@ newest record you received. `telemetryd query` does this for you, and
 `GET /api/v1/export` exists for bulk reads, where the ceiling is 200,000 records per
 request rather than 5,000.
 
+## Discovery
+
+Not part of any upstream API, and telemetryd's own.
+
+| Endpoint | Auth | Returns |
+|---|---|---|
+| `GET /` | none | `Accept: application/json` → an identity document; `text/html` → a page; otherwise plain text |
+| `GET /healthz` | none | `ok` |
+
+The identity document is stable and safe to match on: `product` is the constant
+`"telemetryd"`, `storage_format_version` is what a client must agree with to read this
+instance's data, `signals` lists `logs`, `metrics` and `traces`, and `surfaces[].auth`
+names the credential each group of routes wants — `null` where none is needed.
+
+It describes the product, never the deployment. App names, record counts, disk usage,
+retention windows, the listen address and relay configuration are on `/status`, behind
+the admin token.
+
+Every `401` carries `WWW-Authenticate: Bearer realm="telemetryd"`, so a refusal
+identifies the product too.
+
 ## Non-API notes
 
 - **Multi-tenancy** is the `app` label. No `X-Scope-OrgID` handling; the label is a

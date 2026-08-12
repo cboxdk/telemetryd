@@ -8,12 +8,19 @@
 //! thing, and is it up", and the second is "so what do I call". Both are answerable
 //! without authenticating, because neither answer is about the deployment.
 //!
-//! # What it deliberately does not say
+//! # Three renderings, one table
 //!
-//! No version, no uptime, no app names, no counts, no configuration. This endpoint is
-//! open on an internet-facing port, and a version string there is a free lookup from
-//! "which build is this" to "which advisories apply to it". The version is available on
-//! `/status` and `/api/v1/status/buildinfo`, both of which want a token.
+//! HTML for a browser, JSON for a discovery client that sends `Accept:
+//! application/json`, plain text for everything else. See [`Identity`] for why the JSON
+//! form names the version and the storage format when the first version of this page
+//! deliberately did not.
+//!
+//! # What it still does not say
+//!
+//! Nothing that describes *this deployment*: no uptime, no app names, no record counts,
+//! no disk usage, no retention windows, no listen address, no relay configuration. Those
+//! are on `/status`, behind the admin token, and the line between the two is identity
+//! versus inventory rather than harmless versus sensitive.
 //!
 //! # Why a table rather than prose
 //!
@@ -40,6 +47,10 @@ pub struct Route {
     pub paths: &'static [&'static str],
     pub note: &'static str,
 }
+
+/// The guard of a surface that wants nothing. Named rather than repeated so the JSON
+/// rendering can turn exactly this case into `null` without matching on prose.
+const NO_TOKEN: &str = "no token";
 
 /// The routes worth naming on a landing page.
 ///
@@ -112,7 +123,7 @@ pub const SURFACES: &[Surface] = &[
     },
     Surface {
         title: "Always open",
-        guard: "no token",
+        guard: NO_TOKEN,
         routes: &[
             Route {
                 method: "GET",
@@ -167,18 +178,42 @@ const CBOX: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// Serve HTML to a browser and plain text to everything else.
+/// Whether clicking this path in a browser leads anywhere useful.
+///
+/// Three things disqualify a path, and each would produce a worse experience than no
+/// link at all: a `POST` route answers `405` to a browser's `GET`; a path with a
+/// placeholder in it is not an address, it is a pattern; and the tail endpoint is a
+/// WebSocket, so a plain navigation gets a `400` that reads like the query was wrong.
+///
+/// Everything else is worth a click even when it answers `401` — that is a real answer,
+/// and it is the one that tells you a token is what you are missing.
+fn is_navigable(method: &str, path: &str) -> bool {
+    method == "GET" && !path.contains('{') && path != "/loki/api/v1/tail"
+}
+
+/// Serve HTML to a browser, JSON to a program that asks for it, plain text otherwise.
 ///
 /// Negotiated on `Accept` rather than on a user-agent string, and text is the default:
 /// the overwhelmingly common non-browser caller is `curl`, which sends `*/*`, and a
 /// screenful of markup is not what that caller wanted.
 pub async fn index(headers: HeaderMap) -> Response {
-    let wants_html = headers
+    let accept = headers
         .get(header::ACCEPT)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|accept| accept.contains("text/html"));
+        .unwrap_or_default();
 
-    if wants_html {
+    // JSON is checked first: a discovery client sends `application/json` explicitly,
+    // while a browser's Accept header names `text/html` and then `*/*`. Checking HTML
+    // first would be right too, but only by accident of ordering — this way the more
+    // specific request wins regardless of what else the header lists.
+    if accept.contains("application/json") {
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            json(),
+        )
+            .into_response()
+    } else if accept.contains("text/html") {
         (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -193,6 +228,83 @@ pub async fn index(headers: HeaderMap) -> Response {
         )
             .into_response()
     }
+}
+
+/// The identity a client needs before it holds a credential.
+///
+/// # Why the version is here, on an open endpoint
+///
+/// This page withheld it at first, on the reasoning that a version string on an
+/// internet-facing port turns "which build is this" into "which advisories apply". That
+/// reasoning was worth less than it cost. Anyone who can reach the port can fingerprint
+/// the build from its behaviour anyway, and withholding it broke something real: a
+/// client pointed at a URL got `401` from every guarded route and could not tell a
+/// telemetryd that wants a token from a host with nothing on it. Silence and refusal
+/// look identical, and only one of them is worth prompting a person about.
+///
+/// What stays behind the admin token is everything that describes *this deployment* —
+/// app names, record counts, disk usage, retention, the listen address, whether a relay
+/// is configured. Those are the facts an attacker cannot guess and an operator cares
+/// about. The product name, its version and the shape of its API are none of them.
+#[derive(Debug, serde::Serialize)]
+pub struct Identity {
+    /// Constant. The field a client matches on to know what it is talking to.
+    pub product: &'static str,
+    pub version: &'static str,
+    /// What a client must agree with to read this instance's data at all.
+    pub storage_format_version: u32,
+    pub signals: [&'static str; 3],
+    pub surfaces: Vec<IdentitySurface>,
+    pub docs: &'static str,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct IdentitySurface {
+    pub title: &'static str,
+    /// Which credential this surface wants. `null` when it wants none.
+    pub auth: Option<&'static str>,
+    pub routes: Vec<IdentityRoute>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct IdentityRoute {
+    pub method: &'static str,
+    pub paths: &'static [&'static str],
+    pub note: &'static str,
+}
+
+/// Built from the same table the two human renderings use, so the contract test that
+/// walks it against the router covers this too.
+pub fn identity() -> Identity {
+    Identity {
+        product: "telemetryd",
+        version: telemetryd_core::VERSION,
+        storage_format_version: telemetryd_core::STORAGE_FORMAT_VERSION,
+        signals: ["logs", "metrics", "traces"],
+        surfaces: SURFACES
+            .iter()
+            .map(|surface| IdentitySurface {
+                title: surface.title,
+                auth: (surface.guard != NO_TOKEN).then_some(surface.guard),
+                routes: surface
+                    .routes
+                    .iter()
+                    .map(|route| IdentityRoute {
+                        method: route.method,
+                        paths: route.paths,
+                        note: route.note,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        docs: DOCS[0].1,
+    }
+}
+
+fn json() -> String {
+    // The document is a handful of static strings; a failure here is not reachable, and
+    // an empty body would be a worse answer than the one thing that cannot go wrong.
+    serde_json::to_string_pretty(&identity()).unwrap_or_else(|_| "{}".to_owned())
 }
 
 fn text() -> String {
@@ -243,7 +355,17 @@ fn html() -> String {
             let paths = route
                 .paths
                 .iter()
-                .map(|path| format!("<code>{path}</code>"))
+                .map(|path| {
+                    if is_navigable(route.method, path) {
+                        // Relative, so the link works through whatever proxy, hostname
+                        // and scheme the reader actually arrived on. An absolute URL
+                        // built from the listen address would point at loopback for
+                        // everyone but the operator standing on the box.
+                        format!("<a href=\"{path}\"><code>{path}</code></a>")
+                    } else {
+                        format!("<code>{path}</code>")
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(" ");
             let _ = write!(
@@ -299,6 +421,9 @@ code{{background:var(--code);border-radius:4px;padding:.1rem .35rem;\
 font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap}}\
 .note{{color:var(--dim);font-size:.85rem}}\
 a{{color:var(--link)}}\
+td a{{text-decoration:none}}\
+td a code{{color:var(--link)}}\
+td a:hover code{{text-decoration:underline}}\
 ul{{list-style:none;padding:0;margin:0}}\
 li{{padding:.3rem 0}}\
 footer{{margin-top:3rem;padding-top:1.5rem;border-top:1px solid var(--line);\
@@ -315,8 +440,11 @@ has no web interface of its own. Send a credential as \
 <p class=\"note\">The tables above are the short version. The full surface, including \
 what is deliberately not supported, is in COMPATIBILITY.md.</p></section>\
 <section><h2>From Cbox</h2><ul>{cbox}</ul></section>\
-<footer>No version, uptime or contents are reported here — this page is open, and those \
-are not. They are on <code>/status</code>, which wants the admin token.</footer>\
+<footer>This page is open, and names only what telemetryd is. What this particular \
+deployment holds — apps, record counts, disk, retention — is on \
+<a href=\"/status\"><code>/status</code></a>, which wants the admin token. \
+Send <code>Accept: application/json</code> here for the same identity as a document.\
+</footer>\
 </main></body></html>"
     )
 }
@@ -326,16 +454,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn neither_rendering_leaks_what_the_page_promises_to_withhold() {
-        // The footer makes a promise. This is the test that keeps it: the crate version
-        // must not appear in either body, however the page is rendered.
-        let version = env!("CARGO_PKG_VERSION");
-        for body in [text(), html()] {
-            assert!(
-                !body.contains(version),
-                "the open index printed the version"
-            );
-        }
+    fn a_client_can_identify_the_product_and_its_wire_compatibility() {
+        // The reason this endpoint exists in JSON at all: a client pointed at a URL it
+        // has no credential for must be able to tell "telemetryd, needs a token" from
+        // "nothing is listening here". Those three fields are that answer.
+        let identity = identity();
+        assert_eq!(identity.product, "telemetryd");
+        assert_eq!(identity.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            identity.storage_format_version,
+            telemetryd_core::STORAGE_FORMAT_VERSION
+        );
+
+        // Guarded surfaces name their credential; the open one says null rather than
+        // the words "no token", so a client tests a field instead of parsing prose.
+        let guards: Vec<_> = identity
+            .surfaces
+            .iter()
+            .map(|surface| surface.auth)
+            .collect();
+        assert!(guards.contains(&Some("admin token")), "{guards:?}");
+        assert!(guards.contains(&None), "{guards:?}");
+    }
+
+    #[test]
+    fn only_paths_a_browser_can_actually_follow_are_linked() {
+        // A link that lands on 405, or on a 400 that reads as a query mistake, is worse
+        // than no link. A 401 is not in that category — it is the answer that tells you
+        // a token is the thing you are missing.
+        assert!(is_navigable("GET", "/status"));
+        assert!(is_navigable("GET", "/metrics"));
+        assert!(is_navigable("GET", "/healthz"));
+        assert!(
+            !is_navigable("POST", "/v1/logs"),
+            "POST answers 405 to a GET"
+        );
+        assert!(
+            !is_navigable("GET", "/api/traces/{trace_id}"),
+            "a pattern is not an address"
+        );
+        assert!(
+            !is_navigable("GET", "/loki/api/v1/tail"),
+            "the WebSocket answers 400 to a navigation"
+        );
+
+        // And the rendering honours it: no anchor may wrap a placeholder.
+        let page = html();
+        assert!(page.contains("<a href=\"/status\">"), "{page}");
+        assert!(!page.contains("<a href=\"/v1/logs\">"), "{page}");
+        assert!(!page.contains("<a href=\"/api/traces/"), "{page}");
     }
 
     #[test]
