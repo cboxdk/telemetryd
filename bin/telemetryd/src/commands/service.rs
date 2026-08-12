@@ -234,6 +234,12 @@ fn enable(path: &Path) -> anyhow::Result<()> {
 fn uninstall() -> anyhow::Result<()> {
     let path = unit_path()?;
 
+    // Read it before removing it: the unit is the only record of which directory the
+    // *service* was using, and that is rarely the one the CLI resolves interactively.
+    // Saying "the data directory was left alone" without saying where is an answer that
+    // sends someone hunting.
+    let leftovers = leftovers(&path);
+
     if cfg!(target_os = "macos") {
         exec("launchctl", &["unload", &path.display().to_string()]).ok();
     } else {
@@ -259,14 +265,83 @@ fn uninstall() -> anyhow::Result<()> {
         exec("systemctl", &["daemon-reload"]).ok();
     }
 
-    // The data directory is never touched. Removing a service should not delete the
-    // telemetry it collected, and a flag that did would be one keystroke from a very
-    // bad afternoon.
+    // Nothing else is touched. Removing a service should not delete the telemetry it
+    // collected, and a flag that did would be one keystroke from a very bad afternoon.
+    // What it owes the operator instead is the paths, so the choice is theirs to make.
     crate::out::outln!();
-    crate::out::outln!(
-        "The data directory was left alone. Remove it yourself if you want it gone."
-    );
+    if leftovers.is_empty() {
+        crate::out::outln!("Nothing else was left behind.");
+        return Ok(());
+    }
+    crate::out::outln!("Left alone, because removing a service should not delete data:");
+    crate::out::outln!();
+    for (what, path, size) in &leftovers {
+        match size {
+            Some(size) => crate::out::outln!("  {what:<14} {}  ({size})", path.display()),
+            None => crate::out::outln!("  {what:<14} {}", path.display()),
+        }
+    }
+    crate::out::outln!();
+    crate::out::outln!("Remove them yourself if you want them gone:");
+    for (_, path, _) in &leftovers {
+        crate::out::outln!("  sudo rm -rf {}", path.display());
+    }
     Ok(())
+}
+
+/// What an uninstall deliberately leaves behind, with sizes where they help decide.
+///
+/// The data directory comes from the unit rather than from the CLI's own resolution: the
+/// service runs with `TELEMETRYD_STORAGE_DATA_DIR` set, so what `telemetryd` would pick
+/// interactively is a different directory — on the box this was reported from,
+/// `/root/.local/share/telemetryd` against the service's `/var/lib/telemetryd`. Printing
+/// the wrong one would be worse than printing none.
+fn leftovers(unit: &Path) -> Vec<(&'static str, PathBuf, Option<String>)> {
+    let mut found = Vec::new();
+
+    let data_dir = std::fs::read_to_string(unit).ok().and_then(|text| {
+        text.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("Environment=TELEMETRYD_STORAGE_DATA_DIR=")
+                .map(|value| PathBuf::from(value.trim()))
+        })
+    });
+    if let Some(dir) = data_dir.filter(|dir| dir.exists()) {
+        let size = directory_size(&dir).map(|bytes| bytesize::ByteSize::b(bytes).to_string());
+        found.push(("telemetry", dir, size));
+    }
+
+    let config_dir = PathBuf::from("/etc/telemetryd");
+    if config_dir.exists() {
+        // Named separately: these are credentials, and someone deciding what to keep
+        // should be told they are still on disk rather than discovering it later.
+        found.push(("config, tokens", config_dir, None));
+    }
+    found
+}
+
+/// Bytes under a directory, or `None` if it cannot be walked.
+///
+/// Best effort and non-recursive beyond what `read_dir` gives directly per level; a
+/// number that is roughly right helps someone decide whether they care, and a missing
+/// one is not worth failing an uninstall over.
+fn directory_size(root: &Path) -> Option<u64> {
+    let mut total = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .ok()?
+            .filter_map(std::result::Result::ok)
+        {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total += meta.len();
+            }
+        }
+    }
+    Some(total)
 }
 
 /// Run a service-manager command, surfacing its stderr rather than swallowing it.
@@ -406,6 +481,75 @@ fn manual_steps() -> &'static str {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// The report has to name the directory the *service* used, which is not the one
+    /// the CLI resolves interactively — `/var/lib/telemetryd` against
+    /// `/root/.local/share/telemetryd` on the box this was reported from.
+    #[test]
+    fn the_data_directory_is_read_from_the_unit_being_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("var-lib-telemetryd");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("wal"), vec![0u8; 4096]).unwrap();
+
+        let unit = dir.path().join("telemetryd.service");
+        std::fs::write(
+            &unit,
+            format!(
+                "[Service]\nStateDirectory=telemetryd\n\
+                 Environment=TELEMETRYD_STORAGE_DATA_DIR={}\n",
+                data.display()
+            ),
+        )
+        .unwrap();
+
+        let found = leftovers(&unit);
+        let telemetry = found
+            .iter()
+            .find(|(what, _, _)| *what == "telemetry")
+            .expect("the data directory should be reported");
+        assert_eq!(telemetry.1, data);
+        assert!(
+            telemetry
+                .2
+                .as_deref()
+                .is_some_and(|size| size.contains('4')),
+            "expected a size near 4 KiB, got {:?}",
+            telemetry.2
+        );
+    }
+
+    /// A unit that never recorded one, or a directory already gone, must not invent a
+    /// path — sending someone to `rm -rf` somewhere that was never ours is the one
+    /// genuinely dangerous thing this could do.
+    #[test]
+    fn a_missing_directory_is_not_guessed() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("telemetryd.service");
+        std::fs::write(
+            &unit,
+            "[Service]\nExecStart=/usr/local/bin/telemetryd serve\n",
+        )
+        .unwrap();
+        assert!(
+            !leftovers(&unit)
+                .iter()
+                .any(|(what, _, _)| *what == "telemetry"),
+            "no data directory in the unit means none is reported"
+        );
+
+        std::fs::write(
+            &unit,
+            "[Service]\nEnvironment=TELEMETRYD_STORAGE_DATA_DIR=/nonexistent/telemetryd\n",
+        )
+        .unwrap();
+        assert!(
+            !leftovers(&unit)
+                .iter()
+                .any(|(what, _, _)| *what == "telemetry"),
+            "a directory that is not there is not left behind"
+        );
+    }
 
     /// The unit used to hardcode `User=telemetryd`, which decided for the operator.
     /// On a Forge box `forge` owns everything; somewhere with central user management a

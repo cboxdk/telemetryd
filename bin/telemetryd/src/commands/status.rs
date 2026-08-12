@@ -10,13 +10,16 @@ pub struct StatusArgs {
     #[arg(long, default_value = "http://127.0.0.1:4319", value_name = "URL")]
     pub url: String,
 
-    /// Query token, if the instance requires one.
+    /// Admin token, if the instance requires one.
+    ///
+    /// `/status` is guarded by the admin token; an instance with none configured
+    /// accepts the query token here instead.
     ///
     /// Prefer the environment variable: a token passed as an argument is visible in
     /// `ps` output and shell history.
     #[arg(
         long,
-        env = "TELEMETRYD_AUTH_QUERY_TOKEN",
+        env = "TELEMETRYD_AUTH_ADMIN_TOKEN",
         value_name = "TOKEN",
         hide_env_values = true
     )]
@@ -52,9 +55,17 @@ pub fn run(args: &StatusArgs) -> anyhow::Result<()> {
             .body_mut()
             .read_to_string()
             .context("reading the response body")?,
+        // `/status` is guarded by the *admin* token, falling back to the query token
+        // only when no admin token is configured. Naming the query one sent people to
+        // the wrong credential on every instance `telemetryd init` had set up, which is
+        // now all of them.
         Err(ureq::Error::StatusCode(401)) => bail!(
-            "{url} requires a query token.\n\
-             Pass --token, or set TELEMETRYD_AUTH_QUERY_TOKEN."
+            "{url} requires the admin token.\n\
+             Pass --token, or set TELEMETRYD_AUTH_ADMIN_TOKEN.\n\
+             \n\
+             It guards /status and /metrics, which describe the deployment rather than \
+             the telemetry. An instance with no admin token configured accepts the \
+             query token here instead."
         ),
         Err(ureq::Error::StatusCode(code)) => bail!("{url} returned HTTP {code}"),
         Err(error) => bail!(
