@@ -533,19 +533,99 @@ async fn malformed_otlp_json_is_a_400_naming_the_problem() {
     assert_eq!(json["error"]["code"], "bad_request");
 }
 
+/// A stock OpenTelemetry SDK sends protobuf, and it has to arrive.
+///
+/// This test replaced one asserting the opposite — that protobuf was refused with
+/// `unsupported_feature`. That was correct while telemetryd served JSON only, and it is
+/// precisely what made every official SDK, all of which default to
+/// `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`, store nothing at all.
+///
+/// The bytes are built by hand rather than by an encoder of ours, because an encoder
+/// written next to the decoder would agree with its own mistakes.
 #[tokio::test]
-async fn protobuf_ingest_is_named_as_unsupported() {
+async fn a_protobuf_log_batch_is_stored_and_queryable() {
+    fn raw_varint(mut value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = u8::try_from(value & 0x7f).unwrap();
+            value >>= 7;
+            if value > 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                return out;
+            }
+        }
+    }
+    fn delim(field: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = raw_varint(u64::from((field << 3) | 2));
+        out.extend(raw_varint(payload.len() as u64));
+        out.extend_from_slice(payload);
+        out
+    }
+    fn varint(field: u32, value: u64) -> Vec<u8> {
+        let mut out = raw_varint(u64::from(field << 3));
+        out.extend(raw_varint(value));
+        out
+    }
+    fn fixed64(field: u32, value: u64) -> Vec<u8> {
+        let mut out = raw_varint(u64::from((field << 3) | 1));
+        out.extend_from_slice(&value.to_le_bytes());
+        out
+    }
+    fn attr(key: &str, value: &str) -> Vec<u8> {
+        let mut kv = delim(1, key.as_bytes());
+        kv.extend(delim(2, &delim(1, value.as_bytes())));
+        kv
+    }
+
+    let mut record = fixed64(1, NOW);
+    record.extend(varint(2, 17));
+    record.extend(delim(5, &delim(1, b"payment declined")));
+    record.extend(delim(6, &attr("order.id", "A-99")));
+
+    let scope_logs = delim(2, &record);
+    let mut resource_body = delim(1, &attr("service.name", "checkout"));
+    resource_body.extend(delim(1, &attr("k8s.pod.name", "pod-7f")));
+    let mut resource_logs = delim(1, &resource_body);
+    resource_logs.extend(delim(2, &scope_logs));
+    let wire = delim(1, &resource_logs);
+
     let harness = Harness::new();
     let request = Request::post("/v1/logs")
         .header(header::CONTENT_TYPE, "application/x-protobuf")
-        .body(Body::from(vec![0x08, 0x01]))
+        .body(Body::from(wire))
         .unwrap();
     let (status, body) = harness.send(request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !body.contains("partialSuccess"),
+        "the protobuf batch was accepted but every record was rejected: {body}"
+    );
 
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    let json: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(json["error"]["code"], "unsupported_feature");
-    assert!(json["error"]["hint"].as_str().unwrap().contains("JSON"));
+    // NOW is a fixed 2025 timestamp, not the wall clock, so the range has to be
+    // explicit — the default window is relative to real time and excludes it.
+    let path = format!(
+        "/loki/api/v1/query_range?query={}&start={}&end={}",
+        urlencode(r#"{app="checkout"}"#),
+        NOW - MS,
+        NOW + MS
+    );
+    let (status, json) = harness.get(&path).await;
+    assert_eq!(status, StatusCode::OK);
+    let result = &json["data"]["result"];
+    assert_eq!(result[0]["stream"]["app"], "checkout");
+    assert_eq!(result[0]["stream"]["level"], "error");
+    assert_eq!(result[0]["values"][0][1], "payment declined");
+
+    // The attributes survive both the encoding and the resource/record distinction.
+    let metadata = &result[0]["values"][0][2];
+    assert_eq!(metadata["order.id"], "A-99");
+    assert_eq!(
+        metadata["k8s.pod.name"], "pod-7f",
+        "a resource attribute no stream label claimed must survive the protobuf path too"
+    );
 }
 
 // ---------------------------------------------------------------------------

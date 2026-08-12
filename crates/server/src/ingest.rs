@@ -106,28 +106,33 @@ pub async fn otlp_logs(
         return Err(telemetryd_core::Error::Overloaded.into());
     };
 
-    reject_protobuf(&headers)?;
+    let encoding = encoding(&headers);
     let body = decompress(&state, &headers, &body, "logs", &[])?;
 
     let mut decoded = {
         let limits = state.config.limits.clone();
         let ingest = state.config.ingest.clone();
         let now = telemetryd_store::now_nanos();
-        logs::decode(
-            &body,
-            DecodeContext {
-                limits: &limits,
-                ingest: &ingest,
-                now_nanos: now,
-            },
-        )
-        .map_err(|e| {
-            state.metrics.incr(
-                "telemetryd_ingest_rejected_total",
-                &[("signal", "logs"), ("reason", "malformed_json")],
-            );
-            Error::BadRequest(format!("could not decode the OTLP logs payload: {e}"))
-        })?
+        let ctx = DecodeContext {
+            limits: &limits,
+            ingest: &ingest,
+            now_nanos: now,
+        };
+        match encoding {
+            // One conversion for both encodings: the protobuf decoder produces the same
+            // structs the JSON one does, so limits, rejections and counters below cannot
+            // differ by how the batch arrived.
+            Wire::Protobuf => telemetryd_ingest::otlp_protobuf::logs(&body)
+                .map(|data| logs::convert_data(&data, ctx))
+                .map_err(|e| {
+                    reject(&state, "logs", "malformed_protobuf");
+                    Error::BadRequest(format!("could not decode the OTLP logs payload: {e}"))
+                })?,
+            Wire::Json => logs::decode(&body, ctx).map_err(|e| {
+                reject(&state, "logs", "malformed_json");
+                Error::BadRequest(format!("could not decode the OTLP logs payload: {e}"))
+            })?,
+        }
     };
 
     // Before the tail, before storage, before the per-app counters: everything
@@ -214,20 +219,26 @@ pub async fn otlp_traces(
         return Err(telemetryd_core::Error::Overloaded.into());
     };
 
-    reject_protobuf(&headers)?;
+    let encoding = encoding(&headers);
     let body = decompress(&state, &headers, &body, "traces", &[])?;
 
     let mut decoded = {
         let limits = state.config.limits.clone();
         let ingest = state.config.ingest.clone();
         let now = telemetryd_store::now_nanos();
-        traces::decode(&body, traces::context(&limits, &ingest, now)).map_err(|e| {
-            state.metrics.incr(
-                "telemetryd_ingest_rejected_total",
-                &[("signal", "traces"), ("reason", "malformed_json")],
-            );
-            Error::BadRequest(format!("could not decode the OTLP traces payload: {e}"))
-        })?
+        let ctx = traces::context(&limits, &ingest, now);
+        match encoding {
+            Wire::Protobuf => telemetryd_ingest::otlp_protobuf::traces(&body)
+                .map(|data| traces::convert_data(&data, ctx))
+                .map_err(|e| {
+                    reject(&state, "traces", "malformed_protobuf");
+                    Error::BadRequest(format!("could not decode the OTLP traces payload: {e}"))
+                })?,
+            Wire::Json => traces::decode(&body, ctx).map_err(|e| {
+                reject(&state, "traces", "malformed_json");
+                Error::BadRequest(format!("could not decode the OTLP traces payload: {e}"))
+            })?,
+        }
     };
 
     for rejection in &decoded.rejections {
@@ -298,28 +309,30 @@ pub async fn otlp_metrics(
         return Err(telemetryd_core::Error::Overloaded.into());
     };
 
-    reject_protobuf(&headers)?;
+    let encoding = encoding(&headers);
     let body = decompress(&state, &headers, &body, "metrics", &[])?;
 
     let decoded = {
         let limits = state.config.limits.clone();
         let ingest = state.config.ingest.clone();
         let now = telemetryd_store::now_nanos();
-        otlp_metrics::decode(
-            &body,
-            otlp_metrics::MetricContext {
-                limits: &limits,
-                ingest: &ingest,
-                now_nanos: now,
-            },
-        )
-        .map_err(|e| {
-            state.metrics.incr(
-                "telemetryd_ingest_rejected_total",
-                &[("signal", "metrics"), ("reason", "malformed_json")],
-            );
-            Error::BadRequest(format!("could not decode the OTLP metrics payload: {e}"))
-        })?
+        let ctx = otlp_metrics::MetricContext {
+            limits: &limits,
+            ingest: &ingest,
+            now_nanos: now,
+        };
+        match encoding {
+            Wire::Protobuf => telemetryd_ingest::otlp_protobuf::metrics(&body)
+                .map(|data| otlp_metrics::convert_data(&data, ctx))
+                .map_err(|e| {
+                    reject(&state, "metrics", "malformed_protobuf");
+                    Error::BadRequest(format!("could not decode the OTLP metrics payload: {e}"))
+                })?,
+            Wire::Json => otlp_metrics::decode(&body, ctx).map_err(|e| {
+                reject(&state, "metrics", "malformed_json");
+                Error::BadRequest(format!("could not decode the OTLP metrics payload: {e}"))
+            })?,
+        }
     };
 
     let mut decoded = decoded;
@@ -511,9 +524,24 @@ fn reject(state: &AppState, signal: &'static str, reason: &'static str) {
     );
 }
 
-/// OTLP/HTTP also defines a protobuf encoding. We speak JSON, and saying so beats a
-/// parse error full of binary.
-fn reject_protobuf(headers: &HeaderMap) -> Result<(), ApiError> {
+/// Which of OTLP/HTTP's two encodings a request used.
+///
+/// Both are served. Protobuf is the default in every official OpenTelemetry SDK, so a
+/// JSON-only backend rejects a stock exporter on every batch; JSON is what
+/// `cboxdk/laravel-telemetry` sends and keeps a C extension off the client's path. The
+/// two decode into the same structs and share one conversion, so the encoding decides
+/// how a batch is parsed and nothing else about how it is treated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wire {
+    Json,
+    Protobuf,
+}
+
+/// An absent `Content-Type` is read as JSON.
+///
+/// It is what a hand-written `curl` omits, and guessing binary for a request with no
+/// declared type would turn a typo into an unreadable parse error.
+fn encoding(headers: &HeaderMap) -> Wire {
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -522,13 +550,10 @@ fn reject_protobuf(headers: &HeaderMap) -> Result<(), ApiError> {
     if content_type.starts_with("application/x-protobuf")
         || content_type.starts_with("application/protobuf")
     {
-        return Err(Error::unsupported_with_hint(
-            "OTLP/HTTP protobuf encoding",
-            "send OTLP/HTTP with JSON encoding (Content-Type: application/json)",
-        )
-        .into());
+        Wire::Protobuf
+    } else {
+        Wire::Json
     }
-    Ok(())
 }
 
 /// Whether a request looks like OTLP JSON.
@@ -556,17 +581,29 @@ mod tests {
     }
 
     #[test]
-    fn protobuf_payloads_are_named_not_parsed() {
-        let err = reject_protobuf(&headers("application/x-protobuf")).unwrap_err();
-        assert!(matches!(err.0, Error::Unsupported { .. }));
-        assert!(err.0.to_string().contains("protobuf"));
+    fn protobuf_payloads_are_decoded_rather_than_named() {
+        // This test used to assert the opposite: that a protobuf content type produced
+        // an `Unsupported` error naming the encoding. That was the correct behaviour
+        // while only JSON was served, and it is what made every stock OpenTelemetry SDK
+        // — all of which default to `http/protobuf` — store nothing.
+        assert_eq!(encoding(&headers("application/x-protobuf")), Wire::Protobuf);
+        assert_eq!(encoding(&headers("application/protobuf")), Wire::Protobuf);
+        assert_eq!(
+            encoding(&headers("application/x-protobuf; charset=binary")),
+            Wire::Protobuf
+        );
     }
 
     #[test]
     fn json_and_missing_content_types_are_accepted() {
-        assert!(reject_protobuf(&headers("application/json")).is_ok());
-        assert!(reject_protobuf(&headers("application/json; charset=utf-8")).is_ok());
-        assert!(reject_protobuf(&headers("")).is_ok());
+        assert_eq!(encoding(&headers("application/json")), Wire::Json);
+        assert_eq!(
+            encoding(&headers("application/json; charset=utf-8")),
+            Wire::Json
+        );
+        // An absent type is JSON, not binary: it is what a hand-written curl omits, and
+        // guessing binary would turn a typo into an unreadable parse error.
+        assert_eq!(encoding(&headers("")), Wire::Json);
         assert!(is_json(&headers("application/json")));
         assert!(
             is_json(&headers("")),

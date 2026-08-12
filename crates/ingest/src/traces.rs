@@ -82,6 +82,11 @@ pub fn decode(
     ctx: DecodeContext<'_>,
 ) -> Result<Decoded<SpanRecord>, serde_json::Error> {
     let data: TracesData = serde_json::from_slice(body)?;
+    Ok(convert_data(&data, ctx))
+}
+
+/// Convert an already-parsed payload. See [`crate::logs::convert_data`] for why.
+pub fn convert_data(data: &TracesData, ctx: DecodeContext<'_>) -> Decoded<SpanRecord> {
     let mut decoded = Decoded::default();
 
     for resource_spans in &data.resource_spans {
@@ -114,7 +119,7 @@ pub fn decode(
         }
     }
 
-    Ok(decoded)
+    decoded
 }
 
 fn convert(

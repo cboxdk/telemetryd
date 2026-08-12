@@ -42,6 +42,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "otlp_protobuf"
+path = "fuzz_targets/otlp_protobuf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "remote_write"
 path = "fuzz_targets/remote_write.rs"
 test = false

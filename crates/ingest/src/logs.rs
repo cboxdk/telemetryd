@@ -147,6 +147,15 @@ pub fn decode(
     ctx: DecodeContext<'_>,
 ) -> Result<Decoded<LogRecord>, serde_json::Error> {
     let data: LogsData = serde_json::from_slice(body)?;
+    Ok(convert_data(&data, ctx))
+}
+
+/// Convert an already-parsed payload.
+///
+/// Split from [`decode`] so the protobuf decoder can reach it with the same structs.
+/// Every limit, rejection reason and counter lives below this line, which is what stops
+/// the two encodings drifting: there is one conversion, not one per encoding.
+pub fn convert_data(data: &LogsData, ctx: DecodeContext<'_>) -> Decoded<LogRecord> {
     let mut decoded = Decoded::default();
 
     for resource_logs in &data.resource_logs {
@@ -183,7 +192,7 @@ pub fn decode(
         }
     }
 
-    Ok(decoded)
+    decoded
 }
 
 fn convert(

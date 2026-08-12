@@ -8,22 +8,24 @@ description: "What each ingest endpoint accepts, and what it does with awkward i
 
 | Endpoint | Format |
 |---|---|
-| `POST /v1/logs` | OTLP/HTTP JSON |
-| `POST /v1/traces` | OTLP/HTTP JSON |
-| `POST /v1/metrics` | OTLP/HTTP JSON |
+| `POST /v1/logs` | OTLP/HTTP — JSON or protobuf |
+| `POST /v1/traces` | OTLP/HTTP — JSON or protobuf |
+| `POST /v1/metrics` | OTLP/HTTP — JSON or protobuf |
 | `POST /api/v1/write` | Prometheus `remote_write` (snappy + protobuf) |
 
-## JSON is first-class
+## Either encoding, nothing to configure
 
-OTLP/HTTP with **JSON** encoding is the supported path, because that is what
-`cboxdk/laravel-telemetry` emits — no protobuf library and no C extension on the client,
-which is what makes it work under PHP-FPM.
+A stock OpenTelemetry SDK works as it comes. The official SDKs default to
+`OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`, and that is served; `http/json` is served
+too. The `Content-Type` picks the parser and decides nothing else — both decode into the
+same structures and share one conversion, so limits, rejections and `partialSuccess`
+cannot differ by encoding. A request with no `Content-Type` is read as JSON.
 
-A protobuf `Content-Type` on the OTLP endpoints is refused with a named
-`unsupported_feature` error rather than a parse failure full of binary. OTLP/gRPC is out
-of scope.
+JSON is what `cboxdk/laravel-telemetry` emits, which is why it exists at all: no protobuf
+library and no C extension on the client, which is what makes it work under PHP-FPM.
 
-`remote_write` is protobuf, and that is fine: it is server-side only.
+OTLP/gRPC is out of scope — it needs HTTP/2 with trailers and a second server, and these
+endpoints carry the same payloads.
 
 ## Compressed bodies
 
@@ -112,7 +114,7 @@ streams without bound. See [`ingest.stream_labels`](../configuration/reference.m
 Per-record attributes keep the producer's own key spelling — `exception.type` stays
 `exception.type`, because a trace view should show what was sent. Queries reach them by
 either spelling.
-\n
+
 ## Hand this to an agent
 
 A self-contained brief. It names only commands and endpoints that exist, so an agent can
@@ -122,17 +124,18 @@ Loki and Prometheus APIs telemetryd deliberately does not implement.
 ````markdown
 # Task: send this application's telemetry to telemetryd
 
-telemetryd accepts **OTLP over HTTP with JSON encoding**. Configure the application's
-existing OpenTelemetry SDK to point at it. Do not add a collector, and do not use the
-protobuf or gRPC exporters — telemetryd serves neither.
+telemetryd accepts **OTLP over HTTP** in either encoding — the SDK default
+(`http/protobuf`) and `http/json` both work, so there is nothing to set. Configure the
+application's existing OpenTelemetry SDK to point at it. Do not add a collector, and do
+not use the gRPC exporters — telemetryd serves only the HTTP endpoints.
 
 ## Endpoints
 
 | Endpoint | Payload |
 |---|---|
-| `POST /v1/logs` | OTLP/HTTP JSON |
-| `POST /v1/traces` | OTLP/HTTP JSON |
-| `POST /v1/metrics` | OTLP/HTTP JSON |
+| `POST /v1/logs` | OTLP/HTTP — JSON or protobuf |
+| `POST /v1/traces` | OTLP/HTTP — JSON or protobuf |
+| `POST /v1/metrics` | OTLP/HTTP — JSON or protobuf |
 | `POST /api/v1/write` | Prometheus `remote_write` (snappy + protobuf) |
 
 Base URL is the instance, e.g. `http://127.0.0.1:4319`. If an ingest token is

@@ -59,24 +59,29 @@ single-tenant, and the `app` label is a query namespace rather than a security b
 
 | Endpoint | Format | Status |
 |---|---|---|
-| `POST /v1/logs` | OTLP/HTTP JSON | **done** |
-| `POST /v1/traces` | OTLP/HTTP JSON | done |
-| `POST /v1/metrics` | OTLP/HTTP JSON | done |
+| `POST /v1/logs` | OTLP/HTTP — JSON or protobuf | **done** |
+| `POST /v1/traces` | OTLP/HTTP — JSON or protobuf | done |
+| `POST /v1/metrics` | OTLP/HTTP — JSON or protobuf | done |
 | `POST /api/v1/write` | Prometheus `remote_write` (snappy + protobuf) | done |
 
-**OTLP/HTTP JSON is first-class.** `cboxdk/laravel-telemetry` emits JSON — no protobuf,
-no C extension on the client path. A protobuf `Content-Type` is refused with a named
-`unsupported_feature` rather than a parse error full of binary. **OTLP/gRPC is out of
-scope for v1.**
+**Both OTLP/HTTP encodings are served.** JSON is what `cboxdk/laravel-telemetry` emits —
+no protobuf library and no C extension on the client path — and protobuf is what every
+official OpenTelemetry SDK sends by default. The `Content-Type` selects the parser and
+decides nothing else: both decode into the same structures and share one conversion, so
+limits, rejections and `partialSuccess` cannot differ by encoding. A request with no
+`Content-Type` is read as JSON.
+
+**OTLP/gRPC is out of scope for v1.** gRPC needs HTTP/2 with trailers and a second
+server; the HTTP endpoints above carry the same payloads.
 
 ### Sending from something other than laravel-telemetry
 
-Everything below works from any OTLP producer, with one thing to change first.
+Everything below works from any OTLP producer, as it comes.
 
-**Set `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`.** The official OpenTelemetry SDKs default
-to `http/protobuf`, so a stock exporter pointed at telemetryd is refused on every batch
-until this is set. The refusal names the encoding and nothing is stored in the meantime;
-it does not fail silently, but it does fail completely.
+**Nothing to configure.** The official SDKs default to `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`
+and that works. `http/json` works too. Verified by pointing a stock Python
+`opentelemetry-sdk` at telemetryd with default settings and reading all three signals
+back out.
 
 **`service.name` is optional.** Without it the `app` label is `unknown` and the record is
 kept rather than dropped, because a log line with no service name is still a log line.

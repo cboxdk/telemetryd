@@ -145,6 +145,11 @@ pub fn decode(
     ctx: MetricContext<'_>,
 ) -> Result<Decoded<MetricSample>, serde_json::Error> {
     let data: MetricsData = serde_json::from_slice(body)?;
+    Ok(convert_data(&data, ctx))
+}
+
+/// Convert an already-parsed payload. See [`crate::logs::convert_data`] for why.
+pub fn convert_data(data: &MetricsData, ctx: MetricContext<'_>) -> Decoded<MetricSample> {
     let mut decoded = Decoded::default();
 
     for resource_metrics in &data.resource_metrics {
@@ -167,7 +172,7 @@ pub fn decode(
         }
     }
 
-    Ok(decoded)
+    decoded
 }
 
 fn convert_metric(

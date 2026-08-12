@@ -70,9 +70,10 @@ common — a numeric order id, say — cannot be, and the time bound is what sav
 
 ## Sending data
 
-OTLP over HTTP with **JSON** encoding. There is no protobuf and no gRPC endpoint.
+OTLP over HTTP in **either encoding** — JSON or protobuf. The `Content-Type` picks the
+parser and changes nothing else. There is no gRPC endpoint.
 
-- `POST /v1/logs`, `POST /v1/traces`, `POST /v1/metrics` — OTLP/HTTP JSON
+- `POST /v1/logs`, `POST /v1/traces`, `POST /v1/metrics` — OTLP/HTTP, JSON or protobuf
 - `POST /api/v1/write` — Prometheus `remote_write` (snappy + protobuf)
 
 `gzip`, `deflate` and `zstd` request bodies are decompressed. Records are rejected
@@ -86,9 +87,8 @@ claimed — `k8s.pod.name`, `host.name`, `cloud.region` — is kept as a record 
 under the spelling you sent, so it is queryable and it survives export. A record
 attribute of the same name wins; a promoted one is not stored twice.
 
-Standard OpenTelemetry SDKs default to `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`.
-telemetryd serves JSON only and refuses protobuf with a named `unsupported_feature`, so
-set `http/json` on any sender that is not `cboxdk/laravel-telemetry`.
+A stock OpenTelemetry SDK works with no configuration: the default
+`OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` is served, and so is `http/json`.
 
 ## Authentication
 
@@ -115,7 +115,8 @@ configured. That is deliberate and should not be worked around with `--insecure`
 ## Do not
 
 - Do not add an OpenTelemetry Collector. Applications send OTLP straight to telemetryd.
-- Do not reach for a protobuf or gRPC OTLP exporter; neither is served.
+- Do not reach for a gRPC OTLP exporter; only the HTTP endpoints exist. Either HTTP
+  encoding is fine.
 - Do not assume an unsupported query construct is a bug. Read the `feature` field.
 - Do not publish port 4319 to the internet in plain HTTP. Terminate TLS in front, or set
   `server.tls.cert_file` and `key_file`.
