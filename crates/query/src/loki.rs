@@ -433,7 +433,7 @@ pub fn query_range(
     let records = store.scan(scan, &request.query.matchers, &filter)?;
 
     let returned = records.len() as u64;
-    let result = group_into_streams(records, request.direction);
+    let result = group_into_streams(records, request.direction, &request.query);
 
     Ok(LokiResponse::success(StreamsData {
         result_type: "streams",
@@ -496,14 +496,39 @@ fn build_line_prefilter(query: &LogQuery) -> Option<Prefilter> {
 }
 
 /// Group records by their stream label set, preserving order within each stream.
-fn group_into_streams(records: Vec<LogRecord>, direction: Direction) -> Vec<StreamResult> {
+fn group_into_streams(
+    records: Vec<LogRecord>,
+    direction: Direction,
+    query: &LogQuery,
+) -> Vec<StreamResult> {
+    // Only when the query has one; otherwise every record pays a second pass over its
+    // body to learn that nothing parses it.
+    let parses = query.has_parser_stage();
     let mut grouped: BTreeMap<Labels, Vec<Entry>> = BTreeMap::new();
     for record in records {
-        let metadata: BTreeMap<String, String> = record
+        let mut metadata: BTreeMap<String, String> = record
             .attributes
             .iter()
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect();
+
+        // Fields a `| json` or `| logfmt` stage pulled out of the body. Without these a
+        // filter selected on a value the caller could never see.
+        if parses {
+            for (name, value) in query.extracted(&record.body).iter() {
+                // A parsed field colliding with a stream label is renamed rather than
+                // dropped or allowed to overwrite: `level` is both telemetryd's
+                // severity and, on a JSON line, the application's own idea of level, and
+                // they routinely disagree. Loki spells the survivor `_extracted`, so a
+                // reader of either system finds the same key.
+                let key = if record.stream.get(name).is_some() {
+                    format!("{name}_extracted")
+                } else {
+                    name.to_owned()
+                };
+                metadata.entry(key).or_insert_with(|| value.to_owned());
+            }
+        }
         grouped
             .entry(record.stream.clone())
             .or_default()

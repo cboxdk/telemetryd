@@ -416,6 +416,46 @@ impl LogQuery {
     /// without requiring a parser stage is a deliberate superset of Loki — the data is
     /// already structured, so making a user write `| json` to reach it would be
     /// theatre. Documented in `COMPATIBILITY.md`.
+    /// What a parser stage pulled out of this line, for a record that already matched.
+    ///
+    /// # Why this is a second pass
+    ///
+    /// [`Self::evaluate`] builds the same set to answer label filters and then drops it,
+    /// because it runs inside the scan on every candidate row and returning a `Labels`
+    /// per row would allocate for records that are about to be rejected. This runs only
+    /// on the records actually being returned — at most `limit` of them — so the cost is
+    /// bounded by the response rather than by the search.
+    ///
+    /// # The bug this closes
+    ///
+    /// `| json` and `| logfmt` were filter-only: they parsed the body to decide whether a
+    /// record matched, and nothing about the extraction reached the caller. Asking for
+    /// `| json | level="error"` returned the line and a stream whose `level` label said
+    /// `info` — telemetryd's severity-derived label, not the one the filter matched on. A
+    /// user could not see the value their own query had selected, and the answer looked
+    /// like it contradicted the question.
+    ///
+    /// Returns an empty set when the query has no parser stage, so a caller can merge it
+    /// unconditionally.
+    pub fn extracted(&self, line: &str) -> Labels {
+        let mut labels = Labels::new();
+        for stage in &self.stages {
+            match stage {
+                Stage::Json => merge_json(&mut labels, line),
+                Stage::Logfmt => merge_logfmt(&mut labels, line),
+                Stage::Line(_) | Stage::Label(_) => {}
+            }
+        }
+        labels
+    }
+
+    /// Whether this query parses the line at all, so a caller can skip the second pass.
+    pub fn has_parser_stage(&self) -> bool {
+        self.stages
+            .iter()
+            .any(|stage| matches!(stage, Stage::Json | Stage::Logfmt))
+    }
+
     pub fn evaluate(&self, line: &str, base: &Labels) -> bool {
         let mut extracted: Option<Labels> = None;
 

@@ -628,6 +628,80 @@ async fn a_protobuf_log_batch_is_stored_and_queryable() {
     );
 }
 
+/// A parser stage must return what it parsed, not just filter on it.
+///
+/// `| json` and `| logfmt` were filter-only: they parsed the body to decide whether a
+/// record matched and then discarded the result. `| json | level="error"` returned the
+/// line, and a stream whose `level` label said `info` — telemetryd's severity-derived
+/// label, not the field the filter had matched. The answer looked like it contradicted
+/// the question, and the value that had been selected on was nowhere in the response.
+#[tokio::test]
+async fn a_parser_stage_returns_the_fields_it_extracted() {
+    let harness = Harness::new();
+    harness
+        .post_logs(&json!({
+            "resourceLogs": [{
+                "resource": {"attributes": [
+                    {"key": "service.name", "value": {"stringValue": "checkout"}}
+                ]},
+                "scopeLogs": [{"logRecords": [{
+                    "timeUnixNano": NOW.to_string(),
+                    "severityNumber": 9,
+                    "body": {"stringValue": r#"{"level":"error","order":{"id":"A-1"}}"#},
+                    "attributes": [{"key": "trace.id", "value": {"stringValue": "T-9"}}]
+                }]}]
+            }]
+        }))
+        .await;
+
+    let path = format!(
+        "/loki/api/v1/query_range?query={}&start={}&end={}&direction=forward",
+        urlencode(r#"{app="checkout"} | json | level="error""#),
+        NOW,
+        NOW + MS
+    );
+    let (status, response) = harness.get(&path).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+
+    let entry = &response["data"]["result"][0];
+    let metadata = &entry["values"][0][2];
+
+    // The severity label is untouched: it is a different fact from the body's own idea
+    // of level, and overwriting it would lose telemetryd's.
+    assert_eq!(entry["stream"]["level"], "info");
+    // …and the matched value is present under the name Loki uses for a collision, so a
+    // reader of either system looks in the same place.
+    assert_eq!(metadata["level_extracted"], "error");
+
+    // Nested objects flatten with an underscore, which is what the label filter already
+    // matched on — `| json | order_id="A-1"` worked before this and still does.
+    assert_eq!(metadata["order_id"], "A-1");
+    // Record attributes still come through beside them.
+    assert_eq!(metadata["trace.id"], "T-9");
+}
+
+/// A query with no parser stage pays nothing for the one above.
+#[tokio::test]
+async fn a_query_without_a_parser_extracts_nothing() {
+    let harness = Harness::new();
+    harness
+        .post_logs(&otlp_logs(&[(0, "info", r#"{"level":"error"}"#, "1")]))
+        .await;
+
+    let path = format!(
+        "/loki/api/v1/query_range?query={}&start={}&end={}&direction=forward",
+        urlencode(r#"{app="checkout"}"#),
+        NOW,
+        NOW + MS
+    );
+    let (_, response) = harness.get(&path).await;
+    let metadata = &response["data"]["result"][0]["values"][0][2];
+
+    // The body is valid JSON, and nothing asked for it to be parsed.
+    assert!(metadata.get("level_extracted").is_none(), "{metadata}");
+    assert_eq!(metadata["order.id"], "1", "attributes are unaffected");
+}
+
 // ---------------------------------------------------------------------------
 // range semantics
 // ---------------------------------------------------------------------------
