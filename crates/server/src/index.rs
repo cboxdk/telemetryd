@@ -142,43 +142,55 @@ pub const SURFACES: &[Surface] = &[
             },
         ],
     },
+    Surface {
+        title: "Look at the data",
+        guard: "admin token",
+        routes: &[Route {
+            method: "GET",
+            paths: &["/debug"],
+            note: "recent logs, traces and metrics — sign in with the token on the page",
+        }],
+    },
 ];
 
 /// Documentation, in the order a newcomer needs it.
+/// Documentation, in the order a newcomer needs it.
+///
+/// The documentation site first and the repository named as itself. Sending a reader to
+/// a `.md` file on GitHub is sending them to the source of the docs rather than to the
+/// docs, and it is the wrong front door for anyone who is not already contributing.
 const DOCS: &[(&str, &str)] = &[
+    ("Documentation", "https://cbox.dk/packages/telemetryd"),
     (
         "Quickstart",
-        "https://github.com/cboxdk/telemetryd/blob/main/docs/quickstart.md",
+        "https://cbox.dk/packages/telemetryd/quickstart",
     ),
     (
         "The API subset, endpoint by endpoint",
         "https://github.com/cboxdk/telemetryd/blob/main/COMPATIBILITY.md",
     ),
     (
-        "Cookbook",
-        "https://github.com/cboxdk/telemetryd/tree/main/docs/cookbook",
-    ),
-    (
         "Written for an agent to read",
         "https://github.com/cboxdk/telemetryd/blob/main/llms.txt",
     ),
+    ("Source", "https://github.com/cboxdk/telemetryd"),
 ];
 
 /// The rest of the ecosystem this server was built for.
 const CBOX: &[(&str, &str, &str)] = &[
     (
         "laravel-telemetry",
-        "https://github.com/cboxdk/laravel-telemetry",
+        "https://cbox.dk/packages/laravel-telemetry",
         "the exporter — point a Laravel app here",
     ),
     (
         "laravel-telemetry-ui",
-        "https://github.com/cboxdk/laravel-telemetry-ui",
+        "https://cbox.dk/packages/laravel-telemetry-ui",
         "dashboards over these APIs",
     ),
     (
-        "Cbox on GitHub",
-        "https://github.com/cboxdk",
+        "Cbox packages",
+        "https://cbox.dk/packages",
         "everything else",
     ),
 ];

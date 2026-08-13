@@ -37,7 +37,7 @@ curl -s -H 'Accept: application/json' https://telemetry.example.com/
 ```json
 {
   "product": "telemetryd",
-  "version": "0.40.0",
+  "version": "0.41.0",
   "storage_format_version": 1,
   "signals": ["logs", "metrics", "traces"],
   "surfaces": [
@@ -61,14 +61,14 @@ The document names no app, no count, no disk figure and no retention window. Tho
 
 ### `/status` answers the same question
 
-Since 0.40.0 you get the first four fields from `/status` too, with no credential:
+Since 0.41.0 you get the first four fields from `/status` too, with no credential:
 
 ```bash
 curl -s https://telemetry.example.com/status
 ```
 
 ```json
-{"product":"telemetryd","version":"0.40.0","storage_format_version":1,
+{"product":"telemetryd","version":"0.41.0","storage_format_version":1,
  "signals":["logs","metrics","traces"]}
 ```
 

@@ -19,18 +19,28 @@
 //! belong to `laravel-telemetry-ui`, which is the product; adding them here would start a
 //! second one. What this owes the reader is a fast answer to one question.
 //!
-//! # Authentication, by reusing what already guards the read APIs
+//! # Authentication: a token you type, on a page you can reach
 //!
-//! It sits behind the query token, which means it is **open on a default local instance**
-//! — no tokens configured, loopback bind — and **closed on a server**, where a browser
-//! cannot easily present a bearer token. That asymmetry is the intent rather than a
-//! limitation: a developer gets it for free where the trust boundary is already the
-//! machine, and nobody accidentally publishes a log viewer to the internet. On a server,
-//! SSH in and use `telemetryd query`, or forward the port.
+//! This is meant to be opened from a browser against a real deployment, so it signs you
+//! in rather than answering `401` and leaving you to construct a header. No token
+//! configured — a default local instance — and it is simply open.
 //!
-//! It is rendered on the server for the same reason. A page that fetched from the browser
-//! would need the query token in `localStorage` — a bearer token for every log line the
-//! instance holds, sitting in the one place an XSS bug can read it.
+//! The first version of this file put the page behind the router's bearer-token layer,
+//! which made it unreachable from anywhere but the machine it runs on. That was a scoping
+//! decision presented as a security property, and it was not mine to make.
+//!
+//! The credential is the **admin token**, falling back to the query token when no admin
+//! token is set — the same rule `/status` and `/metrics` already use, so there is one
+//! answer to "what does the operator's credential open".
+//!
+//! # Why a cookie, and why that is not the thing I objected to
+//!
+//! The token is held in an `HttpOnly` cookie, so no script can read it — which is the
+//! whole objection to putting a bearer token in `localStorage`, answered by the mechanism
+//! rather than by refusing the feature. `SameSite=Strict` keeps it off cross-site
+//! requests, `Secure` is set whenever the request arrived over TLS (including through a
+//! proxy that says so), and the token never appears in a URL, where it would land in
+//! access logs and browser history.
 //!
 //! # Escaping is load-bearing here
 //!
@@ -40,13 +50,159 @@
 //! `default-src 'none'`, and there is no script and no inline handler — so even a mistake
 //! in the escaping has nowhere to execute.
 
-use axum::extract::{Query, State};
-use axum::http::{StatusCode, header};
+use axum::extract::{Form, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::error::ApiError;
 use crate::state::AppState;
+
+/// Where the signed-in token lives between requests.
+const COOKIE: &str = "telemetryd_debug";
+
+#[derive(Debug, Deserialize)]
+pub struct LoginForm {
+    pub token: String,
+}
+
+/// What the operator's credential opens here.
+///
+/// The admin token, falling back to the query token when no admin token is configured —
+/// identical to `/status` and `/metrics`, so an operator has one credential to think
+/// about rather than a rule per page.
+fn accepts(state: &AppState, presented: &str) -> bool {
+    if !state.admin_tokens.is_empty() {
+        return state.admin_tokens.verify(presented);
+    }
+    state.query_tokens.verify(presented)
+}
+
+/// Whether anything guards this instance at all.
+fn guarded(state: &AppState) -> bool {
+    !state.admin_tokens.is_empty() || !state.query_tokens.is_empty()
+}
+
+/// The credential on this request: the header if a tool sent one, otherwise the cookie a
+/// browser is carrying. Never a query parameter — that is the one place a token must not
+/// go, because it survives in access logs, referrers and history.
+fn presented(headers: &HeaderMap) -> Option<String> {
+    if let Some(bearer) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    {
+        return Some(bearer.trim().to_owned());
+    }
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())?
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .find(|(name, _)| *name == COOKIE)
+        .map(|(_, value)| value.to_owned())
+}
+
+/// `Secure` only when the connection actually was, or a plain-HTTP deployment would set a
+/// cookie the browser then refuses to send back — and the page would never sign in.
+fn over_tls(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|proto| proto.eq_ignore_ascii_case("https"))
+}
+
+/// The page shown when there is no valid credential.
+///
+/// A form rather than a `401` body, because this is opened by a person in a browser and
+/// the answer to "you need a token" is a place to put one. The token posts in a form
+/// body, never a query string — a URL is logged by the proxy, kept in history and sent
+/// in a `Referer`.
+fn sign_in(problem: &str) -> String {
+    let banner = if problem.is_empty() {
+        String::new()
+    } else {
+        format!("<p class=\"err\">{}</p>", escape(problem))
+    };
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<meta name=\"robots\" content=\"noindex\"><title>telemetryd debug</title>\
+<style>{STYLE}</style></head><body><main style=\"max-width:26rem\">\
+<h1>telemetryd debug</h1>\
+<p class=\"lede\">This instance requires a token. Use the <strong>admin</strong> token, \
+or the query token if no admin token is configured — the same credential \
+<code>/status</code> takes.</p>\
+{banner}\
+<form method=\"post\" action=\"/debug/login\">\
+<input name=\"token\" type=\"password\" placeholder=\"admin token\" \
+aria-label=\"admin token\" autocomplete=\"current-password\" autofocus>\
+<button type=\"submit\">Sign in</button></form>\
+<footer>Kept in a cookie that scripts cannot read, scoped to this page, and marked \
+<code>Secure</code> when you arrived over TLS. It is never put in a URL.</footer>\
+</main></body></html>"
+    )
+}
+
+/// `POST /debug/login`
+pub async fn login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    if !accepts(&state, form.token.trim()) {
+        state
+            .metrics
+            .incr("telemetryd_auth_failures_total", &[("surface", "debug")]);
+        // Same page, same status shape as any other refusal here: a message beside the
+        // field rather than a bare 401 the browser renders as a wall of text.
+        return (
+            StatusCode::UNAUTHORIZED,
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            sign_in("That token was not accepted."),
+        )
+            .into_response();
+    }
+
+    let secure = if over_tls(&headers) { "; Secure" } else { "" };
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, "/debug".to_owned()),
+            (
+                header::SET_COOKIE,
+                format!(
+                    "{COOKIE}={}; HttpOnly; SameSite=Strict; Path=/debug{secure}",
+                    form.token.trim()
+                ),
+            ),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+        (),
+    )
+        .into_response()
+}
+
+/// `GET /debug/logout`
+pub async fn logout(headers: HeaderMap) -> Response {
+    let secure = if over_tls(&headers) { "; Secure" } else { "" };
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, "/debug".to_owned()),
+            (
+                header::SET_COOKIE,
+                format!("{COOKIE}=; HttpOnly; SameSite=Strict; Path=/debug; Max-Age=0{secure}"),
+            ),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+        (),
+    )
+        .into_response()
+}
 
 /// Lines shown. Enough to see a pattern, small enough that the page stays readable and
 /// the query behind it stays cheap.
@@ -154,8 +310,27 @@ struct Row {
 
 pub async fn debug(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<DebugParams>,
 ) -> Result<Response, ApiError> {
+    // Sign-in before anything is read. An instance with no tokens is open, exactly as
+    // every other read surface is.
+    let signed_in = guarded(&state);
+    if signed_in {
+        let ok = presented(&headers).is_some_and(|token| accepts(&state, &token));
+        if !ok {
+            return Ok((
+                StatusCode::UNAUTHORIZED,
+                [
+                    (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                sign_in(""),
+            )
+                .into_response());
+        }
+    }
+
     let signal = params.signal;
     let mins = params.mins.unwrap_or(15).clamp(1, 10_080);
     let typed = params.q.unwrap_or_default();
@@ -195,7 +370,15 @@ pub async fn debug(
             (header::CACHE_CONTROL, "no-store"),
             (header::VARY, "Authorization"),
         ],
-        page(&rows, &suggestions, signal, query, mins, error.as_deref()),
+        page(
+            &rows,
+            &suggestions,
+            signal,
+            query,
+            mins,
+            error.as_deref(),
+            signed_in,
+        ),
     )
         .into_response())
 }
@@ -449,6 +632,7 @@ fn page(
     query: &str,
     mins: u64,
     error: Option<&str>,
+    signed_in: bool,
 ) -> String {
     use std::fmt::Write as _;
 
@@ -551,13 +735,17 @@ aria-label=\"{language} query\" spellcheck=\"false\" autocomplete=\"off\">\
 <h2>Records</h2><table>\
 <tr><th>time</th><th>{col_who}</th><th>{col_tag}</th><th>{col_detail}</th></tr>\
 {lines}</table>\
-<footer>Behind the query token, so this is open on a local instance and closed on one \
-with tokens configured. The same data is in <code>telemetryd query</code>, which is the \
-thing to use over SSH.</footer>\
+<footer>{session}The same data is in <code>telemetryd query</code>, which is the thing \
+to use over SSH.</footer>\
 </main></body></html>",
         slug = signal.slug(),
         language = signal.language(),
         query_value = escape(query),
+        session = if signed_in {
+            "<a href=\"/debug/logout\">Sign out</a> · "
+        } else {
+            ""
+        },
     )
 }
 
@@ -602,7 +790,7 @@ mod tests {
             tag: "error".to_owned(),
             detail: "<script>alert(1)</script>".to_owned(),
         }];
-        let html = page(&rows, &[], Signal::Logs, "", 15, None);
+        let html = page(&rows, &[], Signal::Logs, "", 15, None, false);
         assert!(!html.contains("<script>alert"), "the body was not escaped");
         assert!(html.contains("&lt;script&gt;alert"), "{html}");
     }
@@ -617,6 +805,7 @@ mod tests {
             r#"{app="x"} |= "><script>"#,
             15,
             None,
+            false,
         );
         assert!(!html.contains("|= \"><script>"), "reflected unescaped");
         assert!(html.contains("&gt;&lt;script&gt;"), "{html}");
@@ -626,7 +815,15 @@ mod tests {
     fn a_query_that_does_not_parse_is_explained_rather_than_returned_as_an_error() {
         // The page exists because a mistake in the tooling should not look like an
         // absence of data.
-        let html = page(&[], &[], Signal::Logs, "{oops", 15, Some("expected `}`"));
+        let html = page(
+            &[],
+            &[],
+            Signal::Logs,
+            "{oops",
+            15,
+            Some("expected `}`"),
+            false,
+        );
         assert!(html.contains("did not parse"), "{html}");
         assert!(!html.contains("No records in this window"), "{html}");
     }

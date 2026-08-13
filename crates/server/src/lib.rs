@@ -49,7 +49,15 @@ pub fn router(state: AppState) -> Router {
     // work before anyone has configured a token.
     let public = Router::new()
         .route("/", get(index::index))
-        .route("/healthz", get(routes::healthz));
+        .route("/healthz", get(routes::healthz))
+        // The debug page authenticates itself rather than sitting behind the bearer-token
+        // layer, so that a browser without a credential gets a form to type one into
+        // instead of a `401` it cannot act on. It is meant to be opened against a real
+        // deployment; putting it behind the layer made it reachable only from the machine
+        // it runs on. See `debug` for what the cookie is and why.
+        .route("/debug", get(debug::debug))
+        .route("/debug/login", axum::routing::post(debug::login))
+        .route("/debug/logout", get(debug::logout));
 
     // `/status` and `/metrics` describe the deployment rather than the telemetry:
     // every app name, its series count, its share of the disk, whether the instance is
@@ -82,10 +90,6 @@ pub fn router(state: AppState) -> Router {
         .route("/loki/api/v1/label/{name}/values", get(loki::label_values))
         .route("/loki/api/v1/series", get(loki::series))
         .route("/loki/api/v1/tail", get(loki::tail))
-        // A page for the question "is my data arriving". Behind the query token like the
-        // rest of this router, which makes it open on a default local instance and shut
-        // on one with tokens — the asymmetry is the point, see `debug`.
-        .route("/debug", get(debug::debug))
         // Tempo-compatible read APIs (M2).
         .route("/api/traces/{trace_id}", get(tempo::trace))
         .route("/api/search", get(tempo::search))
