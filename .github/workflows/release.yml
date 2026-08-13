@@ -214,7 +214,28 @@ jobs:
       # no private key — nothing to store, rotate, or leak. Signing SHA256SUMS rather
       # than each file keeps one signature authoritative over everything, since the
       # checksums already cover the artifacts.
+      # Pinned, for the bundle *format* rather than for reproducibility.
+      #
+      # Unpinned, the action installs a cosign 2.x default, which writes cosign's own
+      # older envelope — `base64Signature`, `cert`, `rekorBundle`. Only cosign reads it:
+      # measured, `sigstore-python` rejects it as "malformed", which is true of the
+      # format and not of the file. That made cosign the single tool able to check a
+      # telemetryd release, on hosts where it is not packaged — Ubuntu has none, so an
+      # operator on a server has to fetch a binary from another project's release first,
+      # and most will skip the check instead.
+      #
+      # cosign 3 writes the standardised Sigstore bundle
+      # (`application/vnd.dev.sigstore.bundle.v0.3+json`) by default, with no flag —
+      # there is no `--new-bundle-format` here, it was folded into the default. That
+      # bundle is verifiable by `sigstore-python` from pip, by `sigstore-go`, and by
+      # cosign 2.4 and newer.
+      #
+      # The cost is cosign older than 2.4, which cannot read it. That version is from
+      # August 2024 and anyone installing cosign today gets 3.x, so the minimum is
+      # documented rather than worked around with two signatures.
       - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v3.1.3
 
       - name: sign the checksum file
         run: |

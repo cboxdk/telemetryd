@@ -60,12 +60,55 @@ rather than left as a gap you discover.
 ## Verifying a release
 
 Every release publishes `SHA256SUMS` and `SHA256SUMS.cosign.bundle`, a keyless
-[Sigstore](https://www.sigstore.dev/) signature over it. There is no public key to
+[Sigstore](https://www.sigstore.dev/) signature over it, in the standardised bundle format
+that cosign 2.4+, `sigstore-python` and `sigstore-go` all read. There is no public key to
 fetch or trust on first use: the signing identity is the release workflow itself,
 attested by GitHub's OIDC provider and recorded in the public transparency log.
 
-`install.sh` does this automatically when `cosign` is on your `PATH`, and tells you
-when it is not. To check by hand:
+### Getting a verifier
+
+`install.sh` verifies automatically when `cosign` is on your `PATH`, and says so when it
+is not — which on a server is most of the time. **Ubuntu and Debian do not package
+cosign**; `apt-get install cosign` fails, which is where most people stop.
+
+Two ways to get one. Sigstore's own `.deb`, checked before it is installed:
+
+```bash
+cd /tmp
+curl -fsSLO https://github.com/sigstore/cosign/releases/download/v3.1.3/cosign_3.1.3_arm64.deb
+curl -fsSL https://github.com/sigstore/cosign/releases/download/v3.1.3/cosign_checksums.txt \
+  | grep 'cosign_3.1.3_arm64.deb$' | sha256sum -c -
+sudo apt-get install -y ./cosign_3.1.3_arm64.deb
+```
+
+`sha256sum -c` fails and stops the chain if the download does not match, so `apt-get`
+only ever sees a file that checked out. Swap `arm64` for `amd64` on an Intel host.
+
+Or, without leaving Python — this verifies the same bundle, and needs no binary from
+another project's releases:
+
+```bash
+pipx install sigstore     # or: pip install sigstore
+python -m sigstore verify identity \
+  --bundle SHA256SUMS.cosign.bundle \
+  --cert-identity "https://github.com/cboxdk/telemetryd/.github/workflows/release.yml@refs/tags/v0.39.0" \
+  --cert-oidc-issuer "https://token.actions.githubusercontent.com" \
+  SHA256SUMS
+```
+
+**This works from v0.39.0 onward.** Earlier releases were signed into cosign's own older
+envelope, which only cosign reads — `sigstore-python` rejects it as malformed, and that
+is a statement about the format rather than about the file. cosign verifies every release,
+old and new.
+
+**Whichever you install, you cannot verify the verifier.** The checksum above protects
+against a corrupted or swapped download, not against the upstream release itself being
+bad. That is the bootstrap problem and it has no clean answer; it is worth knowing rather
+than assuming the chain closes all the way down.
+
+### By hand
+
+To check with cosign:
 
 ```bash
 cosign verify-blob \

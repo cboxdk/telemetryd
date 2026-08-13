@@ -116,7 +116,12 @@ main() {
                 say "note: v$version predates release signing, falling back to checksums"
             fi
         else
+            # Naming a way to get one, because the previous message stopped at the
+            # gap. Ubuntu and Debian do not package cosign, so the obvious
+            # `apt-get install cosign` fails and most people stop there rather than
+            # going looking.
             say "note: cosign not installed — verifying the checksum only, not who published it"
+            say "      to check the publisher too: https://github.com/cboxdk/telemetryd/blob/main/docs/getting-started/installation.md#getting-a-verifier"
         fi
 
         expected="$(grep " $name.tar.gz\$" "$tmp/SHA256SUMS" | awk '{print $1}' | head -n 1)"
