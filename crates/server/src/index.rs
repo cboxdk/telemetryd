@@ -163,7 +163,7 @@ const DOCS: &[(&str, &str)] = &[
     ("Documentation", "https://cbox.dk/packages/telemetryd"),
     (
         "Quickstart",
-        "https://cbox.dk/packages/telemetryd/quickstart",
+        "https://cbox.dk/packages/telemetryd/docs/quickstart",
     ),
     (
         "The API subset, endpoint by endpoint",

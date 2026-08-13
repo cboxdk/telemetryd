@@ -110,14 +110,14 @@ configured. That is deliberate and should not be worked around with `--insecure`
 
 ## Docs
 
-- [Quickstart](https://github.com/cboxdk/telemetryd/blob/main/docs/quickstart.md): install, run, send, query — in one read
-- [Installation](https://github.com/cboxdk/telemetryd/blob/main/docs/getting-started/installation.md): includes a copy-paste brief for an agent
-- [Sending data](https://github.com/cboxdk/telemetryd/blob/main/docs/getting-started/sending-data.md): endpoints, labels, and what a 200 does not mean
-- [Docker](https://github.com/cboxdk/telemetryd/blob/main/docs/getting-started/docker.md): the container, and the tokens it generates on first start
-- [Configuration reference](https://github.com/cboxdk/telemetryd/blob/main/docs/configuration/reference.md): every option with its default
+- [Quickstart](https://cbox.dk/packages/telemetryd/docs/quickstart): install, run, send, query — in one read
+- [Installation](https://cbox.dk/packages/telemetryd/docs/getting-started/installation): includes a copy-paste brief for an agent
+- [Sending data](https://cbox.dk/packages/telemetryd/docs/getting-started/sending-data): endpoints, labels, and what a 200 does not mean
+- [Docker](https://cbox.dk/packages/telemetryd/docs/getting-started/docker): the container, and the tokens it generates on first start
+- [Configuration reference](https://cbox.dk/packages/telemetryd/docs/configuration/reference): every option with its default
 - [COMPATIBILITY.md](https://github.com/cboxdk/telemetryd/blob/main/COMPATIBILITY.md): the authoritative API subset, endpoint by endpoint
 - [BUILD-STATUS.md](https://github.com/cboxdk/telemetryd/blob/main/BUILD-STATUS.md): what is built, what is not, and what is deliberately absent
-- [Cookbook](https://github.com/cboxdk/telemetryd/blob/main/docs/cookbook/): task-shaped recipes — relay mode, single sign-on, export and import, exposing it safely
+- [Cookbook](https://cbox.dk/packages/telemetryd/docs/cookbook/_index): task-shaped recipes — relay mode, single sign-on, export and import, exposing it safely
 
 ## Do not
 

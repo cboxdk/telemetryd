@@ -6,6 +6,7 @@ description: "Task-shaped recipes for running telemetryd in anger."
 
 # Cookbook
 
+- [See what is arriving](see-what-is-arriving.md)
 - [Run it as a service](run-as-a-service.md)
 - [Expose it beyond localhost](expose-it-safely.md)
 - [Connect laravel-telemetry-ui](connect-the-ui.md)
