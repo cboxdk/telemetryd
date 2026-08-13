@@ -53,6 +53,20 @@ same telemetryd base URL and set `auth.query_token` to that value.
 `X-Scope-OrgID` is sent when a tenant is configured. telemetryd **ignores** it: it is
 single-tenant, and the `app` label is a query namespace rather than a security boundary.
 
+## Time ranges are inclusive at both ends
+
+`start` and `end` both include a record landing exactly on them, on every read endpoint
+and for all three signals — the store compares `ts >= start && ts <= end`.
+
+That matches Prometheus, whose range queries evaluate at both edges. It differs from
+Loki, where `end` is exclusive. The consequence is one record: two adjacent windows
+`[t0, t1]` and `[t1, t2]` both return whatever sits exactly at `t1`.
+
+So page by advancing `start` **past** the newest timestamp you received rather than to it.
+Verified by querying single-nanosecond windows at each edge of a known set: `[t, t]`
+returns exactly the record at `t`, and the record at a shared boundary appears in both
+halves — 2501 + 3500 records over a 6000-record set, union 6000, no gaps.
+
 ---
 
 ## Ingest
@@ -252,6 +266,35 @@ Driven by what `PromqlCompiler` actually generates:
 `predict_linear`, `holt_winters`, recording and alerting rules, `/api/v1/rules`,
 `/api/v1/alerts`, exemplars, native histograms, and vector-to-vector matching beyond
 the `or` form above (`on`/`ignoring`/`group_left`).
+
+#### `rate` and `increase` do not extrapolate
+
+The one place a supported function answers differently from Prometheus, and it is
+deliberate rather than missing.
+
+telemetryd divides the counter's delta by the time actually spanned by the samples.
+Prometheus divides by the whole range, after extrapolating the observed rate outwards
+towards the window edges. When the window is well covered the two agree exactly; when it
+is not, they do not. Measured against a counter rising by a true 10/s:
+
+| Samples in a `[5m]` window | telemetryd `rate` | Prometheus `rate` | telemetryd `increase` | Prometheus `increase` |
+|---|---|---|---|---|
+| 21, spanning the full 300 s | 10.00/s | 10.00/s | 3000 | 3000 |
+| 7, spanning only 60 s | 10.00/s | 2.17/s | 3000 | 650 |
+
+Where you meet this is a **series that has not existed for the whole window** — the first
+minutes after a deploy, or a metric that only appears under load. telemetryd reports the
+rate the counter was actually moving at; Prometheus reports the average across a window
+the series did not exist for, which is why `increase` there famously returns fractions of
+a request.
+
+Neither is wrong, and telemetryd's answer is usually the one a person wanted. It is
+recorded here because a dashboard built against Prometheus and pointed at telemetryd will
+show different numbers for a new series, and that difference should not have to be
+discovered.
+
+`histogram_quantile` matches Prometheus exactly, including returning the highest finite
+bound when the quantile falls in the `+Inf` bucket. Verified against a known distribution.
 
 ---
 

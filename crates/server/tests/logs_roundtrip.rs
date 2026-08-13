@@ -629,6 +629,117 @@ async fn a_protobuf_log_batch_is_stored_and_queryable() {
 }
 
 // ---------------------------------------------------------------------------
+// range semantics
+// ---------------------------------------------------------------------------
+
+/// Both ends of a time range include a record landing exactly on them.
+///
+/// Matches Prometheus, differs from Loki where `end` is exclusive, and is written down
+/// in COMPATIBILITY.md because the difference is exactly one record and it is invisible
+/// until someone pages two adjacent windows and sees it twice. Pinned here so the
+/// documented answer and the real one cannot drift apart.
+#[tokio::test]
+async fn a_range_includes_records_sitting_on_either_edge() {
+    let harness = Harness::new();
+    harness
+        .post_logs(&otlp_logs(&[
+            (0, "info", "first", "1"),
+            (1, "info", "middle", "2"),
+            (2, "info", "last", "3"),
+        ]))
+        .await;
+
+    let bodies = |response: &Value| -> Vec<String> {
+        response["data"]["result"]
+            .as_array()
+            .map(|streams| {
+                streams
+                    .iter()
+                    .flat_map(|s| s["values"].as_array().unwrap().iter())
+                    .map(|v| v[1].as_str().unwrap().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let at = |start: u64, end: u64| {
+        format!(
+            "/loki/api/v1/query_range?query={}&start={}&end={}&direction=forward",
+            urlencode(r#"{app="checkout"}"#),
+            start,
+            end
+        )
+    };
+
+    // A zero-width window on the first record returns that record and nothing else.
+    let (_, only_first) = harness.get(&at(NOW, NOW)).await;
+    assert_eq!(bodies(&only_first), vec!["first"]);
+
+    // …and on the last.
+    let (_, only_last) = harness.get(&at(NOW + 2 * MS, NOW + 2 * MS)).await;
+    assert_eq!(bodies(&only_last), vec!["last"]);
+
+    // Two adjacent windows meeting at the middle record each return it: that is the one
+    // record of overlap, and the reason to advance `start` past what you last saw.
+    let (_, left) = harness.get(&at(NOW, NOW + MS)).await;
+    let (_, right) = harness.get(&at(NOW + MS, NOW + 2 * MS)).await;
+    assert_eq!(bodies(&left), vec!["first", "middle"]);
+    assert_eq!(bodies(&right), vec!["middle", "last"]);
+
+    // Nothing outside the data.
+    let (_, before) = harness.get(&at(NOW - 2 * MS, NOW - MS)).await;
+    assert!(bodies(&before).is_empty());
+}
+
+/// `direction=backward` with a limit returns the *newest* N, not the oldest N reversed.
+///
+/// The failure this guards is silent and plausible-looking: a dashboard showing the
+/// oldest entries of a range while claiming to show the latest. Checked across sealed
+/// segments and the live buffer at once, because the two are read by different code and
+/// only their combination is what a real query sees.
+#[tokio::test]
+async fn a_limited_query_takes_the_end_the_direction_asked_for() {
+    let harness = Harness::new();
+    harness
+        .post_logs(&otlp_logs(&[
+            (0, "info", "oldest", "1"),
+            (1, "info", "second", "2"),
+            (2, "info", "third", "3"),
+        ]))
+        .await;
+    harness.seal();
+    harness
+        .post_logs(&otlp_logs(&[
+            (3, "info", "fourth", "4"),
+            (4, "info", "newest", "5"),
+        ]))
+        .await;
+
+    let first_body = |response: &Value| -> String {
+        response["data"]["result"][0]["values"][0][1]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let path = |direction: &str| {
+        format!(
+            "/loki/api/v1/query_range?query={}&start={}&end={}&limit=1&direction={direction}",
+            urlencode(r#"{app="checkout"}"#),
+            NOW,
+            NOW + 10 * MS
+        )
+    };
+
+    let (_, backward) = harness.get(&path("backward")).await;
+    let (_, forward) = harness.get(&path("forward")).await;
+    assert_eq!(
+        first_body(&backward),
+        "newest",
+        "backward must reach past the sealed segment into the live buffer"
+    );
+    assert_eq!(first_body(&forward), "oldest");
+}
+
+// ---------------------------------------------------------------------------
 // limits and partial success
 // ---------------------------------------------------------------------------
 
