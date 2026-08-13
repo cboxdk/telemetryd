@@ -239,7 +239,10 @@ jobs:
       # favour of `.sigstore.json` bundles. The download 404s and the step exits 22. That
       # is what broke the first attempt at this release — the action's own bootstrap, not
       # our signing.
-      - uses: sigstore/cosign-installer@v4
+      # Pinned exactly, not `@v4`: this action publishes no floating major tag, only
+      # `v4.1.2` and its siblings, so `@v4` fails to resolve at job setup. `@v3` worked,
+      # which is what made the shorter form look safe.
+      - uses: sigstore/cosign-installer@v4.1.2
         with:
           cosign-release: v3.1.3
 
