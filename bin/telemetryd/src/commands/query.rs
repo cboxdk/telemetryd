@@ -29,11 +29,54 @@ pub enum Output {
     Json,
 }
 
+/// Everything, so the command works with no argument at all.
+///
+/// `{}` would be the obvious spelling and the server refuses it: a selector with no
+/// matcher that requires a value selects the whole store, which is a mistake to make
+/// expensive rather than easy. `{app=~".+"}` says the same thing deliberately, and is
+/// what the UI's own default sends.
+const EVERYTHING: &str = r#"{app=~".+"}"#;
+
+/// Shown under `--help`. Written out rather than described because the first question is
+/// never "what is the grammar" — it is "what does one of these look like".
+const EXAMPLES: &str = r#"Examples:
+  telemetryd query
+      Everything from the last hour, newest first. Start here: it answers
+      "is anything arriving at all" without composing a query.
+
+  telemetryd query '{app="checkout"}'
+      One application. `app` comes from the OTLP resource attribute
+      `service.name`; `telemetryd status` lists the ones that exist.
+
+  telemetryd query '{app="checkout", level="error"}' --since 24h
+      Errors only. `level` is derived from OTLP severity and is always
+      present: debug, info, warn, error, fatal.
+
+  telemetryd query '{app="checkout"} |= "declined"'
+      Lines containing a substring. Case-sensitive, and not a regex.
+
+  telemetryd query '{app=~".+"} |~ "timeout|refused"' --limit 20
+      A regex over the line. Label matchers like `app=~` are anchored to
+      the whole value; line filters like `|~` are not.
+
+  telemetryd query '{app="api"} | json | level="error"'
+      Parse a JSON body and filter on a field inside it. `| logfmt` does
+      the same for key=value lines.
+
+  telemetryd query '{app="api"}' --output json | jq -r .body
+      One JSON object per line, for piping.
+
+Not supported here: metric queries over logs (`rate`, `count_over_time`,
+`sum`). Use the Prometheus API for those — telemetryd names the construct
+it refused rather than reporting a syntax error."#;
+
 #[derive(Debug, Args)]
+#[command(after_help = EXAMPLES, after_long_help = EXAMPLES)]
 pub struct QueryArgs {
-    /// A LogQL query, e.g. '{app="checkout"} |= "declined"'.
+    /// A LogQL query. Omit it to see everything, which is the useful default when
+    /// the question is "is my data arriving".
     #[arg(value_name = "LOGQL")]
-    pub query: String,
+    pub query: Option<String>,
 
     /// How far back to look.
     #[arg(long, default_value = "1h", value_name = "DURATION")]
@@ -68,6 +111,17 @@ pub struct QueryArgs {
 }
 
 pub fn run(args: &QueryArgs) -> anyhow::Result<()> {
+    // No argument, or an empty one, means everything. Before this, `telemetryd query`
+    // was a usage error and `telemetryd query ''` reached the server and came back with
+    // "the `query` parameter is required" — a message about an HTTP parameter, to
+    // somebody who had typed a command.
+    let query = args
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .unwrap_or(EVERYTHING);
+
     let base = args.url.trim_end_matches('/');
     if base.starts_with("https://") {
         bail!(
@@ -86,7 +140,7 @@ pub fn run(args: &QueryArgs) -> anyhow::Result<()> {
 
     let url = format!(
         "{base}/loki/api/v1/query_range?query={}&start={start}&end={now}&limit={}&direction={}",
-        urlencode(&args.query),
+        urlencode(query),
         args.limit,
         if args.forward { "forward" } else { "backward" },
     );
@@ -130,7 +184,7 @@ pub fn run(args: &QueryArgs) -> anyhow::Result<()> {
     };
 
     let parsed: Value = serde_json::from_str(&body).context("parsing the response")?;
-    print(&parsed, args.output);
+    print(&parsed, args.output, args.forward);
     Ok(())
 }
 
@@ -151,7 +205,17 @@ fn line(out: &mut impl Write, text: &str) -> std::ops::ControlFlow<()> {
     }
 }
 
-fn print(response: &Value, output: Output) {
+/// One record, lifted out of the per-stream response so the whole result can be ordered
+/// by time.
+struct Row<'a> {
+    nanos: i128,
+    timestamp: &'a str,
+    text: &'a str,
+    labels: Option<&'a serde_json::Map<String, Value>>,
+    metadata: Option<&'a Value>,
+}
+
+fn print(response: &Value, output: Output, forward: bool) {
     let streams = response
         .get("data")
         .and_then(|data| data.get("result"))
@@ -160,49 +224,83 @@ fn print(response: &Value, output: Output) {
         return;
     };
 
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
-
+    // Flatten before printing.
+    //
+    // The Loki response is grouped by stream, and printing it in that shape emits every
+    // record of one stream, then every record of the next. A single application with
+    // both info and error lines is two streams, so `telemetryd query` printed
+    // 10:16:35, 10:16:32, 10:16:34, 10:16:33 — timestamps on every line and no order
+    // between them. On a command whose stated job is debugging over SSH, that is the
+    // output being wrong, not merely unsorted.
+    let mut rows: Vec<Row<'_>> = Vec::new();
     for stream in streams {
         let labels = stream.get("stream").and_then(Value::as_object);
         let Some(values) = stream.get("values").and_then(Value::as_array) else {
             continue;
         };
-
         for entry in values {
             let Some(pair) = entry.as_array() else {
                 continue;
             };
             let timestamp = pair.first().and_then(Value::as_str).unwrap_or("0");
-            let text = pair.get(1).and_then(Value::as_str).unwrap_or("");
+            rows.push(Row {
+                // Unparseable sorts oldest rather than being dropped: a record whose
+                // timestamp we cannot read is still a record somebody is looking for.
+                nanos: timestamp.parse::<i128>().unwrap_or(0),
+                timestamp,
+                text: pair.get(1).and_then(Value::as_str).unwrap_or(""),
+                labels,
+                metadata: pair.get(2),
+            });
+        }
+    }
+    // Same order the request asked the server for, applied across streams rather than
+    // within one.
+    if forward {
+        rows.sort_by_key(|row| row.nanos);
+    } else {
+        rows.sort_by_key(|row| std::cmp::Reverse(row.nanos));
+    }
 
-            match output {
-                Output::Text => {
-                    let app = labels
-                        .and_then(|l| l.get("app"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("-");
-                    if line(&mut out, &format!("{} {app} {text}", rfc3339(timestamp))).is_break() {
-                        return;
-                    }
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+
+    for row in rows {
+        match output {
+            Output::Text => {
+                let app = row
+                    .labels
+                    .and_then(|l| l.get("app"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("-");
+                if line(
+                    &mut out,
+                    &format!("{} {app} {}", rfc3339(row.timestamp), row.text),
+                )
+                .is_break()
+                {
+                    return;
                 }
-                Output::Json => {
-                    // One object per line: the shape every other tool on the machine
-                    // can read, and the reason this counts as an export path.
-                    let mut record = serde_json::Map::new();
-                    record.insert("timestamp".into(), Value::String(rfc3339(timestamp)));
-                    record.insert("timestamp_nanos".into(), Value::String(timestamp.into()));
-                    record.insert("line".into(), Value::String(text.into()));
-                    if let Some(labels) = labels {
-                        record.insert("labels".into(), Value::Object(labels.clone()));
-                    }
-                    // The third tuple element is structured metadata, when present.
-                    if let Some(extra) = pair.get(2) {
-                        record.insert("metadata".into(), extra.clone());
-                    }
-                    if line(&mut out, &Value::Object(record).to_string()).is_break() {
-                        return;
-                    }
+            }
+            Output::Json => {
+                // One object per line: the shape every other tool on the machine
+                // can read, and the reason this counts as an export path.
+                let mut record = serde_json::Map::new();
+                record.insert("timestamp".into(), Value::String(rfc3339(row.timestamp)));
+                record.insert(
+                    "timestamp_nanos".into(),
+                    Value::String(row.timestamp.into()),
+                );
+                record.insert("line".into(), Value::String(row.text.into()));
+                if let Some(labels) = row.labels {
+                    record.insert("labels".into(), Value::Object(labels.clone()));
+                }
+                // The third tuple element is structured metadata, when present.
+                if let Some(extra) = row.metadata {
+                    record.insert("metadata".into(), extra.clone());
+                }
+                if line(&mut out, &Value::Object(record).to_string()).is_break() {
+                    return;
                 }
             }
         }

@@ -233,7 +233,13 @@ jobs:
       # The cost is cosign older than 2.4, which cannot read it. That version is from
       # August 2024 and anyone installing cosign today gets 3.x, so the minimum is
       # documented rather than worked around with two signatures.
-      - uses: sigstore/cosign-installer@v3
+      #
+      # `@v3` of this action cannot install cosign 3: it verifies the download against a
+      # detached `cosign-linux-amd64.sig`, and cosign 3 stopped publishing those in
+      # favour of `.sigstore.json` bundles. The download 404s and the step exits 22. That
+      # is what broke the first attempt at this release — the action's own bootstrap, not
+      # our signing.
+      - uses: sigstore/cosign-installer@v4
         with:
           cosign-release: v3.1.3
 

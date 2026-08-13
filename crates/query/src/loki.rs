@@ -359,6 +359,14 @@ impl Entry {
             Self::Plain([ts, _]) | Self::WithMetadata(ts, _, _) => ts,
         }
     }
+
+    /// The record's body. Paired with [`Self::timestamp`] so a caller reading entries
+    /// does not have to match on the variant to learn which tuple slot holds what.
+    pub fn line(&self) -> &str {
+        match self {
+            Self::Plain([_, line]) | Self::WithMetadata(_, line, _) => line,
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize)]

@@ -100,7 +100,12 @@ Every setting is an environment variable, so nothing needs a file. See
 
 ```bash
 telemetryd status
+telemetryd query                 # everything from the last hour — start here
 ```
+
+Or open **`http://127.0.0.1:4319/debug`**: the last records for logs, traces and metrics,
+with no query to compose. It sits behind the query token, so it is open on a local
+instance and closed on one with tokens configured.
 
 Point `cboxdk/laravel-telemetry` at `http://127.0.0.1:4319` and query it back:
 

@@ -5,6 +5,7 @@
 //!.
 
 pub mod auth;
+pub mod debug;
 pub mod error;
 pub mod export;
 pub mod index;
@@ -81,6 +82,10 @@ pub fn router(state: AppState) -> Router {
         .route("/loki/api/v1/label/{name}/values", get(loki::label_values))
         .route("/loki/api/v1/series", get(loki::series))
         .route("/loki/api/v1/tail", get(loki::tail))
+        // A page for the question "is my data arriving". Behind the query token like the
+        // rest of this router, which makes it open on a default local instance and shut
+        // on one with tokens — the asymmetry is the point, see `debug`.
+        .route("/debug", get(debug::debug))
         // Tempo-compatible read APIs (M2).
         .route("/api/traces/{trace_id}", get(tempo::trace))
         .route("/api/search", get(tempo::search))

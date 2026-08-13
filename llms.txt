@@ -90,6 +90,11 @@ attribute of the same name wins; a promoted one is not stored twice.
 A stock OpenTelemetry SDK works with no configuration: the default
 `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` is served, and so is `http/json`.
 
+`GET /debug` is a server-rendered page for the question "is my data arriving": the last
+100 records per signal, tabs for logs, traces and metrics, and a query box with
+suggestions built from this instance's own labels. Behind the query token like the read
+APIs, which makes it open on a default local instance and closed on one with tokens.
+
 ## Authentication
 
 Three independent tokens guard three surfaces: `auth.ingest_token` for writes,
