@@ -130,6 +130,14 @@ A body that expands past it is refused with `413` and `limit_exceeded` naming th
 setting — identical to what an oversized uncompressed body gets, because a compressed
 request must not be able to buy more memory than an uncompressed one.
 
+**It bounds the body, not the memory the body costs.** An empty container is cheap to
+encode and not free to represent: measured, 16 MiB of empty protobuf messages reached
+801 MB resident, and the same shape in JSON reached 111 MB, because two bytes on the wire
+become a struct in a vector. Any repeated field past 100,000 elements is now refused with
+a `400` naming the field and telling you to split the batch — far above a real batch, far
+below what it takes to hurt. Refused rather than truncated, so a shortened batch is never
+mistaken for a complete one.
+
 Accepted beyond the strict spec, because real producers send it:
 
 - `int64` fields as JSON numbers as well as strings.

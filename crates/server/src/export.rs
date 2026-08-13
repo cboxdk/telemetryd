@@ -91,6 +91,25 @@ pub async fn export(
     State(state): State<AppState>,
     Query(params): Query<ExportParams>,
 ) -> Result<Response, ApiError> {
+    // Claimed here rather than by a router layer, and held until the last chunk is
+    // written.
+    //
+    // The layer released it when the handler returned, which for a streaming response is
+    // as soon as the *head* is built — while the scanned records are still alive in the
+    // task producing the body. Measured with clients that never read: three admitted at
+    // 317 MB, then three more, then three more, ending at 689 MB against a limit of 3. A
+    // client that stalls is not exotic; it is what a slow network looks like.
+    //
+    // The permit moves into the emitting task below, so it is released when the body
+    // finishes or when the client hangs up, which is when the memory is actually freed.
+    let Some(permit) = state.export_slot() else {
+        state.metrics.incr(
+            "telemetryd_query_rejected_total",
+            &[("surface", "export"), ("reason", "concurrency")],
+        );
+        return Err(telemetryd_core::Error::Overloaded.into());
+    };
+
     let signal: telemetryd_core::Signal = params.signal.into();
     if params.end < params.start {
         return Err(Error::BadRequest("end is before start".to_owned()).into());
@@ -151,6 +170,8 @@ pub async fn export(
     let (sender, receiver) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(2);
 
     tokio::task::spawn_blocking(move || {
+        // Moved in so it lives exactly as long as the records do.
+        let _permit = permit;
         let emit = |line: String| {
             // `blocking_send` is the backpressure: a slow reader parks this thread
             // rather than letting encoded batches pile up in the channel. An error

@@ -52,6 +52,8 @@ dangerous outcome, and it is the one case that cannot happen.
 listen           = "127.0.0.1:4319"  # one port: ingest + query + UI APIs
 insecure         = false             # allow non-loopback bind with no token
 max_body_bytes   = "16MiB"           # per ingest request, before *and* after decompression
+                                     # bounds the body; a repeated field is separately
+                                     # capped at 100,000 elements — see COMPATIBILITY.md
 request_timeout  = "30s"
 shutdown_grace   = "15s"             # drain in-flight requests, then flush WAL
 
@@ -231,7 +233,7 @@ Security:
   ingest       token required
   query        token required
   admin        token required
-  identity     open on / and /status: telemetryd 0.41.1, storage format 1,
+  identity     open on / and /status: telemetryd 0.42.0, storage format 1,
                three signals. Never the deployment. Not a setting.
 ```
 

@@ -91,12 +91,12 @@ another project's releases:
 pipx install sigstore     # or: pip install sigstore
 python -m sigstore verify identity \
   --bundle SHA256SUMS.cosign.bundle \
-  --cert-identity "https://github.com/cboxdk/telemetryd/.github/workflows/release.yml@refs/tags/v0.41.1" \
+  --cert-identity "https://github.com/cboxdk/telemetryd/.github/workflows/release.yml@refs/tags/v0.42.0" \
   --cert-oidc-issuer "https://token.actions.githubusercontent.com" \
   SHA256SUMS
 ```
 
-**This works from v0.41.1 onward.** Earlier releases were signed into cosign's own older
+**This works from v0.42.0 onward.** Earlier releases were signed into cosign's own older
 envelope, which only cosign reads — `sigstore-python` rejects it as malformed, and that
 is a statement about the format rather than about the file. cosign verifies every release,
 old and new.

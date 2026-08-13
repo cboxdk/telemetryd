@@ -113,6 +113,11 @@ pub async fn admin_token_or_identity(
 
 /// Hold a read slot for the length of the request, or refuse it.
 ///
+/// A layer works for the query surface because those responses are built in full before
+/// the handler returns. It does **not** work for a streamed one: `next.run` returns when
+/// the head is ready, and the permit would be gone while the body — and the memory behind
+/// it — still existed. `export` claims its own permit for that reason.
+///
 /// A layer rather than a line in each handler: there are fourteen read routes, and the
 /// one that gets forgotten is the one that matters. The permit is moved into the response
 /// future, so it is released when the response is fully built — including when the
@@ -129,24 +134,6 @@ pub async fn limit_query_concurrency(
         state.metrics.incr(
             "telemetryd_query_rejected_total",
             &[("surface", "query"), ("reason", "concurrency")],
-        );
-        return Err(telemetryd_core::Error::Overloaded.into());
-    };
-    let response = next.run(request).await;
-    drop(permit);
-    Ok(response)
-}
-
-/// The same, against the smaller budget one export is measured against.
-pub async fn limit_export_concurrency(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Result<Response, ApiError> {
-    let Some(permit) = state.export_slot() else {
-        state.metrics.incr(
-            "telemetryd_query_rejected_total",
-            &[("surface", "export"), ("reason", "concurrency")],
         );
         return Err(telemetryd_core::Error::Overloaded.into());
     };

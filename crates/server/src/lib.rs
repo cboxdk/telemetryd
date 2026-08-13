@@ -127,10 +127,9 @@ pub fn router(state: AppState) -> Router {
     // sharing a number with dashboards would mean setting it wrong for both.
     let export = Router::new()
         .route("/api/v1/export", get(export::export))
-        .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            auth::limit_export_concurrency,
-        ))
+        // No concurrency layer here: the export handler claims its own permit and holds
+        // it until the response body is finished. A layer cannot — it releases when the
+        // handler returns, which for a streamed response is before the body exists.
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_query_token,

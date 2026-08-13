@@ -59,6 +59,31 @@ use crate::traces::{ResourceSpans, ScopeSpans, SpanEventJson, SpanJson, StatusJs
 /// the configuration knows about. Attribute values in practice nest once or twice.
 const MAX_VALUE_DEPTH: u32 = 16;
 
+/// Elements one request may materialise in any single repeated field.
+///
+/// `server.max_body_bytes` was assumed to bound the memory a request costs, and it does
+/// not: it bounds the *body*. An empty protobuf message is two bytes, so a 16 MiB body
+/// holds eight million of them — measured at 801 MB of resident memory, from one request
+/// that answered `200`. The equivalent JSON is sixteen bytes per container and reached
+/// 111 MB, so this is a pre-existing shape that the denser encoding made an order of
+/// magnitude worse.
+///
+/// A hundred thousand is far above any real batch — `laravel-telemetry` sends hundreds —
+/// and far below the eight million it takes to hurt. Past it the request is refused
+/// rather than truncated: a silently shortened batch is the failure this project rejects
+/// everywhere else.
+const MAX_REPEATED: usize = 100_000;
+
+/// Refuse a repeated field that has grown past what any real producer sends.
+fn bounded(len: usize, field: &str) -> Result<()> {
+    if len >= MAX_REPEATED {
+        return Err(Error::BadRequest(format!(
+            "{field} exceeds {MAX_REPEATED} elements in one request; split the batch"
+        )));
+    }
+    Ok(())
+}
+
 /// Hex, lowercase. Trace and span ids are raw bytes on the wire and hex strings in JSON;
 /// the conversion path downstream expects the JSON spelling.
 fn hex(bytes: &[u8]) -> String {
@@ -209,6 +234,7 @@ pub fn logs(body: &[u8]) -> Result<LogsData> {
         match (field, wire) {
             (1, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
+                bounded(data.resource_logs.len(), "resource_logs")?;
                 data.resource_logs.push(resource_logs(&mut nested)?);
             }
             _ => reader.skip(wire)?,
@@ -227,6 +253,7 @@ fn resource_logs(reader: &mut Reader<'_>) -> Result<ResourceLogs> {
             }
             (2, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
+                bounded(out.scope_logs.len(), "scope_logs")?;
                 out.scope_logs.push(scope_logs(&mut nested)?);
             }
             _ => reader.skip(wire)?,
@@ -245,6 +272,7 @@ fn scope_logs(reader: &mut Reader<'_>) -> Result<ScopeLogs> {
             }
             (2, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
+                bounded(out.log_records.len(), "log_records")?;
                 out.log_records.push(log_record(&mut nested)?);
             }
             _ => reader.skip(wire)?,
@@ -293,6 +321,7 @@ pub fn traces(body: &[u8]) -> Result<TracesData> {
         match (field, wire) {
             (1, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
+                bounded(data.resource_spans.len(), "resource_spans")?;
                 data.resource_spans.push(resource_spans(&mut nested)?);
             }
             _ => reader.skip(wire)?,
@@ -311,6 +340,7 @@ fn resource_spans(reader: &mut Reader<'_>) -> Result<ResourceSpans> {
             }
             (2, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
+                bounded(out.scope_spans.len(), "scope_spans")?;
                 out.scope_spans.push(scope_spans(&mut nested)?);
             }
             _ => reader.skip(wire)?,
@@ -329,6 +359,7 @@ fn scope_spans(reader: &mut Reader<'_>) -> Result<ScopeSpans> {
             }
             (2, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
+                bounded(out.spans.len(), "spans")?;
                 out.spans.push(span(&mut nested)?);
             }
             _ => reader.skip(wire)?,
@@ -413,6 +444,7 @@ pub fn metrics(body: &[u8]) -> Result<MetricsData> {
         match (field, wire) {
             (1, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
+                bounded(data.resource_metrics.len(), "resource_metrics")?;
                 data.resource_metrics.push(resource_metrics(&mut nested)?);
             }
             _ => reader.skip(wire)?,
@@ -431,6 +463,7 @@ fn resource_metrics(reader: &mut Reader<'_>) -> Result<ResourceMetrics> {
             }
             (2, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
+                bounded(out.scope_metrics.len(), "scope_metrics")?;
                 out.scope_metrics.push(scope_metrics(&mut nested)?);
             }
             _ => reader.skip(wire)?,
@@ -449,6 +482,7 @@ fn scope_metrics(reader: &mut Reader<'_>) -> Result<ScopeMetrics> {
             }
             (2, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
+                bounded(out.metrics.len(), "metrics")?;
                 out.metrics.push(metric(&mut nested)?);
             }
             _ => reader.skip(wire)?,
@@ -601,6 +635,23 @@ mod tests {
         assert_eq!(base64(b"foob"), "Zm9vYg==");
         assert_eq!(base64(&[0xff, 0xef]), "/+8=");
         assert_eq!(base64(b""), "");
+    }
+
+    #[test]
+    fn a_wide_batch_is_refused_before_it_allocates() {
+        // Depth had a guard; width did not. An empty protobuf message is two bytes, so a
+        // body inside `server.max_body_bytes` holds eight million of them — measured at
+        // 801 MB resident, from one request that answered `200`. The body limit bounds
+        // the body, and that was being read as bounding the memory.
+        let hostile: Vec<u8> = [0x0a, 0x00].repeat(MAX_REPEATED + 1);
+        let error = logs(&hostile).unwrap_err();
+        assert!(error.to_string().contains("resource_logs"), "{error}");
+        assert!(error.to_string().contains("split the batch"), "{error}");
+
+        // Refused, not truncated: a silently shortened batch is the failure mode this
+        // project rejects everywhere else.
+        let fine: Vec<u8> = [0x0a, 0x00].repeat(16);
+        assert_eq!(logs(&fine).unwrap().resource_logs.len(), 16);
     }
 
     #[test]
