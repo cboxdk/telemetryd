@@ -256,6 +256,36 @@ spelling, `.service.name` still reaches the `service_name` label.
 Note the probe: the UI calls `/api/v1/status/buildinfo` first and only falls back to
 `query=1`. Without the former, every connection check shows a degraded backend.
 
+### Metric names carry their unit, and counters say `_total`
+
+OTLP names a metric `http.server.request.duration` and puts `ms` in a separate `unit`
+field. Prometheus puts both in the name. telemetryd applies the OpenTelemetry-to-Prometheus
+naming rules at ingest, so that metric is stored and queried as
+`http_server_request_duration_milliseconds` — with `_count`, `_sum` and `_bucket` after
+that for a histogram.
+
+| OTLP name | unit | kind | stored as |
+|---|---|---|---|
+| `http.server.request.duration` | `ms` | histogram | `http_server_request_duration_milliseconds_{count,sum,bucket}` |
+| `cache.operations` | `1` | monotonic sum | `cache_operations_total` |
+| `worker.memory.rss` | `By` | gauge | `worker_memory_rss_bytes` |
+| `job.time` | `s` | monotonic sum | `job_time_seconds_total` |
+
+`1` is dimensionless and adds nothing. A unit already spelled in the name is not repeated,
+so a producer that follows the convention itself does not get `_seconds_seconds`. An
+unrecognised unit is left off rather than appended verbatim, because a name nobody queries
+is the failure this exists to prevent.
+
+**This changed in v0.43.0.** Before it, the unit was read and discarded and monotonic sums
+were stored bare, so `http_server_request_duration_count` was the stored name while every
+client written to the convention asked for
+`http_server_request_duration_milliseconds_count`. The query succeeded and matched nothing
+— a dashboard showed `0` rather than an error. Measured against a real deployment, 60 of
+the 64 metric names its UI asked for did not exist.
+
+Names written before the upgrade keep their old spelling until retention removes them, so
+a range that straddles it has both. Nothing needs to be done about that beyond waiting.
+
 ### PromQL subset
 
 Driven by what `PromqlCompiler` actually generates:

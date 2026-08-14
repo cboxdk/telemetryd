@@ -233,7 +233,7 @@ Security:
   ingest       token required
   query        token required
   admin        token required
-  identity     open on / and /status: telemetryd 0.42.0, storage format 1,
+  identity     open on / and /status: telemetryd 0.43.0, storage format 1,
                three signals. Never the deployment. Not a setting.
 ```
 

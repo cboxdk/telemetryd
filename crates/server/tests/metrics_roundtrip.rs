@@ -176,7 +176,10 @@ async fn otlp_metrics_in_promql_out() {
     assert_eq!(body, json!({}), "a clean batch reports no partial success");
 
     // The counter climbs 100 every 10s, so the rate is 10/sec.
-    let query = urlencode(r#"rate(http_requests{app="checkout"}[60s])"#);
+    // `http.requests` is a monotonic sum, so it is stored as `http_requests_total` —
+    // the suffix that makes it a counter to any Prometheus client. It carries no unit,
+    // so nothing else is appended.
+    let query = urlencode(r#"rate(http_requests_total{app="checkout"}[60s])"#);
     let (status, response) = harness
         .get(&format!(
             "/api/v1/query?query={query}&time={}",
@@ -206,7 +209,7 @@ async fn a_range_query_returns_a_matrix_with_one_point_per_step() {
     let harness = Harness::new();
     harness.post_otlp(&otlp_counter()).await;
 
-    let query = urlencode("http_requests");
+    let query = urlencode("http_requests_total");
     let (status, response) = harness
         .get(&format!(
             "/api/v1/query_range?query={query}&start={}&end={}&step=15",

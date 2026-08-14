@@ -139,6 +139,78 @@ pub fn prometheus_name(otlp_name: &str) -> String {
     if out.is_empty() { "_".to_owned() } else { out }
 }
 
+/// UCUM units, as Prometheus spells them in a metric name.
+///
+/// From the OpenTelemetry-to-Prometheus compatibility specification. Anything not listed
+/// is left alone rather than guessed at: an unknown unit appended verbatim would produce
+/// a name nobody queries, which is the failure this whole function exists to end.
+const UNITS: &[(&str, &str)] = &[
+    ("d", "days"),
+    ("h", "hours"),
+    ("min", "minutes"),
+    ("s", "seconds"),
+    ("ms", "milliseconds"),
+    ("us", "microseconds"),
+    ("ns", "nanoseconds"),
+    ("By", "bytes"),
+    ("KiBy", "kibibytes"),
+    ("MiBy", "mebibytes"),
+    ("GiBy", "gibibytes"),
+    ("TiBy", "tibibytes"),
+    ("KBy", "kilobytes"),
+    ("MBy", "megabytes"),
+    ("GBy", "gigabytes"),
+    ("TBy", "terabytes"),
+    ("%", "percent"),
+    ("Cel", "celsius"),
+    ("Hz", "hertz"),
+    ("V", "volts"),
+    ("A", "amperes"),
+    ("J", "joules"),
+    ("W", "watts"),
+];
+
+/// Assemble the name a Prometheus client will actually ask for.
+///
+/// # The bug this closes
+///
+/// The unit arrived on every OTLP metric and was read into a field nothing used, and
+/// monotonic sums were stored under their bare name. So `http.server.request.duration`
+/// with `unit: "ms"` was stored as `http_server_request_duration`, while every query
+/// written to the convention asks for `http_server_request_duration_milliseconds`. The
+/// request succeeds and matches nothing, so a dashboard shows `0` rather than an error —
+/// measured against a real deployment, 60 of the 64 metric names its UI asks for did not
+/// exist, and 914 successful queries had returned nothing.
+///
+/// Two rules, both from the OpenTelemetry-to-Prometheus specification:
+///
+/// - the unit becomes part of the name, spelled out — `ms` → `milliseconds`
+/// - a monotonic sum gets `_total`, which is what makes it a counter to a reader
+///
+/// `1` is dimensionless and adds nothing; a unit already present in the name is not
+/// repeated, because producers that follow the convention themselves would otherwise get
+/// `_seconds_seconds`.
+fn prometheus_metric_name(otlp_name: &str, unit: &str, counter: bool) -> String {
+    let mut name = prometheus_name(otlp_name);
+
+    let unit = unit.trim();
+    if !unit.is_empty()
+        && unit != "1"
+        && let Some((_, word)) = UNITS.iter().find(|(ucum, _)| *ucum == unit)
+        && !name.ends_with(word)
+    {
+        name.push('_');
+        name.push_str(word);
+    }
+
+    // Suffix order matters: `_total` goes last, so a counter in seconds is
+    // `x_seconds_total` and not `x_total_seconds`.
+    if counter && !name.ends_with("_total") {
+        name.push_str("_total");
+    }
+    name
+}
+
 /// Decode an `ExportMetricsServiceRequest`.
 pub fn decode(
     body: &[u8],
@@ -189,25 +261,30 @@ fn convert_metric(
         ));
         return;
     }
-    let name = prometheus_name(&metric.name);
-
     if let Some(gauge) = &metric.gauge {
+        // A gauge is never a counter, so it never takes `_total`.
+        let name = prometheus_metric_name(&metric.name, &metric.unit, false);
         for point in &gauge.data_points {
             push_number(&name, MetricKind::Gauge, point, resource, app, ctx, decoded);
         }
     }
     if let Some(sum) = &metric.sum {
-        // Monotonic is the only thing that makes a sum a counter.
+        // Monotonic is the only thing that makes a sum a counter — and the only thing
+        // that earns `_total`.
         let kind = if sum.is_monotonic {
             MetricKind::Counter
         } else {
             MetricKind::Gauge
         };
+        let name = prometheus_metric_name(&metric.name, &metric.unit, sum.is_monotonic);
         for point in &sum.data_points {
             push_number(&name, kind, point, resource, app, ctx, decoded);
         }
     }
     if let Some(histogram) = &metric.histogram {
+        // `_count`, `_sum` and `_bucket` are the counter-ish suffixes here; `_total` is
+        // not part of the histogram convention.
+        let name = prometheus_metric_name(&metric.name, &metric.unit, false);
         for point in &histogram.data_points {
             push_histogram(&name, point, resource, app, ctx, decoded);
         }
@@ -554,6 +631,55 @@ mod tests {
                 "name":"up","gauge":{"dataPoints":[{"asDouble":1}]}}]}]}]}"#,
         );
         assert_eq!(decoded.records[0].timestamp_nanos, NOW);
+    }
+
+    #[test]
+    fn a_metric_name_carries_its_unit_and_a_counter_says_total() {
+        // Measured against a real deployment before this existed: 60 of the 64 metric
+        // names the UI asks for did not exist, and 914 successful queries had returned
+        // nothing. A name that is merely wrong produces `200` with an empty result, so a
+        // dashboard shows `0` instead of an error and nothing anywhere says why.
+        assert_eq!(
+            prometheus_metric_name("http.server.request.duration", "ms", false),
+            "http_server_request_duration_milliseconds"
+        );
+        assert_eq!(
+            prometheus_metric_name("cache.operations", "1", true),
+            "cache_operations_total",
+            "`1` is dimensionless and adds nothing to the name"
+        );
+        assert_eq!(
+            prometheus_metric_name("worker.memory", "By", false),
+            "worker_memory_bytes"
+        );
+
+        // Order: a counter measured in seconds is `_seconds_total`, never
+        // `_total_seconds`.
+        assert_eq!(
+            prometheus_metric_name("job.time", "s", true),
+            "job_time_seconds_total"
+        );
+
+        // A producer already following the convention must not be doubled up.
+        assert_eq!(
+            prometheus_metric_name("queue_wait_seconds", "s", false),
+            "queue_wait_seconds"
+        );
+        assert_eq!(
+            prometheus_metric_name("requests_total", "1", true),
+            "requests_total"
+        );
+
+        // An unknown unit is left off rather than guessed at: appending it verbatim
+        // would produce a name nobody queries, which is the failure being fixed.
+        assert_eq!(
+            prometheus_metric_name("odd.thing", "furlongs", false),
+            "odd_thing"
+        );
+        assert_eq!(
+            prometheus_metric_name("plain.gauge", "", false),
+            "plain_gauge"
+        );
     }
 
     #[test]
