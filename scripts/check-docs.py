@@ -107,6 +107,21 @@ def check_versions() -> list[str]:
             if number != current:
                 rel = md.relative_to(REPO)
                 problems.append(f"{rel}: says version {number}, crate is {current}")
+
+    # The Homebrew formula is not a doc, but it is the same failure and it is worse: a
+    # stale one fails the release *after* the tag is published, when the fix costs
+    # another version rather than another line. CI catches it and the publish script
+    # refuses to run — both of them too late to be useful. This is the check running at
+    # the moment it can still be acted on.
+    formula = REPO / "packaging" / "telemetryd.rb"
+    declared = re.search(r'^\s*version "([^"]+)"', formula.read_text(), re.M)
+    if not declared:
+        problems.append("packaging/telemetryd.rb declares no version")
+    elif declared.group(1) != current:
+        problems.append(
+            f"packaging/telemetryd.rb: says version {declared.group(1)}, crate is "
+            f"{current} — bump it in the same commit or the release fails after tagging"
+        )
     return problems
 
 
