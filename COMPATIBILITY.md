@@ -170,6 +170,20 @@ rest and reports the refusal through OTLP's own `partialSuccess` field.
 The UI checks `status`, checks `resultType == "streams"`, and reads
 `result[].stream` plus `result[].values[]`.
 
+**Metadata keys are sanitised; trace attributes are not.** A Loki structured-metadata key
+must be a valid label name, and a label name cannot contain a dot — so `db.query.text`
+leaves this API as `db_query_text`, and a client reads `labels['db_query_text']`. Span
+attributes keep the OTLP spelling, because TraceQL addresses `span.db.query.text` and a
+trace view reads `attributes['db.query.text']`. The two formats genuinely differ and
+matching each is the point; the same client uses both spellings, one per signal.
+
+Label *filters* accept either spelling, so `| db_query_text="x"` and `| db.query.text="x"`
+reach the same attribute. That leniency is why this was invisible for so long: the filter
+matched and the read came back empty.
+
+Two attributes that sanitise to one key — `order.id` and `order_id` on one record — keep
+the first, deterministically.
+
 **Entries carry structured metadata.** Each `values` element is
 `[timestamp, line]` or `[timestamp, line, {…}]`. The third element is where
 per-record OTLP attributes go — `order.id`, `session.id`, `trace_id`. The UI merges it

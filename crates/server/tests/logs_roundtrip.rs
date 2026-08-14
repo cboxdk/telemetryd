@@ -621,9 +621,9 @@ async fn a_protobuf_log_batch_is_stored_and_queryable() {
 
     // The attributes survive both the encoding and the resource/record distinction.
     let metadata = &result[0]["values"][0][2];
-    assert_eq!(metadata["order.id"], "A-99");
+    assert_eq!(metadata["order_id"], "A-99");
     assert_eq!(
-        metadata["k8s.pod.name"], "pod-7f",
+        metadata["k8s_pod_name"], "pod-7f",
         "a resource attribute no stream label claimed must survive the protobuf path too"
     );
 }
@@ -677,7 +677,7 @@ async fn a_parser_stage_returns_the_fields_it_extracted() {
     // matched on — `| json | order_id="A-1"` worked before this and still does.
     assert_eq!(metadata["order_id"], "A-1");
     // Record attributes still come through beside them.
-    assert_eq!(metadata["trace.id"], "T-9");
+    assert_eq!(metadata["trace_id"], "T-9");
 }
 
 /// A query with no parser stage pays nothing for the one above.
@@ -699,7 +699,7 @@ async fn a_query_without_a_parser_extracts_nothing() {
 
     // The body is valid JSON, and nothing asked for it to be parsed.
     assert!(metadata.get("level_extracted").is_none(), "{metadata}");
-    assert_eq!(metadata["order.id"], "1", "attributes are unaffected");
+    assert_eq!(metadata["order_id"], "1", "attributes are unaffected");
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,8 +1070,16 @@ async fn record_attributes_are_returned_as_structured_metadata() {
     let entry = &response["data"]["result"][0]["values"][0];
     let tuple = entry.as_array().unwrap();
     assert_eq!(tuple.len(), 3, "expected structured metadata, got {entry}");
-    // Attributes keep the producer's key spelling all the way to the wire.
-    assert_eq!(tuple[2]["order.id"], "1002");
+    // Sanitised on the way out, because a Loki structured-metadata key must be a valid
+    // label name and a label name cannot contain a dot. The client reads
+    // `labels['order_id']`; the dotted form is a key nothing on this API can address.
+    // Trace attributes are the other convention and stay dotted — see the Tempo tests.
+    assert_eq!(tuple[2]["order_id"], "1002");
+    assert!(
+        tuple[2].get("order.id").is_none(),
+        "the dotted spelling must not also be emitted: {}",
+        tuple[2]
+    );
 
     // Stream labels stay in `stream`, not duplicated into the metadata.
     assert!(tuple[2].get("app").is_none());

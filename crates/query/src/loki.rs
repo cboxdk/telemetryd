@@ -514,11 +514,35 @@ fn group_into_streams(
     let parses = query.has_parser_stage();
     let mut grouped: BTreeMap<Labels, Vec<Entry>> = BTreeMap::new();
     for record in records {
-        let mut metadata: BTreeMap<String, String> = record
-            .attributes
-            .iter()
-            .map(|(k, v)| (k.to_owned(), v.to_owned()))
-            .collect();
+        // Structured-metadata keys are sanitised on the way out, so `db.query.text`
+        // leaves as `db_query_text`.
+        //
+        // Loki's structured metadata keys must be valid label names, and a label name
+        // cannot contain a dot — so a Loki client reads `db_query_text` and never the
+        // dotted form. telemetryd stored and emitted the producer's own spelling on the
+        // grounds that a viewer should show what was sent, which is true of a *trace*
+        // attribute and wrong here: it produced a key no client of this API can address.
+        //
+        // Measured against the real client: its filter matched, because label filters
+        // accept either spelling, and then every read of `labels['db_query_text']` came
+        // back empty. Rows present, fields blank, no error anywhere — the same silent
+        // shape as the metric-name bug, on the other signal.
+        //
+        // Traces are unchanged and stay dotted: TraceQL addresses `span.db.query.text`,
+        // and the same client reads `attributes['db.query.text']` there. The two formats
+        // genuinely differ, and matching each is what compatibility means.
+        //
+        // Two attributes can sanitise to one key — `order.id` and `order_id` on the same
+        // record both become `order_id`. First wins, deterministically, rather than
+        // whichever happened to be inserted last: losing a value silently is the thing
+        // this whole change is about, and at least this way the same record always
+        // renders the same.
+        let mut metadata: BTreeMap<String, String> = BTreeMap::new();
+        for (key, value) in record.attributes.iter() {
+            metadata
+                .entry(telemetryd_core::record::sanitize_label_name(key))
+                .or_insert_with(|| value.to_owned());
+        }
 
         // Fields a `| json` or `| logfmt` stage pulled out of the body. Without these a
         // filter selected on a value the caller could never see.

@@ -139,7 +139,8 @@ LOGS = {
                             "timeUnixNano": str(NOW + i * 1_000_000),
                             "severityText": "ERROR" if i % 5 == 0 else "INFO",
                             "body": {"stringValue": f"payment attempt {i} for order {1000 + i}"},
-                            # A dotted key: ingest must keep the producer's spelling.
+                            # A dotted key: stored verbatim, sanitised on the Loki
+                            # response, kept dotted on the Tempo one.
                             "attributes": [
                                 {"key": "exception.type", "value": {"stringValue": "TimeoutError"}}
                             ],
@@ -285,8 +286,13 @@ def main() -> int:
             "/loki/api/v1/query_range", query='{service_name="checkout"}', limit=1, **window
         )
         raw = json.dumps(body)
-        check("attribute keys keep the producer's spelling",
-              "exception.type" in raw and "exception_type" not in raw)
+        # Sanitised on the Loki side, dotted on the Tempo side — the two formats have
+        # different rules and the client reads each accordingly. A Loki
+        # structured-metadata key must be a valid label name, which cannot contain a dot;
+        # `exception.type` as a key is one nothing on this API can address, and it read
+        # back empty in the real client while its filter matched.
+        check("Loki metadata keys are sanitised",
+              "exception_type" in raw and "exception.type" not in raw)
 
         print("\n=== traces ===")
         status, body = request(f"/api/traces/{TRACE_ID}")
