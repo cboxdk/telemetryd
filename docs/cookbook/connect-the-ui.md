@@ -37,7 +37,7 @@ curl -s -H 'Accept: application/json' https://telemetry.example.com/
 ```json
 {
   "product": "telemetryd",
-  "version": "0.44.0",
+  "version": "0.45.0",
   "storage_format_version": 1,
   "signals": ["logs", "metrics", "traces"],
   "surfaces": [
@@ -68,7 +68,7 @@ curl -s https://telemetry.example.com/status
 ```
 
 ```json
-{"product":"telemetryd","version":"0.44.0","storage_format_version":1,
+{"product":"telemetryd","version":"0.45.0","storage_format_version":1,
  "signals":["logs","metrics","traces"]}
 ```
 

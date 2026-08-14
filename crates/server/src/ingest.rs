@@ -87,6 +87,25 @@ where
     }
 }
 
+/// Count every rejection this batch produced, by reason.
+///
+/// Called after the store has been asked to append, because that is when the full set is
+/// known: the decoder's rejections are present from the start, and a record turned away
+/// by the series limit is added only once the store reports it. Counting earlier — which
+/// is what this used to do — silently omitted the entire second category.
+fn count_rejections<T>(
+    state: &AppState,
+    signal: &'static str,
+    decoded: &telemetryd_ingest::Decoded<T>,
+) {
+    for rejection in &decoded.rejections {
+        state.metrics.incr(
+            "telemetryd_ingest_rejected_total",
+            &[("signal", signal), ("reason", rejection.reason.as_str())],
+        );
+    }
+}
+
 /// `POST /v1/logs`
 pub async fn otlp_logs(
     State(state): State<AppState>,
@@ -144,12 +163,6 @@ pub async fn otlp_logs(
         decoded.records.iter_mut().map(|record| &mut record.stream),
     );
 
-    for rejection in &decoded.rejections {
-        state.metrics.incr(
-            "telemetryd_ingest_rejected_total",
-            &[("signal", "logs"), ("reason", rejection.reason.as_str())],
-        );
-    }
     if decoded.rescaled_timestamps > 0 {
         state.metrics.add(
             "telemetryd_ingest_timestamps_rescaled_total",
@@ -179,6 +192,18 @@ pub async fn otlp_logs(
             .await
             .map_err(|e| Error::Config(format!("ingest task panicked: {e}")))??;
         decoded.note_series_rejections(admitted.rejected, admitted.reason);
+
+        // Counted here, after the store has spoken, rather than before it.
+        //
+        // The loop used to sit above this call, so it saw only the rejections the decoder
+        // had produced. A record refused by the *series limit* is added by the line above
+        // — after the counting had already happened — so those never reached
+        // `telemetryd_ingest_rejected_total` at all. Measured on a real deployment:
+        // `telemetryd_series_rejected_total` at 4,397 and the reason-labelled counter
+        // empty, while every log record was being turned away. `partialSuccess` said so
+        // on every response and nothing anyone monitors did, which is why it took an hour
+        // to find something the server knew immediately.
+        count_rejections(&state, "logs", &decoded);
         let accepted = admitted.stored as u64;
 
         state.metrics.add(
@@ -241,12 +266,6 @@ pub async fn otlp_traces(
         }
     };
 
-    for rejection in &decoded.rejections {
-        state.metrics.incr(
-            "telemetryd_ingest_rejected_total",
-            &[("signal", "traces"), ("reason", rejection.reason.as_str())],
-        );
-    }
     if decoded.rescaled_timestamps > 0 {
         state.metrics.add(
             "telemetryd_ingest_timestamps_rescaled_total",
@@ -269,6 +288,18 @@ pub async fn otlp_traces(
             .await
             .map_err(|e| Error::Config(format!("ingest task panicked: {e}")))??;
         decoded.note_series_rejections(admitted.rejected, admitted.reason);
+
+        // Counted here, after the store has spoken, rather than before it.
+        //
+        // The loop used to sit above this call, so it saw only the rejections the decoder
+        // had produced. A record refused by the *series limit* is added by the line above
+        // — after the counting had already happened — so those never reached
+        // `telemetryd_ingest_rejected_total` at all. Measured on a real deployment:
+        // `telemetryd_series_rejected_total` at 4,397 and the reason-labelled counter
+        // empty, while every log record was being turned away. `partialSuccess` said so
+        // on every response and nothing anyone monitors did, which is why it took an hour
+        // to find something the server knew immediately.
+        count_rejections(&state, "traces", &decoded);
         let accepted = admitted.stored as u64;
 
         state.metrics.add(
@@ -415,12 +446,6 @@ async fn store_samples(
     state: &AppState,
     mut decoded: telemetryd_ingest::Decoded<telemetryd_core::MetricSample>,
 ) -> Result<Response, ApiError> {
-    for rejection in &decoded.rejections {
-        state.metrics.incr(
-            "telemetryd_ingest_rejected_total",
-            &[("signal", "metrics"), ("reason", rejection.reason.as_str())],
-        );
-    }
     if decoded.rescaled_timestamps > 0 {
         state.metrics.add(
             "telemetryd_ingest_timestamps_rescaled_total",
@@ -437,6 +462,18 @@ async fn store_samples(
             .await
             .map_err(|e| Error::Config(format!("ingest task panicked: {e}")))??;
         decoded.note_series_rejections(admitted.rejected, admitted.reason);
+
+        // Counted here, after the store has spoken, rather than before it.
+        //
+        // The loop used to sit above this call, so it saw only the rejections the decoder
+        // had produced. A record refused by the *series limit* is added by the line above
+        // — after the counting had already happened — so those never reached
+        // `telemetryd_ingest_rejected_total` at all. Measured on a real deployment:
+        // `telemetryd_series_rejected_total` at 4,397 and the reason-labelled counter
+        // empty, while every log record was being turned away. `partialSuccess` said so
+        // on every response and nothing anyone monitors did, which is why it took an hour
+        // to find something the server knew immediately.
+        count_rejections(state, "metrics", &decoded);
         let accepted = admitted.stored as u64;
 
         state.metrics.add(

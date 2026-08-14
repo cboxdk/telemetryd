@@ -113,8 +113,11 @@ metrics = "30d"
 # Exceeding any of these rejects the record loudly: a labelled counter on
 # telemetryd_ingest_rejected_total, a structured error, and a count in /status.
 # Nothing here causes a silent drop.
+# About 1.0 KB of memory per series, so this ceiling is roughly 140 MB.
 max_series            = 100000
-max_series_per_app    = 20000
+# Fairness between apps, not a memory ceiling — so it does not bind by default.
+# Lower it when several apps share an instance and one must not crowd out the rest.
+max_series_per_app    = 100000
 max_labels_per_series = 60
 max_label_name_bytes  = 128
 max_label_value_bytes = 2048

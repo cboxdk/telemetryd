@@ -638,7 +638,41 @@ impl RetentionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct LimitsConfig {
+    /// The ceiling on distinct series across every app, and in practice the memory
+    /// ceiling for the process.
+    ///
+    /// Measured against the release binary: 100,000 distinct metric series took a serving
+    /// process from 11 MB to 138 MB, growing linearly at about 1.0 KB per series across
+    /// the whole range. The default is picked from that — it is the largest number that
+    /// keeps a VPS-sized instance comfortably inside a couple of hundred megabytes.
+    ///
+    /// The first attempt at that measurement pushed 100,000 log records carrying 100,000
+    /// distinct *attribute* values and reported a number for them. Log attributes are
+    /// structured metadata rather than stream labels, so all 100,000 were one series, and
+    /// what got measured was the cost of records. Series cardinality has to be driven
+    /// through label sets — the instance's own `series_active` is what says whether it
+    /// was.
     pub max_series: u64,
+    /// The ceiling on distinct series for any one app.
+    ///
+    /// # Why this defaults to the same number as `max_series`
+    ///
+    /// It defaulted to a fifth of it, and that was wrong in the case telemetryd is
+    /// actually for. This limit exists to stop one noisy app consuming the budget the
+    /// others need — a fairness property, and one that has no meaning at all when a
+    /// deployment has one app, which is the common shape here. What it did instead was
+    /// hand the sole user of a 100,000-series budget a 20,000-series ceiling.
+    ///
+    /// That is not a hypothetical. A single small Laravel site — 144 routes, request
+    /// histograms across method, status and bucket — reached the per-app cap and had
+    /// every subsequent log stream refused, on an instance using 0.3% of its disk. The
+    /// workload the default was meant to serve did not fit inside it.
+    ///
+    /// So the default no longer binds before the global limit does, and fairness between
+    /// apps is something an operator with several apps opts into. The memory ceiling is
+    /// `max_series` and it still holds; this one is about who gets to fill it. Running
+    /// out is loud either way — counted, reported in the OTLP response, and warned about
+    /// at 90% in `telemetryd status`.
     pub max_series_per_app: u64,
     pub max_labels_per_series: u32,
     pub max_label_name_bytes: u32,
@@ -680,7 +714,7 @@ impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             max_series: 100_000,
-            max_series_per_app: 20_000,
+            max_series_per_app: 100_000,
             max_labels_per_series: 60,
             max_label_name_bytes: 128,
             max_label_value_bytes: 2048,

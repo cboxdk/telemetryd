@@ -470,6 +470,77 @@ fn launchd_plist(exe: &str) -> String {
     )
 }
 
+/// Directives this version's unit has that the installed one does not.
+///
+/// # Why this is checked at all
+///
+/// Upgrading telemetryd replaces the binary and nothing else. The unit file was written
+/// once, by whichever version happened to be installed that day, and it stays exactly as
+/// it was — so a directive added later never reaches the machine. That is not
+/// theoretical: `ExecReload` arrived in 0.34.0, and a box running 0.44.0 answered
+/// `systemctl reload` with "Job type reload is not applicable for unit
+/// telemetryd.service", because its unit predated the line. Nothing anywhere said why.
+///
+/// Only directive *names* are compared, and only in one direction. Values cannot be
+/// compared: `ExecStart` embeds the path this binary was invoked from, `User=` is an
+/// install-time choice, and the `.deb`'s unit legitimately differs from a
+/// `service install` one in both. A name present in the template and absent from disk is
+/// the narrow thing that actually means "written by an older version", and it is the
+/// only thing reported.
+pub fn missing_directives() -> Vec<String> {
+    let Ok(path) = unit_path() else {
+        return Vec::new();
+    };
+    let Ok(installed) = std::fs::read_to_string(&path) else {
+        // No unit is not a stale unit. Plenty of instances run under something else, or
+        // in the foreground.
+        return Vec::new();
+    };
+    // The account only reaches `User=`/`Group=`, which are excluded below, so any value
+    // renders the same set of names.
+    let Ok(current) = unit_for_this_platform("telemetryd") else {
+        return Vec::new();
+    };
+
+    missing_from(&installed, &current)
+}
+
+fn missing_from(installed: &str, current: &str) -> Vec<String> {
+    let on_disk: std::collections::HashSet<&str> = directives(installed).collect();
+    directives(current)
+        .filter(|key| !on_disk.contains(key))
+        // Written by the operator's choice rather than by the template, and absent from
+        // a launchd plist entirely.
+        .filter(|key| !matches!(*key, "User" | "Group"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The left-hand sides of a unit file, ignoring comments and section headers.
+///
+/// A launchd plist is XML rather than `key=value`, so this yields nothing for one — and
+/// yielding nothing is the correct answer there, not a bug to work around. macOS runs
+/// this as a user agent that is reinstalled by hand, and inventing a plist differ to
+/// support it would be more code than the problem is worth.
+///
+/// The identifier filter is what makes that true. Without it a plist yields two
+/// "directives" — `<?xml version` and `<plist version`, both of which contain an `=` —
+/// which is harmless while both sides are plists and nonsense the moment anything else
+/// is compared. A systemd directive is one word; nothing else counts as one.
+fn directives(unit: &str) -> impl Iterator<Item = &str> {
+    unit.lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#') && !line.starts_with('['))
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, _)| key.trim())
+        .filter(|key| {
+            !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+}
+
 fn manual_steps() -> &'static str {
     if cfg!(target_os = "macos") {
         "  telemetryd service print > ~/Library/LaunchAgents/dk.cbox.telemetryd.plist\n  \
@@ -486,6 +557,41 @@ fn manual_steps() -> &'static str {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// The case this was built for: a unit written before `ExecReload` existed, which is
+    /// what a box that has only ever had its *binary* upgraded is running.
+    #[test]
+    fn a_unit_written_by_an_older_version_is_named_directive_by_directive() {
+        let current = systemd_unit("/usr/bin/telemetryd", "telemetryd");
+        let older: String = current
+            .lines()
+            .filter(|line| !line.starts_with("ExecReload="))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(missing_from(&older, &current), vec!["ExecReload"]);
+    }
+
+    /// The same unit installed under a different account, or from the `.deb` with its own
+    /// `ExecStart` path, is not stale — and saying it is would train people to ignore the
+    /// warning that matters.
+    #[test]
+    fn a_current_unit_is_not_stale_whatever_its_paths_and_account_say() {
+        let current = systemd_unit("/usr/bin/telemetryd", "telemetryd");
+        let installed = systemd_unit("/usr/local/bin/telemetryd", "forge");
+
+        assert!(missing_from(&installed, &current).is_empty());
+        assert!(missing_from(&current, &current).is_empty());
+    }
+
+    /// A plist yields no directives at all, so macOS reports nothing rather than
+    /// reporting every line of the systemd template as missing.
+    #[test]
+    fn a_launchd_plist_is_compared_against_nothing() {
+        let plist = launchd_plist("/usr/local/bin/telemetryd");
+        assert_eq!(directives(&plist).count(), 0);
+        assert!(missing_from(&plist, &plist).is_empty());
+    }
 
     /// The report has to name the directory the *service* used, which is not the one
     /// the CLI resolves interactively — `/var/lib/telemetryd` against

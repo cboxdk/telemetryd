@@ -108,8 +108,8 @@ metrics = "30d"                      # cheaper per unit time — D3
 [limits]
 # Exceeding any of these rejects the record and increments a labelled
 # self-metric; it is never a silent drop. See /status for live counts.
-max_series              = 100_000    # global metric series cardinality
-max_series_per_app      = 20_000
+max_series              = 100_000    # all apps; ~1.1 KB of memory each, so ~200 MB here
+max_series_per_app      = 100_000    # fairness between apps; does not bind by default
 max_labels_per_series   = 60
 max_label_name_bytes    = 128
 max_label_value_bytes   = 2048
@@ -233,7 +233,7 @@ Security:
   ingest       token required
   query        token required
   admin        token required
-  identity     open on / and /status: telemetryd 0.44.0, storage format 1,
+  identity     open on / and /status: telemetryd 0.45.0, storage format 1,
                three signals. Never the deployment. Not a setting.
 ```
 

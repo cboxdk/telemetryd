@@ -1231,6 +1231,63 @@ async fn a_new_series_past_the_cap_is_refused_and_reported() {
     );
 }
 
+/// The refusals also have to reach `telemetryd_ingest_rejected_total`.
+///
+/// They did not, and the way they did not is worth keeping a test for: the counting loop
+/// ran over `decoded.rejections` *before* the store was called, and series refusals are
+/// appended to that list by `note_series_rejections` *after* the store answers. Every
+/// decode-time rejection was counted and every cardinality rejection was invisible. On a
+/// live instance that meant 4,397 refused records, a counter reading zero, a green
+/// `doctor`, and an afternoon spent looking everywhere except at the limit.
+#[tokio::test]
+async fn refusals_past_the_cap_reach_the_rejection_counter() {
+    let harness = Harness::new(|config| {
+        config.limits.max_series = 5;
+        config.limits.max_series_per_app = 5;
+    });
+
+    for i in 0..20 {
+        let payload = serde_json::json!({
+            "resourceLogs": [{
+                "resource": {"attributes": [
+                    {"key": "service.name", "value": {"stringValue": format!("svc-{i}")}}
+                ]},
+                "scopeLogs": [{"logRecords": [{
+                    "timeUnixNano": (1_786_000_000_000_000_000u64 + i).to_string(),
+                    "severityText": "INFO",
+                    "body": {"stringValue": "x"},
+                    "attributes": [],
+                }]}],
+            }]
+        })
+        .to_string();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        let (status, _, _) = harness.request(request).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let (_, _, metrics) = harness.get("/metrics").await;
+    let counted = metrics
+        .lines()
+        .find(|line| {
+            line.starts_with("telemetryd_ingest_rejected_total") && line.contains("series_limit")
+        })
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.trim().parse::<f64>().ok());
+
+    assert_eq!(
+        counted,
+        Some(15.0),
+        "every refused record should be on the counter:\n{metrics}"
+    );
+}
+
 /// A series already being stored keeps working once the cap is reached.
 #[tokio::test]
 async fn an_existing_series_still_ingests_at_the_cap() {

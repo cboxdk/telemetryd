@@ -29,8 +29,14 @@ that nothing panicked.
 records that would create a *new* series past the limit, while series already being
 stored keep ingesting — a labelling mistake should not take out the telemetry that
 still works. Refusals reach the producer in `partialSuccess`, a log line naming the
-limit, and `telemetryd_series_rejected_total`. The count is rebuilt after each
-retention pass, so expired data gives its budget back.
+limit, `telemetryd_ingest_rejected_total{reason="series_limit"}` and
+`telemetryd_series_rejected_total`. The count is rebuilt after each retention pass, so
+expired data gives its budget back.
+
+Usage sits beside the limit in `telemetryd status`, globally and per app, with a warning
+past 90%. That is there because the alternative was measured: an instance at its per-app
+cap refused every new log stream for hours while reporting 0.3% of its disk used, and
+nothing in `status`, `doctor` or the exporter's response said which limit was full.
 
 **Storage.** Write-ahead log with crash recovery, immutable Parquet segments, per-segment
 stream dictionary, Bloom filters for exact-key lookup, trigram indexes for substring

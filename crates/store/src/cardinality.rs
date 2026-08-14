@@ -158,6 +158,22 @@ impl Cardinality {
         read(&self.state).global.len() as u64
     }
 
+    /// Live series per app, which is not the same thing as the per-app figures derived
+    /// from sealed segments.
+    ///
+    /// This is what the per-app *limit* is enforced against, so it is what a report on
+    /// that limit has to read. The segment-derived numbers lag by however long a segment
+    /// takes to seal and are empty on a fresh instance — which is precisely the window in
+    /// which someone is finding out that their app has hit a cap.
+    #[must_use]
+    pub fn series_by_app(&self) -> std::collections::BTreeMap<String, u64> {
+        read(&self.state)
+            .per_app
+            .iter()
+            .map(|(app, series)| (app.clone(), series.len() as u64))
+            .collect()
+    }
+
     #[must_use]
     pub fn rejected_records(&self) -> u64 {
         self.rejected.load(std::sync::atomic::Ordering::Relaxed)

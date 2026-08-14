@@ -28,6 +28,20 @@ Every rejection is counted with a reason. `body_too_large`, `too_many_labels`,
 `invalid_metric_name`, `missing_trace_id` each point somewhere specific. telemetryd
 never drops data quietly, so a zero here genuinely means nothing was refused.
 
+`series_limit` is the one that looks least like a problem and is the most confusing to
+run into. It refuses only **new** series, so everything already flowing keeps flowing and
+one signal simply stops appearing — usually logs, because metrics got there first and
+filled the budget. `telemetryd status` puts the usage next to the limit:
+
+```
+  series       98432 of 100000 (98.4%)
+               98432 of 100000 (98.4%) for checkout, the largest
+```
+
+Past 90% it also says so under **Attention**. Raise `limits.max_series` — about 1 KB of
+memory per series — or send fewer distinct label combinations. The usual cause is a label
+carrying something unbounded: a request id, a user id, a full URL with its query string.
+
 ## 3. The timestamps are wrong
 
 ```bash

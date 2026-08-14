@@ -620,6 +620,9 @@ impl Store {
             traces: self.traces.status(),
             metrics: self.metrics.status(),
             retention: lock(&self.reaper).clone(),
+            series_active: self.cardinality.active_series(),
+            series_by_app: self.cardinality.series_by_app(),
+            series_rejected: self.cardinality.rejected_records(),
             wal_truncations: lock_read(&self.wal_truncations).clone(),
         })
     }
@@ -637,6 +640,23 @@ pub struct StoreStatus {
     pub traces: RecordStoreStatus,
     pub metrics: RecordStoreStatus,
     pub retention: ReaperReport,
+    /// Distinct series admitted right now, against `limits.max_series`.
+    ///
+    /// The disk figures were here from the first day and this was not, which had it
+    /// exactly backwards: a full disk is visible from three other directions and reaps
+    /// itself, while a full series limit is silent. An instance can sit at its cap
+    /// refusing every new stream while reporting 0.3% of the budget used, and nothing
+    /// else in this document says so.
+    pub series_active: u64,
+    /// Records refused because a cardinality cap was full. Monotonic.
+    pub series_rejected: u64,
+    /// The same count split by app, against `limits.max_series_per_app`.
+    ///
+    /// Deliberately not folded into `apps`, which reports what is *stored* — rows, bytes
+    /// and the series found in sealed segments. This reports what is *admitted*, and the
+    /// two differ by however long sealing takes. `apps` is empty for the first minutes of
+    /// an instance's life; the limit is enforced from the first record.
+    pub series_by_app: std::collections::BTreeMap<String, u64>,
     /// Non-empty when a crash cost us records. "Degrade loudly."
     pub wal_truncations: Vec<Truncation>,
 }

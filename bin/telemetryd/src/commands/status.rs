@@ -116,6 +116,131 @@ pub(crate) fn user_agent() -> String {
     format!("telemetryd/{}", telemetryd_core::VERSION)
 }
 
+/// Prints the series lines and returns the warning they imply, if any.
+///
+/// One function because the two are the same reading — the line says where the instance
+/// stands and the warning says it out loud once standing there costs data — and splitting
+/// them would mean deriving the same four numbers twice.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn report_series(status: &Value) -> Option<String> {
+    let number = |pointer: &str| {
+        status
+            .pointer(pointer)
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+    };
+    // Series usage, beside the disk line.
+    //
+    // The number that matters most on a healthy-looking instance, and the one that was
+    // nowhere: a deployment sat at 20,005 series against a 20,000 per-app cap, refusing
+    // every new log stream, while `status` reported 0.3% of the disk used and nothing
+    // else. The ceiling lived in the configuration file and the usage lived in
+    // `/metrics`, and putting the two on one line is the difference between an hour of
+    // diagnosis and a glance.
+    //
+    // Both caps, because either one alone is misleading: the global limit is what the
+    // total is measured against, and the per-app limit is what any single app hits first
+    // — and it is the per-app one that bites, since one app is usually all there is.
+    let series = number("/storage/series_active") as u64;
+    let (worst_app, worst) = biggest_app(status);
+    let max_series = limit(status, "max_series");
+    let max_per_app = limit(status, "max_series_per_app");
+    if max_series > 0 {
+        crate::out::outln!(
+            "  series       {series} of {max_series} ({:.1}%)",
+            share(series, max_series)
+        );
+        if let Some(app) = &worst_app {
+            crate::out::outln!(
+                "               {worst} of {max_per_app} ({:.1}%) for {app}, the largest",
+                share(worst, max_per_app)
+            );
+        }
+    }
+
+    // A full series limit is a silent stop: everything already flowing keeps flowing
+    // while every *new* stream is refused, so the instance looks healthy and one signal
+    // quietly never arrives. Warned at 90%, because the useful moment is before it is
+    // full — after that the data is already being lost.
+    let rejected = number("/storage/series_rejected") as u64;
+    if max_series > 0 && share(series, max_series) >= 90.0 {
+        return Some(series_alert(
+            "series",
+            series,
+            max_series,
+            "limits.max_series",
+            rejected,
+        ));
+    } else if let Some(app) = &worst_app
+        && max_per_app > 0
+        && share(worst, max_per_app) >= 90.0
+    {
+        return Some(series_alert(
+            app,
+            worst,
+            max_per_app,
+            "limits.max_series_per_app",
+            rejected,
+        ));
+    }
+    None
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn share(used: u64, cap: u64) -> f64 {
+    if cap == 0 {
+        0.0
+    } else {
+        used as f64 / cap as f64 * 100.0
+    }
+}
+
+fn limit(status: &Value, key: &str) -> u64 {
+    status
+        .pointer(&format!("/limits/{key}"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+/// The app holding the most series, which is the one that hits the per-app cap first.
+///
+/// Read from `storage.series_by_app` rather than from `apps`. `apps` describes what is
+/// stored and is derived from sealed segments, so it is empty for the first minutes of an
+/// instance's life and lags by a seal interval after that — while the per-app limit is
+/// enforced from the first record. An instance that had already refused 31 records
+/// reported `apps: []`, which would have made this line and its warning silent in exactly
+/// the situation they exist for.
+fn biggest_app(status: &Value) -> (Option<String>, u64) {
+    let Some(apps) = status
+        .pointer("/storage/series_by_app")
+        .and_then(Value::as_object)
+    else {
+        return (None, 0);
+    };
+    apps.iter()
+        .filter_map(|(app, series)| Some((app.clone(), series.as_u64()?)))
+        .max_by_key(|(_, series)| *series)
+        .map_or((None, 0), |(app, series)| (Some(app), series))
+}
+
+/// Says what is full, how full, what to change, and — when it has already cost
+/// something — how much. A cardinality ceiling is the one limit whose consequence is
+/// invisible from the data, so the number of refused records is the part that makes it
+/// concrete.
+fn series_alert(what: &str, used: u64, cap: u64, setting: &str, rejected: u64) -> String {
+    let cost = if rejected > 0 {
+        format!("; {rejected} records refused so far")
+    } else {
+        String::new()
+    };
+    format!(
+        "{what} is at {used} of {cap} series ({:.0}%){cost}. New streams are refused \
+         once it is full, silently from the sender's point of view — raise {setting} or \
+         reduce label cardinality",
+        share(used, cap)
+    )
+}
+
 // Every value here comes from a JSON number and is rendered for a human: byte
 // counts and an uptime in seconds, all far below any lossy boundary.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -159,6 +284,8 @@ fn print_summary(status: &Value) {
         bytesize::ByteSize::b(budget),
     );
 
+    let series_alert = report_series(status);
+
     if let Some(wal) = status
         .pointer("/wal")
         .or_else(|| status.pointer("/storage/wal"))
@@ -185,6 +312,19 @@ fn print_summary(status: &Value) {
              dropping the oldest data",
             bytesize::ByteSize::b(used),
             bytesize::ByteSize::b(budget)
+        ));
+    }
+    alerts.extend(series_alert);
+    // The unit file is the one thing an upgrade never touches, so the machine can be
+    // running a version whose service integration it does not have. Reported here
+    // because this is what an operator runs when something is not behaving.
+    let stale = crate::commands::service::missing_directives();
+    if !stale.is_empty() {
+        alerts.push(format!(
+            "the installed service unit predates this version and is missing {}; \
+             reinstall it with `sudo telemetryd service install` followed by \
+             `sudo systemctl daemon-reload`",
+            stale.join(", ")
         ));
     }
     if flag("/insecure") {
