@@ -131,8 +131,10 @@ impl Store {
             traces,
             metrics,
             cardinality: Cardinality::new(
-                config.limits.max_series,
-                config.limits.max_series_per_app,
+                config.limits.resolved_max_series(),
+                config.limits.resolved_max_series_per_app(),
+                config.limits.series_idle_after.0,
+                config.limits.when_series_full,
             ),
             policy: RwLock::new(RetentionPolicy {
                 disk_budget: config.storage.disk_budget.as_u64(),
@@ -393,10 +395,14 @@ impl Store {
         }
 
         let after = self.data_dir.usage()?.total();
-        // Retention just deleted series along with their segments. Recount from what
-        // survived, or the limiter would keep refusing new series against a budget
-        // held by data that no longer exists.
-        self.refresh_cardinality();
+        // No cardinality recount here any more, and its absence is the point.
+        //
+        // This used to rebuild the counted set from every stream in every surviving
+        // segment, so a series held budget until retention deleted the last segment
+        // mentioning it — thirty days for metrics. The budget therefore described what
+        // the instance had once seen rather than what it was carrying, and a renamed set
+        // of metrics cost double for a month. Series now give their slots back by falling
+        // silent, which is both sooner and the thing the limit is actually about.
 
         report.still_over_budget = after > self.disk_budget();
         if report.still_over_budget {
@@ -555,25 +561,20 @@ impl Store {
         usage
     }
 
-    /// Recount active series from the segments that still exist plus what is buffered.
-    fn refresh_cardinality(&self) {
-        let logs = self.logs.segments();
-        let traces = self.traces.segments();
-        let metrics = self.metrics.segments();
-        let streams = logs
-            .iter()
-            .chain(traces.iter())
-            .chain(metrics.iter())
-            .flat_map(|segment| segment.manifest.streams.iter())
-            .map(|labels| {
-                (
-                    labels
-                        .get(telemetryd_core::APP_LABEL)
-                        .unwrap_or(telemetryd_core::UNKNOWN_APP),
-                    labels,
-                )
-            });
-        self.cardinality.refresh(streams);
+    /// Series reclaimed after falling silent, and series evicted to make room.
+    #[must_use]
+    pub fn series_churn(&self) -> (u64, u64) {
+        (
+            self.cardinality.reclaimed_series(),
+            self.cardinality.evicted_series(),
+        )
+    }
+
+    /// Give back the budget held by series nothing has written to lately.
+    ///
+    /// Returns how many slots came back, for the maintenance log.
+    pub fn reclaim_idle_series(&self) -> usize {
+        self.cardinality.reclaim_idle()
     }
 
     /// Series counted right now, and the caps they are counted against.
@@ -622,6 +623,8 @@ impl Store {
             retention: lock(&self.reaper).clone(),
             series_active: self.cardinality.active_series(),
             series_by_app: self.cardinality.series_by_app(),
+            series_reclaimed: self.cardinality.reclaimed_series(),
+            series_evicted: self.cardinality.evicted_series(),
             series_rejected: self.cardinality.rejected_records(),
             wal_truncations: lock_read(&self.wal_truncations).clone(),
         })
@@ -650,6 +653,12 @@ pub struct StoreStatus {
     pub series_active: u64,
     /// Records refused because a cardinality cap was full. Monotonic.
     pub series_rejected: u64,
+    /// Series that gave their slot back after falling silent. Monotonic, and free —
+    /// this is the budget tracking reality, not a cost.
+    pub series_reclaimed: u64,
+    /// Series dropped to make room under `limits.when_series_full = "evict_oldest"`.
+    /// Monotonic, and *not* free: each one is data that will not be recorded.
+    pub series_evicted: u64,
     /// The same count split by app, against `limits.max_series_per_app`.
     ///
     /// Deliberately not folded into `apps`, which reports what is *stored* — rows, bytes

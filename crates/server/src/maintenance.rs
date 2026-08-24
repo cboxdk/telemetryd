@@ -13,6 +13,13 @@ use tokio::task::JoinHandle;
 
 /// How often to check whether the open buffer's window has elapsed.
 ///
+/// How often idle series are swept out of the budget.
+///
+/// A minute is well under any sensible `series_idle_after`, so a slot comes back within a
+/// minute of being eligible, and the walk is cheap enough at these sizes that the exact
+/// figure does not matter.
+const SERIES_RECLAIM_TICK: Duration = Duration::from_secs(60);
+
 /// Independent of `segment_duration`: the check is cheap, and a coarse tick would mean
 /// a segment configured to seal every minute actually sealing every tick instead.
 const SEAL_TICK: Duration = Duration::from_secs(5);
@@ -41,6 +48,34 @@ pub struct Maintenance {
 
 impl Maintenance {
     /// Expiry by age, the disk budget, and whatever a relay still owes upstream.
+    /// Give idle series their budget back on a timer.
+    ///
+    /// The ingest path already sweeps when it is about to refuse, which is when it
+    /// matters for admission. This exists so the sweep also happens on an instance
+    /// nobody is pushing against its limit — otherwise `series_active` would keep
+    /// counting series that stopped days ago, and `telemetryd status` would report a
+    /// budget filling up when it is not. A number an operator reads has to be true when
+    /// nothing is going wrong, not only when something is.
+    fn spawn_series_reclaim(tasks: &mut Vec<tokio::task::JoinHandle<()>>, store: &Arc<Store>) {
+        let store = Arc::clone(store);
+        tasks.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(SERIES_RECLAIM_TICK);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let store = Arc::clone(&store);
+                // The sweep walks every counted series under a write lock, which blocks
+                // ingest for as long as it takes. Off the async workers, like every other
+                // store call.
+                match tokio::task::spawn_blocking(move || store.reclaim_idle_series()).await {
+                    Ok(0) => {}
+                    Ok(freed) => tracing::debug!(freed, "reclaimed idle series"),
+                    Err(e) => tracing::error!(error = %e, "series reclaim task panicked"),
+                }
+            }
+        }));
+    }
+
     fn spawn_retention(
         tasks: &mut Vec<tokio::task::JoinHandle<()>>,
         store: &Arc<Store>,
@@ -240,6 +275,7 @@ impl Maintenance {
         }
 
         Self::spawn_retention(&mut tasks, store, relay.clone());
+        Self::spawn_series_reclaim(&mut tasks, store);
 
         Self::spawn_relay(&mut tasks, store, relay, relay_interval);
 

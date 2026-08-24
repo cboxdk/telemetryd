@@ -33,6 +33,13 @@ limit, `telemetryd_ingest_rejected_total{reason="series_limit"}` and
 `telemetryd_series_rejected_total`. The count is rebuilt after each retention pass, so
 expired data gives its budget back.
 
+The budget counts **active** series: one that has been silent for
+`limits.series_idle_after` gives its slot back, so a renamed metric heals within the hour
+instead of holding budget until its last segment expires. When the budget is full of
+series that are all still active, `limits.when_series_full` decides between refusing the
+newcomer and evicting the least recently written one. `max_series = 0` derives the
+ceiling from the memory the process may use.
+
 Usage sits beside the limit in `telemetryd status`, globally and per app, with a warning
 past 90%. That is there because the alternative was measured: an instance at its per-app
 cap refused every new log stream for hours while reporting 0.3% of its disk used, and

@@ -158,18 +158,34 @@ fn report_series(status: &Value) -> Option<String> {
         }
     }
 
+    // Evictions are a cost and reclaims are not, so only one of them is shown here.
+    let evicted = number("/storage/series_evicted") as u64;
+    if evicted > 0 {
+        crate::out::outln!(
+            "               {evicted} evicted to make room (when_series_full = evict_oldest)"
+        );
+    }
+
     // A full series limit is a silent stop: everything already flowing keeps flowing
     // while every *new* stream is refused, so the instance looks healthy and one signal
     // quietly never arrives. Warned at 90%, because the useful moment is before it is
     // full — after that the data is already being lost.
-    let rejected = number("/storage/series_rejected") as u64;
+    let lost = if status
+        .pointer("/limits/when_series_full")
+        .and_then(Value::as_str)
+        == Some("evict_oldest")
+    {
+        SeriesLoss::Evicted(evicted)
+    } else {
+        SeriesLoss::Refused(number("/storage/series_rejected") as u64)
+    };
     if max_series > 0 && share(series, max_series) >= 90.0 {
         return Some(series_alert(
             "series",
             series,
             max_series,
             "limits.max_series",
-            rejected,
+            lost,
         ));
     } else if let Some(app) = &worst_app
         && max_per_app > 0
@@ -180,7 +196,7 @@ fn report_series(status: &Value) -> Option<String> {
             worst,
             max_per_app,
             "limits.max_series_per_app",
-            rejected,
+            lost,
         ));
     }
     None
@@ -223,22 +239,41 @@ fn biggest_app(status: &Value) -> (Option<String>, u64) {
         .map_or((None, 0), |(app, series)| (Some(app), series))
 }
 
-/// Says what is full, how full, what to change, and — when it has already cost
-/// something — how much. A cardinality ceiling is the one limit whose consequence is
-/// invisible from the data, so the number of refused records is the part that makes it
-/// concrete.
-fn series_alert(what: &str, used: u64, cap: u64, setting: &str, rejected: u64) -> String {
-    let cost = if rejected > 0 {
-        format!("; {rejected} records refused so far")
-    } else {
-        String::new()
+/// Says what is full, how full, what it has already cost, and what to change.
+///
+/// The consequence depends on the policy, and getting that wrong is worse than leaving it
+/// out: under `evict_oldest` nothing is refused at all, and a warning that says otherwise
+/// sends someone hunting for rejections that do not exist. Both policies deserve the
+/// warning — a full budget is a full budget — but they cost different things, and the
+/// number it has already cost is what makes a cardinality ceiling concrete, since its
+/// consequence is invisible from the data itself.
+fn series_alert(what: &str, used: u64, cap: u64, setting: &str, lost: SeriesLoss) -> String {
+    let (cost, consequence) = match lost {
+        SeriesLoss::Refused(n) => (
+            (n > 0).then(|| format!("; {n} records refused so far")),
+            "New streams are refused once it is full, silently from the sender's point of view",
+        ),
+        SeriesLoss::Evicted(n) => (
+            (n > 0).then(|| format!("; {n} series evicted so far")),
+            "Every new stream now costs the least recently written one, so busy series are losing samples",
+        ),
     };
+    // Named rather than positional. The positional form silently handed `{:.0}` the
+    // cost string and the bare `{}` the percentage, which compiles and renders
+    // "(%)100" — wrong in a way no type checker catches.
     format!(
-        "{what} is at {used} of {cap} series ({:.0}%){cost}. New streams are refused \
-         once it is full, silently from the sender's point of view — raise {setting} or \
-         reduce label cardinality",
-        share(used, cap)
+        "{what} is at {used} of {cap} series ({percent:.0}%){cost}. {consequence} — \
+         raise {setting} or reduce label cardinality",
+        percent = share(used, cap),
+        cost = cost.unwrap_or_default(),
     )
+}
+
+/// What a full budget is costing, which is decided by `limits.when_series_full`.
+#[derive(Debug, Clone, Copy)]
+enum SeriesLoss {
+    Refused(u64),
+    Evicted(u64),
 }
 
 // Every value here comes from a JSON number and is rendered for a human: byte

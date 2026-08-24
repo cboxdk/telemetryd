@@ -199,6 +199,16 @@ pub const DESCRIPTORS: &[Descriptor] = &[
         help: "Configured limits.max_series, so the active count can be alerted on as a ratio",
     },
     Descriptor {
+        name: "telemetryd_series_reclaimed_total",
+        kind: Kind::Counter,
+        help: "Series that gave their budget slot back after falling silent — free, and the budget tracking reality",
+    },
+    Descriptor {
+        name: "telemetryd_series_evicted_total",
+        kind: Kind::Counter,
+        help: "Series dropped to make room under limits.when_series_full = evict_oldest — each one is data not recorded",
+    },
+    Descriptor {
         name: "telemetryd_segments_unreadable_total",
         kind: Kind::Counter,
         help: "Query reads skipped because a segment file is damaged — non-zero means data was lost",
@@ -301,6 +311,10 @@ impl Metrics {
     /// here would let `/metrics` report a number that is no longer true.
     #[allow(clippy::cast_precision_loss)] // exposition format is f64; counters stay far below 2^53
     pub fn render(&self, gauges: &[Sample]) -> String {
+        /// Said once per process: a scraper hits this endpoint on a loop, and one
+        /// missing descriptor must not become a log line every fifteen seconds.
+        static UNDECLARED_SAID: std::sync::Once = std::sync::Once::new();
+
         let counters = self
             .counters
             .read()
@@ -334,6 +348,33 @@ impl Metrics {
                 out.push_str(&line);
                 out.push('\n');
             }
+        }
+
+        // A sample whose name is not in DESCRIPTORS is dropped by the loop above, and
+        // dropped in perfect silence: the endpoint answers 200, the exposition parses,
+        // and the metric simply is not there. That is the same failure this project has
+        // now hit twice from the other direction — a request that succeeds and returns
+        // nothing — and it is worth failing loudly for.
+        //
+        // Debug-asserted so it stops a test run, and warned once in release so an
+        // operator is not left with a metric that never appears and no way to tell why.
+        let undeclared: Vec<&str> = gauges
+            .iter()
+            .map(|sample| sample.name)
+            .filter(|name| !DESCRIPTORS.iter().any(|d| d.name == *name))
+            .collect();
+        if !undeclared.is_empty() {
+            debug_assert!(
+                false,
+                "these gauges have no Descriptor and would be silently dropped from \
+                 /metrics: {undeclared:?}"
+            );
+            UNDECLARED_SAID.call_once(|| {
+                tracing::warn!(
+                    ?undeclared,
+                    "gauges with no descriptor are missing from /metrics"
+                );
+            });
         }
         out
     }

@@ -108,8 +108,10 @@ metrics = "30d"                      # cheaper per unit time — D3
 [limits]
 # Exceeding any of these rejects the record and increments a labelled
 # self-metric; it is never a silent drop. See /status for live counts.
-max_series              = 100_000    # all apps; ~1.1 KB of memory each, so ~200 MB here
-max_series_per_app      = 100_000    # fairness between apps; does not bind by default
+max_series              = 0          # distinct ACTIVE series, all apps; 0 = derive from memory
+max_series_per_app      = 0          # fairness between apps; 0 = same as max_series, so it never binds
+series_idle_after       = "1h"       # silence after which a series gives its slot back; 0 = off
+when_series_full        = "refuse"   # refuse | evict_oldest, when the budget is full of ACTIVE series
 max_labels_per_series   = 60
 max_label_name_bytes    = 128
 max_label_value_bytes   = 2048
@@ -141,6 +143,46 @@ level  = "info"                      # trace | debug | info | warn | error
 format = "text"                      # text | json
 
 
+
+## The series budget
+
+`max_series` bounds distinct **active** series, which is the process's memory ceiling in
+practice — about 1 KB each, measured. `0` derives it from the memory this process may
+use, the same way the two read limits below do, so the number fits the machine rather
+than the machine fitting a number someone typed once.
+
+**A series that goes quiet gives its slot back** after `series_idle_after`. The budget
+used to count every series in every unexpired segment instead, so a slot was held for as
+long as the *data* survived — thirty days for metrics. Renaming a set of metrics
+therefore cost double for a month; on one deployment 93 dead names held half the budget
+while every new log stream was refused. Series at rest are bounded by `disk_budget` and
+retention, which are different controls with their own reaper; counting them twice made
+the tighter one fire for a reason unrelated to load.
+
+`when_series_full` decides what happens when the budget is full of series that are **all
+still active** — nothing idle left to reclaim:
+
+| | |
+|---|---|
+| `refuse` (default) | The new series is turned away, loudly. The admitted set stays complete and stable. |
+| `evict_oldest` | A ring buffer: the least recently written series gives way, so nothing is ever turned away. |
+
+`evict_oldest` is the intuitive answer — it is what `relay.when_full` and the disk reaper
+do — and the difference is what actually gets freed. Overwriting the oldest *records*
+reclaims their memory. Evicting the oldest *series* reclaims nothing on its own, because
+the producer does not know and keeps sending it; it is re-admitted a moment later at the
+cost of another one. At 120,000 active series against a 100,000 budget that churns
+continuously, every series ends up with holes, and the stored dictionary still
+accumulates all 120,000 — so the ceiling stops bounding the thing it exists to bound,
+exactly when it is needed.
+
+Complete data for a bounded set is usually worth more when you are debugging than most of
+everything with gaps in unpredictable places. But that is a judgement about how people
+read telemetry rather than a fact about the machine, so it is yours to make.
+
+Either way it is visible: `telemetryd status` shows usage against the limit and warns
+past 90%, and `telemetryd_series_reclaimed_total` (free) and
+`telemetryd_series_evicted_total` (not free) say which is happening.
 
 ## The two read limits, and why `0` is the default
 
@@ -233,7 +275,7 @@ Security:
   ingest       token required
   query        token required
   admin        token required
-  identity     open on / and /status: telemetryd 0.45.1, storage format 1,
+  identity     open on / and /status: telemetryd 0.46.0, storage format 1,
                three signals. Never the deployment. Not a setting.
 ```
 

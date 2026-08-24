@@ -38,9 +38,19 @@ filled the budget. `telemetryd status` puts the usage next to the limit:
                98432 of 100000 (98.4%) for checkout, the largest
 ```
 
-Past 90% it also says so under **Attention**. Raise `limits.max_series` — about 1 KB of
-memory per series — or send fewer distinct label combinations. The usual cause is a label
-carrying something unbounded: a request id, a user id, a full URL with its query string.
+Past 90% it also says so under **Attention**.
+
+Series that stop being written give their slots back after `limits.series_idle_after`
+(an hour by default), so a full budget means it is full of series that are *currently
+active*. Raise `limits.max_series` — about 1 KB of memory per series — or send fewer
+distinct label combinations. The usual cause is a label carrying something unbounded: a
+request id, a user id, a full URL with its query string.
+
+If you would rather never turn a new series away, `limits.when_series_full =
+"evict_oldest"` makes the budget a ring buffer instead. Busy series then lose samples
+rather than new ones being refused; `telemetryd_series_evicted_total` counts what that
+costs. The [configuration reference](../configuration/reference.md) has the trade-off in
+full.
 
 ## 3. The timestamps are wrong
 

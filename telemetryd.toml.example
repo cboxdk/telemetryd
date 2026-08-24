@@ -113,11 +113,18 @@ metrics = "30d"
 # Exceeding any of these rejects the record loudly: a labelled counter on
 # telemetryd_ingest_rejected_total, a structured error, and a count in /status.
 # Nothing here causes a silent drop.
-# About 1.0 KB of memory per series, so this ceiling is roughly 140 MB.
-max_series            = 100000
-# Fairness between apps, not a memory ceiling — so it does not bind by default.
-# Lower it when several apps share an instance and one must not crowd out the rest.
-max_series_per_app    = 100000
+# Distinct *active* series. 0 derives it from the memory this process may use,
+# at a measured ~1.0 KB per series. A series that goes quiet gives its slot back.
+max_series            = 0
+# Fairness between apps, not a memory ceiling. 0 means "same as max_series", so it
+# does not bind; lower it when several apps share an instance.
+max_series_per_app    = 0
+# Silence after which a series gives its slot back. 0 turns reclaiming off.
+series_idle_after     = "1h"
+# refuse | evict_oldest — when the budget is full of series that are ALL still
+# active. refuse keeps the admitted set complete and says so loudly; evict_oldest
+# makes it a ring buffer, so nothing is turned away but busy series get holes.
+when_series_full      = "refuse"
 max_labels_per_series = 60
 max_label_name_bytes  = 128
 max_label_value_bytes = 2048

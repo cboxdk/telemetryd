@@ -76,8 +76,15 @@ pub struct OidcStatus {
 
 #[derive(Debug, Serialize)]
 pub struct LimitsStatus {
+    /// After `0` was resolved, like `query_concurrency` below. An operator who let this
+    /// derive cannot read the number in force off the configuration file, and this is
+    /// where they look instead.
     pub max_series: u64,
     pub max_series_per_app: u64,
+    /// Silence after which a series gives its slot back, in seconds. `0` is off.
+    pub series_idle_after_seconds: u64,
+    /// `refuse` or `evict_oldest`.
+    pub when_series_full: &'static str,
     pub max_log_line_bytes: u64,
     pub ingest_queue_depth: u32,
     /// After `0` was resolved. An operator who set `0` cannot read the number in force
@@ -162,8 +169,13 @@ pub async fn status(State(state): State<AppState>) -> Result<Response, ApiError>
             retention,
             apps: state.store.app_usage(),
             limits: LimitsStatus {
-                max_series: config.limits.max_series,
-                max_series_per_app: config.limits.max_series_per_app,
+                max_series: config.limits.resolved_max_series(),
+                max_series_per_app: config.limits.resolved_max_series_per_app(),
+                series_idle_after_seconds: config.limits.series_idle_after.0.as_secs(),
+                when_series_full: match config.limits.when_series_full {
+                    telemetryd_core::config::WhenSeriesFull::Refuse => "refuse",
+                    telemetryd_core::config::WhenSeriesFull::EvictOldest => "evict_oldest",
+                },
                 max_log_line_bytes: config.limits.max_log_line_bytes.as_u64(),
                 ingest_queue_depth: config.limits.ingest_queue_depth,
                 query_concurrency: state.query_concurrency(),
@@ -289,10 +301,17 @@ fn push_auth_and_cardinality_gauges(state: &AppState, samples: &mut Vec<Sample>)
     }
 
     let (active_series, rejected_series, max_series, _) = state.store.cardinality_status();
+    let (reclaimed, evicted) = state.store.series_churn();
     for (name, value) in [
         ("telemetryd_series_active", active_series as f64),
         ("telemetryd_series_rejected_total", rejected_series as f64),
         ("telemetryd_series_limit", max_series as f64),
+        // Two very different things, which is why they are two counters. Reclaimed is
+        // the budget correcting itself as series fall silent and costs nothing.
+        // Evicted is the budget being too small for the load, and every one of them is
+        // data that will not be recorded.
+        ("telemetryd_series_reclaimed_total", reclaimed as f64),
+        ("telemetryd_series_evicted_total", evicted as f64),
     ] {
         samples.push(Sample::new(name, &[], value));
     }

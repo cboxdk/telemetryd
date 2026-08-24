@@ -245,6 +245,22 @@ pub struct RelayClient {
     pub token: Secret,
 }
 
+/// What to do when the series budget is full of series that are all still active.
+///
+/// Named like [`WhenFull`] and deliberately not merged with it: they answer the same
+/// question about different resources, and the right answer differs — see
+/// `LimitsConfig::when_series_full` for why a ring buffer of series is not the same
+/// trade as a ring buffer of records.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WhenSeriesFull {
+    /// Refuse the new series, loudly. The admitted set stays complete and stable.
+    #[default]
+    Refuse,
+    /// Drop the least recently written series so the new one fits.
+    EvictOldest,
+}
+
 /// What to do when the disk budget cannot be held because undelivered data is
 /// protected from the reaper.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -638,42 +654,83 @@ impl RetentionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct LimitsConfig {
-    /// The ceiling on distinct series across every app, and in practice the memory
-    /// ceiling for the process.
+    /// The ceiling on distinct *active* series across every app, and in practice the
+    /// memory ceiling for the process. `0` derives it from the memory this process is
+    /// allowed to use.
     ///
     /// Measured against the release binary: 100,000 distinct metric series took a serving
     /// process from 11 MB to 138 MB, growing linearly at about 1.0 KB per series across
-    /// the whole range. The default is picked from that — it is the largest number that
-    /// keeps a VPS-sized instance comfortably inside a couple of hundred megabytes.
+    /// the whole range. That measurement is what `SERIES_COST_BYTES` encodes, and why
+    /// this can be derived rather than guessed.
     ///
-    /// The first attempt at that measurement pushed 100,000 log records carrying 100,000
-    /// distinct *attribute* values and reported a number for them. Log attributes are
-    /// structured metadata rather than stream labels, so all 100,000 were one series, and
-    /// what got measured was the cost of records. Series cardinality has to be driven
-    /// through label sets — the instance's own `series_active` is what says whether it
-    /// was.
+    /// It was a constant — 100,000 — picked from that measurement on a developer laptop
+    /// and then shipped to every machine, including a VPS with a fraction of the memory.
+    /// The number a box can hold is a property of the box, and the box is right there to
+    /// be asked. `query_concurrency` had been derived this way for a while; there was no
+    /// reason for this one to be a guess.
+    ///
+    /// # `0` changed meaning
+    ///
+    /// It used to mean *unlimited*. Unbounded cardinality is how a log store dies, so an
+    /// operator who wrote `0` here almost certainly wanted "stop making me pick a
+    /// number", not "run without a ceiling". Deriving is that, and it fails safe.
+    ///
+    /// The first attempt at the cost measurement pushed 100,000 log records carrying
+    /// 100,000 distinct *attribute* values. Log attributes are structured metadata rather
+    /// than stream labels, so all 100,000 were one series, and what got measured was the
+    /// cost of records. Series cardinality has to be driven through label sets — the
+    /// instance's own `series_active` is what says whether it was.
     pub max_series: u64,
-    /// The ceiling on distinct series for any one app.
+    /// The ceiling on distinct active series for any one app. `0` means the same as
+    /// `max_series`, so it does not bind.
     ///
-    /// # Why this defaults to the same number as `max_series`
+    /// # Why it does not bind by default
     ///
-    /// It defaulted to a fifth of it, and that was wrong in the case telemetryd is
-    /// actually for. This limit exists to stop one noisy app consuming the budget the
-    /// others need — a fairness property, and one that has no meaning at all when a
-    /// deployment has one app, which is the common shape here. What it did instead was
-    /// hand the sole user of a 100,000-series budget a 20,000-series ceiling.
+    /// It defaulted to a fifth of the global limit, and that was wrong in the case
+    /// telemetryd is actually for. This limit exists to stop one noisy app consuming the
+    /// budget the others need — a fairness property, and one that has no meaning at all
+    /// when a deployment has one app, which is the common shape here. What it did instead
+    /// was hand the sole user of a 100,000-series budget a 20,000-series ceiling.
     ///
     /// That is not a hypothetical. A single small Laravel site — 144 routes, request
     /// histograms across method, status and bucket — reached the per-app cap and had
-    /// every subsequent log stream refused, on an instance using 0.3% of its disk. The
-    /// workload the default was meant to serve did not fit inside it.
+    /// every subsequent log stream refused, on an instance using 0.3% of its disk.
     ///
-    /// So the default no longer binds before the global limit does, and fairness between
-    /// apps is something an operator with several apps opts into. The memory ceiling is
-    /// `max_series` and it still holds; this one is about who gets to fill it. Running
-    /// out is loud either way — counted, reported in the OTLP response, and warned about
-    /// at 90% in `telemetryd status`.
+    /// Lower it when several apps share an instance and one must not crowd out the rest.
     pub max_series_per_app: u64,
+    /// Silence after which a series gives its slot in the budget back. `0` disables it.
+    ///
+    /// The budget used to count every series in every unexpired segment, so a slot was
+    /// held for as long as the *data* survived — thirty days for metrics. Renaming a set
+    /// of metrics cost double for a month, and on one deployment 93 dead names held half
+    /// the budget while every new log stream was refused.
+    ///
+    /// An hour is sixty flushes of margin for a client exporting every minute, and short
+    /// enough that a rename heals within a working session. A series that goes quiet and
+    /// comes back is simply re-admitted; that costs nothing unless the budget is full, and
+    /// if it is full, the slot was better spent on whatever was still running.
+    pub series_idle_after: DurationSetting,
+    /// What to do when the budget is full of series that are all still active.
+    ///
+    /// `refuse` keeps the admitted set complete and stable, and says so loudly.
+    /// `evict_oldest` makes the budget a ring buffer: the least recently written series
+    /// gives way, so a new one is never turned away.
+    ///
+    /// The default is `refuse`, and the reasoning is worth stating because the other
+    /// answer is the intuitive one — it is what `relay.when_full` and the disk reaper both
+    /// do. The difference is what gets freed. Overwriting the oldest *records* reclaims
+    /// their memory immediately. Evicting the oldest *series* reclaims nothing on its own,
+    /// because the producer does not know and keeps sending it; the series is simply
+    /// re-admitted a moment later at the cost of another one. At 120,000 active series
+    /// against a 100,000 budget that churns continuously, every series ends up with holes,
+    /// and the stored dictionary still accumulates all 120,000 — so the ceiling stops
+    /// bounding the thing it exists to bound, exactly when it is needed.
+    ///
+    /// Complete data for a bounded set is worth more to someone debugging than most of
+    /// everything with gaps in unpredictable places. But that is a judgement about how
+    /// people read telemetry, not a fact about the machine, so it is a setting rather than
+    /// a decision made for you.
+    pub when_series_full: WhenSeriesFull,
     pub max_labels_per_series: u32,
     pub max_label_name_bytes: u32,
     pub max_label_value_bytes: u32,
@@ -713,8 +770,10 @@ pub struct LimitsConfig {
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
-            max_series: 100_000,
-            max_series_per_app: 100_000,
+            max_series: 0,
+            max_series_per_app: 0,
+            series_idle_after: DurationSetting(Duration::from_secs(60 * 60)),
+            when_series_full: WhenSeriesFull::Refuse,
             max_labels_per_series: 60,
             max_label_name_bytes: 128,
             max_label_value_bytes: 2048,
@@ -743,7 +802,64 @@ const EXPORT_COST_BYTES: u64 = 160 * 1024 * 1024;
 /// once at startup instead.
 const READ_BUDGET_FRACTION: u64 = 4;
 
+/// What one counted series costs the process, all in.
+///
+/// Measured on the release binary rather than reasoned about: 100,000 distinct metric
+/// series took a serving process from 11 MB to 138 MB, linearly across the range. Rounded
+/// up, because erring high derives a smaller ceiling and a smaller ceiling is the safe
+/// direction — it refuses visibly instead of being killed by the kernel.
+const SERIES_COST_BYTES: u64 = 1_400;
+
+/// Share of the memory limit the series budget may hold.
+///
+/// Smaller than the read budget's quarter, because series memory is *resident for the
+/// life of the process* while a query's is transient. It also has to sit alongside the
+/// write buffer, whose own ceiling is `storage.max_segment_bytes`. A sixteenth of 2 GiB
+/// is 128 MiB, or roughly 91,000 series — close to the constant this replaces, which is
+/// the reassuring part: on the machine the constant was measured on, the derivation
+/// agrees with it, and on a smaller machine it does not.
+const SERIES_BUDGET_FRACTION: u64 = 16;
+
+/// Floor and ceiling on the derived series budget.
+///
+/// The floor keeps a small container usable rather than correct-and-useless: 10,000
+/// series is a real Laravel app's request metrics.
+///
+/// The ceiling is 100,000 because that is the largest figure that has been *measured* —
+/// a serving process at 138 MB — rather than extrapolated from a slope. A larger machine
+/// would derive more, and the honest position is that nobody has run this at 300,000
+/// series to find out what else grows there. Memory is also not the only cost: every
+/// series is matcher work on every query, and `SERIES_COST_BYTES` was measured with one
+/// record per series, where in production each carries thousands. Both of those push the
+/// real cost up, and neither is in the arithmetic, so the arithmetic does not get to pick
+/// a number past the one that was checked.
+///
+/// An operator who knows their box can set `max_series` outright; this is the ceiling on
+/// what telemetryd will assume on its own.
+const SERIES_BUDGET_MIN: u64 = 10_000;
+const SERIES_BUDGET_MAX: u64 = 100_000;
+
 impl LimitsConfig {
+    /// The global series ceiling in force, resolving `0`.
+    #[must_use]
+    pub fn resolved_max_series(&self) -> u64 {
+        if self.max_series != 0 {
+            return self.max_series;
+        }
+        let budget = memory_limit_bytes() / SERIES_BUDGET_FRACTION;
+        (budget / SERIES_COST_BYTES).clamp(SERIES_BUDGET_MIN, SERIES_BUDGET_MAX)
+    }
+
+    /// The per-app ceiling in force. `0` means "whatever the global one is", so it does
+    /// not bind until an operator lowers it deliberately.
+    #[must_use]
+    pub fn resolved_max_series_per_app(&self) -> u64 {
+        if self.max_series_per_app != 0 {
+            return self.max_series_per_app;
+        }
+        self.resolved_max_series()
+    }
+
     /// The number of concurrent queries in force, resolving `0`.
     pub fn resolved_query_concurrency(&self) -> u32 {
         if self.query_concurrency != 0 {
