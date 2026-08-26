@@ -32,6 +32,26 @@ impl Origin {
     }
 }
 
+/// Wrap at a width the rest of this output already uses, so a long note does not run off
+/// a terminal and become the one thing nobody reads.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
 pub fn run(config_file: Option<&Path>, data_dir: Option<&Path>) -> anyhow::Result<()> {
     let overrides = Overrides {
         data_dir: data_dir.map(Path::to_path_buf),
@@ -122,6 +142,18 @@ fn print_security_posture(config: &Config) {
     } else {
         "token required"
     };
+
+    // Before the security block, because a configuration that cannot fit in the machine
+    // is a more immediate problem than one whose tokens are fine.
+    let notes = config.memory_notes();
+    if !notes.is_empty() {
+        crate::out::outln!("\nMemory:");
+        for note in notes {
+            for line in wrap(&note, 74) {
+                crate::out::outln!("  {line}");
+            }
+        }
+    }
 
     crate::out::outln!("\nSecurity:");
     crate::out::outln!(

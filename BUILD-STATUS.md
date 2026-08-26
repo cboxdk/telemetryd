@@ -45,6 +45,15 @@ past 90%. That is there because the alternative was measured: an instance at its
 cap refused every new log stream for hours while reporting 0.3% of its disk used, and
 nothing in `status`, `doctor` or the exporter's response said which limit was full.
 
+**Known gap: resident memory scales with stored data.** Every sealed segment keeps its
+stream dictionary, bloom filter, trigram index and Parquet footer in memory for as long as
+the segment exists — measured at 193 MB for 133 segments over a 20,592-series store, at
+rest. That is bounded by `storage.disk_budget` and retention rather than by RAM, so a
+configuration can require more memory than the machine has. `telemetryd validate` and the
+startup log now compute the worst case and say so, and the systemd unit sets `MemoryMax`
+so the kernel bounds the process rather than the machine failing. The real fix — loading
+those four structures on demand behind a bounded cache — is not built yet.
+
 **Storage.** Write-ahead log with crash recovery, immutable Parquet segments, per-segment
 stream dictionary, Bloom filters for exact-key lookup, trigram indexes for substring
 search, retention by age and by a global

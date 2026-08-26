@@ -211,6 +211,48 @@ impl Config {
         Ok(())
     }
 
+    /// Costs this configuration implies that no single setting states.
+    ///
+    /// Returned rather than raised. The estimate is a worst case — every segment holding
+    /// the full series ceiling — and refusing to start on a worst case would take down
+    /// deployments that are nowhere near it. But it is the right question to *ask*,
+    /// because the answer is otherwise invisible: resident memory for open segments is
+    /// bounded by `storage.disk_budget` and retention, not by RAM, so a configuration can
+    /// quietly need several times the memory the machine has and say nothing until the
+    /// kernel intervenes.
+    ///
+    /// Measured, on the deployment that produced this: 133 segments over a 20,592-series
+    /// store held 193 MB resident at rest. The same records unsealed held 24 MB. Segment
+    /// count is set by `retention ÷ segment_duration`, and nothing warned that changing
+    /// the latter from an hour to five minutes multiplied the bill by twelve.
+    #[must_use]
+    pub fn memory_notes(&self) -> Vec<String> {
+        let (implied, budget) = crate::config::manifest_memory(self);
+        if implied <= budget {
+            return Vec::new();
+        }
+        let segment = self.storage.segment_duration.get();
+        let segments: u64 = self
+            .retention
+            .each()
+            .iter()
+            .map(|(_, window)| window.as_secs() / segment.as_secs().max(1))
+            .sum();
+        vec![format!(
+            "this configuration can need about {} of memory just to hold its segments \
+             open, against roughly {} available for that — {segments} segments \
+             (retention ÷ storage.segment_duration = {}) each holding up to \
+             limits.max_series ({}) streams. Every sealed segment keeps a dictionary of \
+             its streams resident. Lengthen storage.segment_duration, shorten retention, \
+             or lower limits.max_series; raising MemoryMax in the unit raises the budget \
+             this is measured against",
+            bytesize::ByteSize::b(implied),
+            bytesize::ByteSize::b(budget),
+            humantime::format_duration(segment),
+            self.limits.resolved_max_series(),
+        )]
+    }
+
     /// Cross-field rules. Run at load time rather than at first use, so a bad
     /// configuration fails at startup instead of at 3am on the first query.
     pub fn validate(&self) -> Result<()> {
@@ -401,6 +443,65 @@ fn discover_config_file() -> Option<PathBuf> {
     }
     candidates.push(PathBuf::from("/etc/telemetryd/telemetryd.toml"));
     candidates.into_iter().find(|p| p.is_file())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod memory_notes_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The configuration that took a server down, and the four-line difference that
+    /// makes it fit. Both directions, because a check that fires on everything is a
+    /// check people learn to scroll past.
+    #[test]
+    fn a_configuration_that_cannot_fit_says_so_and_one_that_can_stays_quiet() {
+        let mut config = Config::default();
+        config.storage.segment_duration = DurationSetting(Duration::from_secs(300));
+        config.limits.max_series = 500_000;
+        let notes = config.memory_notes();
+        assert_eq!(
+            notes.len(),
+            1,
+            "a 5m segment at 500k series must be reported"
+        );
+        let note = &notes[0];
+        assert!(note.contains("12672 segments"), "{note}");
+        assert!(note.contains("500000"), "{note}");
+        assert!(
+            note.contains("segment_duration"),
+            "the lever must be named: {note}"
+        );
+
+        // Default segment duration, a shorter metrics window, and a ceiling the machine
+        // can hold.
+        config.storage.segment_duration = DurationSetting(Duration::from_secs(3600));
+        config.retention.metrics = DurationSetting(Duration::from_secs(7 * 24 * 3600));
+        config.limits.max_series = 20_000;
+        assert!(
+            config.memory_notes().is_empty(),
+            "a configuration that fits must not warn: {:?}",
+            config.memory_notes()
+        );
+    }
+
+    /// Segment count is `retention ÷ segment_duration`, so shortening the segment is a
+    /// multiplier on resident memory — the step that turned a working instance into a
+    /// dying one, and the one nothing pointed at.
+    #[test]
+    fn shortening_the_segment_multiplies_the_bill() {
+        let hourly = Config::default();
+        let mut fast = Config::default();
+        fast.storage.segment_duration = DurationSetting(Duration::from_secs(300));
+
+        let (hourly_bytes, _) = manifest_memory(&hourly);
+        let (fast_bytes, _) = manifest_memory(&fast);
+        assert_eq!(
+            fast_bytes / hourly_bytes.max(1),
+            12,
+            "an hour of segments split into five-minute ones costs twelve times as much"
+        );
+    }
 }
 
 #[cfg(test)]

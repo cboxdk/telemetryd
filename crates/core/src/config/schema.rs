@@ -786,6 +786,26 @@ impl Default for LimitsConfig {
     }
 }
 
+/// What one series costs in a sealed segment's manifest, resident.
+///
+/// Every sealed segment carries a dictionary of the distinct streams it holds, and those
+/// dictionaries stay in memory for as long as the segment does. Measured: 133 segments
+/// over a 20,592-series store held 193 MB resident with nothing being queried and nothing
+/// being ingested — 1.45 MB per segment, which is 20,592 label sets at about 70 bytes
+/// each. The same 200,000 records kept in one unsealed buffer held 24 MB.
+///
+/// That is the term that took a server down, and it is invisible from every other number:
+/// it is bounded by `storage.disk_budget` and by retention, not by memory, so a
+/// configuration can quietly require more RAM than the machine has.
+const MANIFEST_STREAM_BYTES: u64 = 70;
+
+/// Share of the memory limit the resident segment manifests may take.
+///
+/// A third: they compete with the write buffer, the read budget and the series tracker,
+/// and unlike all three this one cannot be shed under pressure — it is what "the store is
+/// open" costs.
+const MANIFEST_BUDGET_FRACTION: u64 = 3;
+
 /// The most concurrent reads telemetryd will give itself.
 ///
 /// It was 64, from a measurement of 4 MB per `query_range` against a 120,000-record
@@ -860,6 +880,30 @@ const SERIES_BUDGET_FRACTION: u64 = 16;
 /// what telemetryd will assume on its own.
 const SERIES_BUDGET_MIN: u64 = 10_000;
 const SERIES_BUDGET_MAX: u64 = 100_000;
+
+/// What this configuration will cost in resident segment manifests once the store is
+/// full, and what it is allowed to cost.
+///
+/// Worst case on purpose. The series count per segment is not knowable in advance, so the
+/// ceiling is used — which is exactly the question being asked: *can this configuration,
+/// at the limits it permits, fit in this machine?* A number that only reports the happy
+/// path is the number that let a 7.5 GiB box run a configuration needing several times
+/// that.
+#[must_use]
+pub fn manifest_memory(config: &Config) -> (u64, u64) {
+    let segment = config.storage.segment_duration.get().as_secs().max(1);
+    let segments: u64 = config
+        .retention
+        .each()
+        .iter()
+        .map(|(_, window)| window.as_secs() / segment)
+        .sum();
+    let series = config.limits.resolved_max_series();
+    let implied = segments
+        .saturating_mul(series)
+        .saturating_mul(MANIFEST_STREAM_BYTES);
+    (implied, memory_limit_bytes() / MANIFEST_BUDGET_FRACTION)
+}
 
 impl LimitsConfig {
     /// The global series ceiling in force, resolving `0`.

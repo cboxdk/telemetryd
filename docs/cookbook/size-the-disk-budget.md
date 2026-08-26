@@ -22,6 +22,40 @@ metrics = "30d"
 in-window data to stay under — and logs a `WARN` every time, because that means one of
 the two numbers is wrong.
 
+## The disk budget also buys memory
+
+Every sealed segment keeps a dictionary of the distinct streams it holds, and that stays
+resident for as long as the segment does. Measured: 133 segments over a 20,592-series
+store held **193 MB** at rest, with nothing being queried and nothing ingested. The same
+200,000 records held in one unsealed buffer cost 24 MB.
+
+So resident memory is roughly
+
+```
+segments x series-per-segment x ~70 bytes,  where  segments = retention / segment_duration
+```
+
+and nothing in the disk budget bounds it. A 20 GiB budget does not imply 20 GiB of RAM,
+but it does mean the store can grow until opening it no longer fits.
+
+The multiplier that surprises people is `storage.segment_duration`. Shortening it from an
+hour to five minutes multiplies the segment count — and the memory — by twelve, while
+looking like a change about how promptly data is written. On one deployment that single
+line took a configuration from comfortable to needing 7.9 GiB.
+
+`telemetryd validate` computes the worst case and says so when it does not fit:
+
+```
+Memory:
+  this configuration can need about 7.9 GiB of memory just to hold its segments open,
+  against roughly 683 MiB available for that — 6048 segments (retention ÷
+  storage.segment_duration = 5m) each holding up to limits.max_series (20000) streams
+```
+
+The same note is logged at startup. Three levers, in the order usually worth trying:
+lengthen `storage.segment_duration`, shorten retention, lower `limits.max_series`. Raising
+`MemoryMax` in the systemd unit raises the budget the estimate is measured against.
+
 ## Working out what you need
 
 The honest way is to measure rather than estimate. Run for a day at a representative

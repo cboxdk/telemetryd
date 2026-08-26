@@ -30,6 +30,9 @@ pub fn run(config_file: Option<&std::path::Path>, overrides: &Overrides) -> anyh
 
     report_recovery(&store);
     warn_if_unbounded(&config);
+    for note in config.memory_notes() {
+        tracing::warn!("{note}");
+    }
 
     // A multi-threaded runtime built here rather than via `#[tokio::main]`, so the
     // non-serving subcommands do not pay for a runtime they never use.
