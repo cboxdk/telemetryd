@@ -18,15 +18,21 @@ use serde::{Deserialize, Serialize};
 /// count the same thing more than once.
 #[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Labels(BTreeMap<String, String>);
+pub struct Labels(std::sync::Arc<BTreeMap<String, String>>);
 
 impl Labels {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Copy-on-write, because the map behind a `Labels` is shared.
+    ///
+    /// A label set is built once at ingest and read forever after, so the clone this can
+    /// trigger costs nothing in practice: while a set is being assembled its refcount is
+    /// one and `make_mut` hands back the map it already owns. Sharing is what makes the
+    /// same stream appearing in a thousand segments cost one map instead of a thousand.
     pub fn insert(&mut self, name: impl Into<String>, value: impl Into<String>) {
-        self.0.insert(name.into(), value.into());
+        std::sync::Arc::make_mut(&mut self.0).insert(name.into(), value.into());
     }
 
     pub fn get(&self, name: &str) -> Option<&str> {
@@ -61,7 +67,7 @@ impl Labels {
     }
 
     pub fn remove(&mut self, name: &str) -> Option<String> {
-        self.0.remove(name)
+        std::sync::Arc::make_mut(&mut self.0).remove(name)
     }
 
     pub fn len(&self) -> usize {
@@ -95,7 +101,7 @@ impl Labels {
                 hash = hash.wrapping_mul(PRIME);
             }
         };
-        for (name, value) in &self.0 {
+        for (name, value) in self.0.iter() {
             feed(name.as_bytes());
             feed(&[0x01]);
             feed(value.as_bytes());
@@ -117,7 +123,36 @@ impl Labels {
 
 impl FromIterator<(String, String)> for Labels {
     fn from_iter<T: IntoIterator<Item = (String, String)>>(iter: T) -> Self {
-        Self(iter.into_iter().collect())
+        Self(std::sync::Arc::new(iter.into_iter().collect()))
+    }
+}
+
+impl Labels {
+    /// Share another set's map instead of holding a copy of it.
+    ///
+    /// Every sealed segment carries a dictionary of the streams it holds, and the same
+    /// stream appears in every segment covering the time it was written to. Those
+    /// dictionaries are identical label sets held once per segment, and that repetition
+    /// is what makes resident memory scale with how much is *stored* rather than with how
+    /// much is running — the term that took a 7.5 GiB server down.
+    ///
+    /// Only useful when the two are already equal; the caller establishes that, which is
+    /// why this is not `PartialEq`-checked here.
+    #[must_use]
+    pub fn shared_with(&self) -> Self {
+        Self(std::sync::Arc::clone(&self.0))
+    }
+
+    /// Whether two label sets are backed by the same allocation.
+    ///
+    /// Public because sharing is a memory *contract*, not an implementation detail: the
+    /// store depends on a segment dictionary costing a pointer per repeated stream rather
+    /// than a map, and a property nothing can assert is a property that quietly stops
+    /// holding. Equality is unaffected either way — this only says whether the saving is
+    /// actually being made.
+    #[must_use]
+    pub fn shares_storage_with(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
     }
 }
 

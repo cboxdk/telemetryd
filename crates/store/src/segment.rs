@@ -308,7 +308,7 @@ impl Segment {
             Err(e) => return Err(Error::io(format!("reading {}", manifest_path.display()), e)),
         };
 
-        let manifest: SegmentManifest = match serde_json::from_str(&raw) {
+        let mut manifest: SegmentManifest = match serde_json::from_str(&raw) {
             Ok(manifest) => manifest,
             Err(e) => {
                 tracing::warn!(
@@ -319,6 +319,13 @@ impl Segment {
                 return Ok(None);
             }
         };
+
+        // Share the stream dictionary with every other segment holding the same sets.
+        // Done here rather than at use because this is the only moment the copies exist
+        // as separate allocations — one line later they would already be resident.
+        for stream in &mut manifest.streams {
+            *stream = crate::intern::shared(std::mem::take(stream));
+        }
 
         if manifest.format_version != SEGMENT_FORMAT_VERSION {
             return Err(Error::StorageVersionMismatch {

@@ -786,18 +786,27 @@ impl Default for LimitsConfig {
     }
 }
 
-/// What one series costs in a sealed segment's manifest, resident.
+/// What one repeated stream costs in a sealed segment's dictionary, resident.
 ///
 /// Every sealed segment carries a dictionary of the distinct streams it holds, and those
-/// dictionaries stay in memory for as long as the segment does. Measured: 133 segments
-/// over a 20,592-series store held 193 MB resident with nothing being queried and nothing
-/// being ingested — 1.45 MB per segment, which is 20,592 label sets at about 70 bytes
-/// each. The same 200,000 records kept in one unsealed buffer held 24 MB.
+/// dictionaries stay in memory for as long as the segment does. That is the term that took
+/// a server down, and it is invisible from every other number: it is bounded by
+/// `storage.disk_budget` and by retention, not by memory, so a configuration can quietly
+/// require more RAM than the machine has.
 ///
-/// That is the term that took a server down, and it is invisible from every other number:
-/// it is bounded by `storage.disk_budget` and by retention, not by memory, so a
-/// configuration can quietly require more RAM than the machine has.
-const MANIFEST_STREAM_BYTES: u64 = 70;
+/// # The number, and the mistake in the first one
+///
+/// This was 70 bytes, from dividing 193 MB across 133 segments by the store's *total*
+/// 20,592 series. That is the wrong denominator: a segment holds only the streams written
+/// during its window, not every series in the store. The per-stream cost is far higher —
+/// a `Labels` is a `BTreeMap`, several hundred bytes — and the segment count is far lower,
+/// and the two errors cancelled well enough to look right.
+///
+/// Since the dictionaries now share one allocation per distinct label set, a stream
+/// repeated across segments costs a pointer and the bookkeeping around it rather than a
+/// map. Re-measured over the same 133-segment store: 161 MB before sharing, 33 MB after.
+/// Sixteen bytes is that residual per repeated stream, rounded up.
+const MANIFEST_STREAM_BYTES: u64 = 16;
 
 /// Share of the memory limit the resident segment manifests may take.
 ///

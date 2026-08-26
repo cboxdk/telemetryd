@@ -45,14 +45,18 @@ past 90%. That is there because the alternative was measured: an instance at its
 cap refused every new log stream for hours while reporting 0.3% of its disk used, and
 nothing in `status`, `doctor` or the exporter's response said which limit was full.
 
-**Known gap: resident memory scales with stored data.** Every sealed segment keeps its
-stream dictionary, bloom filter, trigram index and Parquet footer in memory for as long as
-the segment exists — measured at 193 MB for 133 segments over a 20,592-series store, at
-rest. That is bounded by `storage.disk_budget` and retention rather than by RAM, so a
-configuration can require more memory than the machine has. `telemetryd validate` and the
-startup log now compute the worst case and say so, and the systemd unit sets `MemoryMax`
-so the kernel bounds the process rather than the machine failing. The real fix — loading
-those four structures on demand behind a bounded cache — is not built yet.
+**Resident memory scales with stored data, and is now much smaller.** Every sealed segment
+keeps its stream dictionary, bloom filter, trigram index and Parquet footer in memory for
+as long as the segment exists, so memory grows with `storage.disk_budget` and retention
+rather than with load. Label sets are now shared across segments — a stream in a thousand
+segments costs one map and a thousand pointers — which took a 133-segment store from
+161 MB to 33 MB at rest. `telemetryd validate` and the startup log compute the worst case
+and report it when it does not fit, and the systemd unit sets `MemoryMax` so the kernel
+bounds the process rather than the machine failing.
+
+**Known gap:** the four per-segment structures are still all resident. Loading them on
+demand behind a cache bounded by the process's memory limit is the remaining fix; sharing
+reduced the dominant term but did not make it independent of how much is stored.
 
 **Storage.** Write-ahead log with crash recovery, immutable Parquet segments, per-segment
 stream dictionary, Bloom filters for exact-key lookup, trigram indexes for substring

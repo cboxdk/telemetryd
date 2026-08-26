@@ -25,29 +25,30 @@ the two numbers is wrong.
 ## The disk budget also buys memory
 
 Every sealed segment keeps a dictionary of the distinct streams it holds, and that stays
-resident for as long as the segment does. Measured: 133 segments over a 20,592-series
-store held **193 MB** at rest, with nothing being queried and nothing ingested. The same
-200,000 records held in one unsealed buffer cost 24 MB.
+resident for as long as the segment does. So resident memory grows with how much is
+**stored**, not with how much is running — and the disk budget does not bound it. A 20 GiB
+budget does not imply 20 GiB of RAM, but it does mean the store can grow until opening it
+no longer fits.
 
-So resident memory is roughly
+Label sets are shared across segments: a stream appearing in a thousand segments costs one
+map and a thousand pointers, not a thousand maps. Measured over the same 133-segment
+store, that took resident memory from **161 MB to 33 MB**.
+
+What remains scales as
 
 ```
-segments x series-per-segment x ~70 bytes,  where  segments = retention / segment_duration
+segments x streams-per-segment,   where  segments = retention / segment_duration
 ```
-
-and nothing in the disk budget bounds it. A 20 GiB budget does not imply 20 GiB of RAM,
-but it does mean the store can grow until opening it no longer fits.
 
 The multiplier that surprises people is `storage.segment_duration`. Shortening it from an
 hour to five minutes multiplies the segment count — and the memory — by twelve, while
-looking like a change about how promptly data is written. On one deployment that single
-line took a configuration from comfortable to needing 7.9 GiB.
+looking like a change about how promptly data is written.
 
 `telemetryd validate` computes the worst case and says so when it does not fit:
 
 ```
 Memory:
-  this configuration can need about 7.9 GiB of memory just to hold its segments open,
+  this configuration can need about 1.8 GiB of memory just to hold its segments open,
   against roughly 683 MiB available for that — 6048 segments (retention ÷
   storage.segment_duration = 5m) each holding up to limits.max_series (20000) streams
 ```
