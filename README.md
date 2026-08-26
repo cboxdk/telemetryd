@@ -252,6 +252,8 @@ error, rather than dropping data quietly.
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps   # CI runs this; a doc link
+                                          # to a private item fails the build
 cargo deny check                          # advisories, licenses, bans, sources
 python3 scripts/generate-sbom.py --check  # SBOM is not stale
 python3 scripts/check-docs.py             # docs structure, frontmatter, links

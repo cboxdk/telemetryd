@@ -20,10 +20,10 @@
 //! It does not free an entry when the last segment holding it is deleted. Doing so needs
 //! weak references through `Labels`'s private interior, and the payoff is small: the table
 //! holds one entry per *distinct* label set, which is the same order as the series limit
-//! the store is already sized for. [`CAPACITY`] stops it growing without bound in the case
+//! the store is already sized for. A capacity bound stops it growing without limit in the case
 //! that would matter — an instance churning through label sets faster than retention
-//! removes them — by simply declining to intern beyond it. Declining costs sharing, never
-//! correctness.
+//! removes them — by simply declining to intern beyond a fixed capacity. Declining costs
+//! sharing, never correctness.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
