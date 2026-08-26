@@ -786,11 +786,33 @@ impl Default for LimitsConfig {
     }
 }
 
+/// The most concurrent reads telemetryd will give itself.
+///
+/// It was 64, from a measurement of 4 MB per `query_range` against a 120,000-record
+/// store. Both halves of that aged badly: a production store is much larger, and a
+/// dashboard opening 124 panels at once arrives as one burst that will use every slot it
+/// is offered. Sixty-four of them at the real cost is where 6.65 GB came from.
+///
+/// Sixteen is a deliberate trade. A burst past it waits — the limiter answers `429` with
+/// `Retry-After`, the same answer a full ingest queue gives — and waiting is recoverable
+/// in a way that being killed by the kernel is not. An operator with a large machine and
+/// a measured appetite can still set `query_concurrency` outright.
+///
+/// What is *not* known, and is worth writing down rather than implying: the 6.65 GB was
+/// never attributed to a specific allocation. Re-measured against a 200,000-record store,
+/// 32 concurrent `query_range` calls peaked at 103 MB — about 3 MB each, comfortably
+/// under `QUERY_COST_BYTES`. That store held minutes of data where the one that failed
+/// held weeks, so the constant is defensible at the size it was measured and untested at
+/// the size that matters. This ceiling and the unit's `MemoryMax` are both chosen to
+/// bound a term whose size is still a guess.
+const QUERY_CONCURRENCY_MAX: u32 = 16;
+
 /// Roughly what a read request holds while it runs, from the measurements in
 /// [`LimitsConfig::query_concurrency`] and [`LimitsConfig::export_concurrency`], rounded
 /// up. Deliberately pessimistic: over-estimating costs throughput on a busy instance,
 /// under-estimating costs the process.
 const QUERY_COST_BYTES: u64 = 8 * 1024 * 1024;
+
 const EXPORT_COST_BYTES: u64 = 160 * 1024 * 1024;
 
 /// Share of the memory limit these two may hold between them.
@@ -865,7 +887,7 @@ impl LimitsConfig {
         if self.query_concurrency != 0 {
             return self.query_concurrency;
         }
-        derive_concurrency(QUERY_COST_BYTES, 4, 64)
+        derive_concurrency(QUERY_COST_BYTES, 4, QUERY_CONCURRENCY_MAX)
     }
 
     /// The number of concurrent exports in force, resolving `0`.
@@ -886,12 +908,51 @@ fn derive_concurrency(cost_bytes: u64, min: u32, max: u32) -> u32 {
 /// What this process is actually allowed to use, read once.
 ///
 /// The cgroup limit first, because in a container the host's free memory is not the
-/// number that gets you killed — and the container is a first-class way to run this. Then
-/// `MemTotal`. Then a conservative assumption, which is where macOS lands: reading
-/// `hw.memsize` needs `libc` or a subprocess, and a developer laptop is not the machine
-/// this protects.
+/// number that gets you killed — and the container is a first-class way to run this. The
+/// systemd unit sets `MemoryMax` for the same reason, so a service install lands here too.
+///
+/// # `MemTotal` is not ours, and assuming it was took down a server
+///
+/// The fallback used to return the host's total memory, and every derived limit was a
+/// fraction of that. On a dedicated box that is merely aggressive. On the box this was
+/// reported from — telemetryd sharing a 7.5 GiB VPS with MySQL, php-fpm, Redis, Typesense
+/// and the website those serve — it sized itself as though it owned the machine, derived
+/// 64 concurrent queries, and reached 6.65 GB resident. The load average hit 38 and
+/// nothing on the server answered, telemetryd included.
+///
+/// A single-node observability tool is *usually* a guest on a machine that has a job. It
+/// cannot tell a dedicated host from a shared one, so it assumes the answer that fails
+/// safe: a quarter of what is installed. An operator who has given telemetryd the whole
+/// box says so with `MemoryMax` in the unit, or by setting the limits outright — both of
+/// which are read exactly, and neither of which is guessed.
+/// Whether anything is actually stopping this process from taking the machine.
+///
+/// `false` means no cgroup limit is in force, so every derived limit is a guess about a
+/// share of a host telemetryd does not own, and nothing but those guesses stands between
+/// a heavy query burst and the OOM killer picking a victim — which may well be the
+/// database next door rather than us.
+#[must_use]
+pub fn memory_is_capped() -> bool {
+    for path in [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ] {
+        if let Some(limit) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.split_whitespace().find_map(|w| w.parse::<u64>().ok()))
+            && limit > 0
+            && limit < u64::MAX / 2
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn memory_limit_bytes() -> u64 {
     const ASSUMED: u64 = 2 * 1024 * 1024 * 1024;
+    /// Share of a machine's installed memory to assume is ours when nothing says.
+    const UNCONTAINED_SHARE: u64 = 4;
 
     let read_number = |path: &str| -> Option<u64> {
         std::fs::read_to_string(path)
@@ -922,7 +983,7 @@ fn memory_limit_bytes() -> u64 {
             .nth(1)
             .and_then(|v| v.parse::<u64>().ok())
     {
-        return kib * 1024;
+        return (kib * 1024 / UNCONTAINED_SHARE).max(256 * 1024 * 1024);
     }
 
     ASSUMED

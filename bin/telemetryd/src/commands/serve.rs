@@ -29,6 +29,7 @@ pub fn run(config_file: Option<&std::path::Path>, overrides: &Overrides) -> anyh
     let store = Arc::new(open_store(&config)?);
 
     report_recovery(&store);
+    warn_if_unbounded(&config);
 
     // A multi-threaded runtime built here rather than via `#[tokio::main]`, so the
     // non-serving subcommands do not pay for a runtime they never use.
@@ -109,6 +110,38 @@ fn open_store(config: &Config) -> anyhow::Result<Store> {
             data_dir.display()
         )
     })
+}
+
+/// Say so at startup when nothing bounds this process's memory.
+///
+/// telemetryd sizes its query concurrency and series budget from what it believes it may
+/// use. With a cgroup limit that belief is a fact. Without one it is a guess about a share
+/// of a machine telemetryd does not own — and when the guess is wrong the kernel picks a
+/// victim, which on a shared box is as likely to be the database as us.
+///
+/// This is a `WARN` rather than a refusal because plenty of correct deployments have no
+/// cgroup: a developer laptop, a foreground process, a container run without limits. But
+/// it is the difference between a service that degrades and a server that stops, so it
+/// should never be something an operator discovers from `htop` at the wrong moment.
+///
+/// Skipped when the operator has pinned both limits by hand, which is the other way of
+/// having decided this on purpose.
+fn warn_if_unbounded(config: &Config) {
+    if telemetryd_core::config::memory_is_capped() {
+        return;
+    }
+    if config.limits.query_concurrency != 0 && config.limits.max_series != 0 {
+        return;
+    }
+    tracing::warn!(
+        query_concurrency = config.limits.resolved_query_concurrency(),
+        max_series = config.limits.resolved_max_series(),
+        "no memory limit is in force, so these were derived from a fraction of the \
+         host's total memory rather than from a share this process actually owns. On a \
+         machine shared with a database or a web server, set MemoryMax= in the systemd \
+         unit (`sudo telemetryd service install` writes it), or pin limits.query_concurrency \
+         and limits.max_series"
+    );
 }
 
 /// Report what a previous crash cost us. Loudly, at `WARN`: a truncated write-ahead

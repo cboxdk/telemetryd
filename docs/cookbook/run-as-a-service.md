@@ -79,6 +79,43 @@ TimeoutStopSec=30s
 `SIGTERM` triggers a graceful drain and a final write-ahead log flush. Killing telemetryd
 before that finishes costs the unsynced window — up to `wal_sync_interval` of telemetry.
 
+## Memory, and why the unit bounds it
+
+The generated unit sets `MemoryHigh=20%` and `MemoryMax=25%`, and they are not
+decoration. telemetryd is almost always a guest on a machine that has a job — a database,
+php-fpm, the website they serve — and without a cgroup limit it sized its query
+concurrency and series budget from the host's *total* memory, as though it owned the box.
+On a 7.5 GiB VPS that produced 64 concurrent query slots, 6.65 GB resident, a load average
+of 38, and a server on which nothing answered at all. telemetryd was not killed, because
+nothing had told the kernel it was allowed to be.
+
+`MemoryHigh` throttles and reclaims first, which is a slowdown you can watch. `MemoryMax`
+is the wall: past it the kernel kills telemetryd, `Restart=on-failure` brings it back, and
+the machine is never the thing that dies.
+
+telemetryd reads that limit back out of its own cgroup, so **raising it is the one number
+to change** if you have given telemetryd a machine of its own:
+
+```bash
+sudo systemctl edit telemetryd     # [Service] / MemoryMax=60%
+sudo systemctl daemon-reload && sudo systemctl restart telemetryd
+```
+
+An instance running with no limit in force says so at startup:
+
+```
+WARN no memory limit is in force, so these were derived from a fraction of the host's
+     total memory rather than from a share this process actually owns
+```
+
+That is expected on a laptop and in the foreground. On a server it means one heavy
+dashboard load can make the kernel pick a victim, and the victim may be the database
+rather than telemetryd.
+
+**Upgrading the binary does not rewrite the unit.** `telemetryd status` names the
+directives an older unit is missing, including these; `sudo telemetryd service install`
+followed by `sudo systemctl daemon-reload` brings it up to date.
+
 ## Where data goes
 
 The unit sets `TELEMETRYD_STORAGE_DATA_DIR=/var/lib/telemetryd` and uses systemd's
