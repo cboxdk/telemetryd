@@ -108,6 +108,7 @@ fn install(user: &str) -> anyhow::Result<()> {
     {
         ensure_service_user(user)?;
         grant_token_access(user);
+        grant_data_access(user, &unit);
     }
 
     enable(&path)?;
@@ -166,6 +167,50 @@ fn ensure_service_user(user: &str) -> anyhow::Result<()> {
 /// order — and the service runs as someone else. Best effort: a deployment that keeps
 /// its tokens somewhere else entirely is not wrong, and this should not fail the install
 /// over files it does not own.
+/// Hand the data directory to the account the unit runs as.
+///
+/// # Why this is not left to systemd
+///
+/// `StateDirectory=` makes systemd create and own the directory, which is enough on a
+/// fresh install and not enough on the one that matters: an instance that has been
+/// running as a *different* user already has a directory full of segments, a WAL and a
+/// manifest owned by that user. systemd adjusts the directory it manages; it does not
+/// reliably walk what is inside. So the service starts, cannot write its own WAL, and
+/// exits 1 in 27 milliseconds with a permission error that reads nothing like "the owner
+/// changed".
+///
+/// That is not hypothetical. Switching an instance from `root` to `telemetryd` produced
+/// exactly that, and the recovery — a `chown -R` — was a step in an install guide rather
+/// than in the installer, so it was one broken shell pipeline away from not happening.
+/// The installer already knows the account and just wrote the directory into the unit; it
+/// is the only thing that has both facts.
+///
+/// Best-effort and quiet on failure, like `grant_token_access`: a macOS agent runs as the
+/// user already, and an operator managing permissions themselves should not be argued
+/// with. `confirm_running` is what actually reports a service that cannot start.
+#[cfg(not(target_os = "macos"))]
+fn grant_data_access(user: &str, unit: &str) {
+    // Read the path out of the unit just written, so the two cannot drift.
+    let Some(dir) = unit
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("Environment=TELEMETRYD_STORAGE_DATA_DIR=")
+        })
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+    else {
+        return;
+    };
+    if !std::path::Path::new(dir).exists() {
+        // Nothing to hand over; systemd's StateDirectory will create it correctly.
+        return;
+    }
+    if exec("chown", &["-R", &format!("{user}:{user}"), dir]).is_ok() {
+        crate::out::outln!("gave {user} ownership of {dir}");
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 fn grant_token_access(user: &str) {
     let Ok(entries) = std::fs::read_dir("/etc/telemetryd") else {
@@ -201,16 +246,31 @@ fn confirm_running() -> anyhow::Result<()> {
     if exec("systemctl", &["is-active", "--quiet", "telemetryd"]).is_ok() {
         return Ok(());
     }
-    let detail = std::process::Command::new("systemctl")
-        .args(["status", "telemetryd", "--no-pager", "--lines", "20"])
-        .output()
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-        .unwrap_or_default();
+    let detail = read_output(
+        "systemctl",
+        &["status", "telemetryd", "--no-pager", "--lines", "20"],
+    );
+    // The journal separately, because `systemctl status` shows logs for the *current*
+    // invocation and a unit in `activating (auto-restart)` has none — which is exactly
+    // the state a service that exits on startup is in when this runs. The failure that
+    // prompted this printed a clean status block with no log lines at all, while the
+    // actual cause, one line about a directory it could not write, sat in the journal the
+    // whole time. Printing it here is the difference between an answer and a round trip.
+    let journal = read_output(
+        "journalctl",
+        &["-u", "telemetryd", "-n", "20", "--no-pager"],
+    );
+    let journal: String = journal
+        .lines()
+        .filter(|line| !line.starts_with("-- ") && !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
     bail!(
         "the unit was installed but is not running.\n\n{detail}\n\n\
-         `journalctl -xeu telemetryd` has the rest. Common causes: a token file the \
-         `telemetryd` user cannot read, or a configuration error — `telemetryd validate` \
-         reports those before systemd does."
+         --- journal ---\n{journal}\n\n\
+         Common causes: a data directory or token file the `telemetryd` user cannot \
+         read — usually just after switching which account the service runs as — or a \
+         configuration error, which `telemetryd validate` reports before systemd does."
     );
 }
 
@@ -345,6 +405,15 @@ fn directory_size(root: &Path) -> Option<u64> {
 }
 
 /// Run a service-manager command, surfacing its stderr rather than swallowing it.
+/// Run a command for its output, treating any failure as "nothing to show".
+fn read_output(program: &str, args: &[&str]) -> String {
+    std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .unwrap_or_default()
+}
+
 fn exec(program: &str, args: &[&str]) -> anyhow::Result<()> {
     let output = Command::new(program)
         .args(args)
@@ -574,6 +643,25 @@ fn manual_steps() -> &'static str {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// The data directory is read out of the unit rather than hardcoded, so a change to
+    /// one cannot leave the other chowning a path nothing uses.
+    #[test]
+    fn the_data_directory_handed_over_is_the_one_the_unit_names() {
+        let unit = systemd_unit("/usr/bin/telemetryd", "telemetryd");
+        let named: Vec<&str> = unit
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("Environment=TELEMETRYD_STORAGE_DATA_DIR=")
+            })
+            .collect();
+        assert_eq!(
+            named,
+            vec!["/var/lib/telemetryd"],
+            "the unit must name exactly one data directory for install to hand over"
+        );
+    }
 
     /// The case that matters most: a unit written before the memory limits existed, on a
     /// box where telemetryd shares the machine with a database and a web server. Upgrading
