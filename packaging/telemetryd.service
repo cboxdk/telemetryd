@@ -11,20 +11,26 @@ Restart=on-failure
 RestartSec=5s
 
 # A telemetry backend is almost always a guest on a machine that has a job, and this one
-# is not allowed to evict the host. Without these two lines telemetryd took a 7.5 GiB VPS
-# to 6.65 GB resident and a load average of 38, and nothing on the server answered —
-# MySQL, php-fpm, Redis and the website they serve included. It was not killed, because
-# nothing had told the kernel it was allowed to be.
+# is not allowed to evict the host. Without a limit telemetryd took a 7.5 GiB VPS to
+# 6.65 GB resident and a load average of 38, and nothing on the server answered — MySQL,
+# php-fpm, Redis and the website they serve included. It was not killed, because nothing
+# had told the kernel it was allowed to be.
 #
-# MemoryHigh throttles and reclaims first, which is a slowdown you can see and recover
-# from. MemoryMax is the wall: past it the kernel kills telemetryd, `Restart=on-failure`
-# brings it back, and the machine is never the thing that dies.
+# MemoryMax is the wall: past it the kernel kills telemetryd, `Restart=on-failure` brings
+# it back, and the machine is never the thing that dies.
 #
-# Percentages rather than byte counts so the unit stays right when the box is resized.
-# telemetryd reads this limit back out of its cgroup and sizes its own query concurrency
-# and series budget from it, so raising it here raises those too — this is the one number
-# to change if you have given telemetryd a machine of its own.
-MemoryHigh=20%
+# There is deliberately no MemoryHigh. It throttles instead of failing, and a process that
+# genuinely needs more than the soft limit does not fail — it is held just under it,
+# reclaiming on every allocation, swapping, and making no progress. That is exactly what
+# happened: `systemctl status` reported `active (running)` for twenty-five hours on a
+# process stuck partway through startup with one thread left, `available: 0B` and 899 MB
+# swapped, answering nothing. Failing and restarting is recoverable and visible; being
+# throttled forever is neither.
+#
+# A percentage rather than a byte count so the unit stays right when the box is resized.
+# telemetryd reads this limit back out of its cgroup and sizes its query concurrency and
+# series budget from it, so raising it here raises those too — this is the one number to
+# change if you have given telemetryd a machine of its own.
 MemoryMax=25%
 
 User=telemetryd

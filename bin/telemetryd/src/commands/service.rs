@@ -474,20 +474,26 @@ Restart=on-failure
 RestartSec=5s
 
 # A telemetry backend is almost always a guest on a machine that has a job, and this one
-# is not allowed to evict the host. Without these two lines telemetryd took a 7.5 GiB VPS
-# to 6.65 GB resident and a load average of 38, and nothing on the server answered —
-# MySQL, php-fpm, Redis and the website they serve included. It was not killed, because
-# nothing had told the kernel it was allowed to be.
+# is not allowed to evict the host. Without a limit telemetryd took a 7.5 GiB VPS to
+# 6.65 GB resident and a load average of 38, and nothing on the server answered — MySQL,
+# php-fpm, Redis and the website they serve included. It was not killed, because nothing
+# had told the kernel it was allowed to be.
 #
-# MemoryHigh throttles and reclaims first, which is a slowdown you can see and recover
-# from. MemoryMax is the wall: past it the kernel kills telemetryd, `Restart=on-failure`
-# brings it back, and the machine is never the thing that dies.
+# MemoryMax is the wall: past it the kernel kills telemetryd, `Restart=on-failure` brings
+# it back, and the machine is never the thing that dies.
 #
-# Percentages rather than byte counts so the unit stays right when the box is resized.
-# telemetryd reads this limit back out of its cgroup and sizes its own query concurrency
-# and series budget from it, so raising it here raises those too — this is the one number
-# to change if you have given telemetryd a machine of its own.
-MemoryHigh=20%
+# There is deliberately no MemoryHigh. It throttles instead of failing, and a process that
+# genuinely needs more than the soft limit does not fail — it is held just under it,
+# reclaiming on every allocation, swapping, and making no progress. That is exactly what
+# happened: `systemctl status` reported `active (running)` for twenty-five hours on a
+# process stuck partway through startup with one thread left, `available: 0B` and 899 MB
+# swapped, answering nothing. Failing and restarting is recoverable and visible; being
+# throttled forever is neither.
+#
+# A percentage rather than a byte count so the unit stays right when the box is resized.
+# telemetryd reads this limit back out of its cgroup and sizes its query concurrency and
+# series budget from it, so raising it here raises those too — this is the one number to
+# change if you have given telemetryd a machine of its own.
 MemoryMax=25%
 
 User={user}
@@ -663,22 +669,22 @@ mod tests {
         );
     }
 
-    /// The case that matters most: a unit written before the memory limits existed, on a
-    /// box where telemetryd shares the machine with a database and a web server. Upgrading
-    /// the binary does not add them, so the process stays unbounded and the report has to
-    /// be what tells someone.
+    /// The case that matters most: a unit written before `MemoryMax` existed, on a box
+    /// where telemetryd shares the machine with a database and a web server. Upgrading the
+    /// binary does not add it, so the process stays unbounded and the report has to be
+    /// what tells someone.
     #[test]
     fn a_unit_without_a_memory_limit_is_reported_as_stale() {
         let current = systemd_unit("/usr/bin/telemetryd", "telemetryd");
         let older: String = current
             .lines()
-            .filter(|line| !line.starts_with("Memory"))
+            // Exactly this directive: `MemoryDenyWriteExecute` also starts with "Memory"
+            // and is a hardening flag that has been there all along.
+            .filter(|line| !line.starts_with("MemoryMax="))
             .collect::<Vec<_>>()
             .join("\n");
 
-        let missing = missing_from(&older, &current);
-        assert!(missing.contains(&"MemoryMax".to_owned()), "{missing:?}");
-        assert!(missing.contains(&"MemoryHigh".to_owned()), "{missing:?}");
+        assert_eq!(missing_from(&older, &current), vec!["MemoryMax"]);
     }
 
     /// The case this was built for: a unit written before `ExecReload` existed, which is
