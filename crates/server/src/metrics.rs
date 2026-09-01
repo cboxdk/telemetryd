@@ -199,6 +199,11 @@ pub const DESCRIPTORS: &[Descriptor] = &[
         help: "Configured limits.max_series, so the active count can be alerted on as a ratio",
     },
     Descriptor {
+        name: "telemetryd_query_queued_total",
+        kind: Kind::Counter,
+        help: "Read requests that waited for a concurrency slot — the early warning before refusals start",
+    },
+    Descriptor {
         name: "telemetryd_series_reclaimed_total",
         kind: Kind::Counter,
         help: "Series that gave their budget slot back after falling silent — free, and the budget tracking reality",

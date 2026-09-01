@@ -1,7 +1,7 @@
 //! Shared request state.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use telemetryd_core::{Config, LogRecord, Result, TokenSet};
 use telemetryd_store::Store;
@@ -172,14 +172,50 @@ impl AppState {
         })
     }
 
-    /// Claim a slot for a read request, or `None` when the instance is already running
-    /// as many as it is configured to.
+    /// Claim a slot for a read request, waiting briefly before giving up.
     ///
-    /// `try_acquire` rather than `acquire`: a caller that waits is a caller holding a
-    /// connection and its share of a proxy's worker while it does so, and a `429` with
-    /// `Retry-After` is a thing a client can act on. Same reasoning as the ingest side.
-    pub fn query_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        Arc::clone(&self.query_permits).try_acquire_owned().ok()
+    /// # Why this waits at all
+    ///
+    /// It used to be `try_acquire`, refusing the moment every slot was busy, and the
+    /// reasoning was that a waiting caller holds a connection and its share of a proxy's
+    /// worker while it does so — while a `429` with `Retry-After` is something a client
+    /// can act on.
+    ///
+    /// The second half turned out to be wrong about the client that matters. A dashboard
+    /// opens all of its panels at once: a hundred and twenty-four queries arrive in one
+    /// burst, sixteen run, and the rest were told to come back — which the dashboard
+    /// renders as a hundred and eight errors. Nothing there acts on `Retry-After`; there
+    /// is no queue on the client side to hold the work.
+    ///
+    /// A burst is exactly what a short wait absorbs. Queries against a warm store finish
+    /// in tens of milliseconds, so a few seconds of queueing drains a burst many times
+    /// that size, and the caller sees a slower panel instead of a broken one. Sustained
+    /// overload still refuses, because the wait is bounded — the difference is that
+    /// refusing now means "this instance is genuinely saturated" rather than "two requests
+    /// arrived at the same moment".
+    ///
+    /// Bounded well under `server.request_timeout` so a queued request still has time to
+    /// run: waiting until the timeout would trade a `429` for a `408`, which is not an
+    /// improvement.
+    pub async fn query_slot(&self, wait: Duration) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        // Fast path first: an uncontended slot must not pay for a timer.
+        if let Ok(permit) = Arc::clone(&self.query_permits).try_acquire_owned() {
+            return Some(permit);
+        }
+        tokio::time::timeout(wait, Arc::clone(&self.query_permits).acquire_owned())
+            .await
+            .ok()?
+            .ok()
+    }
+
+    /// How long a read request will wait for a slot before being refused.
+    ///
+    /// Half the request timeout, so a request that waits still has the other half to run
+    /// in. Not separately configurable: the number that matters is how long a client is
+    /// willing to wait in total, and that is `server.request_timeout`.
+    #[must_use]
+    pub fn query_wait(&self) -> Duration {
+        self.config.server.request_timeout / 2
     }
 
     pub fn export_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {

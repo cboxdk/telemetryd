@@ -698,6 +698,27 @@ pub struct LimitsConfig {
     ///
     /// Lower it when several apps share an instance and one must not crowd out the rest.
     pub max_series_per_app: u64,
+    /// The most samples one PromQL query may load. `0` derives it from the memory limit.
+    ///
+    /// # Why a query needs a ceiling of its own
+    ///
+    /// PromQL is evaluated by reading storage once for the whole query — a one-hour range
+    /// at a fifteen-second step is 240 evaluations, and re-reading segments for each would
+    /// make one chart cost 240 scans. The cost of that choice is that every sample for
+    /// every matching series across the window is resident at once, and nothing bounded
+    /// it: not `limit`, which PromQL has no notion of, and not the series cap, which
+    /// counts streams rather than the samples inside them.
+    ///
+    /// A dashboard opening 124 panels against a store with weeks of high-cardinality
+    /// metrics therefore had no ceiling at all. Measured on the deployment this comes
+    /// from: a single query reached roughly 850 MB, four concurrent ones reached 3.46 GB,
+    /// and the kernel killed the process — from a tokio worker, mid-request, five minutes
+    /// after it started serving.
+    ///
+    /// Refusing, not truncating. Answering a chart from part of its data is a wrong chart,
+    /// and a wrong chart is worse than an error that names the limit and what to do about
+    /// it. Prometheus draws the same line for the same reason.
+    pub max_query_samples: u64,
     /// Silence after which a series gives its slot in the budget back. `0` disables it.
     ///
     /// The budget used to count every series in every unexpired segment, so a slot was
@@ -772,6 +793,7 @@ impl Default for LimitsConfig {
         Self {
             max_series: 0,
             max_series_per_app: 0,
+            max_query_samples: 0,
             series_idle_after: DurationSetting(Duration::from_secs(60 * 60)),
             when_series_full: WhenSeriesFull::Refuse,
             max_labels_per_series: 60,
@@ -914,7 +936,33 @@ pub fn manifest_memory(config: &Config) -> (u64, u64) {
     (implied, memory_limit_bytes() / MANIFEST_BUDGET_FRACTION)
 }
 
+/// What one loaded sample costs while a query holds it.
+///
+/// A `MetricSample` carries a timestamp, a value and its series, and the evaluator holds
+/// it three times over before the first step is computed: once as scanned records, once
+/// regrouped by series, once sorted per series. Series labels are shared rather than
+/// copied, so the per-sample residue is the numbers and the vector bookkeeping around
+/// them. Rounded well up, because under-estimating here is what the ceiling exists to
+/// prevent.
+const QUERY_SAMPLE_BYTES: u64 = 96;
+
+/// Share of the memory limit one query may hold in loaded samples.
+///
+/// A sixteenth, so several concurrent queries at the ceiling still fit inside the read
+/// budget rather than each being allowed to fill it alone.
+const QUERY_SAMPLE_FRACTION: u64 = 16;
+
 impl LimitsConfig {
+    /// The most samples one query may load, resolving `0`.
+    #[must_use]
+    pub fn resolved_max_query_samples(&self) -> u64 {
+        if self.max_query_samples != 0 {
+            return self.max_query_samples;
+        }
+        let budget = memory_limit_bytes() / QUERY_SAMPLE_FRACTION;
+        (budget / QUERY_SAMPLE_BYTES).clamp(500_000, 50_000_000)
+    }
+
     /// The global series ceiling in force, resolving `0`.
     #[must_use]
     pub fn resolved_max_series(&self) -> u64 {

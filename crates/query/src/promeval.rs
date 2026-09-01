@@ -65,11 +65,16 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// Load everything the expression could need.
+    /// `max_samples` is a ceiling to refuse at, not a top-N. Zero means unbounded, which
+    /// is what the store did before this existed and what took a server down: a query with
+    /// no `limit` — PromQL has no notion of one — loading every sample for every matching
+    /// series across its window, three times over as it regrouped them.
     pub fn load(
         store: &RecordStore<MetricSchema>,
         expr: &Expr,
         start_nanos: u64,
         end_nanos: u64,
+        max_samples: u64,
     ) -> Result<Self> {
         let lookback = expr.required_lookback();
         let from = start_nanos.saturating_sub(duration_nanos(lookback));
@@ -97,7 +102,24 @@ impl Snapshot {
             })
             .collect();
 
-        let samples = store.query(from, end_nanos, &pushdown, &|_| true)?;
+        // One more than allowed, so a full collector is unambiguously an overflow rather
+        // than a query that happened to fit exactly.
+        let ceiling = usize::try_from(max_samples.saturating_add(1)).unwrap_or(usize::MAX);
+        let samples = store.query_bounded(
+            from,
+            end_nanos,
+            &pushdown,
+            &|_| true,
+            if max_samples == 0 { 0 } else { ceiling },
+        )?;
+        if max_samples != 0 && samples.len() as u64 > max_samples {
+            return Err(Error::BadRequest(format!(
+                "this query would load more than {max_samples} samples into memory at \
+                 once. PromQL is evaluated from a single read of the whole window, so the \
+                 cost is every sample of every matching series — narrow the time range, \
+                 add label matchers, or raise limits.max_query_samples"
+            )));
+        }
 
         let mut by_series: BTreeMap<Labels, Vec<(u64, f64)>> = BTreeMap::new();
         for sample in samples {

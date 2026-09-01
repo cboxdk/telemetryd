@@ -130,13 +130,22 @@ pub async fn limit_query_concurrency(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let Some(permit) = state.query_slot() else {
+    let waited = std::time::Instant::now();
+    let Some(permit) = state.query_slot(state.query_wait()).await else {
         state.metrics.incr(
             "telemetryd_query_rejected_total",
             &[("surface", "query"), ("reason", "concurrency")],
         );
         return Err(telemetryd_core::Error::Overloaded.into());
     };
+    // Counted separately from refusals, because queueing is the early warning and a
+    // refusal is the event. An instance whose queue counter climbs while nothing is
+    // refused is one dashboard away from refusing, and nothing else would say so.
+    if waited.elapsed() > std::time::Duration::from_millis(1) {
+        state
+            .metrics
+            .incr("telemetryd_query_queued_total", &[("surface", "query")]);
+    }
     let response = next.run(request).await;
     drop(permit);
     Ok(response)

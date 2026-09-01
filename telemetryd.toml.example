@@ -119,6 +119,10 @@ max_series            = 0
 # Fairness between apps, not a memory ceiling. 0 means "same as max_series", so it
 # does not bind; lower it when several apps share an instance.
 max_series_per_app    = 0
+# The most samples ONE PromQL query may load. 0 derives it from the memory limit.
+# PromQL has no `limit`, and a query reads its whole window in one pass, so this is
+# the only ceiling on what one chart can cost.
+max_query_samples     = 0
 # Silence after which a series gives its slot back. 0 turns reclaiming off.
 series_idle_after     = "1h"
 # refuse | evict_oldest — when the budget is full of series that are ALL still

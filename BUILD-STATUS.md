@@ -54,6 +54,13 @@ segments costs one map and a thousand pointers — which took a 133-segment stor
 and report it when it does not fit, and the systemd unit sets `MemoryMax` so the kernel
 bounds the process rather than the machine failing.
 
+**One query has a ceiling.** PromQL reads its whole window in one pass, so every sample of
+every matching series is resident at once and neither `limit` nor the series cap bounded
+it — measured at roughly 850 MB for a single query against weeks of high-cardinality
+metrics, and 3.46 GB for four at once, which the kernel ended. `limits.max_query_samples`
+derives from the memory limit and refuses past it, naming the limit rather than truncating
+the answer.
+
 **Known gap:** the four per-segment structures are still all resident. Loading them on
 demand behind a cache bounded by the process's memory limit is the remaining fix; sharing
 reduced the dominant term but did not make it independent of how much is stored.

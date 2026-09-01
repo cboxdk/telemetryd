@@ -609,11 +609,28 @@ impl<S: RecordSchema> RecordStore<S> {
         matchers: &[LabelMatcher],
         extra: &(dyn Fn(&S::Record) -> bool + Sync),
     ) -> Result<Vec<S::Record>> {
+        self.query_bounded(start_nanos, end_nanos, matchers, extra, 0)
+    }
+
+    /// `query`, refusing to collect more than `limit` records.
+    ///
+    /// The bound is a *ceiling to fail at*, not a top-N: a caller passes one more than it
+    /// is willing to handle and treats a full result as an overflow. Truncating instead
+    /// would answer a PromQL query from part of its data, which is a wrong chart rather
+    /// than a refused one.
+    pub fn query_bounded(
+        &self,
+        start_nanos: u64,
+        end_nanos: u64,
+        matchers: &[LabelMatcher],
+        extra: &(dyn Fn(&S::Record) -> bool + Sync),
+        limit: usize,
+    ) -> Result<Vec<S::Record>> {
         self.scan(
             Scan {
                 start_nanos,
                 end_nanos,
-                limit: 0,
+                limit,
                 order: Order::Ascending,
                 exact_key: None,
                 columns: None,

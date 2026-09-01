@@ -26,11 +26,13 @@ pub async fn instant(
 ) -> Result<Response, ApiError> {
     let store = std::sync::Arc::clone(&state.store);
     let now = telemetryd_store::now_nanos();
+    let max_samples = state.config.limits.resolved_max_query_samples();
 
-    let response =
-        tokio::task::spawn_blocking(move || prometheus::instant(store.metrics(), &params, now))
-            .await
-            .map_err(|e| Error::Config(format!("query task panicked: {e}")))??;
+    let response = tokio::task::spawn_blocking(move || {
+        prometheus::instant(store.metrics(), &params, now, max_samples)
+    })
+    .await
+    .map_err(|e| Error::Config(format!("query task panicked: {e}")))??;
 
     Ok(Json(response).into_response())
 }
@@ -42,11 +44,13 @@ pub async fn range(
 ) -> Result<Response, ApiError> {
     let store = std::sync::Arc::clone(&state.store);
     let now = telemetryd_store::now_nanos();
+    let max_samples = state.config.limits.resolved_max_query_samples();
 
-    let response =
-        tokio::task::spawn_blocking(move || prometheus::range(store.metrics(), &params, now))
-            .await
-            .map_err(|e| Error::Config(format!("query task panicked: {e}")))??;
+    let response = tokio::task::spawn_blocking(move || {
+        prometheus::range(store.metrics(), &params, now, max_samples)
+    })
+    .await
+    .map_err(|e| Error::Config(format!("query task panicked: {e}")))??;
 
     Ok(Json(response).into_response())
 }

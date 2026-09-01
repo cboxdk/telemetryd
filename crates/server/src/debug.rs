@@ -343,9 +343,12 @@ pub async fn debug(
     let owned = query.to_owned();
     // On a blocking thread for the same reason every other read is: scanning opens
     // Parquet files, and a runtime worker is the wrong place for that.
-    let outcome = tokio::task::spawn_blocking(move || collect(&store, signal, &owned, start, now))
-        .await
-        .map_err(|e| telemetryd_core::Error::Config(format!("debug query panicked: {e}")))?;
+    let max_samples = state.config.limits.resolved_max_query_samples();
+    let outcome = tokio::task::spawn_blocking(move || {
+        collect(&store, signal, &owned, start, now, max_samples)
+    })
+    .await
+    .map_err(|e| telemetryd_core::Error::Config(format!("debug query panicked: {e}")))?;
 
     let (rows, suggestions, error) = match outcome {
         Ok((rows, suggestions)) => (rows, suggestions, None),
@@ -394,6 +397,7 @@ fn collect(
     query: &str,
     start: u64,
     end: u64,
+    max_samples: u64,
 ) -> telemetryd_core::Result<(Vec<Row>, Vec<String>)> {
     let query = if query.is_empty() {
         signal.everything()
@@ -404,7 +408,7 @@ fn collect(
     match signal {
         Signal::Logs => logs(store, query, start, end),
         Signal::Traces => traces(store, query, start, end),
-        Signal::Metrics => metrics(store, query, start, end),
+        Signal::Metrics => metrics(store, query, start, end, max_samples),
     }
 }
 
@@ -509,6 +513,7 @@ fn metrics(
     query: &str,
     start: u64,
     end: u64,
+    max_samples: u64,
 ) -> telemetryd_core::Result<(Vec<Row>, Vec<String>)> {
     {
         {
@@ -533,6 +538,7 @@ fn metrics(
                         timeout: None,
                     },
                     end,
+                    max_samples,
                 )?;
                 let series = response.data.result.len();
                 let value = response

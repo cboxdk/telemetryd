@@ -249,6 +249,7 @@ async fn the_exported_metric_names_cannot_change_by_accident() {
         "telemetryd_oidc_keys",
         "telemetryd_queries_in_flight",
         "telemetryd_query_concurrency_limit",
+        "telemetryd_query_queued_total",
         "telemetryd_query_rejected_total",
         "telemetryd_query_segments_pruned_total",
         "telemetryd_query_segments_scanned_total",
@@ -1450,4 +1451,130 @@ async fn without_an_admin_token_the_query_token_still_opens_status() {
     assert_is_identity_only(&body);
     let (status, _, _) = harness.get("/metrics").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// A dashboard opens every panel at once, and the burst must not become an error page.
+///
+/// The limiter used to refuse the moment its slots were busy, on the reasoning that a
+/// `429` with `Retry-After` is something a client can act on. A browser opening 124 panels
+/// is not that client: it has no queue of its own, so a refusal is simply a broken panel.
+/// With one slot configured, four simultaneous queries all have to land — they queue for
+/// microseconds and run one after another.
+#[tokio::test]
+async fn a_burst_of_queries_queues_instead_of_being_refused() {
+    let harness = std::sync::Arc::new(Harness::new(|config| {
+        config.limits.query_concurrency = 1;
+    }));
+
+    let mut running = Vec::new();
+    for _ in 0..4 {
+        let harness = std::sync::Arc::clone(&harness);
+        running.push(tokio::spawn(async move {
+            let request = Request::builder()
+                .uri("/loki/api/v1/labels")
+                .body(Body::empty())
+                .unwrap();
+            harness.request(request).await.0
+        }));
+    }
+
+    for outcome in running {
+        assert_eq!(
+            outcome.await.unwrap(),
+            StatusCode::OK,
+            "a burst against a single slot must queue, not refuse"
+        );
+    }
+}
+
+/// The wait is bounded, so genuine saturation still refuses rather than piling up
+/// connections forever. Held by a permit nobody releases.
+///
+/// The timeout is 200 ms rather than something tighter because the whole request lives
+/// inside it: the slot wait is half of it, and the refusal has to land in the other half.
+/// At two milliseconds this passed alone and failed in a parallel suite, racing the
+/// request timeout's `408` against the limiter's `429` — a test asserting a race is worse
+/// than no test.
+#[tokio::test]
+async fn a_slot_that_never_frees_still_refuses() {
+    let harness = Harness::new(|config| {
+        config.limits.query_concurrency = 1;
+        config.server.request_timeout = std::time::Duration::from_millis(200);
+    });
+
+    let held = harness
+        .state
+        .query_slot(std::time::Duration::from_millis(50))
+        .await
+        .expect("the first slot is free");
+
+    let request = Request::builder()
+        .uri("/loki/api/v1/labels")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, _) = harness.request(request).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    drop(held);
+}
+
+/// A query that would load more than it is allowed to must say so, not be killed.
+///
+/// PromQL has no `limit`, and the evaluator reads the whole window in one pass, so before
+/// this the only bound on a query's memory was how much data matched. A dashboard against
+/// a store with weeks of high-cardinality metrics reached roughly 850 MB per query; four
+/// at once reached 3.46 GB and the kernel killed the process from inside a request.
+#[tokio::test]
+async fn a_query_past_the_sample_ceiling_is_refused_with_a_reason() {
+    let harness = Harness::new(|config| {
+        config.limits.max_query_samples = 5;
+    });
+
+    let points: Vec<serde_json::Value> = (0..50u32)
+        .map(|i| {
+            serde_json::json!({
+                "timeUnixNano": (1_786_000_000_000_000_000u64 + u64::from(i) * 1_000_000_000)
+                    .to_string(),
+                "asDouble": f64::from(i),
+                "attributes": [{"key": "shard", "value": {"stringValue": i.to_string()}}],
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "resourceMetrics": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "checkout"}}
+            ]},
+            "scopeMetrics": [{"metrics": [{
+                "name": "probe", "unit": "1", "gauge": {"dataPoints": points}
+            }]}],
+        }]
+    })
+    .to_string();
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/metrics")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(payload))
+        .unwrap();
+    assert_eq!(harness.request(request).await.0, StatusCode::OK);
+
+    let request = Request::builder()
+        // At the end of the fifty samples, not the start: an instant query looks
+        // *backwards* over its lookback window, and asking at the first sample's time
+        // matched exactly one — a green test that proved nothing.
+        .uri("/api/v1/query?query=probe&time=1786000060")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, body) = harness.request(request).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.contains("max_query_samples"),
+        "the refusal must name the limit to raise: {body}"
+    );
+    assert!(
+        body.contains("narrow the time range"),
+        "and what to do instead: {body}"
+    );
 }

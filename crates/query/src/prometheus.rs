@@ -203,6 +203,7 @@ pub fn instant(
     store: &RecordStore<MetricSchema>,
     params: &InstantParams,
     now_nanos: u64,
+    max_samples: u64,
 ) -> Result<PromResponse<InstantData>> {
     let expr = required_query(params.query.as_ref())?;
     let at = match params.time.as_deref().filter(|s| !s.is_empty()) {
@@ -210,7 +211,7 @@ pub fn instant(
         None => now_nanos,
     };
 
-    let snapshot = Snapshot::load(store, &expr, at, at)?;
+    let snapshot = Snapshot::load(store, &expr, at, at, max_samples)?;
     let vector = match snapshot.eval(&expr, at)? {
         Value::Vector(vector) => vector,
         Value::Scalar(value) => crate::promeval::InstantVector {
@@ -238,6 +239,7 @@ pub fn range(
     store: &RecordStore<MetricSchema>,
     params: &RangeParams,
     now_nanos: u64,
+    max_samples: u64,
 ) -> Result<PromResponse<RangeData>> {
     let expr = required_query(params.query.as_ref())?;
 
@@ -270,7 +272,7 @@ pub fn range(
     }
 
     // Load once, evaluate every step from memory.
-    let snapshot = Snapshot::load(store, &expr, start, end)?;
+    let snapshot = Snapshot::load(store, &expr, start, end, max_samples)?;
 
     // Keyed by label set so a series' points stay together across steps.
     let mut series: BTreeMap<Labels, Vec<(f64, String)>> = BTreeMap::new();

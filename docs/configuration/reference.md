@@ -110,6 +110,7 @@ metrics = "30d"                      # cheaper per unit time — D3
 # self-metric; it is never a silent drop. See /status for live counts.
 max_series              = 0          # distinct ACTIVE series, all apps; 0 = derive from memory
 max_series_per_app      = 0          # fairness between apps; 0 = same as max_series, so it never binds
+max_query_samples       = 0          # most samples ONE PromQL query may load; 0 = derive from memory
 series_idle_after       = "1h"       # silence after which a series gives its slot back; 0 = off
 when_series_full        = "refuse"   # refuse | evict_oldest, when the budget is full of ACTIVE series
 max_labels_per_series   = 60
@@ -183,6 +184,52 @@ read telemetry rather than a fact about the machine, so it is yours to make.
 Either way it is visible: `telemetryd status` shows usage against the limit and warns
 past 90%, and `telemetryd_series_reclaimed_total` (free) and
 `telemetryd_series_evicted_total` (not free) say which is happening.
+
+## What one query is allowed to cost
+
+PromQL is evaluated from a **single read of the whole window**: a one-hour range at a
+fifteen-second step is 240 evaluations, and re-reading storage for each would make one
+chart cost 240 scans. The price of that choice is that every sample of every matching
+series is resident at once — and nothing bounded it. PromQL has no `limit`, and the series
+cap counts streams rather than the samples inside them.
+
+Measured on a deployment with weeks of high-cardinality metrics: one query held roughly
+850 MB, four concurrent ones reached 3.46 GB, and the kernel killed the process from
+inside a request handler five minutes after it started serving.
+
+`limits.max_query_samples` is the ceiling. `0` derives it from the memory this process may
+use — about 218 MB of samples on a 3.4 GiB limit — and a query past it is **refused**,
+naming the limit and what to do:
+
+```
+this query would load more than 2376772 samples into memory at once. PromQL is evaluated
+from a single read of the whole window, so the cost is every sample of every matching
+series — narrow the time range, add label matchers, or raise limits.max_query_samples
+```
+
+Refused rather than truncated. Answering a chart from part of its data is a wrong chart,
+and a wrong chart is worse than an error that says what happened.
+
+## What happens when every read slot is busy
+
+A read request waits for a slot for up to half of `server.request_timeout`, and is refused
+with `429` and `Retry-After` only if that expires.
+
+It used to refuse immediately, on the reasoning that `429` is something a client can act
+on. That is true of a script and false of the client that matters: a dashboard opens all
+of its panels at once, so 124 queries arrive in one burst, the configured number run, and
+the rest render as errors. Nothing there acts on `Retry-After` — there is no queue on the
+client side to hold the work. Queries against a warm store finish in tens of milliseconds,
+so a few seconds of queueing drains a burst many times larger than the slot count, and the
+viewer sees a slower panel instead of a broken one.
+
+The wait is bounded, so sustained overload still refuses. The difference is what a refusal
+now means: the instance is genuinely saturated, rather than two requests having arrived at
+the same moment.
+
+`telemetryd_query_queued_total` counts requests that waited, separately from
+`telemetryd_query_rejected_total`, which counts those refused. Queueing is the early
+warning; a refusal is the event.
 
 ## The two read limits, and why `0` is the default
 
@@ -275,7 +322,7 @@ Security:
   ingest       token required
   query        token required
   admin        token required
-  identity     open on / and /status: telemetryd 0.47.2, storage format 1,
+  identity     open on / and /status: telemetryd 0.48.0, storage format 1,
                three signals. Never the deployment. Not a setting.
 ```
 
