@@ -127,7 +127,7 @@ with the feature named — not an empty result:
 {
   "error": {
     "code": "unsupported_feature",
-    "feature": "PromQL function `topk`",
+    "feature": "PromQL function `quantile`",
     "docs": "https://github.com/cboxdk/telemetryd/blob/main/COMPATIBILITY.md"
   }
 }

@@ -35,6 +35,8 @@ pub enum Expr {
     Aggregation {
         op: AggregateOp,
         grouping: Grouping,
+        /// The scalar `k` of `topk(k, v)`. `None` for the operators that take none.
+        param: Option<Box<Expr>>,
         inner: Box<Expr>,
     },
     Binary {
@@ -109,6 +111,29 @@ pub enum AggregateOp {
     Min,
     Max,
     Count,
+    /// `topk(k, v)` — the `k` largest elements, keeping their own labels.
+    TopK,
+    /// `bottomk(k, v)` — the `k` smallest.
+    BottomK,
+}
+
+impl AggregateOp {
+    /// Whether the operator takes a scalar before the vector, as `topk(5, x)` does.
+    #[must_use]
+    pub fn takes_parameter(self) -> bool {
+        matches!(self, Self::TopK | Self::BottomK)
+    }
+
+    /// Whether the result keeps each element's own labels instead of the grouping's.
+    ///
+    /// `sum by (route)` reduces a group to one value labelled by the grouping.
+    /// `topk` selects *elements*: the answer is a subset of the input, labels and all,
+    /// and grouping only decides within which set the selection happens. Treating it
+    /// like `sum` would collapse the very series the panel is asking to see.
+    #[must_use]
+    pub fn selects_elements(self) -> bool {
+        matches!(self, Self::TopK | Self::BottomK)
+    }
 }
 
 impl AggregateOp {
@@ -119,6 +144,8 @@ impl AggregateOp {
             "min" => Self::Min,
             "max" => Self::Max,
             "count" => Self::Count,
+            "topk" => Self::TopK,
+            "bottomk" => Self::BottomK,
             _ => return None,
         })
     }
@@ -130,6 +157,8 @@ impl AggregateOp {
             Self::Min => "min",
             Self::Max => "max",
             Self::Count => "count",
+            Self::TopK => "topk",
+            Self::BottomK => "bottomk",
         }
     }
 }
@@ -338,6 +367,13 @@ impl Parser<'_> {
         let mut grouping = self.parse_grouping()?;
 
         self.expect(&Token::LeftParen, "`(` after an aggregation")?;
+        let param = if op.takes_parameter() {
+            let k = self.parse_expr()?;
+            self.expect(&Token::Comma, "`,` after the count in `topk`/`bottomk`")?;
+            Some(Box::new(k))
+        } else {
+            None
+        };
         let inner = self.parse_expr()?;
         self.expect(&Token::RightParen, "`)`")?;
 
@@ -348,6 +384,7 @@ impl Parser<'_> {
         Ok(Expr::Aggregation {
             op,
             grouping,
+            param,
             inner: Box::new(inner),
         })
     }
@@ -817,8 +854,8 @@ mod tests {
         for (query, needle) in [
             ("predict_linear(up[1h], 3600)", "predict_linear"),
             ("holt_winters(up[1h], 0.5, 0.5)", "holt_winters"),
-            ("topk(5, up)", "topk"),
             ("quantile(0.9, up)", "quantile"),
+            ("count_values(\"v\", up)", "count_values"),
             (
                 "label_replace(up, \"a\", \"b\", \"c\", \"d\")",
                 "label_replace",

@@ -182,9 +182,29 @@ impl Snapshot {
             Expr::Aggregation {
                 op,
                 grouping,
+                param,
                 inner,
             } => {
                 let vector = self.eval(inner, at_nanos)?.into_vector();
+                if op.selects_elements() {
+                    // `topk(k, …)`: `k` is a scalar, and a vector there is a query error
+                    // rather than something to coerce — `topk(sum(x), y)` means nothing.
+                    let k = match param.as_deref() {
+                        Some(expr) => match self.eval(expr, at_nanos)? {
+                            Value::Scalar(k) => k,
+                            Value::Vector(_) => {
+                                return Err(Error::BadRequest(format!(
+                                    "`{}` needs a number as its first argument, like \
+                                     `{}(5, …)`",
+                                    op.as_str(),
+                                    op.as_str()
+                                )));
+                            }
+                        },
+                        None => 0.0,
+                    };
+                    return Ok(Value::Vector(select_elements(*op, grouping, &vector, k)));
+                }
                 Ok(Value::Vector(aggregate(*op, grouping, &vector)))
             }
             Expr::Binary { op, left, right } => {
@@ -365,23 +385,83 @@ fn strip_name(labels: &Labels) -> Labels {
     out
 }
 
+/// The group key a sample falls into under `by`/`without`.
+fn group_key(labels: &Labels, grouping: &Grouping) -> Labels {
+    match grouping {
+        Grouping::All => Labels::new(),
+        Grouping::By(names) => names
+            .iter()
+            .filter_map(|name| labels.get(name).map(|v| (name.clone(), v.to_owned())))
+            .collect(),
+        Grouping::Without(names) => labels
+            .iter()
+            .filter(|(name, _)| !names.iter().any(|excluded| excluded == name))
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect(),
+    }
+}
+
+/// `topk` and `bottomk`: keep the k best elements of each group, labels intact.
+///
+/// Unlike every other aggregation here, the result is a *subset of the input* rather than
+/// one value per group — which is the whole point, since a panel asking for the five
+/// slowest routes wants to know which five. Grouping decides within which set the
+/// selection happens, not what the answer is labelled with.
+///
+/// NaN values are dropped rather than ordered. They are not comparable, so any ordering
+/// of them is arbitrary, and a NaN sorting to the top of a "slowest routes" panel is a
+/// wrong answer that looks like a real one.
+fn select_elements(
+    op: AggregateOp,
+    grouping: &Grouping,
+    vector: &InstantVector,
+    k: f64,
+) -> InstantVector {
+    if !k.is_finite() || k < 1.0 {
+        return InstantVector::default();
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let keep = k.floor().min(f64::from(u32::MAX)) as usize;
+
+    let mut groups: BTreeMap<Labels, Vec<(Labels, f64)>> = BTreeMap::new();
+    for (labels, value) in &vector.samples {
+        if value.is_nan() {
+            continue;
+        }
+        groups
+            .entry(group_key(labels, grouping))
+            .or_default()
+            .push((labels.clone(), *value));
+    }
+
+    let mut samples = Vec::new();
+    for (_, mut members) in groups {
+        members.sort_by(|(a_labels, a), (b_labels, b)| {
+            let ordered = match op {
+                AggregateOp::BottomK => a.partial_cmp(b),
+                _ => b.partial_cmp(a),
+            };
+            // Ties broken by label set so the answer is stable between identical calls;
+            // an unstable order makes a dashboard flicker between equal values.
+            ordered
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a_labels.cmp(b_labels))
+        });
+        members.truncate(keep);
+        samples.extend(members);
+    }
+
+    InstantVector { samples }
+}
+
 fn aggregate(op: AggregateOp, grouping: &Grouping, vector: &InstantVector) -> InstantVector {
     let mut groups: BTreeMap<Labels, Vec<f64>> = BTreeMap::new();
 
     for (labels, value) in &vector.samples {
-        let key = match grouping {
-            Grouping::All => Labels::new(),
-            Grouping::By(names) => names
-                .iter()
-                .filter_map(|name| labels.get(name).map(|v| (name.clone(), v.to_owned())))
-                .collect(),
-            Grouping::Without(names) => labels
-                .iter()
-                .filter(|(name, _)| !names.iter().any(|excluded| excluded == name))
-                .map(|(name, value)| (name.to_owned(), value.to_owned()))
-                .collect(),
-        };
-        groups.entry(key).or_default().push(*value);
+        groups
+            .entry(group_key(labels, grouping))
+            .or_default()
+            .push(*value);
     }
 
     let samples = groups
@@ -393,6 +473,10 @@ fn aggregate(op: AggregateOp, grouping: &Grouping, vector: &InstantVector) -> In
                 AggregateOp::Min => values.iter().copied().fold(f64::INFINITY, f64::min),
                 AggregateOp::Max => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
                 AggregateOp::Count => values.len() as f64,
+                // Handled by `select_elements`, which keeps each element rather than
+                // reducing a group to one number. Unreachable, and cheaper to say so than
+                // to make the type encode it.
+                AggregateOp::TopK | AggregateOp::BottomK => f64::NAN,
             };
             (labels, value)
         })
@@ -543,6 +627,111 @@ fn without_le(labels: &Labels) -> Labels {
 
 fn duration_nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod topk_tests {
+    use super::*;
+    use crate::promql::Grouping;
+
+    fn labelled(pairs: &[(&str, &str)]) -> Labels {
+        let mut labels = Labels::new();
+        for (k, v) in pairs {
+            labels.insert(*k, *v);
+        }
+        labels
+    }
+
+    fn vector(rows: &[(&str, f64)]) -> InstantVector {
+        InstantVector {
+            samples: rows
+                .iter()
+                .map(|(route, value)| (labelled(&[("route", route)]), *value))
+                .collect(),
+        }
+    }
+
+    /// The answer is a subset of the input with its own labels, not one reduced value.
+    /// A panel asking for the slowest routes wants to know *which* routes.
+    #[test]
+    fn topk_keeps_the_largest_elements_and_their_labels() {
+        let picked = select_elements(
+            AggregateOp::TopK,
+            &Grouping::All,
+            &vector(&[("/a", 1.0), ("/b", 9.0), ("/c", 5.0)]),
+            2.0,
+        );
+
+        let routes: Vec<&str> = picked
+            .samples
+            .iter()
+            .map(|(labels, _)| labels.get("route").unwrap())
+            .collect();
+        assert_eq!(routes, vec!["/b", "/c"], "largest first, labels intact");
+        assert!((picked.samples[0].1 - 9.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn bottomk_takes_the_other_end() {
+        let picked = select_elements(
+            AggregateOp::BottomK,
+            &Grouping::All,
+            &vector(&[("/a", 1.0), ("/b", 9.0), ("/c", 5.0)]),
+            1.0,
+        );
+        assert_eq!(picked.samples.len(), 1);
+        assert!((picked.samples[0].1 - 1.0).abs() < f64::EPSILON);
+    }
+
+    /// Grouping decides *within which set* the selection happens — one winner per group,
+    /// not one winner overall.
+    #[test]
+    fn grouping_selects_within_each_group() {
+        let samples = vec![
+            (labelled(&[("app", "a"), ("route", "/x")]), 1.0),
+            (labelled(&[("app", "a"), ("route", "/y")]), 7.0),
+            (labelled(&[("app", "b"), ("route", "/z")]), 3.0),
+        ];
+        let picked = select_elements(
+            AggregateOp::TopK,
+            &Grouping::By(vec!["app".to_owned()]),
+            &InstantVector { samples },
+            1.0,
+        );
+        assert_eq!(picked.samples.len(), 2, "one per app");
+        let mut values: Vec<f64> = picked.samples.iter().map(|(_, v)| *v).collect();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!((values[0] - 3.0).abs() < f64::EPSILON);
+        assert!((values[1] - 7.0).abs() < f64::EPSILON);
+    }
+
+    /// NaN is not comparable, so ordering it is arbitrary — and a NaN at the top of a
+    /// "slowest routes" panel is a wrong answer wearing the shape of a real one.
+    #[test]
+    fn not_a_number_is_dropped_rather_than_ordered() {
+        let picked = select_elements(
+            AggregateOp::TopK,
+            &Grouping::All,
+            &vector(&[("/a", f64::NAN), ("/b", 2.0)]),
+            5.0,
+        );
+        assert_eq!(picked.samples.len(), 1);
+        assert!((picked.samples[0].1 - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_count_below_one_selects_nothing() {
+        for k in [0.0, -3.0, f64::NAN] {
+            let picked = select_elements(
+                AggregateOp::TopK,
+                &Grouping::All,
+                &vector(&[("/a", 1.0)]),
+                k,
+            );
+            assert!(picked.samples.is_empty(), "k = {k}");
+        }
+    }
 }
 
 #[cfg(test)]

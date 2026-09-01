@@ -38,7 +38,7 @@ deliberate subset — writing a valid PromQL or LogQL expression is not enough f
 run here.
 
 Anything outside the subset is refused with HTTP 400 and a structured body naming the
-construct: `{"error":{"code":"unsupported_feature","feature":"PromQL function `topk`"}}`.
+construct: `{"error":{"code":"unsupported_feature","feature":"PromQL function `quantile`"}}`.
 The languages are parsed in full and then lowered, which is why the error can name the
 function rather than reporting a syntax error.
 
@@ -47,7 +47,7 @@ Verified against a running instance:
 - **PromQL works** for selectors and label matchers, `rate`, `increase`,
   `histogram_quantile`, `sum`, `avg`, `min`, `max`, `count`, `by (...)`, `without (...)`,
   `offset`, and arithmetic on a series.
-- **PromQL is refused** for `topk`, `bottomk`, `quantile`, `stddev`, `irate`, `delta`,
+- **PromQL is refused** for `quantile`, `count_values`, `stddev`, `irate`, `delta`,
   `absent`, and comparison operators such as `> 5`.
 - **LogQL works** for stream selectors, `|=`, `!=`, `|~`, `| json` and `| logfmt`.
 - **LogQL is refused** for `| line_format` and for every metric query over log streams —

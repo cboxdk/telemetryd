@@ -307,6 +307,10 @@ Driven by what `PromqlCompiler` actually generates:
 - selectors: `name{label="value", …}` with `=`, `!=`, `=~`, `!~`
 - `rate(sel[5m])`, `increase(sel[5m])`
 - aggregations `sum`, `avg`, `min`, `max`, `count`, with `by (…)` / `without (…)`
+- **`topk(k, …)` and `bottomk(k, …)`**, which select elements rather than reducing them:
+  the result keeps each series' own labels, and `by`/`without` decides within which set
+  the selection happens. Added because the UI's Duration panel uses it — it was listed as
+  out of scope and the panel returned `400`.
 - `histogram_quantile(0.95, sum by (le, …) (rate(sel[5m])))`
 - arithmetic against scalars: `expr * 60`
 - **`offset`**, **`or` between vectors**, and **`clamp_min`** — required by the
@@ -314,7 +318,7 @@ Driven by what `PromqlCompiler` actually generates:
   `clamp_min(sel - (sel offset 5m or sel * 0), 0)`. Our first plan listed all three as
   out of scope; they are not.
 
-*Not supported:* subqueries, the `@` modifier, `topk`/`bottomk`/`quantile`,
+*Not supported:* subqueries, the `@` modifier, `quantile`, `count_values`,
 `predict_linear`, `holt_winters`, recording and alerting rules, `/api/v1/rules`,
 `/api/v1/alerts`, exemplars, native histograms, and vector-to-vector matching beyond
 the `or` form above (`on`/`ignoring`/`group_left`).
