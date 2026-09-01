@@ -52,6 +52,20 @@ rather than new ones being refused; `telemetryd_series_evicted_total` counts wha
 costs. The [configuration reference](../configuration/reference.md) has the trade-off in
 full.
 
+## 2b. A query was refused
+
+A `400` from a dashboard panel is now recorded on the server too:
+
+```bash
+sudo journalctl -u telemetryd | grep "refused a query"
+curl -s localhost:4319/metrics | grep telemetryd_query_rejected_total
+```
+
+The log line carries the expression and the reason; the counter is labelled by surface
+(`promql`, `logql`) and reason. Before this, a refusal existed only in the client's
+response — an operator looking at their own instance could not tell which query had failed
+or that any had.
+
 ## 3. The timestamps are wrong
 
 ```bash

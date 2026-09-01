@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use telemetryd_core::{Config, LogRecord, Result, TokenSet};
+use telemetryd_core::{Config, Error, LogRecord, Result, TokenSet};
 use telemetryd_store::Store;
 use time::OffsetDateTime;
 use tokio::sync::{Semaphore, broadcast};
@@ -206,6 +206,39 @@ impl AppState {
             .await
             .ok()?
             .ok()
+    }
+
+    /// Record a query this instance refused, so the server keeps a trace of it.
+    ///
+    /// # Why this exists
+    ///
+    /// A refused query used to leave nothing behind. The client got a `400` with a
+    /// perfectly good explanation, and the server kept no record that it had happened —
+    /// so an operator looking at their own instance could not tell which query had failed,
+    /// or that any had. Diagnosing one meant packet-capturing loopback traffic to read a
+    /// request the server had already parsed and rejected.
+    ///
+    /// Ingest has had this from the start: every rejected record is counted by reason,
+    /// named in the response and logged. The read side had the response and nothing else.
+    ///
+    /// `WARN`, because a refusal means someone is looking at a broken panel right now. The
+    /// expression is included because the reason is meaningless without it, and truncated
+    /// because a query is caller-controlled input.
+    pub fn refused_query(&self, surface: &'static str, query: &str, error: &Error) {
+        const MAX_LOGGED: usize = 400;
+        let reason = error.code();
+        let shown: String = query.chars().take(MAX_LOGGED).collect();
+        tracing::warn!(
+            surface,
+            reason,
+            query = %shown,
+            truncated = query.chars().count() > MAX_LOGGED,
+            "refused a query: {error}"
+        );
+        self.metrics.incr(
+            "telemetryd_query_rejected_total",
+            &[("surface", surface), ("reason", reason)],
+        );
     }
 
     /// How long a read request will wait for a slot before being refused.

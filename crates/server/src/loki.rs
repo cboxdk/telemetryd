@@ -19,13 +19,18 @@ pub async fn query_range(
     State(state): State<AppState>,
     Query(params): Query<QueryRangeParams>,
 ) -> Result<Response, ApiError> {
-    let request = QueryRangeRequest::from_params(&params, telemetryd_store::now_nanos())?;
+    // Parsed before the guard so a malformed selector is recorded too: a query refused
+    // at parse time is exactly as invisible to the operator as one refused later.
+    let expression = params.query.clone().unwrap_or_default();
+    let request = QueryRangeRequest::from_params(&params, telemetryd_store::now_nanos())
+        .inspect_err(|error| state.refused_query("logql", &expression, error))?;
 
     // Reading segments is blocking file I/O; keep it off the async runtime.
     let store = std::sync::Arc::clone(&state.store);
     let response = tokio::task::spawn_blocking(move || loki::query_range(store.logs(), &request))
         .await
-        .map_err(|e| Error::Config(format!("query task panicked: {e}")))??;
+        .map_err(|e| Error::Config(format!("query task panicked: {e}")))?
+        .inspect_err(|error| state.refused_query("logql", &expression, error))?;
 
     Ok(Json(response).into_response())
 }

@@ -1578,3 +1578,35 @@ async fn a_query_past_the_sample_ceiling_is_refused_with_a_reason() {
         "and what to do instead: {body}"
     );
 }
+
+/// A refused query has to leave a trace on the server, not only in the client.
+///
+/// It used to leave none: the caller got a `400` with a good explanation and the instance
+/// kept no record that anything had been refused. Diagnosing one on a live deployment
+/// meant packet-capturing loopback traffic to recover a request the server had already
+/// parsed and rejected.
+#[tokio::test]
+async fn a_refused_query_is_counted_by_reason() {
+    let harness = Harness::new(|_| {});
+
+    let request = Request::builder()
+        .uri("/api/v1/query?query=probe%20@%20end()")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, _) = harness.request(request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (_, _, metrics) = harness.get("/metrics").await;
+    let counted: f64 = metrics
+        .lines()
+        .filter(|line| {
+            line.starts_with("telemetryd_query_rejected_total") && line.contains("promql")
+        })
+        .filter_map(|line| line.rsplit(' ').next()?.trim().parse::<f64>().ok())
+        .sum();
+
+    assert!(
+        counted >= 1.0,
+        "the refusal should be counted by surface and reason:\n{metrics}"
+    );
+}

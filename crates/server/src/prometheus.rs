@@ -28,11 +28,13 @@ pub async fn instant(
     let now = telemetryd_store::now_nanos();
     let max_samples = state.config.limits.resolved_max_query_samples();
 
+    let expression = params.query.clone().unwrap_or_default();
     let response = tokio::task::spawn_blocking(move || {
         prometheus::instant(store.metrics(), &params, now, max_samples)
     })
     .await
-    .map_err(|e| Error::Config(format!("query task panicked: {e}")))??;
+    .map_err(|e| Error::Config(format!("query task panicked: {e}")))?
+    .inspect_err(|error| state.refused_query("promql", &expression, error))?;
 
     Ok(Json(response).into_response())
 }
@@ -46,11 +48,13 @@ pub async fn range(
     let now = telemetryd_store::now_nanos();
     let max_samples = state.config.limits.resolved_max_query_samples();
 
+    let expression = params.query.clone().unwrap_or_default();
     let response = tokio::task::spawn_blocking(move || {
         prometheus::range(store.metrics(), &params, now, max_samples)
     })
     .await
-    .map_err(|e| Error::Config(format!("query task panicked: {e}")))??;
+    .map_err(|e| Error::Config(format!("query task panicked: {e}")))?
+    .inspect_err(|error| state.refused_query("promql", &expression, error))?;
 
     Ok(Json(response).into_response())
 }
