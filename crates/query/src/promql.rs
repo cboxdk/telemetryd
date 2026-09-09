@@ -164,7 +164,7 @@ impl AggregateOp {
 }
 
 /// `by (…)` / `without (…)`, or neither.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Grouping {
     #[default]
     All,
@@ -594,6 +594,43 @@ impl Expr {
         let mut out = Vec::new();
         self.collect_selectors(&mut out);
         out
+    }
+
+    /// Every grouping this expression aggregates by, so they can be resolved once
+    /// instead of once per step.
+    #[must_use]
+    pub fn groupings(&self) -> Vec<Grouping> {
+        let mut out = Vec::new();
+        self.collect_groupings(&mut out);
+        out
+    }
+
+    fn collect_groupings(&self, out: &mut Vec<Grouping>) {
+        match self {
+            Self::Aggregation {
+                grouping,
+                param,
+                inner,
+                ..
+            } => {
+                out.push(grouping.clone());
+                if let Some(param) = param {
+                    param.collect_groupings(out);
+                }
+                inner.collect_groupings(out);
+            }
+            Self::Call { args, .. } => {
+                for arg in args {
+                    arg.collect_groupings(out);
+                }
+            }
+            Self::Binary { left, right, .. } => {
+                left.collect_groupings(out);
+                right.collect_groupings(out);
+            }
+            Self::Negate(inner) => inner.collect_groupings(out),
+            Self::Selector(_) | Self::Number(_) => {}
+        }
     }
 
     fn collect_selectors<'a>(&'a self, out: &mut Vec<&'a Selector>) {

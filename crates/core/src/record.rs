@@ -154,6 +154,22 @@ impl Labels {
     pub fn shares_storage_with(&self, other: &Self) -> bool {
         std::sync::Arc::ptr_eq(&self.0, &other.0)
     }
+
+    /// An identifier for the shared map behind this label set.
+    ///
+    /// Two `Labels` with the same id are the same allocation and therefore equal; two with
+    /// different ids may still be equal, so this identifies, it does not compare. That is
+    /// enough to key a cache on: a query evaluator that hands every step the *same*
+    /// label set for a series can then look up what it precomputed about that series
+    /// without comparing label values at all — which is otherwise a handful of string
+    /// comparisons per sample per step, and the hottest thing in a range query.
+    ///
+    /// Only meaningful while the label set is alive. A cache keyed on it must hold the
+    /// `Labels` it came from, or an address could be reused by a later allocation.
+    #[must_use]
+    pub fn storage_id(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.0) as usize
+    }
 }
 
 impl fmt::Debug for Labels {

@@ -58,9 +58,46 @@ impl Value {
 }
 
 /// Series loaded once and evaluated many times.
+///
+/// # What is precomputed, and why it has to be
+///
+/// A range query evaluates the same expression at every step — 361 of them for six hours
+/// at a minute's resolution. Three costs used to be paid inside that loop that do not
+/// depend on the step at all:
+///
+/// - **Which series a selector matches.** Re-filtered every step: 361 x 2,886 matcher
+///   evaluations for one panel, over a set that cannot change.
+/// - **Stripping `__name__` from the result labels.** `Labels` shares its map, so cloning
+///   is a pointer — but *removing* a key copies the map. Once per series per step.
+/// - **Finding the window of a range selector.** A linear scan of the whole series,
+///   collected into a fresh `Vec`: 361 x 2,886 x 360 comparisons and a million
+///   allocations.
+///
+/// All three are now done once at load. What remains inside the loop is a binary search
+/// over sorted samples and the arithmetic itself.
 #[derive(Debug, Default)]
 pub struct Snapshot {
     series: Vec<Series>,
+    /// `series[i].labels` without `__name__`, ready to be handed to a result.
+    stripped: Vec<Labels>,
+    /// For each distinct selector in the expression, the series it matches.
+    resolved: Vec<(Vec<telemetryd_core::LabelMatcher>, Vec<usize>)>,
+    /// For each grouping the expression aggregates by, where each series lands.
+    ///
+    /// Keyed by [`Labels::storage_id`] rather than by the label set: every step is handed
+    /// the *same* shared label set for a given series, so identity answers the question
+    /// that comparing values was answering a million times over. Profiling a six-hour
+    /// panel put `memcmp` at the top, and this is what it was.
+    grouped: Vec<GroupIndex>,
+}
+
+/// Where every series lands under one grouping, worked out once.
+#[derive(Debug)]
+struct GroupIndex {
+    grouping: Grouping,
+    /// `storage_id` of a series' labels to the index of its group in `keys`.
+    of_series: HashMap<usize, usize>,
+    keys: Vec<Labels>,
 }
 
 impl Snapshot {
@@ -141,7 +178,53 @@ impl Snapshot {
             .collect();
         series.sort_by(|a, b| a.labels.cmp(&b.labels));
 
-        Ok(Self { series })
+        // Resolve every selector against the loaded series once. A query has a handful
+        // of selectors; the loop inside `eval` has hundreds of steps.
+        let stripped: Vec<Labels> = series.iter().map(|s| strip_name(&s.labels)).collect();
+        let mut resolved: Vec<(Vec<telemetryd_core::LabelMatcher>, Vec<usize>)> = Vec::new();
+        for selector in expr.selectors() {
+            if resolved.iter().any(|(m, _)| *m == selector.matchers) {
+                continue;
+            }
+            let members = series
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| telemetryd_core::matches_all(&selector.matchers, &s.labels))
+                .map(|(i, _)| i)
+                .collect();
+            resolved.push((selector.matchers.clone(), members));
+        }
+
+        // Every grouping the expression aggregates by, resolved against the series once.
+        let mut grouped: Vec<GroupIndex> = Vec::new();
+        for grouping in expr.groupings() {
+            if grouped.iter().any(|index| index.grouping == grouping) {
+                continue;
+            }
+            let mut of_series = HashMap::new();
+            let mut keys: Vec<Labels> = Vec::new();
+            for labels in &stripped {
+                let key = group_key(labels, &grouping);
+                let position = keys.iter().position(|existing| *existing == key);
+                let position = position.unwrap_or_else(|| {
+                    keys.push(key);
+                    keys.len() - 1
+                });
+                of_series.insert(labels.storage_id(), position);
+            }
+            grouped.push(GroupIndex {
+                grouping,
+                of_series,
+                keys,
+            });
+        }
+
+        Ok(Self {
+            series,
+            stripped,
+            resolved,
+            grouped,
+        })
     }
 
     /// Build directly from samples, for testing and for the in-memory path.
@@ -153,14 +236,22 @@ impl Snapshot {
                 .or_default()
                 .push((sample.timestamp_nanos, sample.value));
         }
+        let mut series: Vec<Series> = by_series
+            .into_iter()
+            .map(|(labels, mut samples)| {
+                samples.sort_by_key(|(ts, _)| *ts);
+                Series { labels, samples }
+            })
+            .collect();
+        series.sort_by(|a, b| a.labels.cmp(&b.labels));
+        let stripped = series.iter().map(|s| strip_name(&s.labels)).collect();
+        // No expression to resolve against here, so selectors fall back to filtering.
+        // This path is the in-memory one and evaluates a handful of steps at most.
         Self {
-            series: by_series
-                .into_iter()
-                .map(|(labels, mut samples)| {
-                    samples.sort_by_key(|(ts, _)| *ts);
-                    Series { labels, samples }
-                })
-                .collect(),
+            series,
+            stripped,
+            resolved: Vec::new(),
+            grouped: Vec::new(),
         }
     }
 
@@ -209,7 +300,7 @@ impl Snapshot {
                     };
                     return Ok(Value::Vector(select_elements(*op, grouping, &vector, k)));
                 }
-                Ok(Value::Vector(aggregate(*op, grouping, &vector)))
+                Ok(Value::Vector(self.aggregate(*op, grouping, &vector)))
             }
             Expr::Binary { op, left, right } => {
                 let left = self.eval(left, at_nanos)?;
@@ -291,14 +382,15 @@ impl Snapshot {
         let floor = at.saturating_sub(duration_nanos(crate::promql::DEFAULT_LOOKBACK));
 
         let mut samples = Vec::new();
-        for series in self.matching(selector) {
+        for index in self.matching(selector) {
+            let series = &self.series[index];
             if let Some((_, value)) = series
                 .samples
                 .iter()
                 .rev()
                 .find(|(ts, _)| *ts <= at && *ts > floor)
             {
-                samples.push((strip_name(&series.labels), *value));
+                samples.push((self.stripped[index].clone(), *value));
             }
         }
         InstantVector { samples }
@@ -332,13 +424,16 @@ impl Snapshot {
         let floor = at.saturating_sub(duration_nanos(range));
 
         let mut samples = Vec::new();
-        for series in self.matching(selector) {
-            let window: Vec<(u64, f64)> = series
-                .samples
-                .iter()
-                .copied()
-                .filter(|(ts, _)| *ts > floor && *ts <= at)
-                .collect();
+        for index in self.matching(selector) {
+            let series = &self.series[index];
+            // Samples are sorted by time, so `(floor, at]` is a contiguous slice: found by
+            // two binary searches rather than a scan of the whole series, and used in
+            // place rather than copied. This ran once per series per step — for a
+            // six-hour panel, 361 x 2,886 scans of 360 samples each, and as many
+            // allocations.
+            let start = series.samples.partition_point(|(ts, _)| *ts <= floor);
+            let end = series.samples.partition_point(|(ts, _)| *ts <= at);
+            let window = &series.samples[start..end];
 
             // One point cannot describe a change.
             if window.len() < 2 {
@@ -369,15 +464,31 @@ impl Snapshot {
             } else {
                 per_second_rate * (duration_nanos(range) as f64 / NANOS_PER_SECOND)
             };
-            samples.push((strip_name(&series.labels), value));
+            samples.push((self.stripped[index].clone(), value));
         }
         InstantVector { samples }
     }
 
-    fn matching<'a>(&'a self, selector: &'a Selector) -> impl Iterator<Item = &'a Series> {
+    /// Indices of the series a selector matches, resolved at load.
+    ///
+    /// Falls back to filtering when a selector was not seen at load — which cannot happen
+    /// for an expression evaluated against its own snapshot, but a wrong answer here
+    /// would be silent, and an empty result is not the kind of thing to risk on an
+    /// invariant that lives in another function.
+    fn matching(&self, selector: &Selector) -> Vec<usize> {
+        if let Some((_, members)) = self
+            .resolved
+            .iter()
+            .find(|(matchers, _)| *matchers == selector.matchers)
+        {
+            return members.clone();
+        }
         self.series
             .iter()
-            .filter(move |series| telemetryd_core::matches_all(&selector.matchers, &series.labels))
+            .enumerate()
+            .filter(|(_, series)| telemetryd_core::matches_all(&selector.matchers, &series.labels))
+            .map(|(i, _)| i)
+            .collect()
     }
 }
 
@@ -526,6 +637,62 @@ fn select_elements(
     InstantVector { samples }
 }
 
+impl Snapshot {
+    /// `sum`/`avg`/`min`/`max`/`count`, using the precomputed group index when the
+    /// samples came from this snapshot's series.
+    ///
+    /// A sample whose label set this snapshot does not recognise — one built by a binary
+    /// operation, say — falls through to grouping it the slow way. Correct either way;
+    /// the index is a shortcut for the common case, not a requirement.
+    fn aggregate(
+        &self,
+        op: AggregateOp,
+        grouping: &Grouping,
+        vector: &InstantVector,
+    ) -> InstantVector {
+        let Some(index) = self.grouped.iter().find(|g| g.grouping == *grouping) else {
+            return aggregate(op, grouping, vector);
+        };
+
+        let mut values: Vec<Vec<f64>> = vec![Vec::new(); index.keys.len()];
+        let mut spilled: InstantVector = InstantVector::default();
+        for (labels, value) in &vector.samples {
+            match index.of_series.get(&labels.storage_id()) {
+                Some(&group) => values[group].push(*value),
+                None => spilled.samples.push((labels.clone(), *value)),
+            }
+        }
+
+        let mut samples: Vec<(Labels, f64)> = values
+            .into_iter()
+            .enumerate()
+            .filter(|(_, group)| !group.is_empty())
+            .map(|(position, group)| (index.keys[position].clone(), reduce(op, &group)))
+            .collect();
+        if !spilled.samples.is_empty() {
+            samples.extend(aggregate(op, grouping, &spilled).samples);
+        }
+        samples.sort_by(|(a, _), (b, _)| a.cmp(b));
+        InstantVector { samples }
+    }
+}
+
+/// Reduce one group to a single value.
+fn reduce(op: AggregateOp, values: &[f64]) -> f64 {
+    match op {
+        AggregateOp::Sum => values.iter().sum(),
+        #[allow(clippy::cast_precision_loss)]
+        AggregateOp::Avg => values.iter().sum::<f64>() / values.len() as f64,
+        AggregateOp::Min => values.iter().copied().fold(f64::INFINITY, f64::min),
+        AggregateOp::Max => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        #[allow(clippy::cast_precision_loss)]
+        AggregateOp::Count => values.len() as f64,
+        // Handled by `select_elements`, which keeps each element rather than reducing a
+        // group to one number.
+        AggregateOp::TopK | AggregateOp::BottomK => f64::NAN,
+    }
+}
+
 fn aggregate(op: AggregateOp, grouping: &Grouping, vector: &InstantVector) -> InstantVector {
     // Keyed by hash with the label set carried alongside, so the common case — a sample
     // joining a group that already exists — allocates nothing. A bucket holds a list
@@ -546,20 +713,7 @@ fn aggregate(op: AggregateOp, grouping: &Grouping, vector: &InstantVector) -> In
 
     let mut samples: Vec<(Labels, f64)> = groups
         .into_iter()
-        .map(|(labels, values)| {
-            let value = match op {
-                AggregateOp::Sum => values.iter().sum(),
-                AggregateOp::Avg => values.iter().sum::<f64>() / values.len() as f64,
-                AggregateOp::Min => values.iter().copied().fold(f64::INFINITY, f64::min),
-                AggregateOp::Max => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-                AggregateOp::Count => values.len() as f64,
-                // Handled by `select_elements`, which keeps each element rather than
-                // reducing a group to one number. Unreachable, and cheaper to say so than
-                // to make the type encode it.
-                AggregateOp::TopK | AggregateOp::BottomK => f64::NAN,
-            };
-            (labels, value)
-        })
+        .map(|(labels, values)| (labels, reduce(op, &values)))
         .collect();
     samples.sort_by(|(a, _), (b, _)| a.cmp(b));
 
@@ -709,6 +863,76 @@ fn without_le(labels: &Labels) -> Labels {
 
 fn duration_nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod group_index_tests {
+    use super::*;
+    use crate::promql::Grouping;
+    use telemetryd_core::MetricSample;
+
+    fn sample(route: &str, le: &str, value: f64) -> MetricSample {
+        let mut labels = Labels::new();
+        labels.insert("__name__", "probe");
+        labels.insert("route", route);
+        labels.insert("le", le);
+        MetricSample {
+            series: labels,
+            timestamp_nanos: 1_000_000_000,
+            value,
+            kind: telemetryd_core::MetricKind::Gauge,
+        }
+    }
+
+    /// The index is keyed by label-set identity, so anything it does not recognise has to
+    /// fall through to grouping the slow way rather than being dropped. A silently
+    /// missing series is the worst outcome available here.
+    #[test]
+    fn samples_the_index_does_not_know_are_still_grouped() {
+        let snapshot = Snapshot::from_samples(vec![sample("/a", "1", 1.0), sample("/b", "1", 2.0)]);
+
+        // `from_samples` builds no index, so this is the fallback path end to end.
+        let mut foreign = Labels::new();
+        foreign.insert("route", "/c");
+        let vector = InstantVector {
+            samples: vec![(foreign, 5.0)],
+        };
+        let out = snapshot.aggregate(
+            AggregateOp::Sum,
+            &Grouping::By(vec!["route".to_owned()]),
+            &vector,
+        );
+        assert_eq!(out.samples.len(), 1);
+        assert!((out.samples[0].1 - 5.0).abs() < f64::EPSILON);
+        assert_eq!(out.samples[0].0.get("route"), Some("/c"));
+    }
+
+    /// Mixed input: some samples known to the index, some not. Both have to appear, and
+    /// samples of the same group must land together whichever path they took.
+    #[test]
+    fn known_and_unknown_samples_end_up_in_the_same_answer() {
+        let snapshot = Snapshot::from_samples(vec![sample("/a", "1", 1.0)]);
+        let mut known = snapshot.stripped[0].clone();
+        known.remove("le");
+        let mut other = Labels::new();
+        other.insert("route", "/z");
+
+        let vector = InstantVector {
+            samples: vec![(known, 3.0), (other, 4.0)],
+        };
+        let out = snapshot.aggregate(
+            AggregateOp::Sum,
+            &Grouping::By(vec!["route".to_owned()]),
+            &vector,
+        );
+        let routes: Vec<&str> = out
+            .samples
+            .iter()
+            .map(|(labels, _)| labels.get("route").unwrap())
+            .collect();
+        assert_eq!(routes, vec!["/a", "/z"]);
+    }
 }
 
 #[cfg(test)]
