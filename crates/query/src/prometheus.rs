@@ -5,7 +5,7 @@
 //! `/api/v1/status/buildinfo` exists because the UI probes it first and shows a
 //! degraded backend without it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -274,8 +274,12 @@ pub fn range(
     // Load once, evaluate every step from memory.
     let snapshot = Snapshot::load(store, &expr, start, end, max_samples)?;
 
-    // Keyed by label set so a series' points stay together across steps.
-    let mut series: BTreeMap<Labels, Vec<(f64, String)>> = BTreeMap::new();
+    // Keyed by label set so a series' points stay together across steps. A hash map
+    // rather than an ordered one: this is entered once per result series per step — for a
+    // six-hour chart at a minute's resolution, hundreds of thousands of times — and an
+    // ordered lookup pays for comparing whole label sets on every one. Order is restored
+    // below, where it costs one sort instead of one per insert.
+    let mut series: HashMap<Labels, Vec<(f64, String)>> = HashMap::new();
     let mut at = start;
     loop {
         if let Value::Vector(vector) = snapshot.eval(&expr, at)? {
@@ -292,6 +296,8 @@ pub fn range(
         at = (at + step_nanos).min(end);
     }
 
+    let mut series: Vec<(Labels, Vec<(f64, String)>)> = series.into_iter().collect();
+    series.sort_by(|(a, _), (b, _)| a.cmp(b));
     let result = series
         .into_iter()
         .map(|(labels, values)| RangeResult {

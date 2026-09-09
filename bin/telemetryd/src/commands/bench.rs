@@ -118,6 +118,7 @@ pub fn run(args: &BenchArgs) -> anyhow::Result<()> {
                 let at = Instant::now();
                 store.scan(
                     Scan {
+                        abort_over: 0,
                         start_nanos: 0,
                         end_nanos: u64::MAX,
                         limit: 100,

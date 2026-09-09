@@ -72,6 +72,7 @@ fn record(i: u64) -> LogRecord {
 
 fn everything() -> Scan<'static> {
     Scan {
+        abort_over: 0,
         start_nanos: 0,
         end_nanos: u64::MAX,
         limit: 0,
@@ -239,6 +240,7 @@ fn a_segment_from_before_these_fields_existed_still_reads() {
     let found = store
         .scan(
             Scan {
+                abort_over: 0,
                 start_nanos: 0,
                 end_nanos: u64::MAX,
                 limit: 0,

@@ -13,7 +13,7 @@
 //! — are far below the 2^53 boundary where that would matter.
 #![allow(clippy::cast_precision_loss)]
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::time::Duration;
 
 use telemetryd_core::{Error, LabelMatcher, Labels, MetricSample, Result};
@@ -121,7 +121,7 @@ impl Snapshot {
             )));
         }
 
-        let mut by_series: BTreeMap<Labels, Vec<(u64, f64)>> = BTreeMap::new();
+        let mut by_series: HashMap<Labels, Vec<(u64, f64)>> = HashMap::new();
         for sample in samples {
             by_series
                 .entry(sample.series.clone())
@@ -129,20 +129,24 @@ impl Snapshot {
                 .push((sample.timestamp_nanos, sample.value));
         }
 
-        let series = by_series
+        // Sorted explicitly. Grouping moved from a BTreeMap to a HashMap for speed, and
+        // with it went the ordering callers had been getting for free — an unstable order
+        // makes identical queries disagree and a dashboard reshuffle between refreshes.
+        let mut series: Vec<Series> = by_series
             .into_iter()
             .map(|(labels, mut samples)| {
                 samples.sort_by_key(|(ts, _)| *ts);
                 Series { labels, samples }
             })
             .collect();
+        series.sort_by(|a, b| a.labels.cmp(&b.labels));
 
         Ok(Self { series })
     }
 
     /// Build directly from samples, for testing and for the in-memory path.
     pub fn from_samples(samples: Vec<MetricSample>) -> Self {
-        let mut by_series: BTreeMap<Labels, Vec<(u64, f64)>> = BTreeMap::new();
+        let mut by_series: HashMap<Labels, Vec<(u64, f64)>> = HashMap::new();
         for sample in samples {
             by_series
                 .entry(sample.series.clone())
@@ -385,6 +389,63 @@ fn strip_name(labels: &Labels) -> Labels {
     out
 }
 
+/// Hash of the group a sample falls into, without building the group's label set.
+///
+/// `sum by (le, route)` over a range query asks this question once per sample per step —
+/// on a 2,886-series histogram over 360 steps, a million times. Materialising a `Labels`
+/// each time means a million `BTreeMap` allocations to answer a question whose answer is
+/// almost always "the group I built on the previous sample". Hashing the selected pairs
+/// directly costs no allocation, and the label set is built only when a group is new.
+///
+/// A hash is not an identity, so [`group_matches`] confirms the hit. That check is also
+/// allocation-free: it compares the projected values in place.
+fn group_hash(labels: &Labels, grouping: &Grouping) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match grouping {
+        Grouping::All => {}
+        Grouping::By(names) => {
+            // Sorted, so `by (a, b)` and `by (b, a)` are the same group — which they are.
+            let mut selected: Vec<(&str, &str)> = names
+                .iter()
+                .filter_map(|name| labels.get(name).map(|value| (name.as_str(), value)))
+                .collect();
+            selected.sort_unstable();
+            for pair in selected {
+                pair.hash(&mut hasher);
+            }
+        }
+        Grouping::Without(names) => {
+            for (name, value) in labels.iter() {
+                if !names.iter().any(|excluded| excluded == name) {
+                    (name, value).hash(&mut hasher);
+                }
+            }
+        }
+    }
+    hasher.finish()
+}
+
+/// Whether `labels` belongs to the group `key` describes, without building either.
+fn group_matches(labels: &Labels, key: &Labels, grouping: &Grouping) -> bool {
+    match grouping {
+        Grouping::All => true,
+        Grouping::By(names) => names.iter().all(|name| labels.get(name) == key.get(name)),
+        Grouping::Without(names) => {
+            let kept = |set: &Labels| {
+                set.iter()
+                    .filter(|(name, _)| !names.iter().any(|excluded| excluded == name))
+                    .count()
+            };
+            kept(labels) == key.len()
+                && labels
+                    .iter()
+                    .filter(|(name, _)| !names.iter().any(|excluded| excluded == name))
+                    .all(|(name, value)| key.get(name) == Some(value))
+        }
+    }
+}
+
 /// The group key a sample falls into under `by`/`without`.
 fn group_key(labels: &Labels, grouping: &Grouping) -> Labels {
     match grouping {
@@ -423,7 +484,7 @@ fn select_elements(
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let keep = k.floor().min(f64::from(u32::MAX)) as usize;
 
-    let mut groups: BTreeMap<Labels, Vec<(Labels, f64)>> = BTreeMap::new();
+    let mut groups: HashMap<Labels, Vec<(Labels, f64)>> = HashMap::new();
     for (labels, value) in &vector.samples {
         if value.is_nan() {
             continue;
@@ -450,21 +511,40 @@ fn select_elements(
         members.truncate(keep);
         samples.extend(members);
     }
+    // Groups come out of the map in no particular order; the selection within each group
+    // is already ordered, so this only settles the groups against each other.
+    samples.sort_by(|(a_labels, a), (b_labels, b)| {
+        let ordered = match op {
+            AggregateOp::BottomK => a.partial_cmp(b),
+            _ => b.partial_cmp(a),
+        };
+        ordered
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a_labels.cmp(b_labels))
+    });
 
     InstantVector { samples }
 }
 
 fn aggregate(op: AggregateOp, grouping: &Grouping, vector: &InstantVector) -> InstantVector {
-    let mut groups: BTreeMap<Labels, Vec<f64>> = BTreeMap::new();
+    // Keyed by hash with the label set carried alongside, so the common case — a sample
+    // joining a group that already exists — allocates nothing. A bucket holds a list
+    // because a hash is not an identity; `group_matches` picks the right member.
+    let mut groups: HashMap<u64, Vec<(Labels, Vec<f64>)>> = HashMap::new();
 
     for (labels, value) in &vector.samples {
-        groups
-            .entry(group_key(labels, grouping))
-            .or_default()
-            .push(*value);
+        let bucket = groups.entry(group_hash(labels, grouping)).or_default();
+        match bucket
+            .iter_mut()
+            .find(|(key, _)| group_matches(labels, key, grouping))
+        {
+            Some((_, values)) => values.push(*value),
+            None => bucket.push((group_key(labels, grouping), vec![*value])),
+        }
     }
+    let groups = groups.into_values().flatten();
 
-    let samples = groups
+    let mut samples: Vec<(Labels, f64)> = groups
         .into_iter()
         .map(|(labels, values)| {
             let value = match op {
@@ -481,6 +561,7 @@ fn aggregate(op: AggregateOp, grouping: &Grouping, vector: &InstantVector) -> In
             (labels, value)
         })
         .collect();
+    samples.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     InstantVector { samples }
 }
@@ -564,7 +645,7 @@ fn histogram_quantile(quantile: f64, vector: &InstantVector) -> InstantVector {
     }
 
     // Group buckets by everything except `le`.
-    let mut histograms: BTreeMap<Labels, Vec<(f64, f64)>> = BTreeMap::new();
+    let mut histograms: HashMap<Labels, Vec<(f64, f64)>> = HashMap::new();
     for (labels, count) in &vector.samples {
         let Some(le) = labels.get("le") else { continue };
         let bound = if le == "+Inf" {
@@ -581,7 +662,7 @@ fn histogram_quantile(quantile: f64, vector: &InstantVector) -> InstantVector {
             .push((bound, *count));
     }
 
-    let samples = histograms
+    let mut samples: Vec<(Labels, f64)> = histograms
         .into_iter()
         .filter_map(|(labels, mut buckets)| {
             buckets.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -614,6 +695,7 @@ fn histogram_quantile(quantile: f64, vector: &InstantVector) -> InstantVector {
             Some((labels, previous_bound))
         })
         .collect();
+    samples.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     InstantVector { samples }
 }
@@ -627,6 +709,91 @@ fn without_le(labels: &Labels) -> Labels {
 
 fn duration_nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod grouping_tests {
+    use super::*;
+    use crate::promql::Grouping;
+
+    fn labelled(pairs: &[(&str, &str)]) -> Labels {
+        let mut labels = Labels::new();
+        for (k, v) in pairs {
+            labels.insert(*k, *v);
+        }
+        labels
+    }
+
+    /// The hash exists to avoid building the key; it is only sound if it agrees with the
+    /// key that would have been built. Same group must hash the same, different groups
+    /// must (in practice) not — and `group_matches` is what makes a clash harmless.
+    #[test]
+    fn the_hash_agrees_with_the_key_it_replaces() {
+        let by = Grouping::By(vec!["route".to_owned(), "le".to_owned()]);
+        let a = labelled(&[("route", "/x"), ("le", "5"), ("pod", "one")]);
+        let b = labelled(&[("route", "/x"), ("le", "5"), ("pod", "two")]);
+        let c = labelled(&[("route", "/y"), ("le", "5"), ("pod", "one")]);
+
+        assert_eq!(group_key(&a, &by), group_key(&b, &by), "same group");
+        assert_eq!(group_hash(&a, &by), group_hash(&b, &by));
+        assert!(group_matches(&b, &group_key(&a, &by), &by));
+
+        assert_ne!(group_key(&a, &by), group_key(&c, &by), "different group");
+        assert!(!group_matches(&c, &group_key(&a, &by), &by));
+    }
+
+    /// `by (a, b)` and `by (b, a)` are the same grouping, so they must hash alike — the
+    /// projected pairs are sorted before hashing for exactly this reason.
+    #[test]
+    fn the_order_of_by_names_does_not_change_the_group() {
+        let one = Grouping::By(vec!["a".to_owned(), "b".to_owned()]);
+        let other = Grouping::By(vec!["b".to_owned(), "a".to_owned()]);
+        let labels = labelled(&[("a", "1"), ("b", "2")]);
+        assert_eq!(group_hash(&labels, &one), group_hash(&labels, &other));
+        assert_eq!(group_key(&labels, &one), group_key(&labels, &other));
+    }
+
+    /// `without` is the awkward direction: the key is everything *except* the named
+    /// labels, so a sample carrying an extra label belongs to a different group even
+    /// though every label the key does have matches.
+    #[test]
+    fn without_grouping_distinguishes_an_extra_label() {
+        let without = Grouping::Without(vec!["le".to_owned()]);
+        let key = group_key(&labelled(&[("route", "/x"), ("le", "5")]), &without);
+
+        assert!(group_matches(
+            &labelled(&[("route", "/x"), ("le", "9")]),
+            &key,
+            &without
+        ));
+        assert!(
+            !group_matches(
+                &labelled(&[("route", "/x"), ("pod", "one"), ("le", "5")]),
+                &key,
+                &without
+            ),
+            "an extra label outside the exclusion list is a different group"
+        );
+        assert!(!group_matches(
+            &labelled(&[("route", "/y"), ("le", "5")]),
+            &key,
+            &without
+        ));
+    }
+
+    /// Everything collapses into one group, so anything matches it.
+    #[test]
+    fn grouping_over_everything_is_one_group() {
+        let all = Grouping::All;
+        let key = group_key(&labelled(&[("a", "1")]), &all);
+        assert!(key.is_empty());
+        assert!(group_matches(&labelled(&[("b", "2")]), &key, &all));
+        assert_eq!(
+            group_hash(&labelled(&[("a", "1")]), &all),
+            group_hash(&labelled(&[("b", "2")]), &all)
+        );
+    }
 }
 
 #[cfg(test)]

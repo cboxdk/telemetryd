@@ -123,6 +123,7 @@ pub async fn export(
     // runtime worker is what parked one in the Cbox ID path.
     let scanned = tokio::task::spawn_blocking(move || -> Result<Scanned, Error> {
         let scan = Scan {
+            abort_over: 0,
             start_nanos: start,
             end_nanos: end,
             limit,

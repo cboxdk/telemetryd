@@ -75,6 +75,7 @@ fn record(i: u64) -> LogRecord {
 
 fn newest_hundred() -> Scan<'static> {
     Scan {
+        abort_over: 0,
         start_nanos: 0,
         end_nanos: u64::MAX,
         limit: 100,
@@ -200,6 +201,7 @@ fn a_query_sees_records_appended_a_moment_ago() {
         let found = store
             .scan(
                 Scan {
+                    abort_over: 0,
                     start_nanos: 0,
                     end_nanos: u64::MAX,
                     limit: 0,

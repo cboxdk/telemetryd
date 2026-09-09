@@ -142,6 +142,7 @@ fn a_limited_query_does_not_open_every_segment() {
     let results = store
         .scan(
             Scan {
+                abort_over: 0,
                 start_nanos: 0,
                 end_nanos: u64::MAX,
                 limit: 10,
@@ -173,6 +174,7 @@ fn a_limited_query_still_returns_the_correct_records() {
     let newest = store
         .scan(
             Scan {
+                abort_over: 0,
                 start_nanos: 0,
                 end_nanos: u64::MAX,
                 limit: 5,
@@ -207,6 +209,7 @@ fn an_ascending_limited_query_takes_the_oldest_and_prunes_from_the_other_end() {
     let results = store
         .scan(
             Scan {
+                abort_over: 0,
                 start_nanos: 0,
                 end_nanos: u64::MAX,
                 limit: 10,
@@ -322,6 +325,7 @@ fn a_trace_lookup_does_not_read_the_whole_retention_window() {
     let results = store
         .scan(
             Scan {
+                abort_over: 0,
                 start_nanos: 0,
                 end_nanos: u64::MAX,
                 limit: 0,
@@ -365,6 +369,7 @@ fn the_bloom_filter_never_hides_a_trace_that_exists() {
         let found = store
             .scan(
                 Scan {
+                    abort_over: 0,
                     start_nanos: 0,
                     end_nanos: u64::MAX,
                     limit: 0,
@@ -398,6 +403,7 @@ fn a_limited_query_over_a_large_store_stays_bounded() {
     let results = store
         .scan(
             Scan {
+                abort_over: 0,
                 start_nanos: 0,
                 end_nanos: u64::MAX,
                 limit: 20,
@@ -468,6 +474,7 @@ fn parallel_scanning_returns_exactly_the_sequential_answer() {
         (Order::Descending, 0),
     ] {
         let request = || Scan {
+            abort_over: 0,
             start_nanos: 0,
             end_nanos: u64::MAX,
             limit,
@@ -520,6 +527,7 @@ fn a_parallel_query_is_deterministic_across_runs() {
 
     let store = harness.logs_with_parallelism(8);
     let request = || Scan {
+        abort_over: 0,
         start_nanos: 0,
         end_nanos: u64::MAX,
         limit: 50,
@@ -589,6 +597,7 @@ fn a_stream_is_pruned_on_its_own_time_range_not_the_segments() {
         let found = store
             .scan(
                 Scan {
+                    abort_over: 0,
                     start_nanos: 0,
                     end_nanos: u64::MAX,
                     limit: 100,
@@ -676,6 +685,7 @@ fn trigram_pruning_never_changes_the_answer() {
     for pattern in patterns {
         let scan = |with_index: bool| {
             let mut request = Scan {
+                abort_over: 0,
                 start_nanos: 0,
                 end_nanos: u64::MAX,
                 limit: 0,
@@ -743,6 +753,7 @@ fn a_pattern_that_appears_nowhere_reads_no_segments() {
     let found = store
         .scan(
             Scan {
+                abort_over: 0,
                 start_nanos: 0,
                 end_nanos: u64::MAX,
                 limit: 0,

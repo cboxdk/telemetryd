@@ -271,7 +271,23 @@ pub struct Scan<'a> {
     pub start_nanos: u64,
     pub end_nanos: u64,
     /// `0` means unbounded.
+    ///
+    /// This is *top-N*, not a ceiling: the collector keeps the best `limit` records by
+    /// time, evicting as it goes, which costs a heap sift on every record offered. Use it
+    /// when the caller genuinely wants the newest or oldest N. A caller that wants "refuse
+    /// if there are more than N" wants [`Scan::abort_over`] instead — passing that
+    /// through `limit` turns an append into a heap build over the whole result.
     pub limit: usize,
+    /// Refuse the scan once this many records have been collected. `0` means no ceiling.
+    ///
+    /// Separate from `limit` because it is a different question with a different answer.
+    /// `limit` orders and evicts; this one only counts, so the collector keeps its fast
+    /// append path and the scan stops early instead of returning a truncated answer.
+    ///
+    /// Added after the PromQL sample ceiling was first built on `limit`, which quietly
+    /// put every metric scan through a `BinaryHeap` — measured at six seconds to load a
+    /// six-hour window that had been well under one.
+    pub abort_over: usize,
     pub order: Order,
     /// An exact value for the schema's key column, when the query is a point lookup.
     /// Lets the per-segment Bloom filter rule segments out before any I/O.
@@ -311,6 +327,7 @@ impl<'a> Scan<'a> {
             start_nanos,
             end_nanos,
             limit: 0,
+            abort_over: 0,
             order: Order::Ascending,
             exact_key: None,
             columns: None,
@@ -624,13 +641,14 @@ impl<S: RecordSchema> RecordStore<S> {
         end_nanos: u64,
         matchers: &[LabelMatcher],
         extra: &(dyn Fn(&S::Record) -> bool + Sync),
-        limit: usize,
+        ceiling: usize,
     ) -> Result<Vec<S::Record>> {
         self.scan(
             Scan {
+                abort_over: ceiling,
                 start_nanos,
                 end_nanos,
-                limit,
+                limit: 0,
                 order: Order::Ascending,
                 exact_key: None,
                 columns: None,
@@ -709,6 +727,7 @@ impl<S: RecordSchema> RecordStore<S> {
         if workers <= 1 {
             for (ordinal, segment) in segments.iter().enumerate() {
                 self.scan_segment(segment, ordinal, &request, matchers, extra, &mut collector);
+                Self::over_ceiling(&request, collector.len())?;
             }
             return Ok(collector.into_sorted());
         }
@@ -781,6 +800,22 @@ impl<S: RecordSchema> RecordStore<S> {
     /// Conservative on purpose besides: this process is accepting writes at the same
     /// time, and handing every core to one query makes ingest stutter under exactly
     /// the load an operator is trying to look at.
+    /// Stop a scan that has collected more than the caller is willing to hold.
+    ///
+    /// Checked between segments rather than per record: the granularity costs at most one
+    /// segment's worth of overshoot, and a branch on every record of a hundred-million-row
+    /// store costs more than the bound is worth.
+    fn over_ceiling(request: &Scan, collected: usize) -> Result<()> {
+        if request.abort_over != 0 && collected > request.abort_over {
+            return Err(telemetryd_core::Error::BadRequest(format!(
+                "this query matched more than {} records, which is more than one query \
+                 is allowed to hold at once",
+                request.abort_over
+            )));
+        }
+        Ok(())
+    }
+
     fn scan_workers(&self, request: &Scan, segments: usize) -> usize {
         let configured = self.settings.query_parallelism;
         if configured <= 1 || request.limit != 0 || segments < MIN_SEGMENTS_PER_EXTRA_WORKER {

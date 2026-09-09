@@ -390,6 +390,7 @@ pub fn trace(store: &RecordStore<SpanSchema>, trace_id: &str) -> Result<TraceRes
     // between a millisecond and several seconds on a full disk.
     let spans = store.scan(
         telemetryd_store::Scan {
+            abort_over: 0,
             start_nanos: 0,
             end_nanos: u64::MAX,
             limit: 0,

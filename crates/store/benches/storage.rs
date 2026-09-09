@@ -216,6 +216,7 @@ fn bench_query(c: &mut Criterion) {
             store
                 .scan(
                     Scan {
+                        abort_over: 0,
                         start_nanos: 0,
                         end_nanos: u64::MAX,
                         limit: 100,
@@ -238,6 +239,7 @@ fn bench_query(c: &mut Criterion) {
             store
                 .scan(
                     Scan {
+                        abort_over: 0,
                         start_nanos: 0,
                         end_nanos: u64::MAX,
                         limit: 100,
@@ -286,6 +288,7 @@ fn bench_query(c: &mut Criterion) {
             parallel
                 .scan(
                     Scan {
+                        abort_over: 0,
                         start_nanos: 0,
                         end_nanos: u64::MAX,
                         limit: 100,
