@@ -272,7 +272,19 @@ pub fn range(
     }
 
     // Load once, evaluate every step from memory.
-    let snapshot = Snapshot::load(store, &expr, start, end, max_samples)?;
+    let mut snapshot = Snapshot::load(store, &expr, start, end, max_samples)?;
+    // The step timestamps, so range-vector calls can be turned inside out: each series
+    // walked once with a sliding window, instead of every series bisected at every step.
+    let mut timestamps = Vec::new();
+    let mut cursor = start;
+    loop {
+        timestamps.push(cursor);
+        if cursor >= end {
+            break;
+        }
+        cursor = (cursor + step_nanos).min(end);
+    }
+    snapshot.prepare(&expr, &timestamps);
 
     // Keyed by label set so a series' points stay together across steps. A hash map
     // rather than an ordered one: this is entered once per result series per step — for a

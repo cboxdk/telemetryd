@@ -82,6 +82,12 @@ pub struct Snapshot {
     stripped: Vec<Labels>,
     /// For each distinct selector in the expression, the series it matches.
     resolved: Vec<(Vec<telemetryd_core::LabelMatcher>, Vec<usize>)>,
+    /// Range-vector calls evaluated for every step in one pass per series.
+    ///
+    /// Empty until [`Snapshot::prepare`] is called, which only the range handler does.
+    prepared: Vec<PreparedRate>,
+    /// The step timestamps `prepared` was built for, so a lookup can find its index.
+    prepared_steps: Vec<u64>,
     /// For each grouping the expression aggregates by, where each series lands.
     ///
     /// Keyed by [`Labels::storage_id`] rather than by the label set: every step is handed
@@ -89,6 +95,107 @@ pub struct Snapshot {
     /// that comparing values was answering a million times over. Profiling a six-hour
     /// panel put `memcmp` at the top, and this is what it was.
     grouped: Vec<GroupIndex>,
+}
+
+/// `rate`/`increase` over one already-selected window.
+///
+/// Shared by the prepared pass and the per-step path so the two cannot disagree: the
+/// counter-reset handling and the observed-span division are subtle enough that a second
+/// copy would eventually be a second answer.
+///
+/// Counter resets are handled the way Prometheus does: a drop between consecutive samples
+/// means the process restarted, so the new value is the increase rather than a negative
+/// delta. The rate is computed over the span actually **observed** rather than the nominal
+/// window, because a range selector is half-open and a series scraped exactly on the
+/// boundary contributes one fewer interval than it appears to.
+fn rate_over(window: &[(u64, f64)], range_nanos: u64, per_second: bool) -> Option<f64> {
+    // One point cannot describe a change.
+    if window.len() < 2 {
+        return None;
+    }
+    let mut increase = 0.0;
+    for pair in window.windows(2) {
+        let (previous, current) = (pair[0].1, pair[1].1);
+        increase += if current < previous {
+            current
+        } else {
+            current - previous
+        };
+    }
+    let observed_nanos = window[window.len() - 1].0.saturating_sub(window[0].0);
+    if observed_nanos == 0 {
+        // Every sample shares a timestamp; there is no elapsed time to divide by, and
+        // inventing one would report an arbitrary rate.
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let per_second_rate = increase / (observed_nanos as f64 / NANOS_PER_SECOND);
+    Some(if per_second {
+        per_second_rate
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        let window_seconds = range_nanos as f64 / NANOS_PER_SECOND;
+        per_second_rate * window_seconds
+    })
+}
+
+/// Every `rate`/`increase` call in an expression, with what it is applied to.
+fn rate_calls(expr: &Expr) -> Vec<(&Selector, Duration, bool)> {
+    let mut out = Vec::new();
+    collect_rate_calls(expr, &mut out);
+    out
+}
+
+fn collect_rate_calls<'a>(expr: &'a Expr, out: &mut Vec<(&'a Selector, Duration, bool)>) {
+    match expr {
+        Expr::Call { function, args } => {
+            if matches!(function, Function::Rate | Function::Increase)
+                && let Some(Expr::Selector(selector)) = args.first()
+                && let Some(range) = selector.range
+            {
+                out.push((selector, range, *function == Function::Rate));
+            }
+            for arg in args {
+                collect_rate_calls(arg, out);
+            }
+        }
+        Expr::Aggregation { param, inner, .. } => {
+            if let Some(param) = param {
+                collect_rate_calls(param, out);
+            }
+            collect_rate_calls(inner, out);
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_rate_calls(left, out);
+            collect_rate_calls(right, out);
+        }
+        Expr::Negate(inner) => collect_rate_calls(inner, out),
+        Expr::Selector(_) | Expr::Number(_) => {}
+    }
+}
+
+/// One `rate`/`increase` call, evaluated for every step of a range query up front.
+///
+/// # Why this is not evaluated per step
+///
+/// Evaluating a step touches every matching series: 2,886 of them, 361 times, each time
+/// bisecting into that series' own sample vector. Those vectors are scattered across the
+/// heap, so the loop walks 2,886 unrelated memory regions and then does it again, 361
+/// times over — a million cache misses doing arithmetic that costs nanoseconds.
+///
+/// Turned inside out, each series is visited once and its window slides forward through
+/// the steps in order. The samples are read sequentially, the window bounds only ever
+/// advance, and the whole series is done before the next one is touched.
+#[derive(Debug)]
+struct PreparedRate {
+    matchers: Vec<telemetryd_core::LabelMatcher>,
+    range: Duration,
+    offset: Duration,
+    per_second: bool,
+    /// `by_step[s]` holds `(series index, value)` for every series with a value at step
+    /// `s`. Indices, not labels: the label set is attached when the vector is handed to
+    /// the evaluator.
+    by_step: Vec<Vec<(usize, f64)>>,
 }
 
 /// Where every series lands under one grouping, worked out once.
@@ -224,6 +331,8 @@ impl Snapshot {
             stripped,
             resolved,
             grouped,
+            prepared: Vec::new(),
+            prepared_steps: Vec::new(),
         })
     }
 
@@ -252,6 +361,8 @@ impl Snapshot {
             stripped,
             resolved: Vec::new(),
             grouped: Vec::new(),
+            prepared: Vec::new(),
+            prepared_steps: Vec::new(),
         }
     }
 
@@ -384,13 +495,17 @@ impl Snapshot {
         let mut samples = Vec::new();
         for index in self.matching(selector) {
             let series = &self.series[index];
-            if let Some((_, value)) = series
-                .samples
-                .iter()
-                .rev()
-                .find(|(ts, _)| *ts <= at && *ts > floor)
-            {
-                samples.push((self.stripped[index].clone(), *value));
+            // The newest sample at or before `at`, found by bisection. This was a reverse
+            // linear scan, which is cheap at the end of a series and O(n) at its start —
+            // so an early step of a range query walked the whole series to find one
+            // value, once per series, per step.
+            let end = series.samples.partition_point(|(ts, _)| *ts <= at);
+            if end == 0 {
+                continue;
+            }
+            let (ts, value) = series.samples[end - 1];
+            if ts > floor {
+                samples.push((self.stripped[index].clone(), value));
             }
         }
         InstantVector { samples }
@@ -413,6 +528,60 @@ impl Snapshot {
     /// `increase` is then that rate extrapolated across the window, which is what
     /// Prometheus reports and what makes `increase(x[1h])` comparable between series
     /// scraped at different intervals.
+    /// Evaluate every `rate`/`increase` in the expression for every step, once per series.
+    ///
+    /// Called by the range handler before stepping. An instant query has one step and
+    /// nothing to gain, so it does not call this and every lookup falls through to the
+    /// per-step path — which stays correct and is what the unit tests exercise.
+    pub fn prepare(&mut self, expr: &Expr, steps: &[u64]) {
+        if steps.len() < 2 {
+            return;
+        }
+        for (selector, range, per_second) in rate_calls(expr) {
+            let offset = selector.offset.unwrap_or(Duration::ZERO);
+            if self.prepared.iter().any(|p| {
+                p.matchers == selector.matchers
+                    && p.range == range
+                    && p.offset == offset
+                    && p.per_second == per_second
+            }) {
+                continue;
+            }
+            let mut by_step: Vec<Vec<(usize, f64)>> = vec![Vec::new(); steps.len()];
+            let range_nanos = duration_nanos(range);
+            let offset_nanos = duration_nanos(offset);
+
+            for index in self.matching(selector) {
+                let samples = &self.series[index].samples;
+                // The window only ever moves forward, so both bounds are cursors rather
+                // than searches: across every step of one series they advance through the
+                // sample vector exactly once.
+                let (mut start, mut end) = (0usize, 0usize);
+                for (step, at_nanos) in steps.iter().enumerate() {
+                    let at = at_nanos.saturating_sub(offset_nanos);
+                    let floor = at.saturating_sub(range_nanos);
+                    while end < samples.len() && samples[end].0 <= at {
+                        end += 1;
+                    }
+                    while start < end && samples[start].0 <= floor {
+                        start += 1;
+                    }
+                    if let Some(value) = rate_over(&samples[start..end], range_nanos, per_second) {
+                        by_step[step].push((index, value));
+                    }
+                }
+            }
+            self.prepared.push(PreparedRate {
+                matchers: selector.matchers.clone(),
+                range,
+                offset,
+                per_second,
+                by_step,
+            });
+        }
+        self.prepared_steps = steps.to_vec();
+    }
+
     fn rate(
         &self,
         selector: &Selector,
@@ -420,51 +589,39 @@ impl Snapshot {
         at_nanos: u64,
         per_second: bool,
     ) -> InstantVector {
+        // Prepared for this exact step? Then the work is already done and this is a
+        // lookup. Falls through otherwise — an instant query, or a call the preparation
+        // pass did not see.
+        if let Some(prepared) = self.prepared.iter().find(|p| {
+            p.matchers == selector.matchers
+                && p.range == range
+                && p.per_second == per_second
+                && p.offset == selector.offset.unwrap_or(Duration::ZERO)
+        }) && let Ok(step) = self.prepared_steps.binary_search(&at_nanos)
+        {
+            return InstantVector {
+                samples: prepared.by_step[step]
+                    .iter()
+                    .map(|(index, value)| (self.stripped[*index].clone(), *value))
+                    .collect(),
+            };
+        }
+
         let at = at_nanos.saturating_sub(duration_nanos(selector.offset.unwrap_or(Duration::ZERO)));
         let floor = at.saturating_sub(duration_nanos(range));
 
         let mut samples = Vec::new();
         for index in self.matching(selector) {
             let series = &self.series[index];
-            // Samples are sorted by time, so `(floor, at]` is a contiguous slice: found by
-            // two binary searches rather than a scan of the whole series, and used in
-            // place rather than copied. This ran once per series per step — for a
-            // six-hour panel, 361 x 2,886 scans of 360 samples each, and as many
-            // allocations.
             let start = series.samples.partition_point(|(ts, _)| *ts <= floor);
             let end = series.samples.partition_point(|(ts, _)| *ts <= at);
-            let window = &series.samples[start..end];
-
-            // One point cannot describe a change.
-            if window.len() < 2 {
-                continue;
+            if let Some(value) = rate_over(
+                &series.samples[start..end],
+                duration_nanos(range),
+                per_second,
+            ) {
+                samples.push((self.stripped[index].clone(), value));
             }
-
-            let mut increase = 0.0;
-            for pair in window.windows(2) {
-                let (previous, current) = (pair[0].1, pair[1].1);
-                increase += if current < previous {
-                    current
-                } else {
-                    current - previous
-                };
-            }
-
-            let observed_nanos = window[window.len() - 1].0.saturating_sub(window[0].0);
-            if observed_nanos == 0 {
-                // Every sample shares a timestamp; there is no elapsed time to divide
-                // by, and inventing one would report an arbitrary rate.
-                continue;
-            }
-            let observed_seconds = observed_nanos as f64 / NANOS_PER_SECOND;
-            let per_second_rate = increase / observed_seconds;
-
-            let value = if per_second {
-                per_second_rate
-            } else {
-                per_second_rate * (duration_nanos(range) as f64 / NANOS_PER_SECOND)
-            };
-            samples.push((self.stripped[index].clone(), value));
         }
         InstantVector { samples }
     }
@@ -863,6 +1020,81 @@ fn without_le(labels: &Labels) -> Labels {
 
 fn duration_nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod prepared_tests {
+    use super::*;
+    use telemetryd_core::{MetricKind, MetricSample};
+
+    fn counter(route: &str, minute: u64, value: f64) -> MetricSample {
+        let mut labels = Labels::new();
+        labels.insert("__name__", "probe");
+        labels.insert("route", route);
+        MetricSample {
+            series: labels,
+            timestamp_nanos: minute * 60 * 1_000_000_000,
+            value,
+            kind: MetricKind::Counter,
+        }
+    }
+
+    fn samples() -> Vec<MetricSample> {
+        let mut out = Vec::new();
+        for route in ["/a", "/b"] {
+            for minute in 1..=30u64 {
+                #[allow(clippy::cast_precision_loss)]
+                let value = (minute * if route == "/a" { 2 } else { 5 }) as f64;
+                out.push(counter(route, minute, value));
+            }
+        }
+        out
+    }
+
+    /// The prepared pass and the per-step path are two implementations of one definition,
+    /// and the whole point of preparing is that nobody notices. A sliding window that
+    /// disagrees with a bisected one at even one step would show up as a chart that
+    /// changes shape when the resolution changes — which nobody would read as a bug.
+    #[test]
+    fn preparing_gives_exactly_what_stepping_gives() {
+        let expr = crate::promql::parse("sum by (route) (rate(probe[5m]))").unwrap();
+        let steps: Vec<u64> = (5..=30).map(|m| m * 60 * 1_000_000_000).collect();
+
+        let plain = Snapshot::from_samples(samples());
+        let mut prepared = Snapshot::from_samples(samples());
+        prepared.prepare(&expr, &steps);
+        assert!(!prepared.prepared.is_empty(), "the pass must have run");
+
+        for at in steps {
+            let a = plain.eval(&expr, at).unwrap().into_vector();
+            let b = prepared.eval(&expr, at).unwrap().into_vector();
+            assert_eq!(a.samples.len(), b.samples.len(), "at {at}");
+            for ((la, va), (lb, vb)) in a.samples.iter().zip(&b.samples) {
+                assert_eq!(la, lb, "at {at}");
+                assert!((va - vb).abs() < 1e-9, "at {at}: {va} vs {vb}");
+            }
+        }
+    }
+
+    /// `offset` shifts the window, and the prepared pass has to shift with it — an
+    /// offset applied in one path and not the other would read a different window and
+    /// silently return the wrong number.
+    #[test]
+    fn an_offset_moves_both_paths_the_same_way() {
+        let expr = crate::promql::parse("rate(probe[5m] offset 5m)").unwrap();
+        let steps: Vec<u64> = (10..=30).map(|m| m * 60 * 1_000_000_000).collect();
+
+        let plain = Snapshot::from_samples(samples());
+        let mut prepared = Snapshot::from_samples(samples());
+        prepared.prepare(&expr, &steps);
+
+        for at in steps {
+            let a = plain.eval(&expr, at).unwrap().into_vector();
+            let b = prepared.eval(&expr, at).unwrap().into_vector();
+            assert_eq!(a.samples, b.samples, "at {at}");
+        }
+    }
 }
 
 #[cfg(test)]
