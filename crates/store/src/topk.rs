@@ -79,6 +79,13 @@ pub struct TopK<T> {
     /// expressed as a max-heap by flipping the key.
     heap: BinaryHeap<Reverse<Keyed<T>>>,
     ascending: BinaryHeap<Keyed<T>>,
+    /// Used instead of either heap when `limit == 0`.
+    ///
+    /// An unbounded collector never evicts, so the ordering a heap maintains on every
+    /// insert is thrown away: `into_sorted` sorts what it drains regardless. Keeping heap
+    /// order for four million rows is a sift-up each — tens of millions of comparisons
+    /// whose only result is a shape that is immediately flattened and re-sorted.
+    unbounded: Vec<Keyed<T>>,
 }
 
 impl<T> TopK<T> {
@@ -90,11 +97,12 @@ impl<T> TopK<T> {
             row: 0,
             heap: BinaryHeap::new(),
             ascending: BinaryHeap::new(),
+            unbounded: Vec::new(),
         }
     }
 
     pub fn len(&self) -> usize {
-        self.heap.len() + self.ascending.len()
+        self.heap.len() + self.ascending.len() + self.unbounded.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -135,6 +143,7 @@ impl<T> TopK<T> {
         // hundred thousand records one at a time re-sifts the heap on every insert,
         // and that serial tail was eating most of what parallel scanning had won.
         if self.limit == 0 {
+            self.unbounded.append(&mut other.unbounded);
             self.heap.append(&mut other.heap);
             self.ascending.append(&mut other.ascending);
             return;
@@ -148,6 +157,10 @@ impl<T> TopK<T> {
     }
 
     fn offer(&mut self, entry: Keyed<T>) {
+        if self.limit == 0 {
+            self.unbounded.push(entry);
+            return;
+        }
         match self.order {
             Order::Descending => {
                 if self.is_full() {
@@ -205,9 +218,13 @@ impl<T> TopK<T> {
 
     /// Drain in the requested order.
     pub fn into_sorted(self) -> Vec<T> {
-        let mut entries: Vec<Keyed<T>> = match self.order {
-            Order::Descending => self.heap.into_iter().map(|Reverse(entry)| entry).collect(),
-            Order::Ascending => self.ascending.into_vec(),
+        let mut entries: Vec<Keyed<T>> = if self.limit == 0 {
+            self.unbounded
+        } else {
+            match self.order {
+                Order::Descending => self.heap.into_iter().map(|Reverse(entry)| entry).collect(),
+                Order::Ascending => self.ascending.into_vec(),
+            }
         };
         entries.sort();
         if self.order == Order::Descending {
@@ -320,6 +337,41 @@ mod tests {
             b.push(42, value);
         }
         assert_eq!(a.into_sorted(), b.into_sorted());
+    }
+
+    #[test]
+    /// The unbounded path skips the heap entirely, so it has to be shown that it lands
+    /// in the same place — same records, same order, in both directions. A collector that
+    /// ordered differently depending on whether a limit happened to be set would make a
+    /// query's answer depend on a setting that is supposed to bound it, not shape it.
+    #[test]
+    fn unbounded_and_bounded_agree_on_order() {
+        for order in [Order::Descending, Order::Ascending] {
+            let pushes: [(u64, &str); 6] = [
+                (30, "c"),
+                (10, "a"),
+                (50, "e"),
+                (20, "b"),
+                (60, "f"),
+                (40, "d"),
+            ];
+
+            let mut unbounded = TopK::new(0, order);
+            // A limit larger than the input never evicts, so it exercises the heap while
+            // keeping every record — the same set the unbounded collector holds.
+            let mut bounded = TopK::new(100, order);
+            for (ts, value) in pushes {
+                unbounded.push(ts, value);
+                bounded.push(ts, value);
+            }
+
+            assert_eq!(unbounded.len(), 6);
+            assert_eq!(
+                unbounded.into_sorted(),
+                bounded.into_sorted(),
+                "order {order:?}"
+            );
+        }
     }
 
     #[test]

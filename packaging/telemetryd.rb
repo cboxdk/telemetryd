@@ -10,7 +10,7 @@
 class Telemetryd < Formula
   desc "Single-binary observability backend: OTLP in, Loki/Tempo/Prometheus APIs out"
   homepage "https://github.com/cboxdk/telemetryd"
-  version "0.50.2"
+  version "0.51.0"
   license "MIT"
 
   on_macos do
