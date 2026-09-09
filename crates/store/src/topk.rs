@@ -339,7 +339,6 @@ mod tests {
         assert_eq!(a.into_sorted(), b.into_sorted());
     }
 
-    #[test]
     /// The unbounded path skips the heap entirely, so it has to be shown that it lands
     /// in the same place — same records, same order, in both directions. A collector that
     /// ordered differently depending on whether a limit happened to be set would make a
