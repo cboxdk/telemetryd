@@ -97,6 +97,63 @@ pub struct Snapshot {
     grouped: Vec<GroupIndex>,
 }
 
+/// Turn scanned samples into series, sorted by label set and by time.
+///
+/// # Grouped by identity first, then by value
+///
+/// Every row a segment materialises carries a clone of the same interned label set, so
+/// the pointer *is* the stream — and hashing a pointer is one machine word where hashing
+/// a label set walks every name and value it holds. Over four million rows, that walk was
+/// the load: 185 ms became 112 ms on a store of the reported shape.
+///
+/// Identity can under-group where value would not. Two equal label sets that were never
+/// interned together — past the interner's capacity, after a fingerprint clash, or
+/// straight out of the unsealed write buffer, which is not interned at all — are separate
+/// allocations and would become two series carrying half the data each. So the groups are
+/// merged by value afterwards. That pass is over *groups*, of which there are thousands,
+/// rather than over rows, of which there are millions.
+fn group_samples(samples: Vec<MetricSample>) -> Vec<Series> {
+    let mut by_identity: HashMap<usize, (Labels, Vec<(u64, f64)>)> = HashMap::new();
+    for sample in samples {
+        let id = sample.series.storage_id();
+        match by_identity.get_mut(&id) {
+            Some((_, points)) => points.push((sample.timestamp_nanos, sample.value)),
+            None => {
+                by_identity.insert(
+                    id,
+                    (sample.series, vec![(sample.timestamp_nanos, sample.value)]),
+                );
+            }
+        }
+    }
+
+    let mut by_value: HashMap<Labels, Vec<(u64, f64)>> = HashMap::new();
+    for (_, (labels, points)) in by_identity {
+        match by_value.get_mut(&labels) {
+            Some(existing) => existing.extend(points),
+            None => {
+                by_value.insert(labels, points);
+            }
+        }
+    }
+
+    // Sorted explicitly. Grouping is by hash map, and with it went the ordering callers
+    // had been getting for free from an ordered map — an unstable order makes identical
+    // queries disagree and a dashboard reshuffle between refreshes.
+    let mut series: Vec<Series> = by_value
+        .into_iter()
+        .map(|(labels, mut points)| {
+            points.sort_by_key(|(ts, _)| *ts);
+            Series {
+                labels,
+                samples: points,
+            }
+        })
+        .collect();
+    series.sort_by(|a, b| a.labels.cmp(&b.labels));
+    series
+}
+
 /// `rate`/`increase` over one already-selected window.
 ///
 /// Shared by the prepared pass and the per-step path so the two cannot disagree: the
@@ -265,25 +322,7 @@ impl Snapshot {
             )));
         }
 
-        let mut by_series: HashMap<Labels, Vec<(u64, f64)>> = HashMap::new();
-        for sample in samples {
-            by_series
-                .entry(sample.series.clone())
-                .or_default()
-                .push((sample.timestamp_nanos, sample.value));
-        }
-
-        // Sorted explicitly. Grouping moved from a BTreeMap to a HashMap for speed, and
-        // with it went the ordering callers had been getting for free — an unstable order
-        // makes identical queries disagree and a dashboard reshuffle between refreshes.
-        let mut series: Vec<Series> = by_series
-            .into_iter()
-            .map(|(labels, mut samples)| {
-                samples.sort_by_key(|(ts, _)| *ts);
-                Series { labels, samples }
-            })
-            .collect();
-        series.sort_by(|a, b| a.labels.cmp(&b.labels));
+        let series = group_samples(samples);
 
         // Resolve every selector against the loaded series once. A query has a handful
         // of selectors; the loop inside `eval` has hundreds of steps.
@@ -337,25 +376,12 @@ impl Snapshot {
     }
 
     /// Build directly from samples, for testing and for the in-memory path.
+    /// Build directly from samples, for testing and for the in-memory path.
     pub fn from_samples(samples: Vec<MetricSample>) -> Self {
-        let mut by_series: HashMap<Labels, Vec<(u64, f64)>> = HashMap::new();
-        for sample in samples {
-            by_series
-                .entry(sample.series.clone())
-                .or_default()
-                .push((sample.timestamp_nanos, sample.value));
-        }
-        let mut series: Vec<Series> = by_series
-            .into_iter()
-            .map(|(labels, mut samples)| {
-                samples.sort_by_key(|(ts, _)| *ts);
-                Series { labels, samples }
-            })
-            .collect();
-        series.sort_by(|a, b| a.labels.cmp(&b.labels));
+        let series = group_samples(samples);
         let stripped = series.iter().map(|s| strip_name(&s.labels)).collect();
-        // No expression to resolve against here, so selectors fall back to filtering.
-        // This path is the in-memory one and evaluates a handful of steps at most.
+        // No expression to resolve against here, so selectors and groupings fall back to
+        // being worked out per call. This path evaluates a handful of steps at most.
         Self {
             series,
             stripped,
@@ -1020,6 +1046,83 @@ fn without_le(labels: &Labels) -> Labels {
 
 fn duration_nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod grouping_by_identity_tests {
+    use super::*;
+    use telemetryd_core::{MetricKind, MetricSample};
+
+    fn built_fresh(route: &str) -> Labels {
+        // Built from scratch each call, so two equal sets get two allocations — exactly
+        // what the unsealed write buffer produces, since only sealed segments are
+        // interned.
+        let mut labels = Labels::new();
+        labels.insert("__name__", "probe");
+        labels.insert("route", route);
+        labels
+    }
+
+    fn at(series: Labels, minute: u64, value: f64) -> MetricSample {
+        MetricSample {
+            series,
+            timestamp_nanos: minute * 60 * 1_000_000_000,
+            value,
+            kind: MetricKind::Gauge,
+        }
+    }
+
+    /// The whole risk of grouping by pointer: equal label sets that are separate
+    /// allocations must still end up as one series. Splitting them would hand a chart
+    /// half its points, twice, and look like a real answer.
+    #[test]
+    fn equal_labels_from_different_allocations_become_one_series() {
+        let a = built_fresh("/x");
+        let b = built_fresh("/x");
+        assert_eq!(a, b, "equal by value");
+        assert!(!a.shares_storage_with(&b), "and separately allocated");
+
+        let series = group_samples(vec![at(a, 1, 1.0), at(b, 2, 2.0)]);
+
+        assert_eq!(series.len(), 1, "one stream, not two");
+        assert_eq!(series[0].samples.len(), 2);
+        assert_eq!(series[0].samples[0].0, 60 * 1_000_000_000, "sorted by time");
+    }
+
+    /// Samples that do share an allocation take the fast path, and must land together
+    /// with their points in time order however they arrived.
+    #[test]
+    fn shared_labels_group_and_sort() {
+        let shared = built_fresh("/y");
+        let series = group_samples(vec![
+            at(shared.clone(), 3, 3.0),
+            at(shared.clone(), 1, 1.0),
+            at(shared, 2, 2.0),
+        ]);
+
+        assert_eq!(series.len(), 1);
+        let times: Vec<u64> = series[0].samples.iter().map(|(ts, _)| *ts).collect();
+        assert_eq!(
+            times,
+            vec![60_000_000_000, 120_000_000_000, 180_000_000_000]
+        );
+    }
+
+    /// Different streams stay different, and come out ordered by label set so identical
+    /// queries agree with each other.
+    #[test]
+    fn distinct_streams_stay_distinct_and_ordered() {
+        let series = group_samples(vec![
+            at(built_fresh("/b"), 1, 1.0),
+            at(built_fresh("/a"), 1, 2.0),
+        ]);
+        let routes: Vec<&str> = series
+            .iter()
+            .map(|s| s.labels.get("route").unwrap())
+            .collect();
+        assert_eq!(routes, vec!["/a", "/b"]);
+    }
 }
 
 #[cfg(test)]
