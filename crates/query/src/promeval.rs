@@ -330,7 +330,12 @@ impl Snapshot {
     /// enough that ninety days of a busy histogram never costs more than a minute of it,
     /// and large enough that a ninety-day query is a couple of thousand scans rather than
     /// a couple of million.
-    const FOLD_SLICE: Duration = Duration::from_secs(3600);
+    /// Six hours rather than one. A slice costs a scan, and a scan prunes every segment
+    /// in the store before it reads anything — on a deployment with 482 metric segments,
+    /// ninety days at an hour a slice was 2,160 scans and a million pruning checks, which
+    /// timed out at thirty seconds while using no memory at all. Six hours is still far
+    /// below what the fold exists to avoid holding, and a quarter of the scans.
+    const FOLD_SLICE: Duration = Duration::from_secs(6 * 3600);
 
     /// The most evaluation points a folded load will carry accumulators for.
     ///
@@ -434,7 +439,16 @@ impl Snapshot {
         let lookback = expr.required_lookback();
         let first = points.iter().copied().min().unwrap_or(0);
         let last = points.iter().copied().max().unwrap_or(0);
-        let from = first.saturating_sub(duration_nanos(lookback));
+        let asked_from = first.saturating_sub(duration_nanos(lookback));
+
+        // Clamped to what the store actually holds. A ninety-day window against seven
+        // days of retention is eighty-three days of empty slices, and an empty slice
+        // still pays a full scan: the segments are pruned on their time range before one
+        // row is read, so the cost is the same whether it finds anything or not.
+        let from = match store.status().oldest_record_nanos {
+            Some(oldest) => asked_from.max(oldest),
+            None => asked_from,
+        };
 
         let mut identities: HashMap<usize, usize> = HashMap::new();
         let mut labels: Vec<Labels> = Vec::new();
