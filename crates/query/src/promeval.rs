@@ -154,6 +154,59 @@ fn group_samples(samples: Vec<MetricSample>) -> Vec<Series> {
     series
 }
 
+/// Running state for one series' `rate`/`increase` over one window.
+///
+/// Holds four numbers instead of the samples, which is what lets a ninety-day window cost
+/// the same as an hour. Samples must arrive in ascending time order — the store's
+/// ascending scan guarantees that within a slice, and slices are read in order.
+#[derive(Debug, Clone, Copy, Default)]
+struct Fold {
+    seen: u32,
+    first_nanos: u64,
+    last_nanos: u64,
+    last_value: f64,
+    increase: f64,
+}
+
+impl Fold {
+    fn add(&mut self, timestamp: u64, value: f64) {
+        if self.seen == 0 {
+            self.first_nanos = timestamp;
+        } else {
+            // The same counter-reset rule the windowed form uses: a drop means the
+            // process restarted, so the new value *is* the increase.
+            self.increase += if value < self.last_value {
+                value
+            } else {
+                value - self.last_value
+            };
+        }
+        self.seen = self.seen.saturating_add(1);
+        self.last_nanos = timestamp;
+        self.last_value = value;
+    }
+
+    /// The same answer [`rate_over`] gives for the same samples.
+    fn finish(&self, range_nanos: u64, per_second: bool) -> Option<f64> {
+        if self.seen < 2 {
+            return None;
+        }
+        let observed_nanos = self.last_nanos.saturating_sub(self.first_nanos);
+        if observed_nanos == 0 {
+            return None;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let per_second_rate = self.increase / (observed_nanos as f64 / NANOS_PER_SECOND);
+        Some(if per_second {
+            per_second_rate
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            let window_seconds = range_nanos as f64 / NANOS_PER_SECOND;
+            per_second_rate * window_seconds
+        })
+    }
+}
+
 /// `rate`/`increase` over one already-selected window.
 ///
 /// Shared by the prepared pass and the per-step path so the two cannot disagree: the
@@ -270,6 +323,204 @@ impl Snapshot {
     /// is what the store did before this existed and what took a server down: a query with
     /// no `limit` — PromQL has no notion of one — loading every sample for every matching
     /// series across its window, three times over as it regrouped them.
+    /// How much of a window is read at a time when folding a long range selector.
+    ///
+    /// A slice is scanned, folded into per-series accumulators, and dropped before the
+    /// next is read — so peak memory is one slice, not one window. An hour is small
+    /// enough that ninety days of a busy histogram never costs more than a minute of it,
+    /// and large enough that a ninety-day query is a couple of thousand scans rather than
+    /// a couple of million.
+    const FOLD_SLICE: Duration = Duration::from_secs(3600);
+
+    /// The most evaluation points a folded load will carry accumulators for.
+    ///
+    /// Folding keeps four numbers per series *per point*, so the state grows with both.
+    /// The queries that need folding are the ones a dashboard sends for a total or a
+    /// quantile over the whole period — one point, an enormous window — and those are
+    /// exactly the ones the sample ceiling was refusing. A chart asks for hundreds of
+    /// points but over a window sized to its step, which the ordinary path handles in the
+    /// memory it always did.
+    const FOLD_MAX_POINTS: usize = 8;
+
+    /// The range above which a selector is folded rather than loaded.
+    ///
+    /// Below it, loading the samples costs less than the machinery of folding and keeps
+    /// one code path for the common case.
+    const FOLD_ABOVE: Duration = Duration::from_secs(2 * 3600);
+
+    /// Whether this query should be answered by folding slices instead of loading the
+    /// whole window.
+    fn should_fold(expr: &Expr, points: &[u64]) -> bool {
+        if points.len() > Self::FOLD_MAX_POINTS {
+            return false;
+        }
+        // Only when every sample need is foldable. A bare selector inside the expression
+        // needs the newest sample in a five-minute lookback, which folds; anything the
+        // parser accepts reduces to one of those two.
+        rate_calls(expr)
+            .iter()
+            .any(|(_, range, _)| *range > Self::FOLD_ABOVE)
+    }
+
+    /// The evaluation points `load` is being asked about.
+    ///
+    /// An instant query passes the same value twice and has one point. A range query
+    /// calls `prepare` with its real step list afterwards; here it only needs to be known
+    /// whether the window is small enough to load, and its ends answer that.
+    fn points_of(start_nanos: u64, end_nanos: u64) -> Vec<u64> {
+        if start_nanos == end_nanos {
+            vec![start_nanos]
+        } else {
+            vec![start_nanos, end_nanos]
+        }
+    }
+
+    /// Where each series lands under every grouping the expression uses.
+    fn group_index(expr: &Expr, stripped: &[Labels]) -> Vec<GroupIndex> {
+        let mut grouped: Vec<GroupIndex> = Vec::new();
+        for grouping in expr.groupings() {
+            if grouped.iter().any(|index| index.grouping == grouping) {
+                continue;
+            }
+            let mut of_series = HashMap::new();
+            let mut keys: Vec<Labels> = Vec::new();
+            for labels in stripped {
+                let key = group_key(labels, &grouping);
+                let position = keys
+                    .iter()
+                    .position(|existing| *existing == key)
+                    .unwrap_or_else(|| {
+                        keys.push(key);
+                        keys.len() - 1
+                    });
+                of_series.insert(labels.storage_id(), position);
+            }
+            grouped.push(GroupIndex {
+                grouping,
+                of_series,
+                keys,
+            });
+        }
+        grouped
+    }
+
+    /// Answer a query by folding the window in slices, holding no samples.
+    ///
+    /// # Why this exists
+    ///
+    /// The evaluator reads storage once for the whole query and keeps every sample of
+    /// every matching series resident. That is affordable for a chart, whose range
+    /// selector is sized to its step, and impossible for the other thing a dashboard
+    /// asks: a total or a quantile *over the whole period*, which compiles to
+    /// `rate(metric[P])` with `P` the period itself. Twenty-four hours of one Laravel
+    /// app's request histogram is twelve million samples and 620 MB; ninety days is
+    /// ninety times that, and no ceiling makes it fit.
+    ///
+    /// But `rate` does not need the samples. Over any window it needs four numbers per
+    /// series — the first and last timestamps, the last value, and the accumulated
+    /// increase — and those fold in one pass, in time order, with the counter-reset rule
+    /// carrying across a slice boundary on the previous value alone. So the window is
+    /// read an hour at a time, folded, and dropped.
+    ///
+    /// Memory becomes O(series), not O(window): twelve thousand series is under a
+    /// megabyte whether the window is an hour or a year.
+    fn load_folded(
+        store: &RecordStore<MetricSchema>,
+        expr: &Expr,
+        points: &[u64],
+        pushdown: &[telemetryd_core::LabelMatcher],
+    ) -> Result<Self> {
+        let calls = rate_calls(expr);
+        let lookback = expr.required_lookback();
+        let first = points.iter().copied().min().unwrap_or(0);
+        let last = points.iter().copied().max().unwrap_or(0);
+        let from = first.saturating_sub(duration_nanos(lookback));
+
+        let mut identities: HashMap<usize, usize> = HashMap::new();
+        let mut labels: Vec<Labels> = Vec::new();
+        // One accumulator per (call, series, point), grown as series are discovered.
+        let mut folds: Vec<Vec<Vec<Fold>>> = vec![Vec::new(); calls.len()];
+
+        let slice = duration_nanos(Self::FOLD_SLICE);
+        let mut cursor = from;
+        while cursor <= last {
+            let slice_end = cursor.saturating_add(slice).min(last);
+            // Unbounded within a slice: a slice is an hour, and refusing inside one would
+            // refuse a query whose whole point is that it never holds the window.
+            let samples = store.query_bounded(cursor, slice_end, pushdown, &|_| true, 0)?;
+            for sample in samples {
+                let id = sample.series.storage_id();
+                let index = if let Some(index) = identities.get(&id) {
+                    *index
+                } else {
+                    let index = labels.len();
+                    identities.insert(id, index);
+                    labels.push(sample.series.clone());
+                    for per_series in &mut folds {
+                        per_series.push(vec![Fold::default(); points.len()]);
+                    }
+                    index
+                };
+                for (call, (selector, range, _)) in calls.iter().enumerate() {
+                    let offset = duration_nanos(selector.offset.unwrap_or(Duration::ZERO));
+                    let range_nanos = duration_nanos(*range);
+                    // A sample at `s` belongs to the points `p` where
+                    // `p - offset - range < s <= p - offset`.
+                    for (point, fold) in folds[call][index].iter_mut().enumerate() {
+                        let at = points[point].saturating_sub(offset);
+                        let floor = at.saturating_sub(range_nanos);
+                        if sample.timestamp_nanos > floor && sample.timestamp_nanos <= at {
+                            fold.add(sample.timestamp_nanos, sample.value);
+                        }
+                    }
+                }
+            }
+            if slice_end == last {
+                break;
+            }
+            cursor = slice_end.saturating_add(1);
+        }
+
+        let mut prepared = Vec::new();
+        for (call, (selector, range, per_second)) in calls.iter().enumerate() {
+            let range_nanos = duration_nanos(*range);
+            let mut by_step: Vec<Vec<(usize, f64)>> = vec![Vec::new(); points.len()];
+            for (index, per_point) in folds[call].iter().enumerate() {
+                for (point, fold) in per_point.iter().enumerate() {
+                    if let Some(value) = fold.finish(range_nanos, *per_second) {
+                        by_step[point].push((index, value));
+                    }
+                }
+            }
+            prepared.push(PreparedRate {
+                matchers: selector.matchers.clone(),
+                range: *range,
+                offset: selector.offset.unwrap_or(Duration::ZERO),
+                per_second: *per_second,
+                by_step,
+            });
+        }
+
+        let series: Vec<Series> = labels
+            .iter()
+            .map(|labels| Series {
+                labels: labels.clone(),
+                samples: Vec::new(),
+            })
+            .collect();
+        let stripped: Vec<Labels> = labels.iter().map(strip_name).collect();
+        let grouped = Self::group_index(expr, &stripped);
+
+        Ok(Self {
+            series,
+            stripped,
+            resolved: Vec::new(),
+            grouped,
+            prepared,
+            prepared_steps: points.to_vec(),
+        })
+    }
+
     pub fn load(
         store: &RecordStore<MetricSchema>,
         expr: &Expr,
@@ -277,6 +528,24 @@ impl Snapshot {
         end_nanos: u64,
         max_samples: u64,
     ) -> Result<Self> {
+        let points = Self::points_of(start_nanos, end_nanos);
+        Self::load_at(store, expr, &points, max_samples)
+    }
+
+    /// `load`, told exactly which moments will be evaluated.
+    ///
+    /// The points decide whether the window can be folded and, when it is, which moments
+    /// the fold produces values for. A range query has to pass its real step list: a
+    /// folded load built for two points and a step loop asking for twelve is how an index
+    /// went out of bounds and took the server down with it.
+    pub fn load_at(
+        store: &RecordStore<MetricSchema>,
+        expr: &Expr,
+        points: &[u64],
+        max_samples: u64,
+    ) -> Result<Self> {
+        let start_nanos = points.iter().copied().min().unwrap_or(0);
+        let end_nanos = points.iter().copied().max().unwrap_or(0);
         let lookback = expr.required_lookback();
         let from = start_nanos.saturating_sub(duration_nanos(lookback));
 
@@ -302,6 +571,12 @@ impl Snapshot {
                     .all(|selector| selector.matchers.contains(matcher))
             })
             .collect();
+
+        // A window too large to hold is folded instead, which reads it a slice at a time
+        // and keeps four numbers per series rather than every sample.
+        if Self::should_fold(expr, points) {
+            return Self::load_folded(store, expr, points, &pushdown);
+        }
 
         // One more than allowed, so a full collector is unambiguously an overflow rather
         // than a query that happened to fit exactly.
@@ -341,29 +616,7 @@ impl Snapshot {
             resolved.push((selector.matchers.clone(), members));
         }
 
-        // Every grouping the expression aggregates by, resolved against the series once.
-        let mut grouped: Vec<GroupIndex> = Vec::new();
-        for grouping in expr.groupings() {
-            if grouped.iter().any(|index| index.grouping == grouping) {
-                continue;
-            }
-            let mut of_series = HashMap::new();
-            let mut keys: Vec<Labels> = Vec::new();
-            for labels in &stripped {
-                let key = group_key(labels, &grouping);
-                let position = keys.iter().position(|existing| *existing == key);
-                let position = position.unwrap_or_else(|| {
-                    keys.push(key);
-                    keys.len() - 1
-                });
-                of_series.insert(labels.storage_id(), position);
-            }
-            grouped.push(GroupIndex {
-                grouping,
-                of_series,
-                keys,
-            });
-        }
+        let grouped = Self::group_index(expr, &stripped);
 
         Ok(Self {
             series,
@@ -563,6 +816,14 @@ impl Snapshot {
         if steps.len() < 2 {
             return;
         }
+        // Already prepared — by a folded load, which built its values for exactly these
+        // points. Re-running would rebuild from samples the fold deliberately did not
+        // keep, and overwriting `prepared_steps` alone left the two lists disagreeing:
+        // twelve steps against two sets of values, and an index straight out of bounds
+        // that killed the runtime worker and the server with it.
+        if !self.prepared.is_empty() {
+            return;
+        }
         for (selector, range, per_second) in rate_calls(expr) {
             let offset = selector.offset.unwrap_or(Duration::ZERO);
             if self.prepared.iter().any(|p| {
@@ -624,9 +885,10 @@ impl Snapshot {
                 && p.per_second == per_second
                 && p.offset == selector.offset.unwrap_or(Duration::ZERO)
         }) && let Ok(step) = self.prepared_steps.binary_search(&at_nanos)
+            && let Some(at_step) = prepared.by_step.get(step)
         {
             return InstantVector {
-                samples: prepared.by_step[step]
+                samples: at_step
                     .iter()
                     .map(|(index, value)| (self.stripped[*index].clone(), *value))
                     .collect(),
@@ -1122,6 +1384,121 @@ mod grouping_by_identity_tests {
             .map(|s| s.labels.get("route").unwrap())
             .collect();
         assert_eq!(routes, vec!["/a", "/b"]);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod fold_tests {
+    use super::*;
+    use telemetryd_core::{MetricKind, MetricSample};
+
+    /// A folded snapshot built for two points, then asked to prepare twelve, indexed
+    /// `by_step` out of bounds — a panic inside a runtime worker, which takes the whole
+    /// server down. Every read stops, not just this one.
+    ///
+    /// Two things keep it out: `prepare` leaves a folded snapshot alone, and the lookup
+    /// asks rather than indexes. This drives both.
+    #[test]
+    fn preparing_more_steps_than_a_fold_built_cannot_panic() {
+        let expr = crate::promql::parse("sum by (route) (rate(probe[1h]))").unwrap();
+        let mut labels = Labels::new();
+        labels.insert("__name__", "probe");
+        labels.insert("route", "/a");
+
+        let samples: Vec<MetricSample> = (1..=10u64)
+            .map(|minute| MetricSample {
+                series: labels.clone(),
+                timestamp_nanos: minute * 60 * 1_000_000_000,
+                #[allow(clippy::cast_precision_loss)]
+                value: minute as f64,
+                kind: MetricKind::Counter,
+            })
+            .collect();
+
+        let mut snapshot = Snapshot::from_samples(samples);
+        // Two points, as a folded load would have produced.
+        let two: Vec<u64> = vec![5 * 60 * 1_000_000_000, 10 * 60 * 1_000_000_000];
+        snapshot.prepare(&expr, &two);
+
+        // Now ask for twelve, the way a step loop would.
+        let twelve: Vec<u64> = (1..=12).map(|m| m * 60 * 1_000_000_000).collect();
+        snapshot.prepare(&expr, &twelve);
+
+        // Every one of them must evaluate without panicking.
+        for at in twelve {
+            let _ = snapshot.eval(&expr, at).unwrap();
+        }
+    }
+
+    /// The fold and the windowed form are two ways of computing one definition, and the
+    /// counter-reset rule is where they would most easily part company. Driven over a
+    /// counter that restarts, which is what a deploy looks like in the data.
+    #[test]
+    fn folding_matches_the_windowed_form_across_a_counter_reset() {
+        let points: Vec<(u64, f64)> = vec![
+            (10 * 1_000_000_000, 5.0),
+            (20 * 1_000_000_000, 9.0),
+            // Restart: the counter drops, so 2.0 is the increase, not -7.0.
+            (30 * 1_000_000_000, 2.0),
+            (40 * 1_000_000_000, 11.0),
+        ];
+        let range_nanos = 60 * 1_000_000_000;
+
+        let windowed = rate_over(&points, range_nanos, true).unwrap();
+
+        let mut fold = Fold::default();
+        for (ts, value) in &points {
+            fold.add(*ts, *value);
+        }
+        let folded = fold.finish(range_nanos, true).unwrap();
+
+        assert!(
+            (windowed - folded).abs() < 1e-9,
+            "windowed {windowed} vs folded {folded}"
+        );
+    }
+
+    /// `increase` scales by the nominal window where `rate` divides by the observed span,
+    /// and both forms have to make the same choice.
+    #[test]
+    fn folding_matches_the_windowed_form_for_increase() {
+        let points: Vec<(u64, f64)> = (1..=5u32)
+            .map(|i| (u64::from(i) * 10 * 1_000_000_000, f64::from(i) * 3.0))
+            .collect();
+        let range_nanos = 120 * 1_000_000_000;
+
+        let windowed = rate_over(&points, range_nanos, false).unwrap();
+        let mut fold = Fold::default();
+        for (ts, value) in &points {
+            fold.add(*ts, *value);
+        }
+        assert!((windowed - fold.finish(range_nanos, false).unwrap()).abs() < 1e-9);
+    }
+
+    /// One point cannot describe a change, and neither form may invent one.
+    #[test]
+    fn a_single_sample_yields_nothing_either_way() {
+        let one = [(10 * 1_000_000_000u64, 1.0)];
+        assert!(rate_over(&one, 60 * 1_000_000_000, true).is_none());
+
+        let mut fold = Fold::default();
+        fold.add(one[0].0, one[0].1);
+        assert!(fold.finish(60 * 1_000_000_000, true).is_none());
+    }
+
+    /// Samples sharing one timestamp leave no elapsed time to divide by; inventing one
+    /// would report an arbitrary rate.
+    #[test]
+    fn a_zero_span_yields_nothing_either_way() {
+        let same = [(10 * 1_000_000_000u64, 1.0), (10 * 1_000_000_000, 4.0)];
+        assert!(rate_over(&same, 60 * 1_000_000_000, true).is_none());
+
+        let mut fold = Fold::default();
+        for (ts, value) in same {
+            fold.add(ts, value);
+        }
+        assert!(fold.finish(60 * 1_000_000_000, true).is_none());
     }
 }
 

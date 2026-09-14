@@ -54,6 +54,14 @@ segments costs one map and a thousand pointers — which took a 133-segment stor
 and report it when it does not fit, and the systemd unit sets `MemoryMax` so the kernel
 bounds the process rather than the machine failing.
 
+**A long window is folded rather than loaded.** `rate`/`increase` over a window needs four
+numbers per series, not the samples, so a window wider than two hours evaluated at a
+handful of points is read an hour at a time and folded — memory proportional to series
+rather than to window length. 90 days over a 300-series store answers in 436 ms with no
+measurable memory growth, and the results are identical to the unfolded path across
+21,168 values. Charts, which ask for many points over a short window, take the ordinary
+path unchanged.
+
 **One query has a ceiling.** PromQL reads its whole window in one pass, so every sample of
 every matching series is resident at once and neither `limit` nor the series cap bounded
 it — measured at roughly 850 MB for a single query against weeks of high-cardinality

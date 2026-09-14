@@ -271,10 +271,9 @@ pub fn range(
         )));
     }
 
-    // Load once, evaluate every step from memory.
-    let mut snapshot = Snapshot::load(store, &expr, start, end, max_samples)?;
-    // The step timestamps, so range-vector calls can be turned inside out: each series
-    // walked once with a sliding window, instead of every series bisected at every step.
+    // The step timestamps, computed before loading: they decide both whether the window
+    // can be folded and, if it is, which points the fold produces values for. Computing
+    // them afterwards is what let a folded load and the step loop disagree.
     let mut timestamps = Vec::new();
     let mut cursor = start;
     loop {
@@ -284,6 +283,12 @@ pub fn range(
         }
         cursor = (cursor + step_nanos).min(end);
     }
+
+    // Load once, evaluate every step from memory.
+    let mut snapshot = Snapshot::load_at(store, &expr, &timestamps, max_samples)?;
+    // Range-vector calls turned inside out: each series walked once with a sliding
+    // window, instead of every series bisected at every step. A no-op after a folded
+    // load, which already produced values for these points.
     snapshot.prepare(&expr, &timestamps);
 
     // Keyed by label set so a series' points stay together across steps. A hash map

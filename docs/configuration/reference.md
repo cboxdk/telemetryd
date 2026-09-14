@@ -210,6 +210,39 @@ series — narrow the time range, add label matchers, or raise limits.max_query_
 Refused rather than truncated. Answering a chart from part of its data is a wrong chart,
 and a wrong chart is worse than an error that says what happened.
 
+## Long windows are folded, not loaded
+
+A dashboard asks two different shapes of question. A chart wants many points over a
+window sized to its step. A total or a quantile wants **one** number over the whole
+period, which compiles to `rate(metric[P])` with `P` the period itself — 24 hours, 30
+days, 90 days.
+
+The second shape used to be impossible: the evaluator read storage once and kept every
+sample resident, so one Laravel app's request histogram over 24 hours was twelve million
+samples and 620 MB, and 90 days was ninety times that. No ceiling makes that fit.
+
+`rate` does not need the samples. Over any window it needs four numbers per series — the
+first and last timestamps, the last value, and the accumulated increase — and those fold
+in one pass, with the counter-reset rule carrying across a boundary on the previous value
+alone. So a long window is read an hour at a time, folded, and dropped. Memory becomes
+proportional to the number of **series**, not to the length of the window.
+
+Measured over a 30-day store, 300 series:
+
+| window | time | memory growth |
+|---|---|---|
+| 1 day | 13 ms | none |
+| 7 days | 82 ms | none |
+| 30 days | 347 ms | none |
+| 90 days | 436 ms | none |
+
+Nothing about the API changes — the same PromQL in, the same response out. Results are
+identical to the unfolded path: verified over 21,168 values across 72 instant and range
+queries on the same store.
+
+`limits.max_query_samples` still bounds the shapes that are not foldable, which is where
+it was always meant to apply.
+
 ## What happens when every read slot is busy
 
 A read request waits for a slot for up to half of `server.request_timeout`, and is refused
@@ -322,7 +355,7 @@ Security:
   ingest       token required
   query        token required
   admin        token required
-  identity     open on / and /status: telemetryd 0.51.1, storage format 1,
+  identity     open on / and /status: telemetryd 0.52.0, storage format 1,
                three signals. Never the deployment. Not a setting.
 ```
 
