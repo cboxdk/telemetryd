@@ -20,6 +20,15 @@ use tokio::task::JoinHandle;
 /// figure does not matter.
 const SERIES_RECLAIM_TICK: Duration = Duration::from_secs(60);
 
+/// Segments to summarise per tick.
+///
+/// Each one is read whole, so this competes with ingest for memory. A few at a time
+/// clears a week of hourly segments within the hour while staying invisible.
+const FOLD_BACKFILL_PER_TICK: usize = 8;
+
+/// How often to look for segments still missing their summaries.
+const FOLD_BACKFILL_TICK: Duration = Duration::from_secs(30);
+
 /// Independent of `segment_duration`: the check is cheap, and a coarse tick would mean
 /// a segment configured to seal every minute actually sealing every tick instead.
 const SEAL_TICK: Duration = Duration::from_secs(5);
@@ -71,6 +80,34 @@ impl Maintenance {
                     Ok(0) => {}
                     Ok(freed) => tracing::debug!(freed, "reclaimed idle series"),
                     Err(e) => tracing::error!(error = %e, "series reclaim task panicked"),
+                }
+            }
+        }));
+    }
+
+    /// Give old segments the counter summaries that make a long window cheap.
+    ///
+    /// Segments sealed before summaries existed carry none, and queries over them fall
+    /// back to reading every row. Without this the speed-up would arrive only as those
+    /// segments aged out — a week, on a week's retention.
+    fn spawn_fold_backfill(tasks: &mut Vec<tokio::task::JoinHandle<()>>, store: &Arc<Store>) {
+        let store = Arc::clone(store);
+        tasks.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(FOLD_BACKFILL_TICK);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let store = Arc::clone(&store);
+                // Reading segments is blocking file I/O, like every other store call.
+                match tokio::task::spawn_blocking(move || {
+                    store.backfill_metric_folds(FOLD_BACKFILL_PER_TICK)
+                })
+                .await
+                {
+                    Ok(Ok(0)) => {}
+                    Ok(Ok(written)) => tracing::debug!(written, "summarised older segments"),
+                    Ok(Err(e)) => tracing::warn!(error = %e, "could not summarise a segment"),
+                    Err(e) => tracing::error!(error = %e, "fold backfill task panicked"),
                 }
             }
         }));
@@ -276,6 +313,7 @@ impl Maintenance {
 
         Self::spawn_retention(&mut tasks, store, relay.clone());
         Self::spawn_series_reclaim(&mut tasks, store);
+        Self::spawn_fold_backfill(&mut tasks, store);
 
         Self::spawn_relay(&mut tasks, store, relay, relay_interval);
 

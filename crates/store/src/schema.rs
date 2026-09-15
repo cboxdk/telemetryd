@@ -92,6 +92,16 @@ pub trait RecordSchema: Send + Sync + 'static {
     /// Event time in Unix nanoseconds. Drives segment time bounds and query pruning.
     fn timestamp(record: &Self::Record) -> u64;
 
+    /// The value a counter summary accumulates, when this signal has one.
+    ///
+    /// `None` for signals whose records are not counters — a log line has no value to
+    /// take an increase over. Metrics override it, and a segment of metrics therefore
+    /// carries per-stream summaries that let a long-window query read six numbers per
+    /// series instead of every sample. See [`crate::folds`].
+    fn counter_value(_record: &Self::Record) -> Option<f64> {
+        None
+    }
+
     /// The labels that identify this record's stream. Indexed in the manifest, so
     /// these are what a selector can prune on without opening the Parquet file.
     fn index_labels(record: &Self::Record) -> &Labels;

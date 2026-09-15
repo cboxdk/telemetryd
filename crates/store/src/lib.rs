@@ -8,6 +8,7 @@
 pub mod bloom;
 pub mod cardinality;
 pub mod datadir;
+pub mod folds;
 pub mod intern;
 pub mod logs;
 pub mod metrics;
@@ -569,6 +570,13 @@ impl Store {
             self.cardinality.reclaimed_series(),
             self.cardinality.evicted_series(),
         )
+    }
+
+    /// Write counter summaries for metric segments that predate them.
+    ///
+    /// Returns how many were written, for the maintenance log.
+    pub fn backfill_metric_folds(&self, limit: usize) -> Result<usize> {
+        self.metrics.backfill_folds(limit)
     }
 
     /// Give back the budget held by series nothing has written to lately.

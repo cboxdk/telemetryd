@@ -61,6 +61,19 @@ Sealing is atomic: written to `tmp/`, then moved with `rename(2)`. A reader neve
 partial segment, and a crash mid-seal leaves only a `tmp/` directory the janitor
 removes.
 
+## Counter summaries
+
+Sealing also writes `folds.bin` next to the Parquet file: one 48-byte record per stream
+holding the sample count, the first and last timestamp and value, and the increase over
+the segment with counter resets applied. It is what lets a `rate` over a long window skip
+the segment entirely — see [Query performance](performance.md).
+
+The file is additive and optional. Segments written before it exists have none, an older
+telemetryd ignores it, and deleting it costs speed rather than correctness: a background
+task writes it again. It is deliberately a separate file rather than part of the
+manifest, so that it is read when a query needs the numbers and stays off the heap
+otherwise.
+
 ## Retention
 
 Two limits, one pass:

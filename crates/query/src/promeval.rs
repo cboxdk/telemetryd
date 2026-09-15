@@ -218,6 +218,36 @@ impl Fold {
 /// delta. The rate is computed over the span actually **observed** rather than the nominal
 /// window, because a range selector is half-open and a series scraped exactly on the
 /// boundary contributes one fewer interval than it appears to.
+/// The same arithmetic as [`rate_over`], applied to a summary instead of to rows.
+///
+/// It has to be the same: the two paths answer the same query, and a store that has
+/// summarised half its segments would otherwise report a step at the boundary. The
+/// summary already carries the counter-reset handling and the join across segments, so
+/// what is left here is the division `rate_over` does at the end.
+fn finish_fold(
+    fold: &telemetryd_store::folds::StreamFold,
+    range_nanos: u64,
+    per_second: bool,
+) -> Option<f64> {
+    // One sample cannot describe a change, exactly as in `rate_over`.
+    if fold.seen < 2 {
+        return None;
+    }
+    let observed_nanos = fold.last_nanos.saturating_sub(fold.first_nanos);
+    if observed_nanos == 0 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let per_second_rate = fold.increase / (observed_nanos as f64 / NANOS_PER_SECOND);
+    Some(if per_second {
+        per_second_rate
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        let window_seconds = range_nanos as f64 / NANOS_PER_SECOND;
+        per_second_rate * window_seconds
+    })
+}
+
 fn rate_over(window: &[(u64, f64)], range_nanos: u64, per_second: bool) -> Option<f64> {
     // One point cannot describe a change.
     if window.len() < 2 {
@@ -367,6 +397,77 @@ impl Snapshot {
             .any(|(_, range, _)| *range > Self::FOLD_ABOVE)
     }
 
+    /// Answer every window from the store's per-segment counter summaries, if it can.
+    ///
+    /// `None` means the store declined: enough segments in some window carry no summary
+    /// that reading them would cost more than the ordinary scan. The caller then takes
+    /// that scan, untouched, so this can only ever add speed.
+    fn fold_from_summaries(
+        store: &RecordStore<MetricSchema>,
+        expr: &Expr,
+        calls: &[(&Selector, Duration, bool)],
+        points: &[u64],
+        pushdown: &[telemetryd_core::LabelMatcher],
+    ) -> Result<Option<Self>> {
+        let mut labels: Vec<Labels> = Vec::new();
+        let mut index: HashMap<Labels, usize> = HashMap::new();
+        let mut prepared = Vec::with_capacity(calls.len());
+
+        for (selector, range, per_second) in calls {
+            let offset = selector.offset.unwrap_or(Duration::ZERO);
+            let range_nanos = duration_nanos(*range);
+            let offset_nanos = duration_nanos(offset);
+            let mut by_step: Vec<Vec<(usize, f64)>> = vec![Vec::new(); points.len()];
+
+            for (point, at_nanos) in points.iter().enumerate() {
+                let at = at_nanos.saturating_sub(offset_nanos);
+                let floor = at.saturating_sub(range_nanos);
+                let Some(folded) = store.fold_window(floor, at, pushdown)? else {
+                    return Ok(None);
+                };
+                for (series, summary) in folded {
+                    let Some(value) = finish_fold(&summary, range_nanos, *per_second) else {
+                        continue;
+                    };
+                    let at_index = if let Some(at_index) = index.get(&series) {
+                        *at_index
+                    } else {
+                        let at_index = labels.len();
+                        index.insert(series.clone(), at_index);
+                        labels.push(series);
+                        at_index
+                    };
+                    by_step[point].push((at_index, value));
+                }
+            }
+            prepared.push(PreparedRate {
+                matchers: selector.matchers.clone(),
+                range: *range,
+                offset,
+                per_second: *per_second,
+                by_step,
+            });
+        }
+
+        let series: Vec<Series> = labels
+            .iter()
+            .map(|labels| Series {
+                labels: labels.clone(),
+                samples: Vec::new(),
+            })
+            .collect();
+        let stripped: Vec<Labels> = labels.iter().map(strip_name).collect();
+        let grouped = Self::group_index(expr, &stripped);
+        Ok(Some(Self {
+            series,
+            stripped,
+            resolved: Vec::new(),
+            grouped,
+            prepared,
+            prepared_steps: points.to_vec(),
+        }))
+    }
+
     /// The evaluation points `load` is being asked about.
     ///
     /// An instant query passes the same value twice and has one point. A range query
@@ -454,6 +555,15 @@ impl Snapshot {
         let mut labels: Vec<Labels> = Vec::new();
         // One accumulator per (call, series, point), grown as series are discovered.
         let mut folds: Vec<Vec<Vec<Fold>>> = vec![Vec::new(); calls.len()];
+
+        // Try the shortcut first: when every segment in every window carries a counter
+        // summary, the store answers from those instead of reading rows. It declines when
+        // enough segments lack one that reading them whole would cost more than the scan
+        // below — which is the same scan the store has always used, left untouched so the
+        // shortcut can only ever add speed, never take it away.
+        if let Some(snapshot) = Self::fold_from_summaries(store, expr, &calls, points, pushdown)? {
+            return Ok(snapshot);
+        }
 
         let slice = duration_nanos(Self::FOLD_SLICE);
         let mut cursor = from;

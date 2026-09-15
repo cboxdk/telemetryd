@@ -619,6 +619,27 @@ impl<S: RecordSchema> RecordStore<S> {
     ///
     /// Prefer [`Self::scan`] with a limit wherever the caller has one: this variant
     /// materialises every match.
+    /// Records sitting in the unsealed buffer within `(start, end]`.
+    ///
+    /// The newest and smallest part of the store, and the one part with no segment to
+    /// carry a precomputed summary — so a caller folding a window has to walk it.
+    pub(crate) fn buffered_between(&self, start_nanos: u64, end_nanos: u64) -> Vec<S::Record> {
+        let chunks = lock(&self.writer).buffer.snapshot();
+        let mut out = Vec::new();
+        for chunk in &chunks {
+            if !chunk.overlaps(start_nanos, end_nanos) {
+                continue;
+            }
+            for record in &chunk.records {
+                let at = S::timestamp(record);
+                if at > start_nanos && at <= end_nanos {
+                    out.push(record.clone());
+                }
+            }
+        }
+        out
+    }
+
     pub fn query(
         &self,
         start_nanos: u64,

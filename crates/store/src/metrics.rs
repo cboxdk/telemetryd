@@ -19,6 +19,244 @@ use crate::schema::{RecordSchema, Rows, schema_ref};
 #[derive(Debug, Clone, Copy)]
 pub struct MetricSchema;
 
+impl crate::RecordStore<MetricSchema> {
+    /// Compute and store summaries for segments that have none.
+    ///
+    /// Segments sealed before summaries existed carry none, and a query over them falls
+    /// back to reading their rows — correct, and as slow as it was. Without this the
+    /// speed-up would arrive only as old segments aged out, which on a week's retention
+    /// means a week.
+    ///
+    /// Bounded per call and driven from maintenance, because it reads whole segments: a
+    /// backfill that tried to do a hundred at once would compete with ingest for exactly
+    /// the memory the reaper is there to protect.
+    ///
+    /// Returns how many it wrote. A segment that cannot be read is left alone and counted
+    /// as done, so one damaged file does not make this retry forever.
+    pub fn backfill_folds(&self, limit: usize) -> Result<usize> {
+        let mut written = 0;
+        for segment in &self.segments() {
+            if written >= limit {
+                break;
+            }
+            if segment.has_folds() || segment.is_unreadable() {
+                continue;
+            }
+            let Ok(records) = segment.read::<MetricSchema>() else {
+                continue;
+            };
+            let mut rows: Vec<(usize, u64, f64)> = Vec::with_capacity(records.len());
+            let index: std::collections::HashMap<u64, usize> = segment
+                .manifest
+                .streams
+                .iter()
+                .enumerate()
+                .map(|(id, labels)| (labels.fingerprint(), id))
+                .collect();
+            for record in &records {
+                if let Some(&id) = index.get(&record.series.fingerprint()) {
+                    rows.push((id, record.timestamp_nanos, record.value));
+                }
+            }
+            rows.sort_unstable_by_key(|(id, at, _)| (*id, *at));
+            let mut folds =
+                vec![crate::folds::StreamFold::default(); segment.manifest.streams.len()];
+            for (id, at, value) in rows {
+                folds[id].add(at, value);
+            }
+            crate::folds::StreamFolds(folds).write(&segment.dir)?;
+            segment.mark_folds_written();
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    /// Per-stream counter summaries over `(start, end]`.
+    ///
+    /// # Why the store answers this rather than the query layer
+    ///
+    /// The shortcut is a storage fact. A segment lying wholly inside the window
+    /// contributes exactly its precomputed summary: every row in it is in the window, so
+    /// there is nothing to filter and nothing to read. Only the segments straddling an
+    /// edge, and the unsealed tail, are walked row by row.
+    ///
+    /// For a week over hourly segments that is a few hundred file reads of a hundred and
+    /// forty kilobytes instead of thirty million rows. The answer is the same either way —
+    /// counters are additive, and the step across a join is applied by `merge_later`
+    /// exactly as it would be mid-segment.
+    ///
+    /// Segments are visited oldest first, and the unsealed tail last, because the merge
+    /// requires it: joined out of order, a later value would be taken as the window's
+    /// first and the step back to it read as a counter reset.
+    pub fn fold_window(
+        &self,
+        start_nanos: u64,
+        end_nanos: u64,
+        matchers: &[telemetryd_core::LabelMatcher],
+    ) -> Result<Option<Vec<(Labels, crate::folds::StreamFold)>>> {
+        use crate::folds::StreamFold;
+        use std::collections::HashMap;
+
+        // How many segments would have to be read row by row. Reading one is cheap and
+        // reading many is not: each is read *whole*, because a time-range scan would also
+        // touch the neighbours already taken from summaries. Past a handful the single
+        // pruned scan the store has always used is faster, and falling back to it is what
+        // keeps a store whose segments are not summarised yet from being slower than one
+        // that never had summaries at all — measured at thirty seconds against five.
+        const READ_WHOLE_LIMIT: usize = 4;
+
+        // Keyed by the label set itself, not by the allocation behind it. Segments
+        // normally share one, so a pointer would do — but "normally" is not a property to
+        // rest an answer on, and getting it wrong here multiplies a rate by the number of
+        // segments in the window while looking entirely ordinary. This runs once per
+        // stream per segment, not once per row.
+        let mut by_series: HashMap<Labels, StreamFold> = HashMap::new();
+        let mut order: Vec<Labels> = Vec::new();
+        let note = |by_series: &mut HashMap<Labels, StreamFold>,
+                    order: &mut Vec<Labels>,
+                    labels: &Labels| {
+            if !by_series.contains_key(labels) {
+                by_series.insert(labels.clone(), StreamFold::default());
+                order.push(labels.clone());
+            }
+            labels.clone()
+        };
+
+        let segments = self.segments();
+
+        // Nothing is summarised yet, which is every store's first half hour after an
+        // upgrade. Say so before sorting or inspecting anything: the answer is the same
+        // either way, and this is the one case where the shortcut is pure overhead.
+        if !segments.iter().any(|segment| segment.has_folds()) {
+            return Ok(None);
+        }
+
+        let needs_rows = segments
+            .iter()
+            .filter(|segment| {
+                let m = &segment.manifest;
+                m.min_time_nanos <= end_nanos
+                    && m.max_time_nanos > start_nanos
+                    && !(m.min_time_nanos > start_nanos
+                        && m.max_time_nanos <= end_nanos
+                        && segment.has_folds())
+            })
+            .count();
+        if needs_rows > READ_WHOLE_LIMIT {
+            // Decline. The caller then takes the ordinary pruned scan it has always taken,
+            // untouched, so a store whose segments are not summarised yet is never slower
+            // than one that never had summaries at all. Replacing that scan with a second
+            // fold-shaped implementation was tried and measured: thirty seconds against
+            // five. Summaries are a shortcut over the existing path, not a rewrite of it.
+            return Ok(None);
+        }
+
+        // Ordered only now: joining two summaries means adding the step between them, so
+        // the loop below has to see segments in time order. The two exits above do not.
+        let mut segments = segments;
+        segments
+            .sort_by_key(|segment| (segment.manifest.min_time_nanos, segment.manifest.id.clone()));
+
+        for segment in &segments {
+            let manifest = &segment.manifest;
+            if manifest.min_time_nanos > end_nanos || manifest.max_time_nanos <= start_nanos {
+                continue;
+            }
+            let allowed: Vec<bool> = manifest
+                .streams
+                .iter()
+                .map(|labels| telemetryd_core::matches_all(matchers, labels))
+                .collect();
+            if !manifest.streams.is_empty() && !allowed.iter().any(|ok| *ok) {
+                continue;
+            }
+
+            let wholly_inside =
+                manifest.min_time_nanos > start_nanos && manifest.max_time_nanos <= end_nanos;
+            if wholly_inside && let Some(precomputed) = segment.folds() {
+                for (stream, labels) in manifest.streams.iter().enumerate() {
+                    if !allowed.get(stream).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    let Some(fold) = precomputed.get(stream).filter(|f| f.seen > 0) else {
+                        continue;
+                    };
+                    let key = note(&mut by_series, &mut order, labels);
+                    if let Some(entry) = by_series.get_mut(&key) {
+                        entry.merge_later(fold);
+                    }
+                }
+                continue;
+            }
+
+            // Straddles an edge, or predates summaries: read this one segment. Reading the
+            // *segment* rather than a time range matters — a range scan would also touch
+            // its neighbours, which the loop has already taken from their summaries.
+            let rows = segment.read::<MetricSchema>()?;
+            fold_rows(
+                rows.into_iter(),
+                start_nanos,
+                end_nanos,
+                matchers,
+                &mut by_series,
+                &mut order,
+            );
+        }
+
+        fold_rows(
+            self.buffered_between(start_nanos, end_nanos).into_iter(),
+            start_nanos,
+            end_nanos,
+            matchers,
+            &mut by_series,
+            &mut order,
+        );
+
+        let mut out: Vec<(Labels, StreamFold)> = order
+            .into_iter()
+            .filter_map(|labels| by_series.remove(&labels).map(|fold| (labels, fold)))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(Some(out))
+    }
+}
+
+/// Fold a run of raw samples into `by_series`, in time order per stream.
+///
+/// Order is the whole point: a fold applies the counter-reset rule by comparing each
+/// sample with the previous one, so feeding it rows in storage order would invent resets
+/// that never happened and inflate the result. Sorting here rather than at every call
+/// site is what keeps that from being something each caller has to remember.
+fn fold_rows(
+    records: impl Iterator<Item = MetricSample>,
+    start_nanos: u64,
+    end_nanos: u64,
+    matchers: &[telemetryd_core::LabelMatcher],
+    by_series: &mut std::collections::HashMap<Labels, crate::folds::StreamFold>,
+    order: &mut Vec<Labels>,
+) {
+    let mut rows: Vec<(Labels, u64, f64)> = Vec::new();
+    for record in records {
+        if record.timestamp_nanos <= start_nanos
+            || record.timestamp_nanos > end_nanos
+            || !telemetryd_core::matches_all(matchers, &record.series)
+        {
+            continue;
+        }
+        if !by_series.contains_key(&record.series) {
+            by_series.insert(record.series.clone(), crate::folds::StreamFold::default());
+            order.push(record.series.clone());
+        }
+        rows.push((record.series, record.timestamp_nanos, record.value));
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    for (key, at, value) in rows {
+        if let Some(entry) = by_series.get_mut(&key) {
+            entry.add(at, value);
+        }
+    }
+}
+
 impl RecordSchema for MetricSchema {
     type Record = MetricSample;
 
@@ -129,6 +367,10 @@ impl RecordSchema for MetricSchema {
             });
         }
         Ok(out)
+    }
+
+    fn counter_value(record: &Self::Record) -> Option<f64> {
+        Some(record.value)
     }
 
     fn timestamp(record: &Self::Record) -> u64 {

@@ -69,6 +69,19 @@ measurable memory growth, and the results are identical to the unfolded path acr
 21,168 values. Charts, which ask for many points over a short window, take the ordinary
 path unchanged.
 
+**And the fold is precomputed per segment.** Folding still reads every row it covers,
+which is why a wide panel cost seconds. So sealing writes the fold beside the Parquet
+file — 48 bytes per stream in `folds.bin` — and a window that wholly contains a segment
+takes that total without opening it. Only the two segments at the window's edges are
+read. On a 30-million-row store: 24 hours 724 → 234 ms, 7 days 6.4 s → 555 ms, 90 days
+7.1 s → 316 ms, agreeing with the row-by-row path on all 2,456 values to within 1.07e-15.
+
+It is a shortcut, not a replacement: when too many segments in a window lack a summary,
+the store declines and the query takes the previous path, byte for byte the same code.
+The whole change is additive — 482 inserted lines, none deleted — so a store with no
+summaries behaves exactly as it did before, and existing segments are folded by a
+background task rather than by a rewrite at startup.
+
 **One query has a ceiling.** PromQL reads its whole window in one pass, so every sample of
 every matching series is resident at once and neither `limit` nor the series cap bounded
 it — measured at roughly 850 MB for a single query against weeks of high-cardinality

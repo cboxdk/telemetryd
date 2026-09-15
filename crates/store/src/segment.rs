@@ -270,6 +270,15 @@ pub struct Segment {
     /// instead lets the rest of the answer through, and makes the failure something
     /// reported rather than something that has to be re-discovered on every query.
     pub(crate) unreadable: Arc<AtomicBool>,
+    /// Whether this segment has a counter summary next to it.
+    ///
+    /// A bit rather than the summary itself: a query needs to know *whether* to take the
+    /// shortcut far more often than it needs the numbers, and the numbers are deliberately
+    /// not resident. Statting the file on every decision was measured costing more than
+    /// the shortcut saved on a wide window, because the decision is made once per
+    /// evaluation point per segment. Only two things create the file — sealing and the
+    /// backfill — and both set this, so it cannot go stale under us.
+    has_folds: Arc<AtomicBool>,
     /// Parquet footer, parsed once and reused.
     ///
     /// Segments are immutable, so their metadata can never go stale. Re-reading and
@@ -300,6 +309,27 @@ impl Segment {
     /// Returns `Ok(None)` for a directory without a readable manifest rather than an
     /// error: that is what a crash mid-seal looks like, and the catalogue should skip
     /// it and let the janitor remove it, not refuse to start.
+    /// This segment's per-stream counter summaries, read from disk on demand.
+    ///
+    /// Not held: see [`crate::folds`]. `None` for a segment written before summaries
+    /// existed, or one whose file a crash truncated — the rows are still there, and the
+    /// caller falls back to them.
+    #[must_use]
+    pub fn folds(&self) -> Option<crate::folds::StreamFolds> {
+        crate::folds::StreamFolds::read(&self.dir)
+    }
+
+    /// Whether [`folds`](Self::folds) would find anything, without reading it.
+    #[must_use]
+    pub fn has_folds(&self) -> bool {
+        self.has_folds.load(Ordering::Relaxed)
+    }
+
+    /// Record that a summary now sits next to this segment.
+    pub(crate) fn mark_folds_written(&self) {
+        self.has_folds.store(true, Ordering::Relaxed);
+    }
+
     pub fn load(dir: &Path) -> Result<Option<Self>> {
         let manifest_path = dir.join(MANIFEST_FILE);
         let raw = match fs::read_to_string(&manifest_path) {
@@ -348,6 +378,9 @@ impl Segment {
             manifest,
             dir: dir.to_path_buf(),
             unreadable: Arc::new(AtomicBool::new(false)),
+            has_folds: Arc::new(AtomicBool::new(
+                dir.join(crate::folds::FOLDS_FILE).is_file(),
+            )),
             metadata: Arc::new(OnceLock::new()),
         }))
     }
@@ -503,6 +536,42 @@ fn segment_corrupt(path: &Path, error: &dyn std::fmt::Display) -> Error {
 ///
 /// One pass over the records with a hash lookup each. Sealing already encodes every
 /// record into Arrow and compresses it, so this is not the expensive part.
+/// Per-stream counter summaries, for signals that have a counter value.
+///
+/// Records are sorted by time before folding: a summary is built by walking samples
+/// forward, and the seal path receives them in whatever order the buffer held. Folding
+/// them unsorted would take an arbitrary sample as the window's first and read a
+/// legitimate step as a counter reset — producing a number that is wrong and plausible.
+fn stream_folds<S: RecordSchema>(
+    records: &[S::Record],
+    streams: &[Labels],
+) -> Option<crate::folds::StreamFolds> {
+    // One probe: a signal either has counter values or it does not.
+    S::counter_value(records.first()?)?;
+
+    let index: std::collections::HashMap<u64, usize> = streams
+        .iter()
+        .enumerate()
+        .map(|(id, labels)| (labels.fingerprint(), id))
+        .collect();
+
+    let mut ordered: Vec<(usize, u64, f64)> = Vec::with_capacity(records.len());
+    for record in records {
+        if let Some(&id) = index.get(&S::index_labels(record).fingerprint())
+            && let Some(value) = S::counter_value(record)
+        {
+            ordered.push((id, S::timestamp(record), value));
+        }
+    }
+    ordered.sort_unstable_by_key(|(id, at, _)| (*id, *at));
+
+    let mut folds = vec![crate::folds::StreamFold::default(); streams.len()];
+    for (id, at, value) in ordered {
+        folds[id].add(at, value);
+    }
+    Some(crate::folds::StreamFolds(folds))
+}
+
 fn stream_statistics<S: RecordSchema>(
     records: &[S::Record],
     streams: &[Labels],
@@ -635,7 +704,17 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
         .map_err(|e| Error::io(format!("creating {}", staging.display()), e))?;
 
     let (batch, streams) = S::to_batch(records)?;
+    // Shared with every other segment holding the same sets, exactly as `load` does.
+    //
+    // Interning used to happen only when a segment was read back from disk, so a segment
+    // sealed while the process ran kept its own copies until the next restart. That cost
+    // memory the sharing was introduced to save, and it silently broke anything treating
+    // label-set identity as stream identity — `fold_window` returned one entry per
+    // segment instead of one per stream, which reads as a rate multiplied by the number
+    // of segments in the window.
+    let streams: Vec<Labels> = streams.into_iter().map(crate::intern::shared).collect();
     let (stream_bounds, stream_rows) = stream_statistics::<S>(records, &streams);
+    let folds = stream_folds::<S>(records, &streams);
     let data_path = staging.join(DATA_FILE);
     let bytes = write_parquet(&data_path, &batch, options.compression)?;
 
@@ -655,6 +734,10 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
         stream_rows,
     };
     write_manifest(&staging.join(MANIFEST_FILE), &manifest)?;
+    let wrote_folds = folds.is_some();
+    if let Some(folds) = &folds {
+        folds.write(&staging)?;
+    }
     if let Some(bloom) = &bloom {
         bloom.write(&staging)?;
     }
@@ -701,6 +784,7 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
         bloom,
         text,
         unreadable: Arc::new(AtomicBool::new(false)),
+        has_folds: Arc::new(AtomicBool::new(wrote_folds)),
         metadata: Arc::new(OnceLock::new()),
     })
 }
