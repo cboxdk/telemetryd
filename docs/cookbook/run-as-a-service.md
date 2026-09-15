@@ -108,6 +108,13 @@ sudo systemctl edit telemetryd     # [Service] / MemoryMax=60%
 sudo systemctl daemon-reload && sudo systemctl restart telemetryd
 ```
 
+**Before 0.53.0 this did not work on a systemd host.** telemetryd looked at
+`/sys/fs/cgroup/memory.max`, which is the *root* cgroup — correct inside a container and
+absent under systemd — so `MemoryMax` had no effect on any derived limit and the startup
+warning below announced that nothing was capping the process while the kernel was capping
+it. If you are on an older build, set `limits.query_concurrency` and `limits.max_series`
+by hand or upgrade.
+
 An instance running with no limit in force says so at startup:
 
 ```

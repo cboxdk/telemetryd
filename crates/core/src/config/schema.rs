@@ -1034,20 +1034,95 @@ fn derive_concurrency(cost_bytes: u64, min: u32, max: u32) -> u32 {
 /// database next door rather than us.
 #[must_use]
 pub fn memory_is_capped() -> bool {
-    for path in [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ] {
-        if let Some(limit) = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|text| text.split_whitespace().find_map(|w| w.parse::<u64>().ok()))
-            && limit > 0
-            && limit < u64::MAX / 2
-        {
-            return true;
+    cgroup_memory_limit().is_some()
+}
+
+/// The memory limit on this process's own cgroup, if one is set.
+///
+/// # Why the root cgroup is the wrong place to look
+///
+/// This used to read `/sys/fs/cgroup/memory.max` and nothing else. In a container that is
+/// the container's own limit and the answer is right. Under systemd it is the *root*
+/// cgroup — which on the deployment this was written for does not exist as a file at all,
+/// so every lookup missed and every derived limit fell back to a fraction of the host's
+/// total memory.
+///
+/// The consequence was quiet and went unnoticed for a week: `MemoryMax=25%` in the unit
+/// had no effect on the concurrency, series budget or query ceiling telemetryd derived,
+/// and the startup warning announced that no limit was in force while the kernel was
+/// enforcing one. The unit's own comments, the service documentation and several of my
+/// own explanations all said telemetryd reads this back out of its cgroup. It did not.
+///
+/// So the process's own path is read from `/proc/self/cgroup` — `0::/system.slice/…` on
+/// cgroup v2 — and every level from there up to the root is consulted, because a limit on
+/// any ancestor binds just as hard as one on the leaf. The smallest wins. The old root
+/// paths stay as a fallback: in a namespaced container they are the process's own cgroup,
+/// and `/proc/self/cgroup` there names a path that does not exist under `/sys/fs/cgroup`.
+fn cgroup_memory_limit() -> Option<u64> {
+    let read_limit = |path: &str| -> Option<u64> {
+        std::fs::read_to_string(path)
+            .ok()?
+            .split_whitespace()
+            .find_map(|word| word.parse::<u64>().ok())
+            // cgroup v2 writes the literal `max` when unlimited, which parses to nothing.
+            // cgroup v1 spells it as a number near `u64::MAX` instead.
+            .filter(|limit| *limit > 0 && *limit < u64::MAX / 2)
+    };
+
+    let mut smallest: Option<u64> = None;
+    let mut consider = |limit: Option<u64>| {
+        if let Some(limit) = limit {
+            smallest = Some(smallest.map_or(limit, |current: u64| current.min(limit)));
+        }
+    };
+
+    if let Some(own) = cgroup_path() {
+        // `/system.slice/telemetryd.service` walks to `/system.slice`, then to the root.
+        let mut at = own.as_str();
+        loop {
+            consider(read_limit(&format!("/sys/fs/cgroup{at}/memory.max")));
+            consider(read_limit(&format!(
+                "/sys/fs/cgroup/memory{at}/memory.limit_in_bytes"
+            )));
+            match at.rfind('/') {
+                Some(0) | None => break,
+                Some(cut) => at = &at[..cut],
+            }
         }
     }
-    false
+
+    consider(read_limit("/sys/fs/cgroup/memory.max"));
+    consider(read_limit("/sys/fs/cgroup/memory/memory.limit_in_bytes"));
+    smallest
+}
+
+/// This process's cgroup path, as `/system.slice/telemetryd.service`.
+fn cgroup_path() -> Option<String> {
+    parse_cgroup_path(&std::fs::read_to_string("/proc/self/cgroup").ok()?)
+}
+
+/// Pull the path out of `/proc/self/cgroup`.
+///
+/// cgroup v2 is one line, `0::/system.slice/telemetryd.service`. v1 is several, one per
+/// controller, and only the memory controller's is relevant here.
+fn parse_cgroup_path(contents: &str) -> Option<String> {
+    let mut v1 = None;
+    for line in contents.lines() {
+        let mut fields = line.splitn(3, ':');
+        let hierarchy = fields.next()?;
+        let controllers = fields.next()?;
+        let path = fields.next()?;
+        if !path.starts_with('/') {
+            continue;
+        }
+        if hierarchy == "0" && controllers.is_empty() {
+            return Some(path.to_owned());
+        }
+        if controllers.split(',').any(|name| name == "memory") {
+            v1 = Some(path.to_owned());
+        }
+    }
+    v1
 }
 
 fn memory_limit_bytes() -> u64 {
@@ -1055,25 +1130,9 @@ fn memory_limit_bytes() -> u64 {
     /// Share of a machine's installed memory to assume is ours when nothing says.
     const UNCONTAINED_SHARE: u64 = 4;
 
-    let read_number = |path: &str| -> Option<u64> {
-        std::fs::read_to_string(path)
-            .ok()?
-            .split_whitespace()
-            .find_map(|word| word.parse::<u64>().ok())
-    };
-
-    // cgroup v2 writes the literal `max` when unlimited, which parses to nothing and
-    // falls through — which is the behaviour we want.
-    for path in [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ] {
-        if let Some(limit) = read_number(path) {
-            // cgroup v1 spells "unlimited" as a number near u64::MAX rather than a word.
-            if limit > 0 && limit < u64::MAX / 2 {
-                return limit;
-            }
-        }
+    // This process's own cgroup, not the root one — see `cgroup_memory_limit`.
+    if let Some(limit) = cgroup_memory_limit() {
+        return limit;
     }
 
     // `MemTotal:  16305892 kB` — the first number on that line, in kibibytes.
@@ -1161,4 +1220,56 @@ where
         .map(|text| text.trim().to_owned())
         .filter(|text| !text.is_empty())
         .map(PathBuf::from))
+}
+
+#[cfg(test)]
+mod cgroup_tests {
+    use super::parse_cgroup_path;
+
+    /// The shape on a systemd host, which is exactly where this was getting the wrong
+    /// answer: the root cgroup has no `memory.max` file there, so every lookup missed.
+    #[test]
+    fn a_cgroup_v2_line_gives_the_services_own_path() {
+        assert_eq!(
+            parse_cgroup_path("0::/system.slice/telemetryd.service\n").as_deref(),
+            Some("/system.slice/telemetryd.service")
+        );
+    }
+
+    /// v1 lists one line per controller, and only the memory one decides a memory limit.
+    #[test]
+    fn a_cgroup_v1_file_picks_the_memory_controller() {
+        let contents = concat!(
+            "12:pids:/system.slice/telemetryd.service\n",
+            "9:memory:/system.slice/telemetryd.service\n",
+            "3:cpu,cpuacct:/system.slice/something-else.slice\n",
+        );
+        assert_eq!(
+            parse_cgroup_path(contents).as_deref(),
+            Some("/system.slice/telemetryd.service")
+        );
+    }
+
+    /// v2 wins where both appear, which is what a hybrid host looks like.
+    #[test]
+    fn version_two_wins_over_a_version_one_line() {
+        let contents = concat!(
+            "9:memory:/legacy/path\n",
+            "0::/system.slice/telemetryd.service\n",
+        );
+        assert_eq!(
+            parse_cgroup_path(contents).as_deref(),
+            Some("/system.slice/telemetryd.service")
+        );
+    }
+
+    /// Nothing usable must yield nothing rather than a guess. The caller then assumes a
+    /// share of the host, which is the safe direction; a path invented here would send it
+    /// looking in the wrong place and report "no limit" just as confidently.
+    #[test]
+    fn nonsense_yields_nothing() {
+        assert_eq!(parse_cgroup_path("").as_deref(), None);
+        assert_eq!(parse_cgroup_path("not a cgroup file\n").as_deref(), None);
+        assert_eq!(parse_cgroup_path("0::relative/path\n").as_deref(), None);
+    }
 }

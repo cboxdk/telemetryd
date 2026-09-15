@@ -1,15 +1,15 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
-  "serialNumber": "urn:uuid:43ac8056-ceb5-5979-acc5-bb5ac9f6da2c",
+  "serialNumber": "urn:uuid:e9e16a55-52b8-598b-9d92-7ff7935626d3",
   "version": 1,
   "metadata": {
     "component": {
       "type": "application",
-      "bom-ref": "pkg:cargo/telemetryd@0.52.1",
+      "bom-ref": "pkg:cargo/telemetryd@0.53.0",
       "name": "telemetryd",
-      "version": "0.52.1",
-      "purl": "pkg:cargo/telemetryd@0.52.1",
+      "version": "0.53.0",
+      "purl": "pkg:cargo/telemetryd@0.53.0",
       "description": "Single-binary, zero-config observability backend",
       "licenses": [
         {
@@ -4548,10 +4548,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/rustls@0.23.43",
+      "bom-ref": "pkg:cargo/rustls@0.23.45",
       "name": "rustls",
-      "version": "0.23.43",
-      "purl": "pkg:cargo/rustls@0.23.43",
+      "version": "0.23.45",
+      "purl": "pkg:cargo/rustls@0.23.45",
       "description": "Rustls is a modern TLS library written in Rust.",
       "licenses": [
         {
@@ -4605,10 +4605,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/rustls-webpki@0.103.13",
+      "bom-ref": "pkg:cargo/rustls-webpki@0.103.15",
       "name": "rustls-webpki",
-      "version": "0.103.13",
-      "purl": "pkg:cargo/rustls-webpki@0.103.13",
+      "version": "0.103.15",
+      "purl": "pkg:cargo/rustls-webpki@0.103.15",
       "description": "Web PKI X.509 Certificate Verification.",
       "licenses": [
         {

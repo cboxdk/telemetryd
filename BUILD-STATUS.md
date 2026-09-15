@@ -54,6 +54,13 @@ segments costs one map and a thousand pointers — which took a 133-segment stor
 and report it when it does not fit, and the systemd unit sets `MemoryMax` so the kernel
 bounds the process rather than the machine failing.
 
+**Derived limits read the process's own cgroup.** Query concurrency, the series budget
+and the per-query sample ceiling are sized from the memory this process may use, which is
+read from `/proc/self/cgroup` and every ancestor of it — the smallest limit wins. Before
+0.53.0 only the root cgroup was consulted, which is right in a container and absent under
+systemd, so `MemoryMax` in the unit changed nothing and the startup warning contradicted
+the kernel.
+
 **A long window is folded rather than loaded.** `rate`/`increase` over a window needs four
 numbers per series, not the samples, so a window wider than two hours evaluated at a
 handful of points is read an hour at a time and folded — memory proportional to series
