@@ -29,6 +29,45 @@ pub struct DataDir {
     _lock: File,
 }
 
+/// Remove every permission "others" have on the data directory.
+///
+/// It holds every log line with its secrets and personal data, and it was created under
+/// the process's umask — 0755 under a default one — with files at 0644, so any account
+/// on the machine could read it. Taking the other bits off the root closes all of it at
+/// once, including files written before this ran, since nothing beneath can be reached
+/// without passing through. Group bits are left as they are: an operator who gave a
+/// backup group access meant to. A directory this process cannot change is logged and
+/// left, rather than refusing to start over it.
+fn close_to_others(root: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(metadata) = fs::metadata(root) else {
+            return;
+        };
+        let mode = metadata.permissions().mode();
+        let others = mode & 0o007;
+        if others == 0 {
+            return;
+        }
+        match fs::set_permissions(root, fs::Permissions::from_mode(mode ^ others)) {
+            Ok(()) => tracing::info!(
+                data_dir = %root.display(),
+                "the data directory was open to every account on this machine; it no \
+                 longer is"
+            ),
+            Err(error) => tracing::warn!(
+                data_dir = %root.display(),
+                %error,
+                "the data directory is readable by every account on this machine and \
+                 could not be changed; restrict it with chmod o-rwx"
+            ),
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = root;
+}
+
 impl DataDir {
     /// Create the layout if absent, verify the format version, and take the writer
     /// lock.
@@ -40,6 +79,7 @@ impl DataDir {
         // Lock before touching anything else, so two concurrent starts cannot both
         // decide the directory is empty and race on VERSION.
         let lock = acquire_lock(&root)?;
+        close_to_others(&root);
         check_or_write_version(&root)?;
         create_layout(&root)?;
 
@@ -239,6 +279,22 @@ fn dir_size(path: &Path) -> Result<u64> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A data directory under a default umask was readable by every account on the
+    /// machine. Opening it takes the other bits off and leaves the group's.
+    #[cfg(unix)]
+    #[test]
+    fn opening_closes_the_data_directory_to_other_accounts() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _dir = DataDir::open(&root).unwrap();
+        let mode = fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o750);
+    }
 
     #[test]
     fn creates_the_full_layout_and_is_idempotent() {

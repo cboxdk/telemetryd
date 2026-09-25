@@ -185,17 +185,11 @@ pub fn ensure_self_signed(dir: &std::path::Path, names: &[String]) -> Result<(Pa
         .map_err(|e| Error::io(format!("creating {}", dir.display()), e))?;
     std::fs::write(&cert_path, certificate.pem())
         .map_err(|e| Error::io(format!("writing {}", cert_path.display()), e))?;
-    // The key is written before anything serves with it, and only the owner may read
-    // it. A private key at 0644 next to the data directory is the kind of thing nobody
-    // notices until it matters.
-    std::fs::write(&key_path, signing_key.serialize_pem())
+    // Only the owner may read the key, from the moment it exists. It used to be written
+    // under the umask and restricted afterwards, which left it readable by everyone in
+    // between.
+    write_private(&key_path, signing_key.serialize_pem().as_bytes())
         .map_err(|e| Error::io(format!("writing {}", key_path.display()), e))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| Error::io(format!("securing {}", key_path.display()), e))?;
-    }
 
     tracing::warn!(
         names = names.join(", "),
@@ -206,6 +200,19 @@ pub fn ensure_self_signed(dir: &std::path::Path, names: &[String]) -> Result<(Pa
          clients already trust wherever you can."
     );
     Ok((cert_path, key_path))
+}
+
+/// Write a file only its owner can read, created that way rather than restricted after.
+fn write_private(path: &std::path::Path, contents: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(contents)
 }
 
 /// A listener that hands `axum::serve` connections which have already handshaken.

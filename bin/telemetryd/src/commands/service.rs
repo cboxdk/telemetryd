@@ -79,6 +79,18 @@ fn unit_path() -> anyhow::Result<PathBuf> {
 fn install(user: &str) -> anyhow::Result<()> {
     let unit = unit_for_this_platform(user)?;
     let path = unit_path()?;
+    #[cfg(not(target_os = "macos"))]
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(concern) = writable_by_others(&exe)
+    {
+        crate::out::outln!(
+            "warning: the unit will run {} as a service, and {concern}. Whoever can \
+             replace that file can run code as the service. Install the binary \
+             somewhere only root can write — /usr/local/bin — and install again from \
+             there.",
+            exe.display()
+        );
+    }
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
@@ -118,6 +130,24 @@ fn install(user: &str) -> anyhow::Result<()> {
     crate::out::outln!("telemetryd is running and will start on boot.");
     crate::out::outln!("Check it with: telemetryd status");
     Ok(())
+}
+
+/// Why someone other than root could replace this file, if anyone could: it is not
+/// owned by root, or its group or everyone may write it. A unit's `ExecStart` pointing at
+/// a binary in a home directory is an escalation path waiting for its first bug.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn writable_by_others(path: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.uid() != 0 {
+        return Some(format!(
+            "it is owned by uid {} rather than root",
+            metadata.uid()
+        ));
+    }
+    let mode = metadata.permissions().mode();
+    let writable = mode & 0o022;
+    (writable != 0).then(|| format!("its mode {:o} lets others write it", mode & 0o777))
 }
 
 /// Create the account the unit runs as, if it is not already there.
@@ -511,19 +541,41 @@ ExecReload=/bin/kill -HUP $MAINPID
 KillSignal=SIGTERM
 TimeoutStopSec=30s
 
+# Telemetry holds every log line with its secrets: nothing this process writes is for
+# other accounts, and its directory is closed to them.
+UMask=0077
+StateDirectoryMode=0700
+
+# Enough descriptors that connections cannot starve the write-ahead log and segments.
+# telemetryd serves at most half of these as connections at once.
+LimitNOFILE=65536
+
 NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+# Other processes are invisible. Not ProcSubset=pid: telemetryd reads /proc/meminfo to
+# size itself when no cgroup limit applies.
+ProtectProc=invisible
 RestrictAddressFamilies=AF_INET AF_INET6
 RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 
 [Install]

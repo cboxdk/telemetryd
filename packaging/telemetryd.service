@@ -48,19 +48,41 @@ ExecReload=/bin/kill -HUP $MAINPID
 KillSignal=SIGTERM
 TimeoutStopSec=30s
 
+# Telemetry holds every log line with its secrets: nothing this process writes is for
+# other accounts, and its directory is closed to them.
+UMask=0077
+StateDirectoryMode=0700
+
+# Enough descriptors that connections cannot starve the write-ahead log and segments.
+# telemetryd serves at most half of these as connections at once.
+LimitNOFILE=65536
+
 NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+# Other processes are invisible. Not ProcSubset=pid: telemetryd reads /proc/meminfo to
+# size itself when no cgroup limit applies.
+ProtectProc=invisible
 RestrictAddressFamilies=AF_INET AF_INET6
 RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 
 [Install]
