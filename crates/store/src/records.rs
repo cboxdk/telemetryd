@@ -88,7 +88,7 @@ pub struct RecordStore<S: RecordSchema> {
     /// When the last seal failed, while failures continue; cleared by a success.
     seal_failed_at: Mutex<Option<Instant>>,
     seal_sequence: AtomicU64,
-    stats: Stats,
+    pub(crate) stats: Stats,
     /// The torn tail replay found and cut off at startup, if it found one.
     wal_truncation: Option<crate::wal::Truncation>,
 }
@@ -160,14 +160,14 @@ struct Buffer<S: RecordSchema> {
 /// `limit=100` query had to examine every buffered record, because nothing said which
 /// ones could not possibly be in the newest hundred — the same problem sealed segments
 /// solve with their manifest, and the same solution.
-struct Chunk<S: RecordSchema> {
-    records: Vec<S::Record>,
-    min_nanos: u64,
-    max_nanos: u64,
+pub(crate) struct Chunk<S: RecordSchema> {
+    pub(crate) records: Vec<S::Record>,
+    pub(crate) min_nanos: u64,
+    pub(crate) max_nanos: u64,
 }
 
 impl<S: RecordSchema> Chunk<S> {
-    fn overlaps(&self, start_nanos: u64, end_nanos: u64) -> bool {
+    pub(crate) fn overlaps(&self, start_nanos: u64, end_nanos: u64) -> bool {
         self.min_nanos <= end_nanos && self.max_nanos >= start_nanos
     }
 }
@@ -269,20 +269,20 @@ impl<S: RecordSchema> Buffer<S> {
 }
 
 #[derive(Debug, Default)]
-struct Stats {
+pub(crate) struct Stats {
     appended: AtomicU64,
     sealed_segments: AtomicU64,
     /// Reads that failed because a segment file is damaged.
-    segments_unreadable: AtomicU64,
+    pub(crate) segments_unreadable: AtomicU64,
     sealed_records: AtomicU64,
     recovered: AtomicU64,
     /// Segments actually opened and decoded. The counterpart to `segments_pruned`:
     /// together they say how much of the store a query had to touch, which is the
     /// number to watch when queries get slow.
-    segments_scanned: AtomicU64,
+    pub(crate) segments_scanned: AtomicU64,
     /// Segments a query skipped without any I/O — by time range, label index, Bloom
     /// filter, or the limit cutoff.
-    segments_pruned: AtomicU64,
+    pub(crate) segments_pruned: AtomicU64,
 }
 
 /// A bounded query request.
@@ -667,7 +667,7 @@ impl<S: RecordSchema> RecordStore<S> {
     /// one to the other: taken apart, a query could read the buffer before a drain and
     /// the segments after the publish, and count a seal's records twice — or the other
     /// way round and miss them.
-    fn view(&self) -> (Vec<Arc<Chunk<S>>>, Vec<Arc<Segment>>) {
+    pub(crate) fn view(&self) -> (Vec<Arc<Chunk<S>>>, Vec<Arc<Segment>>) {
         let catalogue = lock_read(&self.catalogue);
         let chunks = Self::buffered_in(&mut lock(&self.writer));
         (chunks, catalogue.clone())
@@ -945,22 +945,6 @@ impl<S: RecordSchema> RecordStore<S> {
         Ok(collector.into_sorted())
     }
 
-    /// How many threads to scan with.
-    ///
-    /// **Only unbounded queries are parallelised**, and that is the measured result
-    /// rather than a guess. A limited query is fast because the collector's cutoff
-    /// tightens on the first segment and the other nineteen are then skipped without
-    /// being opened; four workers instead race ahead and do real work on segments the
-    /// cutoff would have discarded. On the benchmark store that made `limit=100` go
-    /// from 1.45 ms to 2.33 ms — parallelism bought nothing and cost 60%.
-    ///
-    /// An unbounded scan has no cutoff to lose, so the work divides. It gains about
-    /// 1.3× at four workers — real, but nothing like linear, because materialising a
-    /// hundred thousand records is bound by allocation rather than by decode.
-    ///
-    /// Conservative on purpose besides: this process is accepting writes at the same
-    /// time, and handing every core to one query makes ingest stutter under exactly
-    /// the load an operator is trying to look at.
     /// Stop a scan that has collected more than the caller is willing to hold.
     ///
     /// Checked between segments rather than per record: the granularity costs at most one
@@ -977,6 +961,22 @@ impl<S: RecordSchema> RecordStore<S> {
         Ok(())
     }
 
+    /// How many threads to scan with.
+    ///
+    /// **Only unbounded queries are parallelised**, and that is the measured result
+    /// rather than a guess. A limited query is fast because the collector's cutoff
+    /// tightens on the first segment and the other nineteen are then skipped without
+    /// being opened; four workers instead race ahead and do real work on segments the
+    /// cutoff would have discarded. On the benchmark store that made `limit=100` go
+    /// from 1.45 ms to 2.33 ms — parallelism bought nothing and cost 60%.
+    ///
+    /// An unbounded scan has no cutoff to lose, so the work divides. It gains about
+    /// 1.3× at four workers — real, but nothing like linear, because materialising a
+    /// hundred thousand records is bound by allocation rather than by decode.
+    ///
+    /// Conservative on purpose besides: this process is accepting writes at the same
+    /// time, and handing every core to one query makes ingest stutter under exactly
+    /// the load an operator is trying to look at.
     fn scan_workers(&self, request: &Scan, segments: usize) -> usize {
         let configured = self.settings.query_parallelism;
         if configured <= 1 || request.limit != 0 || segments < MIN_SEGMENTS_PER_EXTRA_WORKER {
@@ -1100,6 +1100,15 @@ impl<S: RecordSchema> RecordStore<S> {
             Ok(Flow::Continue)
         });
 
+        self.settle_scan(segment, outcome)
+    }
+
+    /// What a failed segment read means for the query that made it.
+    ///
+    /// Shared by every path that reads segments, so a damaged file is treated the same
+    /// whichever query found it.
+    pub(crate) fn settle_scan(&self, segment: &Segment, outcome: Result<()>) -> Result<()> {
+        let manifest = &segment.manifest;
         match outcome {
             Ok(()) => Ok(()),
             // Deleted by retention while this query was on its way to it: the data was

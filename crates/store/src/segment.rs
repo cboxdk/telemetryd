@@ -223,6 +223,9 @@ impl SegmentManifest {
 /// find one row; large enough that per-batch overhead stays amortised.
 const SCAN_BATCH_ROWS: usize = 8192;
 
+/// Rows per Parquet row group in a sealed segment.
+const ROW_GROUP_ROWS: usize = 65_536;
+
 /// Evaluates a selection over a projected batch.
 pub type SelectionMask =
     std::sync::Arc<dyn Fn(&RecordBatch) -> Result<arrow::array::BooleanArray> + Send + Sync>;
@@ -440,16 +443,7 @@ impl Segment {
         let file = File::open(&path)
             .map_err(|e| Error::io(format!("opening segment {}", path.display()), e))?;
 
-        // Parse the footer once per segment, then reuse it for every later query.
-        let metadata = if let Some(metadata) = self.metadata.get() {
-            metadata.clone()
-        } else {
-            let loaded = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())
-                .map_err(|e| segment_corrupt(&path, &e))?;
-            let _ = self.metadata.set(loaded.clone());
-            loaded
-        };
-
+        let metadata = self.reader_metadata(&file)?;
         let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata)
             .with_batch_size(SCAN_BATCH_ROWS);
 
@@ -476,6 +470,58 @@ impl Segment {
             }
         }
         Ok(())
+    }
+
+    /// Stream just `columns`, from the row groups whose timestamps overlap one of
+    /// `windows` — sorted, disjoint `(start, end)` pairs, both ends included.
+    ///
+    /// No row filter and no records: the caller walks the few numeric columns it asked
+    /// for itself. For a metric fold that measured several times faster than filtering
+    /// rows and decoding each into a sample, and it holds one batch rather than a
+    /// slice's worth of samples. Rows come back in storage order, which is time order.
+    pub fn scan_columns<F>(
+        &self,
+        columns: &[&str],
+        windows: &[(u64, u64)],
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&RecordBatch) -> Result<Flow>,
+    {
+        let path = self.data_path();
+        let file = File::open(&path)
+            .map_err(|e| Error::io(format!("opening segment {}", path.display()), e))?;
+        let metadata = self.reader_metadata(&file)?;
+        let row_groups = row_groups_within(metadata.metadata(), windows);
+        if row_groups.is_empty() {
+            return Ok(());
+        }
+        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata)
+            .with_batch_size(SCAN_BATCH_ROWS);
+        let projection = ProjectionMask::columns(builder.parquet_schema(), columns.iter().copied());
+        let reader = builder
+            .with_projection(projection)
+            .with_row_groups(row_groups)
+            .build()
+            .map_err(|e| segment_corrupt(&path, &e))?;
+        for batch in reader {
+            let batch = batch.map_err(|e| segment_corrupt(&path, &e))?;
+            if visit(&batch)? == Flow::Stop {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// The Parquet footer, parsed once per segment and reused by every later read.
+    fn reader_metadata(&self, file: &File) -> Result<ArrowReaderMetadata> {
+        if let Some(metadata) = self.metadata.get() {
+            return Ok(metadata.clone());
+        }
+        let loaded = ArrowReaderMetadata::load(file, ArrowReaderOptions::default())
+            .map_err(|e| segment_corrupt(&self.data_path(), &e))?;
+        let _ = self.metadata.set(loaded.clone());
+        Ok(loaded)
     }
 
     /// Read every record back, resolving stream ids through the manifest dictionary.
@@ -831,8 +877,13 @@ fn write_parquet(path: &Path, batch: &RecordBatch, compression: Compression) -> 
         Compression::Snappy => ParquetCompression::SNAPPY,
         Compression::None => ParquetCompression::UNCOMPRESSED,
     };
+    // Row groups of a size a time range can skip. Rows are sealed in time order, so each
+    // group's timestamp statistics bound a stretch of it, and a chart that needs five
+    // minutes in forty reads the groups holding those. Parquet's default of a million
+    // rows made every segment one group, and every read of it a read of all of it.
     let properties = WriterProperties::builder()
         .set_compression(compression)
+        .set_max_row_group_row_count(Some(ROW_GROUP_ROWS))
         .build();
 
     let file =
@@ -875,6 +926,40 @@ fn sync_dir(path: &Path) -> Result<()> {
         }
         Err(e) => Err(Error::io(format!("opening {} to sync", path.display()), e)),
     }
+}
+
+/// The row groups whose `timestamp_nanos` statistics overlap one of `windows`.
+///
+/// A group without statistics, or a file without the column, is always read: this only
+/// ever skips what it can prove holds nothing wanted.
+fn row_groups_within(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    windows: &[(u64, u64)],
+) -> Vec<usize> {
+    let column = metadata
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .position(|column| column.name() == "timestamp_nanos");
+    (0..metadata.num_row_groups())
+        .filter(|&group| {
+            let bounds = column.and_then(|column| {
+                match metadata.row_group(group).column(column).statistics()? {
+                    parquet::file::statistics::Statistics::Int64(stats) => Some((
+                        stats.min_opt()?.cast_unsigned(),
+                        stats.max_opt()?.cast_unsigned(),
+                    )),
+                    _ => None,
+                }
+            });
+            let Some((min, max)) = bounds else {
+                return true;
+            };
+            let first = windows.partition_point(|(_, end)| *end < min);
+            windows.get(first).is_some_and(|(start, _)| *start <= max)
+        })
+        .collect()
 }
 
 /// Scan a signal's segment directory and load every readable segment, oldest first.
@@ -961,6 +1046,62 @@ mod tests {
             stream_bounds: Vec::new(),
             stream_rows: Vec::new(),
         }
+    }
+
+    /// A segment is written in row groups a time range can skip, and a read over a
+    /// narrow window decodes only the group holding it.
+    #[test]
+    fn a_narrow_read_skips_the_row_groups_outside_it() {
+        use telemetryd_core::{MetricKind, MetricSample};
+        let dir = tempfile::tempdir().unwrap();
+        let (segments_dir, tmp_dir) = (dir.path().join("segments"), dir.path().join("tmp"));
+        fs::create_dir_all(&segments_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let series = labels(&[("__name__", "x_total")]);
+        let rows = 3 * ROW_GROUP_ROWS as u64;
+        let records: Vec<MetricSample> = (0..rows)
+            .map(|at| MetricSample {
+                series: series.clone(),
+                timestamp_nanos: at,
+                value: 1.0,
+                kind: MetricKind::Counter,
+            })
+            .collect();
+        let segment = seal::<crate::MetricSchema>(
+            &records,
+            SealOptions {
+                segments_dir: &segments_dir,
+                tmp_dir: &tmp_dir,
+                compression: Compression::Zstd,
+                now_nanos: 1,
+                sequence: 1,
+                wal_sequence: 0,
+            },
+        )
+        .unwrap();
+
+        let read = |windows: &[(u64, u64)]| {
+            let mut seen = Vec::new();
+            segment
+                .scan_columns(&["timestamp_nanos"], windows, |batch| {
+                    let column = crate::schema::arrow_util::u64_column(batch, "timestamp_nanos")?;
+                    seen.extend_from_slice(column.values());
+                    Ok(Flow::Continue)
+                })
+                .unwrap();
+            seen
+        };
+        let middle = read(&[(ROW_GROUP_ROWS as u64 + 10, ROW_GROUP_ROWS as u64 + 20)]);
+        assert_eq!(middle.len(), ROW_GROUP_ROWS, "one group of three is read");
+        assert_eq!(middle[0], ROW_GROUP_ROWS as u64);
+        assert!(
+            read(&[(rows + 1, rows + 10)]).is_empty(),
+            "past the end reads nothing"
+        );
+        assert_eq!(
+            read(&[(5, 6), (rows - 2, rows - 1)]).len(),
+            2 * ROW_GROUP_ROWS
+        );
     }
 
     #[test]

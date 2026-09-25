@@ -369,6 +369,120 @@ fn rate_over(samples: &[(u64, f64)], window: Window, per_second: bool) -> Option
 /// Indexed `[call][series][point]`, with `series` lining up with the labels beside it.
 type FoldedSpan = (Vec<Labels>, Vec<Vec<Vec<Fold>>>);
 
+/// What folding a span accumulates: one cell per call, series and point.
+struct FoldState<'a> {
+    calls: &'a [(&'a Selector, Duration, bool)],
+    points: &'a [u64],
+    /// Bisection needs the points in order. A range query builds them that way;
+    /// checking rather than trusting costs one pass and keeps any other caller correct.
+    ordered: bool,
+    max_samples: u64,
+    labels: Vec<Labels>,
+    /// Which calls each series belongs to. The read uses only the matchers every
+    /// selector shares, so one series can be wanted by `x{code="500"}` and not by the
+    /// `x` beside it, or the other way round. Decided once per series, not per sample.
+    wanted: Vec<Vec<bool>>,
+    folds: Vec<Vec<Vec<Fold>>>,
+}
+
+impl<'a> FoldState<'a> {
+    fn new(
+        calls: &'a [(&'a Selector, Duration, bool)],
+        points: &'a [u64],
+        max_samples: u64,
+    ) -> Self {
+        Self {
+            calls,
+            points,
+            ordered: points.windows(2).all(|pair| pair[0] <= pair[1]),
+            max_samples,
+            labels: Vec::new(),
+            wanted: Vec::new(),
+            folds: vec![Vec::new(); calls.len()],
+        }
+    }
+
+    /// Make room for a series seen for the first time, and say where it went.
+    fn discover(&mut self, series: &Labels) -> Result<usize> {
+        let index = self.labels.len();
+        self.labels.push(series.clone());
+        self.wanted.push(
+            self.calls
+                .iter()
+                .map(|(selector, _, _)| telemetryd_core::matches_all(&selector.matchers, series))
+                .collect(),
+        );
+        for per_series in &mut self.folds {
+            per_series.push(vec![Fold::default(); self.points.len()]);
+        }
+        // Folding does not hold the samples, but it does hold a cell per call, series
+        // and point, and a query asking for a thousand points across ten thousand
+        // series would trade one way of exhausting memory for another. So the same
+        // allowance covers both shapes — converted, because they are not the same size.
+        // `limits.max_query_samples` is counted in samples, and a sample is budgeted at
+        // 96 bytes because the evaluator holds it three times over; a fold cell is held
+        // once and is a fifth of that. Charging a cell as if it were a sample refused a
+        // chart that needed a tenth of the memory the limit allows, and did it at the
+        // boundary, so the same panel failed and succeeded by turns.
+        let cells_allowed = self
+            .max_samples
+            .saturating_mul(telemetryd_core::config::QUERY_SAMPLE_BYTES)
+            / (std::mem::size_of::<Fold>() as u64).max(1);
+        let held = (self.calls.len() as u64)
+            .saturating_mul(self.labels.len() as u64)
+            .saturating_mul(self.points.len() as u64);
+        if self.max_samples != 0 && held > cells_allowed {
+            return Err(Error::BadRequest(format!(
+                "this query would hold more than {cells_allowed} values at once: {} series \
+                 across {} points. Narrow the time range, add label matchers, ask for fewer \
+                 points, or raise limits.max_query_samples",
+                self.labels.len(),
+                self.points.len()
+            )));
+        }
+        Ok(index)
+    }
+
+    /// Fold one sample of series `index` into every point whose window holds it.
+    fn add(&mut self, index: usize, at_nanos: u64, value: f64) {
+        for (call, (selector, range, _)) in self.calls.iter().enumerate() {
+            if !self.wanted[index][call] {
+                continue;
+            }
+            let offset = selector.offset;
+            let range_nanos = duration_nanos(*range);
+            // A sample at `s` belongs to the points `p` where
+            // `p - offset - range < s <= p - offset`. Both bounds rise with `p`, so the
+            // points that qualify are one contiguous run and bisection finds its ends.
+            // Walking every point instead is what made this affordable only for a
+            // handful: a chart asks for hundreds of points and a sample belongs to two
+            // or three of them.
+            let (lo, hi) = if self.ordered {
+                (
+                    self.points.partition_point(|p| at_nanos > offset.apply(*p)),
+                    self.points.partition_point(|p| {
+                        at_nanos > offset.apply(*p).saturating_sub(range_nanos)
+                    }),
+                )
+            } else {
+                (0, self.points.len())
+            };
+            let cells = &mut self.folds[call][index][lo..hi];
+            for (cell, point) in cells.iter_mut().zip(&self.points[lo..hi]) {
+                let at = offset.apply(*point);
+                let floor = at.saturating_sub(range_nanos);
+                if at_nanos > floor && at_nanos <= at {
+                    cell.add(at_nanos, value);
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> FoldedSpan {
+        (self.labels, self.folds)
+    }
+}
+
 /// Whether every sample this expression needs can come from a fold.
 ///
 /// A fold carries a window's first and last sample and the increase between them, which
@@ -696,129 +810,200 @@ impl Snapshot {
         }
     }
 
-    /// Read the span a slice at a time, folding each sample into every point it serves.
+    /// Fold every sample of `[from, last]` that some point's window needs.
     ///
-    /// Nothing here holds the samples: a slice is read, folded and dropped, so the memory
-    /// a query needs follows the number of series and points it asks about rather than the
+    /// Nothing here holds the samples: they are folded as they are read, so the memory a
+    /// query needs follows the number of series and points it asks about rather than the
     /// width of the window. That is the whole reason this path exists.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// The store's columns are read directly first. That needs each series' samples in
+    /// time order, which the store gives within a segment but not across two that
+    /// overlap — late data — so when a series steps back the read is abandoned and the
+    /// span is read again in slices, where every sample is sorted before it is folded.
     fn accumulate_folds(
         store: &RecordStore<MetricSchema>,
         calls: &[(&Selector, Duration, bool)],
         points: &[u64],
         pushdown: &[telemetryd_core::LabelMatcher],
-        from: u64,
-        last: u64,
+        (from, last): (u64, u64),
         max_samples: u64,
     ) -> Result<FoldedSpan> {
-        let mut identities: HashMap<usize, usize> = HashMap::new();
-        let mut labels: Vec<Labels> = Vec::new();
-        // One accumulator per (call, series, point), grown as series are discovered.
-        let mut folds: Vec<Vec<Vec<Fold>>> = vec![Vec::new(); calls.len()];
-        // Which calls each series belongs to. The read uses only the matchers every
-        // selector shares, so one series can be wanted by `x{code="500"}` and not by the
-        // `x` beside it, or the other way round. Decided once per series, not per sample.
-        let mut wanted: Vec<Vec<bool>> = Vec::new();
-
-        // Bisection below needs the points in order. A range query builds them that way;
-        // checking rather than trusting costs one pass and keeps any other caller correct.
-        let ordered = points.windows(2).all(|pair| pair[0] <= pair[1]);
-
-        let slice = duration_nanos(Self::FOLD_SLICE);
-        let mut cursor = from;
-        while cursor <= last {
-            let slice_end = cursor.saturating_add(slice).min(last);
-            // Unbounded within a slice: a slice is an hour, and refusing inside one would
-            // refuse a query whose whole point is that it never holds the window.
-            let samples = store.query_bounded(cursor, slice_end, pushdown, &|_| true, 0)?;
-            for sample in samples {
-                let id = sample.series.storage_id();
-                let index = if let Some(index) = identities.get(&id) {
-                    *index
-                } else {
-                    let index = labels.len();
-                    identities.insert(id, index);
-                    labels.push(sample.series.clone());
-                    wanted.push(
-                        calls
-                            .iter()
-                            .map(|(selector, _, _)| {
-                                telemetryd_core::matches_all(&selector.matchers, &sample.series)
-                            })
-                            .collect(),
-                    );
-                    for per_series in &mut folds {
-                        per_series.push(vec![Fold::default(); points.len()]);
-                    }
-                    // Folding does not hold the samples, but it does hold a cell per
-                    // call, series and point, and a query asking for a thousand points
-                    // across ten thousand series would trade one way of exhausting memory
-                    // for another. So the same allowance covers both shapes — converted,
-                    // because they are not the same size. `limits.max_query_samples` is
-                    // counted in samples, and a sample is budgeted at 96 bytes because the
-                    // evaluator holds it three times over; a fold cell is held once and is
-                    // a fifth of that. Charging a cell as if it were a sample refused a
-                    // chart that needed a tenth of the memory the limit allows, and did it
-                    // at the boundary, so the same panel failed and succeeded by turns.
-                    let cells_allowed = max_samples
-                        .saturating_mul(telemetryd_core::config::QUERY_SAMPLE_BYTES)
-                        / (std::mem::size_of::<Fold>() as u64).max(1);
-                    let held = (calls.len() as u64)
-                        .saturating_mul(labels.len() as u64)
-                        .saturating_mul(points.len() as u64);
-                    if max_samples != 0 && held > cells_allowed {
-                        return Err(Error::BadRequest(format!(
-                            "this query would hold more than {cells_allowed} values at \
-                             once: {} series across {} points. Narrow the time range, add \
-                             label matchers, ask for fewer points, or raise \
-                             limits.max_query_samples",
-                            labels.len(),
-                            points.len()
-                        )));
-                    }
-                    index
-                };
-                let at_nanos = sample.timestamp_nanos;
-                for (call, (selector, range, _)) in calls.iter().enumerate() {
-                    if !wanted[index][call] {
-                        continue;
-                    }
-                    let offset = selector.offset;
-                    let range_nanos = duration_nanos(*range);
-                    // A sample at `s` belongs to the points `p` where
-                    // `p - offset - range < s <= p - offset`. Both bounds rise with `p`,
-                    // so the points that qualify are one contiguous run and bisection
-                    // finds its ends. Walking every point instead is what made this
-                    // affordable only for a handful: a chart asks for hundreds of points
-                    // and a sample belongs to two or three of them, so the old loop did
-                    // the work of a hundred comparisons to find three.
-                    let (lo, hi) = if ordered {
-                        (
-                            points.partition_point(|p| at_nanos > offset.apply(*p)),
-                            points.partition_point(|p| {
-                                at_nanos > offset.apply(*p).saturating_sub(range_nanos)
-                            }),
-                        )
-                    } else {
-                        (0, points.len())
-                    };
-                    let per_point = &mut folds[call][index];
-                    for point in lo..hi {
-                        let at = offset.apply(points[point]);
-                        let floor = at.saturating_sub(range_nanos);
-                        if at_nanos > floor && at_nanos <= at {
-                            per_point[point].add(at_nanos, sample.value);
-                        }
-                    }
-                }
-            }
-            if slice_end == last {
-                break;
-            }
-            cursor = slice_end.saturating_add(1);
+        let windows = Self::windows_read(calls, points, from, last);
+        let mut state = FoldState::new(calls, points, max_samples);
+        if Self::fold_columns(store, &mut state, pushdown, &windows)? {
+            return Ok(state.finish());
         }
-        Ok((labels, folds))
+        let mut state = FoldState::new(calls, points, max_samples);
+        Self::fold_slices(store, &mut state, pushdown, &windows)?;
+        Ok(state.finish())
     }
+
+    /// Fold straight from the store's columns. `Ok(false)` when a series' samples came
+    /// out of time order, and `state` is then to be discarded.
+    fn fold_columns(
+        store: &RecordStore<MetricSchema>,
+        state: &mut FoldState<'_>,
+        pushdown: &[telemetryd_core::LabelMatcher],
+        windows: &[(u64, u64)],
+    ) -> Result<bool> {
+        use std::ops::ControlFlow;
+
+        let (Some(&(first, _)), Some(&(_, last))) = (windows.first(), windows.last()) else {
+            return Ok(true);
+        };
+        let mut by_labels: HashMap<Labels, usize> = HashMap::new();
+        // Per series: the last sample folded, and which source it came from.
+        let mut latest: Vec<(u64, usize)> = Vec::new();
+        // Per stream of the current source: unresolved, not selected, or a series.
+        let mut resolved: Vec<Option<Option<usize>>> = Vec::new();
+        let mut current = usize::MAX;
+        let mut refused = None;
+
+        let complete = store.scan_samples(windows, pushdown, &mut |run| {
+            if run.source != current {
+                current = run.source;
+                resolved.clear();
+                resolved.resize(run.streams.len(), None);
+            }
+            for row in 0..run.timestamps.len() {
+                let at = run.timestamps[row];
+                if at < first || at > last {
+                    continue;
+                }
+                let stream = run.stream_ids[row] as usize;
+                // A row naming no stream: an old segment without a dictionary. The
+                // sliced read knows what to make of it.
+                let Some(slot) = resolved.get_mut(stream) else {
+                    return ControlFlow::Break(());
+                };
+                let index = if let Some(known) = *slot {
+                    known
+                } else {
+                    let labels = &run.streams[stream];
+                    let found = if !telemetryd_core::matches_all(pushdown, labels) {
+                        None
+                    } else if let Some(&index) = by_labels.get(labels) {
+                        Some(index)
+                    } else {
+                        match state.discover(labels) {
+                            Ok(index) => {
+                                by_labels.insert(labels.clone(), index);
+                                latest.push((0, usize::MAX));
+                                Some(index)
+                            }
+                            Err(error) => {
+                                refused = Some(error);
+                                return ControlFlow::Break(());
+                            }
+                        }
+                    };
+                    *slot = Some(found);
+                    found
+                };
+                let Some(index) = index else {
+                    continue;
+                };
+                // Two samples at one instant from two sources are ordered by where
+                // they were stored, and only the sliced read reproduces that order.
+                let (seen_at, seen_in) = latest[index];
+                if seen_in != usize::MAX
+                    && (at < seen_at || (at == seen_at && seen_in != run.source))
+                {
+                    return ControlFlow::Break(());
+                }
+                latest[index] = (at, run.source);
+                state.add(index, at, run.values[row]);
+            }
+            ControlFlow::Continue(())
+        })?;
+        if let Some(error) = refused {
+            return Err(error);
+        }
+        Ok(complete)
+    }
+
+    /// Fold the windows a slice at a time, each slice sorted by the store before it is
+    /// folded.
+    fn fold_slices(
+        store: &RecordStore<MetricSchema>,
+        state: &mut FoldState<'_>,
+        pushdown: &[telemetryd_core::LabelMatcher],
+        windows: &[(u64, u64)],
+    ) -> Result<()> {
+        let slice = duration_nanos(Self::FOLD_SLICE);
+        let mut identities: HashMap<usize, usize> = HashMap::new();
+        for &(span_start, span_end) in windows {
+            let mut cursor = span_start;
+            while cursor <= span_end {
+                let slice_end = cursor.saturating_add(slice).min(span_end);
+                // Unbounded within a slice: a slice is hours, and refusing inside one
+                // would refuse a query whose whole point is that it never holds the window.
+                let samples = store.query_bounded(cursor, slice_end, pushdown, &|_| true, 0)?;
+                for sample in samples {
+                    let id = sample.series.storage_id();
+                    let index = if let Some(index) = identities.get(&id) {
+                        *index
+                    } else {
+                        let index = state.discover(&sample.series)?;
+                        identities.insert(id, index);
+                        index
+                    };
+                    state.add(index, sample.timestamp_nanos, sample.value);
+                }
+                if slice_end == span_end {
+                    break;
+                }
+                cursor = slice_end.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    /// The stretches of time the points' windows cover, merged, within `[from, last]`.
+    ///
+    /// A point folds only the samples in its own window, so nothing between windows is
+    /// ever used — and a chart's windows are often far apart. Seven days at 250 points
+    /// is a point every forty minutes; with `rate(x[5m])` each needs five of them, an
+    /// eighth of the span. The whole span used to be read.
+    ///
+    /// Windows closer together than their own length are joined: the gap would be
+    /// read anyway by any segment spanning it, and one read beats two.
+    fn windows_read(
+        calls: &[(&Selector, Duration, bool)],
+        points: &[u64],
+        from: u64,
+        last: u64,
+    ) -> Vec<(u64, u64)> {
+        let mut windows: Vec<(u64, u64)> = calls
+            .iter()
+            .flat_map(|(selector, range, _)| {
+                let range_nanos = duration_nanos(*range);
+                points.iter().map(move |point| {
+                    let at = selector.offset.apply(*point);
+                    (at.saturating_sub(range_nanos).max(from), at.min(last))
+                })
+            })
+            .filter(|(start, end)| start <= end)
+            .collect();
+        windows.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(windows.len());
+        for (start, end) in windows {
+            match merged.last_mut() {
+                Some(previous)
+                    if start
+                        <= previous
+                            .1
+                            .saturating_add(1)
+                            .saturating_add(previous.1 - previous.0) =>
+                {
+                    previous.1 = previous.1.max(end);
+                }
+                _ => merged.push((start, end)),
+            }
+        }
+        merged
+    }
+
     /// Answer a query by folding the window in slices, holding no samples.
     ///
     /// # Why this exists
@@ -871,8 +1056,14 @@ impl Snapshot {
             return Ok(snapshot);
         }
 
-        let (labels, folds) =
-            Self::accumulate_folds(store, &calls, points, pushdown, from, through, max_samples)?;
+        let (labels, folds) = Self::accumulate_folds(
+            store,
+            &calls,
+            points,
+            pushdown,
+            (from, through),
+            max_samples,
+        )?;
 
         let mut prepared = Vec::new();
         for (call, (selector, range, per_second)) in calls.iter().enumerate() {
@@ -1990,6 +2181,51 @@ mod fold_tests {
             fold.add(ts, value);
         }
         assert!(fold.finish(window, true).is_none());
+    }
+
+    /// The store's columns are folded directly while every series comes in time order,
+    /// and the read is abandoned — for the sorted one — the moment one steps back.
+    #[test]
+    fn columns_are_folded_directly_until_a_series_steps_back() {
+        const SECOND: u64 = 1_000_000_000;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = telemetryd_core::config::Config::default();
+        config.storage.data_dir = Some(dir.path().to_path_buf());
+        let store = telemetryd_store::Store::open(&config).unwrap();
+        let sample = |second: u64| {
+            let mut series = Labels::new();
+            series.insert("__name__", "x_total");
+            #[allow(clippy::cast_precision_loss)]
+            let value = second as f64;
+            MetricSample {
+                series,
+                timestamp_nanos: second * SECOND,
+                value,
+                kind: MetricKind::Counter,
+            }
+        };
+        store
+            .metrics()
+            .append(&(1..=100).map(sample).collect::<Vec<_>>())
+            .unwrap();
+        store.metrics().seal_now().unwrap();
+
+        let expr = crate::promql::parse("rate(x_total[1m])").unwrap();
+        let calls = rate_calls(&expr);
+        let points = [60 * SECOND, 100 * SECOND];
+        let windows = Snapshot::windows_read(&calls, &points, 0, 100 * SECOND);
+        let fold = |store: &telemetryd_store::Store| {
+            let mut state = FoldState::new(&calls, &points, 0);
+            Snapshot::fold_columns(store.metrics(), &mut state, &[], &windows).unwrap()
+        };
+        assert!(fold(&store), "in order: read directly");
+
+        // Seconds 50 to 60 again, arriving late into the buffer.
+        store
+            .metrics()
+            .append(&(50..=60).map(sample).collect::<Vec<_>>())
+            .unwrap();
+        assert!(!fold(&store), "a series stepped back: abandoned");
     }
 }
 

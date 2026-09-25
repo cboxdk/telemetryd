@@ -13,13 +13,146 @@ use arrow::record_batch::RecordBatch;
 use telemetryd_core::metric::{METRIC_NAME_LABEL, MetricKind, MetricSample};
 use telemetryd_core::{Error, Labels, Result, Signal};
 
-use crate::schema::arrow_util::{string_column, u32_column, u64_column};
+use crate::schema::arrow_util::{f64_column, string_column, u32_column, u64_column};
 use crate::schema::{RecordSchema, Rows, schema_ref};
 
 #[derive(Debug, Clone, Copy)]
 pub struct MetricSchema;
 
+/// A run of metric samples from one place in the store, as columns.
+///
+/// `streams[stream_ids[i]]` is the series of sample `i`. Stream ids are numbered per
+/// source, so `source` changing is the signal that a consumer's per-stream cache no
+/// longer applies.
+#[derive(Debug, Clone, Copy)]
+pub struct SampleRun<'a> {
+    pub source: usize,
+    pub streams: &'a [Labels],
+    pub stream_ids: &'a [u32],
+    pub timestamps: &'a [u64],
+    pub values: &'a [f64],
+}
+
 impl crate::RecordStore<MetricSchema> {
+    /// Hand `visit` every sample that may fall in `windows` — sorted, disjoint
+    /// `(start, end)` pairs, both ends included — a batch of columns at a time.
+    ///
+    /// Only three columns are read and nothing is materialised: no labels are cloned,
+    /// no sample is built, and nothing is held past the batch. A week-long chart that
+    /// used to decode every sample of the week into a record reads the timestamps,
+    /// stream ids and values of the row groups its windows touch.
+    ///
+    /// `matchers` prune segments only; which streams a consumer wants is its decision,
+    /// made once per stream. Sources come oldest first — sealed segments by their
+    /// earliest sample, then the unsealed buffer — and rows within one come in time
+    /// order. Across sources they need not: late data lands in a later segment. A
+    /// consumer that needs order checks it and returns `Break`, and this returns
+    /// `Ok(false)` so it can read another way.
+    pub fn scan_samples(
+        &self,
+        windows: &[(u64, u64)],
+        matchers: &[telemetryd_core::LabelMatcher],
+        visit: &mut dyn FnMut(SampleRun<'_>) -> std::ops::ControlFlow<()>,
+    ) -> Result<bool> {
+        use std::sync::atomic::Ordering;
+
+        let (Some(&(start, _)), Some(&(_, end))) = (windows.first(), windows.last()) else {
+            return Ok(true);
+        };
+        let wanted = |min: u64, max: u64| {
+            let first = windows.partition_point(|(_, window_end)| *window_end < min);
+            windows
+                .get(first)
+                .is_some_and(|(window_start, _)| *window_start <= max)
+        };
+        let (mut chunks, mut segments) = self.view();
+        segments.sort_by_key(|segment| segment.manifest.min_time_nanos);
+        chunks.sort_by_key(|chunk| chunk.min_nanos);
+
+        let mut source = 0;
+        for segment in &segments {
+            let manifest = &segment.manifest;
+            if !wanted(manifest.min_time_nanos, manifest.max_time_nanos)
+                || !manifest.might_match(matchers)
+            {
+                self.stats.segments_pruned.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if segment.is_unreadable() {
+                self.stats
+                    .segments_unreadable
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            self.stats.segments_scanned.fetch_add(1, Ordering::Relaxed);
+            source += 1;
+            let mut abandoned = false;
+            let outcome = segment.scan_columns(
+                &["timestamp_nanos", "stream_id", "value"],
+                windows,
+                |batch| {
+                    let run = SampleRun {
+                        source,
+                        streams: &manifest.streams,
+                        stream_ids: u32_column(batch, "stream_id")?.values(),
+                        timestamps: u64_column(batch, "timestamp_nanos")?.values(),
+                        values: f64_column(batch, "value")?.values(),
+                    };
+                    if visit(run).is_break() {
+                        abandoned = true;
+                        return Ok(crate::segment::Flow::Stop);
+                    }
+                    Ok(crate::segment::Flow::Continue)
+                },
+            );
+            self.settle_scan(segment, outcome)?;
+            if abandoned {
+                return Ok(false);
+            }
+        }
+
+        // The buffer holds records, not columns, so each chunk is laid out as one run.
+        // Its label sets are numbered by allocation: the chunk holds every one alive
+        // while the run is built, so an address cannot be reused under it.
+        for chunk in &chunks {
+            if !wanted(chunk.min_nanos, chunk.max_nanos) {
+                continue;
+            }
+            source += 1;
+            let mut numbered: std::collections::HashMap<usize, u32> =
+                std::collections::HashMap::new();
+            let mut streams: Vec<Labels> = Vec::new();
+            let mut stream_ids = Vec::with_capacity(chunk.records.len());
+            let mut timestamps = Vec::with_capacity(chunk.records.len());
+            let mut values = Vec::with_capacity(chunk.records.len());
+            for record in &chunk.records {
+                if record.timestamp_nanos < start || record.timestamp_nanos > end {
+                    continue;
+                }
+                let id = *numbered
+                    .entry(record.series.storage_id())
+                    .or_insert_with(|| {
+                        streams.push(record.series.clone());
+                        u32::try_from(streams.len() - 1).unwrap_or(u32::MAX)
+                    });
+                stream_ids.push(id);
+                timestamps.push(record.timestamp_nanos);
+                values.push(record.value);
+            }
+            let run = SampleRun {
+                source,
+                streams: &streams,
+                stream_ids: &stream_ids,
+                timestamps: &timestamps,
+                values: &values,
+            };
+            if visit(run).is_break() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Compute and store summaries for segments that have none.
     ///
     /// Segments sealed before summaries existed carry none, and a query over them falls

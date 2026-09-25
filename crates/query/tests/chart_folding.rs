@@ -324,3 +324,82 @@ fn the_answer_is_bounded_like_the_read() {
     telemetryd_query::prometheus::range(store.metrics(), &params("60"), now, 5_000)
         .expect("720 points fit");
 }
+
+/// Three counters at one-second resolution, so a segment spans several Parquet row groups and a sparse chart can skip some of them.
+fn dense(ticks: u64) -> Vec<MetricSample> {
+    let mut out = Vec::new();
+    for tick in 1..=ticks {
+        for (pod, per_tick) in [("a", 1.0), ("b", 2.5), ("c", 7.0)] {
+            let mut series = Labels::new();
+            series.insert("__name__", "dense_total");
+            series.insert("pod", pod);
+            #[allow(clippy::cast_precision_loss)]
+            let raw = tick as f64 * per_tick;
+            // `c` restarts every ten thousand ticks, when its value passes 70,000.
+            let value = if pod == "c" { raw % 70_000.0 } else { raw };
+            out.push(MetricSample {
+                series,
+                timestamp_nanos: tick * SECOND,
+                value,
+                kind: MetricKind::Counter,
+            });
+        }
+    }
+    out
+}
+
+/// A chart whose windows are far apart reads only what they cover — and gives the
+/// answer reading everything gives, over sealed row groups and the unsealed buffer.
+#[test]
+fn a_sparse_chart_agrees_with_the_ordinary_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&config(dir.path())).unwrap();
+    let rows = dense(40_000);
+    let (sealed, buffered) = rows.split_at(90_000);
+    store.metrics().append(sealed).unwrap();
+    store.metrics().seal_now().unwrap();
+    store.metrics().append(buffered).unwrap();
+
+    // A point every twenty minutes, each wanting one minute: a twentieth of the span.
+    let chart: Vec<u64> = (1..=33).map(|i| i * 1_200 * SECOND).collect();
+    for query in [
+        "rate(dense_total[1m])",
+        "sum(increase(dense_total[1m]))",
+        r#"sum(rate(dense_total{pod="c"}[1m])) / sum(rate(dense_total[1m]))"#,
+    ] {
+        assert!(
+            compare(&store, rows.clone(), query, &chart) >= 33,
+            "{query}"
+        );
+    }
+}
+
+/// Late data in a chart: segments overlap in time, so a series' samples arrive out of
+/// order across them, and the fold has to notice and read them sorted.
+#[test]
+fn a_chart_over_late_data_agrees_with_the_ordinary_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&config(dir.path())).unwrap();
+    let rows = samples();
+    // The second half arrives first, then the first half, then a tail left unsealed.
+    let (early, late) = rows.split_at(720);
+    let (late, tail) = late.split_at(late.len() - 40);
+    store.metrics().append(late).unwrap();
+    store.metrics().seal_now().unwrap();
+    store.metrics().append(early).unwrap();
+    store.metrics().seal_now().unwrap();
+    store.metrics().append(tail).unwrap();
+
+    let first = 30 * SECOND;
+    let last = 720 * 30 * SECOND;
+    let step = (last - first) / 249;
+    let chart: Vec<u64> = (0..250).map(|i| first + i * step).collect();
+    assert!(
+        compare(
+            &store,
+            rows.clone(),
+            "sum by (route) (rate(probe[15m]))",
+            &chart
+        ) > 400
+    );
+}

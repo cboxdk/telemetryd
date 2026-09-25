@@ -195,6 +195,18 @@ pub(crate) mod arrow_util {
             .ok_or_else(|| wrong_type(name, "UInt64"))
     }
 
+    pub(crate) fn f64_column<'a>(
+        batch: &'a arrow::record_batch::RecordBatch,
+        name: &str,
+    ) -> Result<&'a arrow::array::Float64Array> {
+        batch
+            .column_by_name(name)
+            .ok_or_else(|| missing(name))?
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .ok_or_else(|| wrong_type(name, "Float64"))
+    }
+
     /// Read a nullable string cell, mapping empty-or-null to `None`.
     pub(crate) fn optional_string(array: &StringArray, row: usize) -> Option<String> {
         if array.is_null(row) {
