@@ -1007,6 +1007,18 @@ impl<S: RecordSchema> RecordStore<S> {
         collector.set_unit(u32::try_from(ordinal.saturating_add(BUFFER_UNITS)).unwrap_or(u32::MAX));
 
         let manifest = &segment.manifest;
+        // The cheap refusals first: a segment wholly outside the range, or one whose
+        // label index rules the matchers out, costs a comparison or a set lookup to
+        // skip. Evaluating every stream's labels first cost a week-long chart three
+        // seconds, most of it on segments the time range alone would have dropped.
+        if manifest.min_time_nanos > request.end_nanos
+            || manifest.max_time_nanos < request.start_nanos
+            || !manifest.might_match(matchers)
+        {
+            self.stats.segments_pruned.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+
         // Evaluate the matchers once per distinct stream, not once per row. A
         // segment with a million rows across fifty streams does fifty
         // evaluations; before interning it did a million.
@@ -1026,7 +1038,6 @@ impl<S: RecordSchema> RecordStore<S> {
         let prunable = no_stream_matches
             || min_nanos > request.end_nanos
             || max_nanos < request.start_nanos
-            || !manifest.might_match(matchers)
             // An exact-key lookup (a trace id) can rule out a segment outright.
             || request
                 .exact_key
