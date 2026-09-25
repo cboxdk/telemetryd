@@ -65,7 +65,10 @@ pub enum Error {
     #[error("{limit} exceeded: {detail}")]
     LimitExceeded { limit: &'static str, detail: String },
 
-    #[error("ingest queue is full")]
+    /// Every slot for this kind of request is taken — ingest, queries, exports or live
+    /// tails. It said "ingest queue is full" whichever it was, which sent someone whose
+    /// export was refused looking at their ingest.
+    #[error("telemetryd is at capacity for this kind of request; retry shortly")]
     Overloaded,
 
     // ---- storage ----
