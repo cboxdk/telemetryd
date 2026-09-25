@@ -107,7 +107,8 @@ telemetryd query                 # everything from the last hour — start here
 Or open **`/debug`** in a browser — locally at `http://127.0.0.1:4319/debug`, and on a
 server at whatever hostname you put in front of it. The last records for logs, traces and
 metrics, with no query to compose. An instance with tokens asks for the admin token on the
-page and keeps it in a cookie no script can read; one without is simply open.
+page and opens a session — the cookie holds a random id, never the token; one without
+is simply open.
 
 Point `cboxdk/laravel-telemetry` at `http://127.0.0.1:4319` and query it back:
 

@@ -2372,3 +2372,70 @@ async fn a_rebound_name_is_refused_while_the_instance_is_open() {
     let (status, _, _) = guarded.request(rebound()).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "the token decides now");
 }
+
+/// The `/debug` sign-in keeps the token out of the browser: the cookie names a session
+/// known only to the server, which ends on sign-out and when the credentials are
+/// reloaded. It used to be the admin token itself.
+#[tokio::test]
+async fn a_debug_session_holds_no_token_and_ends_with_the_credentials() {
+    let harness = Harness::new(|config| {
+        config.auth.query_token = serde_json::from_str(r#""admin-secret""#).unwrap();
+    });
+    let login = |token: &str| {
+        Request::post("/debug/login")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(format!("token={token}")))
+            .unwrap()
+    };
+    let (status, headers, _) = harness.request(login("admin-secret")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let cookie = headers
+        .iter()
+        .find(|(name, _)| name == "set-cookie")
+        .map(|(_, value)| value.clone())
+        .unwrap();
+    assert!(!cookie.contains("admin-secret"), "{cookie}");
+    let session = cookie.split(';').next().unwrap().to_owned();
+
+    let page = |session: &str| {
+        Request::get("/debug")
+            .header(header::COOKIE, session)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (status, _, _) = harness.request(page(&session)).await;
+    assert_eq!(status, StatusCode::OK);
+    // A made-up id is not a session.
+    let (status, _, _) = harness.request(page("telemetryd_debug=00ff")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Rotating the token signs out every browser that signed in with the old one.
+    let mut rotated = (*harness.state.config).clone();
+    rotated.auth.query_token = serde_json::from_str(r#""rotated""#).unwrap();
+    harness
+        .state
+        .replace_credentials(telemetryd_server::state::Credentials::resolve(&rotated).unwrap());
+    let (status, _, _) = harness.request(page(&session)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// Guessing at the sign-in form is budgeted: past thirty refusals a minute, the form
+/// answers 429 until the minute is out.
+#[tokio::test]
+async fn debug_sign_in_guesses_are_budgeted() {
+    let harness = Harness::new(|config| {
+        config.auth.query_token = serde_json::from_str(r#""admin-secret""#).unwrap();
+    });
+    let guess = || {
+        Request::post("/debug/login")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("token=wrong"))
+            .unwrap()
+    };
+    for _ in 0..30 {
+        let (status, _, _) = harness.request(guess()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    let (status, _, _) = harness.request(guess()).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}

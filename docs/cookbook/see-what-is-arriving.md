@@ -25,10 +25,14 @@ An instance with tokens shows a sign-in form and takes the **admin token**, or t
 token when no admin token is configured — the same credential `/status` and `/metrics`
 take. An instance with no tokens, which is the default locally, is simply open.
 
-The token is held in a cookie that scripts cannot read, scoped to `/debug`, and marked
-`Secure` whenever the request arrived over TLS — including through a reverse proxy that
-sets `X-Forwarded-Proto`. It is never put in a URL, where it would survive in the proxy's
-access log, in browser history and in a `Referer` header. **Sign out** clears it.
+Signing in opens a session: the browser's cookie holds a random id that only the server
+can resolve, never the token. The cookie is invisible to scripts, scoped to `/debug`, and
+marked `Secure` whenever the connection was encrypted — telemetryd's own TLS, or a reverse
+proxy that sets `X-Forwarded-Proto`. A session ends after twelve hours, on **Sign out**, or
+when the tokens are reloaded, so revoking a token also signs out the browsers that used
+it. More than thirty refused tokens in a minute pause the form for the rest of the minute.
+The token is never put in a URL, where it would survive in the proxy's access log, in
+browser history and in a `Referer` header.
 
 `Authorization: Bearer <token>` works too, for a script.
 

@@ -58,8 +58,129 @@ use serde::Deserialize;
 use crate::error::ApiError;
 use crate::state::AppState;
 
-/// Where the signed-in token lives between requests.
+/// Where the signed-in session's id lives between requests.
 const COOKIE: &str = "telemetryd_debug";
+
+/// How long a signed-in session lasts.
+const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
+
+/// How many sessions are kept at once; past this the oldest is forgotten.
+const MAX_SESSIONS: usize = 256;
+
+/// Failed sign-ins allowed per minute, across all callers.
+///
+/// Global rather than per address, because nothing on this path knows the address. A
+/// random token cannot be guessed at any rate; a chosen one can, and this makes that a
+/// matter of years. At the budget the form answers `429` for the rest of the minute —
+/// the header still works for tools.
+const FAILURES_PER_MINUTE: u32 = 30;
+
+/// Signed-in browser sessions, and the budget for failed sign-ins.
+///
+/// The cookie used to hold the admin token itself, so a copy of it lived in every
+/// browser that had signed in, and anything that read a cookie jar read the token. It
+/// holds a random id now, known only here, that ends after `SESSION_TTL`, on sign-out,
+/// or when the credentials are reloaded — revoking a token signs out its sessions too.
+#[derive(Debug, Default)]
+pub struct Sessions {
+    inner: std::sync::Mutex<SessionState>,
+}
+
+#[derive(Debug, Default)]
+struct SessionState {
+    open: std::collections::HashMap<String, Session>,
+    failures: u32,
+    window: Option<std::time::Instant>,
+}
+
+#[derive(Debug)]
+struct Session {
+    created: std::time::Instant,
+    /// The credentials in force when it signed in. A reload replaces them, and a
+    /// session from before no longer matches.
+    credentials: std::sync::Arc<crate::state::Credentials>,
+}
+
+impl Sessions {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SessionState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Open a session, returning its id; `None` when no randomness was available.
+    fn open(&self, credentials: std::sync::Arc<crate::state::Credentials>) -> Option<String> {
+        let mut bytes = [0u8; 32];
+        rustls::crypto::ring::default_provider()
+            .secure_random
+            .fill(&mut bytes)
+            .ok()?;
+        let id = bytes.iter().fold(String::with_capacity(64), |mut id, b| {
+            use std::fmt::Write;
+            let _ = write!(id, "{b:02x}");
+            id
+        });
+        let mut state = self.lock();
+        if state.open.len() >= MAX_SESSIONS
+            && let Some(oldest) = state
+                .open
+                .iter()
+                .min_by_key(|(_, session)| session.created)
+                .map(|(id, _)| id.clone())
+        {
+            state.open.remove(&oldest);
+        }
+        state.open.insert(
+            id.clone(),
+            Session {
+                created: std::time::Instant::now(),
+                credentials,
+            },
+        );
+        Some(id)
+    }
+
+    /// Whether `id` is a live session under `credentials`, forgetting it if not.
+    fn valid(&self, id: &str, credentials: &std::sync::Arc<crate::state::Credentials>) -> bool {
+        let mut state = self.lock();
+        let live = state.open.get(id).is_some_and(|session| {
+            session.created.elapsed() < SESSION_TTL
+                && std::sync::Arc::ptr_eq(&session.credentials, credentials)
+        });
+        if !live {
+            state.open.remove(id);
+        }
+        live
+    }
+
+    fn close(&self, id: &str) {
+        self.lock().open.remove(id);
+    }
+
+    /// Count a failed sign-in; `false` once this minute's budget is spent.
+    fn fail(&self) -> bool {
+        let mut state = self.lock();
+        let now = std::time::Instant::now();
+        if state
+            .window
+            .is_none_or(|start| now.duration_since(start) >= std::time::Duration::from_secs(60))
+        {
+            state.window = Some(now);
+            state.failures = 0;
+        }
+        state.failures += 1;
+        state.failures <= FAILURES_PER_MINUTE
+    }
+
+    /// Whether this minute's budget of failures is already spent.
+    fn exhausted(&self) -> bool {
+        let state = self.lock();
+        state.failures >= FAILURES_PER_MINUTE
+            && state
+                .window
+                .is_some_and(|start| start.elapsed() < std::time::Duration::from_secs(60))
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct LoginForm {
@@ -101,17 +222,22 @@ fn guarded(state: &AppState) -> bool {
     !credentials.admin.is_empty() || !credentials.query.is_empty() || state.oidc.is_enabled()
 }
 
-/// The credential on this request: the header if a tool sent one, otherwise the cookie a
-/// browser is carrying. Never a query parameter — that is the one place a token must not
-/// go, because it survives in access logs, referrers and history.
-fn presented(headers: &HeaderMap) -> Option<String> {
+/// Whether this request is signed in: a token in the header if a tool sent one,
+/// otherwise the session a browser's cookie names. Never a query parameter — that is the
+/// one place a token must not go, because it survives in access logs, referrers and
+/// history.
+fn signed_in(state: &AppState, headers: &HeaderMap) -> bool {
     if let Some(bearer) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
     {
-        return Some(bearer.trim().to_owned());
+        return accepts(state, bearer.trim());
     }
+    session_id(headers).is_some_and(|id| state.debug_sessions.valid(&id, &state.credentials()))
+}
+
+fn session_id(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())?
@@ -121,13 +247,16 @@ fn presented(headers: &HeaderMap) -> Option<String> {
         .map(|(_, value)| value.to_owned())
 }
 
-/// `Secure` only when the connection actually was, or a plain-HTTP deployment would set a
-/// cookie the browser then refuses to send back — and the page would never sign in.
-fn over_tls(headers: &HeaderMap) -> bool {
-    headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|proto| proto.eq_ignore_ascii_case("https"))
+/// `Secure` when the connection was encrypted: telemetryd's own TLS, or a proxy that
+/// says it terminated TLS. Not otherwise, or a plain-HTTP deployment would set a cookie
+/// the browser refuses to send back and the page would never sign in. Native TLS used
+/// not to count, so its cookie could be sent in clear to a plain listener on the host.
+fn over_tls(state: &AppState, headers: &HeaderMap) -> bool {
+    state.config.server.tls.is_enabled()
+        || headers
+            .get("x-forwarded-proto")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|proto| proto.eq_ignore_ascii_case("https"))
 }
 
 /// The page shown when there is no valid credential.
@@ -156,8 +285,9 @@ or the query token if no admin token is configured — the same credential \
 <input name=\"token\" type=\"password\" placeholder=\"admin token\" \
 aria-label=\"admin token\" autocomplete=\"current-password\" autofocus>\
 <button type=\"submit\">Sign in</button></form>\
-<footer>Kept in a cookie that scripts cannot read, scoped to this page, and marked \
-<code>Secure</code> when you arrived over TLS. It is never put in a URL.</footer>\
+<footer>Signing in opens a session for twelve hours. The cookie holds a random id, not \
+the token; scripts cannot read it, it is scoped to this page and marked \
+<code>Secure</code> when you arrived over TLS. The token is never put in a URL.</footer>\
 </main></body></html>"
     )
 }
@@ -168,10 +298,23 @@ pub async fn login(
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
+    if state.debug_sessions.exhausted() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-store"),
+                (header::RETRY_AFTER, "60"),
+            ],
+            sign_in("Too many tokens were refused in the last minute. Try again shortly."),
+        )
+            .into_response();
+    }
     if !accepts(&state, form.token.trim()) {
         state
             .metrics
             .incr("telemetryd_auth_failures_total", &[("surface", "debug")]);
+        let _ = state.debug_sessions.fail();
         // Same page, same status shape as any other refusal here: a message beside the
         // field rather than a bare 401 the browser renders as a wall of text.
         return (
@@ -185,17 +328,26 @@ pub async fn login(
             .into_response();
     }
 
-    let secure = if over_tls(&headers) { "; Secure" } else { "" };
+    let Some(session) = state.debug_sessions.open(state.credentials()) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CACHE_CONTROL, "no-store")],
+            "no randomness was available to start a session",
+        )
+            .into_response();
+    };
+    let secure = if over_tls(&state, &headers) {
+        "; Secure"
+    } else {
+        ""
+    };
     (
         StatusCode::SEE_OTHER,
         [
             (header::LOCATION, "/debug".to_owned()),
             (
                 header::SET_COOKIE,
-                format!(
-                    "{COOKIE}={}; HttpOnly; SameSite=Strict; Path=/debug{secure}",
-                    form.token.trim()
-                ),
+                format!("{COOKIE}={session}; HttpOnly; SameSite=Strict; Path=/debug{secure}"),
             ),
             (header::CACHE_CONTROL, "no-store".to_owned()),
         ],
@@ -205,8 +357,15 @@ pub async fn login(
 }
 
 /// `GET /debug/logout`
-pub async fn logout(headers: HeaderMap) -> Response {
-    let secure = if over_tls(&headers) { "; Secure" } else { "" };
+pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(id) = session_id(&headers) {
+        state.debug_sessions.close(&id);
+    }
+    let secure = if over_tls(&state, &headers) {
+        "; Secure"
+    } else {
+        ""
+    };
     (
         StatusCode::SEE_OTHER,
         [
@@ -333,9 +492,9 @@ pub async fn debug(
 ) -> Result<Response, ApiError> {
     // Sign-in before anything is read. An instance with no tokens is open, exactly as
     // every other read surface is.
-    let signed_in = guarded(&state);
-    if signed_in {
-        let ok = presented(&headers).is_some_and(|token| accepts(&state, &token));
+    let guarded = guarded(&state);
+    if guarded {
+        let ok = signed_in(&state, &headers);
         if !ok {
             return Ok((
                 StatusCode::UNAUTHORIZED,
@@ -405,7 +564,7 @@ pub async fn debug(
             query,
             mins,
             error.as_deref(),
-            signed_in,
+            guarded,
         ),
     )
         .into_response())

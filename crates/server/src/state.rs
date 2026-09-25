@@ -69,6 +69,8 @@ pub struct AppState {
     queue_depth: usize,
     tail: broadcast::Sender<Arc<LogRecord>>,
     tail_permits: Arc<Semaphore>,
+    /// Signed-in `/debug` browser sessions.
+    pub debug_sessions: Arc<crate::debug::Sessions>,
 }
 
 /// Every static credential the server checks, resolved from one configuration.
@@ -261,6 +263,7 @@ impl AppState {
             queue_depth,
             tail,
             tail_permits: Arc::new(Semaphore::new(MAX_TAILS)),
+            debug_sessions: Arc::new(crate::debug::Sessions::default()),
         })
     }
 
