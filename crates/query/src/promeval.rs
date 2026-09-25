@@ -280,6 +280,27 @@ fn rate_over(window: &[(u64, f64)], range_nanos: u64, per_second: bool) -> Optio
 }
 
 /// Every `rate`/`increase` call in an expression, with what it is applied to.
+/// The series a folded read discovered, and one accumulator per call, series and point.
+///
+/// Indexed `[call][series][point]`, with `series` lining up with the labels beside it.
+type FoldedSpan = (Vec<Labels>, Vec<Vec<Vec<Fold>>>);
+
+/// Whether every sample this expression needs can come from a fold.
+///
+/// A fold carries a window's first and last sample and the increase between them, which
+/// is exactly what `rate` and `increase` ask for and nothing more. A selector standing on
+/// its own — `up`, or the right-hand side of `errors / requests` — wants the newest
+/// sample within a lookback, and no fold holds it: folding such an expression would drop
+/// that operand and return a confidently wrong number rather than an error.
+fn fully_foldable(expr: &Expr) -> bool {
+    let folded = rate_calls(expr);
+    expr.selectors().iter().all(|selector| {
+        folded
+            .iter()
+            .any(|(inside, _, _)| std::ptr::eq(*inside, *selector))
+    })
+}
+
 fn rate_calls(expr: &Expr) -> Vec<(&Selector, Duration, bool)> {
     let mut out = Vec::new();
     collect_rate_calls(expr, &mut out);
@@ -367,16 +388,6 @@ impl Snapshot {
     /// below what the fold exists to avoid holding, and a quarter of the scans.
     const FOLD_SLICE: Duration = Duration::from_secs(6 * 3600);
 
-    /// The most evaluation points a folded load will carry accumulators for.
-    ///
-    /// Folding keeps four numbers per series *per point*, so the state grows with both.
-    /// The queries that need folding are the ones a dashboard sends for a total or a
-    /// quantile over the whole period — one point, an enormous window — and those are
-    /// exactly the ones the sample ceiling was refusing. A chart asks for hundreds of
-    /// points but over a window sized to its step, which the ordinary path handles in the
-    /// memory it always did.
-    const FOLD_MAX_POINTS: usize = 8;
-
     /// The range above which a selector is folded rather than loaded.
     ///
     /// Below it, loading the samples costs less than the machinery of folding and keeps
@@ -386,15 +397,26 @@ impl Snapshot {
     /// Whether this query should be answered by folding slices instead of loading the
     /// whole window.
     fn should_fold(expr: &Expr, points: &[u64]) -> bool {
-        if points.len() > Self::FOLD_MAX_POINTS {
+        // Only when every sample need is foldable. A fold holds four numbers per series
+        // per point, which answers `rate` and `increase` exactly — and nothing else. A
+        // bare selector wants the newest sample in a lookback, which no fold carries, so
+        // an expression holding one is read the ordinary way however wide it is.
+        if !fully_foldable(expr) {
             return false;
         }
-        // Only when every sample need is foldable. A bare selector inside the expression
-        // needs the newest sample in a five-minute lookback, which folds; anything the
-        // parser accepts reduces to one of those two.
-        rate_calls(expr)
-            .iter()
-            .any(|(_, range, _)| *range > Self::FOLD_ABOVE)
+
+        // Either the window is too wide to hold, or the span is. A chart asks for a
+        // narrow window at hundreds of points spread over a wide span: no single window
+        // is large, but reading the span in one piece means holding every sample in it,
+        // and that is the read that fails on a day of histogram buckets. Folding reads
+        // the same rows a slice at a time and keeps four numbers per series per point.
+        let first = points.iter().copied().min().unwrap_or(0);
+        let last = points.iter().copied().max().unwrap_or(0);
+        let span = Duration::from_nanos(last.saturating_sub(first));
+        span > Self::FOLD_ABOVE
+            || rate_calls(expr)
+                .iter()
+                .any(|(_, range, _)| *range > Self::FOLD_ABOVE)
     }
 
     /// Answer every window from the store's per-segment counter summaries, if it can.
@@ -510,6 +532,106 @@ impl Snapshot {
         grouped
     }
 
+    /// Read the span a slice at a time, folding each sample into every point it serves.
+    ///
+    /// Nothing here holds the samples: a slice is read, folded and dropped, so the memory
+    /// a query needs follows the number of series and points it asks about rather than the
+    /// width of the window. That is the whole reason this path exists.
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_folds(
+        store: &RecordStore<MetricSchema>,
+        calls: &[(&Selector, Duration, bool)],
+        points: &[u64],
+        pushdown: &[telemetryd_core::LabelMatcher],
+        from: u64,
+        last: u64,
+        max_samples: u64,
+    ) -> Result<FoldedSpan> {
+        let mut identities: HashMap<usize, usize> = HashMap::new();
+        let mut labels: Vec<Labels> = Vec::new();
+        // One accumulator per (call, series, point), grown as series are discovered.
+        let mut folds: Vec<Vec<Vec<Fold>>> = vec![Vec::new(); calls.len()];
+
+        // Bisection below needs the points in order. A range query builds them that way;
+        // checking rather than trusting costs one pass and keeps any other caller correct.
+        let ordered = points.windows(2).all(|pair| pair[0] <= pair[1]);
+
+        let slice = duration_nanos(Self::FOLD_SLICE);
+        let mut cursor = from;
+        while cursor <= last {
+            let slice_end = cursor.saturating_add(slice).min(last);
+            // Unbounded within a slice: a slice is an hour, and refusing inside one would
+            // refuse a query whose whole point is that it never holds the window.
+            let samples = store.query_bounded(cursor, slice_end, pushdown, &|_| true, 0)?;
+            for sample in samples {
+                let id = sample.series.storage_id();
+                let index = if let Some(index) = identities.get(&id) {
+                    *index
+                } else {
+                    let index = labels.len();
+                    identities.insert(id, index);
+                    labels.push(sample.series.clone());
+                    for per_series in &mut folds {
+                        per_series.push(vec![Fold::default(); points.len()]);
+                    }
+                    // Folding does not hold the samples, but it does hold a cell per
+                    // call, series and point, and a query asking for a thousand points
+                    // across ten thousand series would trade one way of exhausting memory
+                    // for another. The same allowance covers both shapes, so raising the
+                    // limit raises it for whichever the query turns out to be.
+                    let held = (calls.len() as u64)
+                        .saturating_mul(labels.len() as u64)
+                        .saturating_mul(points.len() as u64);
+                    if max_samples != 0 && held > max_samples {
+                        return Err(Error::BadRequest(format!(
+                            "this query would hold more than {max_samples} values at once: \
+                             {} series across {} points. Narrow the time range, add label \
+                             matchers, ask for fewer points, or raise \
+                             limits.max_query_samples",
+                            labels.len(),
+                            points.len()
+                        )));
+                    }
+                    index
+                };
+                let at_nanos = sample.timestamp_nanos;
+                for (call, (selector, range, _)) in calls.iter().enumerate() {
+                    let offset = duration_nanos(selector.offset.unwrap_or(Duration::ZERO));
+                    let range_nanos = duration_nanos(*range);
+                    // A sample at `s` belongs to the points `p` where
+                    // `p - offset - range < s <= p - offset`. Both bounds rise with `p`,
+                    // so the points that qualify are one contiguous run and bisection
+                    // finds its ends. Walking every point instead is what made this
+                    // affordable only for a handful: a chart asks for hundreds of points
+                    // and a sample belongs to two or three of them, so the old loop did
+                    // the work of a hundred comparisons to find three.
+                    let (lo, hi) = if ordered {
+                        (
+                            points.partition_point(|p| at_nanos > p.saturating_sub(offset)),
+                            points.partition_point(|p| {
+                                at_nanos > p.saturating_sub(offset).saturating_sub(range_nanos)
+                            }),
+                        )
+                    } else {
+                        (0, points.len())
+                    };
+                    let per_point = &mut folds[call][index];
+                    for point in lo..hi {
+                        let at = points[point].saturating_sub(offset);
+                        let floor = at.saturating_sub(range_nanos);
+                        if at_nanos > floor && at_nanos <= at {
+                            per_point[point].add(at_nanos, sample.value);
+                        }
+                    }
+                }
+            }
+            if slice_end == last {
+                break;
+            }
+            cursor = slice_end.saturating_add(1);
+        }
+        Ok((labels, folds))
+    }
     /// Answer a query by folding the window in slices, holding no samples.
     ///
     /// # Why this exists
@@ -535,6 +657,7 @@ impl Snapshot {
         expr: &Expr,
         points: &[u64],
         pushdown: &[telemetryd_core::LabelMatcher],
+        max_samples: u64,
     ) -> Result<Self> {
         let calls = rate_calls(expr);
         let lookback = expr.required_lookback();
@@ -551,11 +674,6 @@ impl Snapshot {
             None => asked_from,
         };
 
-        let mut identities: HashMap<usize, usize> = HashMap::new();
-        let mut labels: Vec<Labels> = Vec::new();
-        // One accumulator per (call, series, point), grown as series are discovered.
-        let mut folds: Vec<Vec<Vec<Fold>>> = vec![Vec::new(); calls.len()];
-
         // Try the shortcut first: when every segment in every window carries a counter
         // summary, the store answers from those instead of reading rows. It declines when
         // enough segments lack one that reading them whole would cost more than the scan
@@ -565,45 +683,8 @@ impl Snapshot {
             return Ok(snapshot);
         }
 
-        let slice = duration_nanos(Self::FOLD_SLICE);
-        let mut cursor = from;
-        while cursor <= last {
-            let slice_end = cursor.saturating_add(slice).min(last);
-            // Unbounded within a slice: a slice is an hour, and refusing inside one would
-            // refuse a query whose whole point is that it never holds the window.
-            let samples = store.query_bounded(cursor, slice_end, pushdown, &|_| true, 0)?;
-            for sample in samples {
-                let id = sample.series.storage_id();
-                let index = if let Some(index) = identities.get(&id) {
-                    *index
-                } else {
-                    let index = labels.len();
-                    identities.insert(id, index);
-                    labels.push(sample.series.clone());
-                    for per_series in &mut folds {
-                        per_series.push(vec![Fold::default(); points.len()]);
-                    }
-                    index
-                };
-                for (call, (selector, range, _)) in calls.iter().enumerate() {
-                    let offset = duration_nanos(selector.offset.unwrap_or(Duration::ZERO));
-                    let range_nanos = duration_nanos(*range);
-                    // A sample at `s` belongs to the points `p` where
-                    // `p - offset - range < s <= p - offset`.
-                    for (point, fold) in folds[call][index].iter_mut().enumerate() {
-                        let at = points[point].saturating_sub(offset);
-                        let floor = at.saturating_sub(range_nanos);
-                        if sample.timestamp_nanos > floor && sample.timestamp_nanos <= at {
-                            fold.add(sample.timestamp_nanos, sample.value);
-                        }
-                    }
-                }
-            }
-            if slice_end == last {
-                break;
-            }
-            cursor = slice_end.saturating_add(1);
-        }
+        let (labels, folds) =
+            Self::accumulate_folds(store, &calls, points, pushdown, from, last, max_samples)?;
 
         let mut prepared = Vec::new();
         for (call, (selector, range, per_second)) in calls.iter().enumerate() {
@@ -699,7 +780,7 @@ impl Snapshot {
         // A window too large to hold is folded instead, which reads it a slice at a time
         // and keeps four numbers per series rather than every sample.
         if Self::should_fold(expr, points) {
-            return Self::load_folded(store, expr, points, &pushdown);
+            return Self::load_folded(store, expr, points, &pushdown, max_samples);
         }
 
         // One more than allowed, so a full collector is unambiguously an overflow rather

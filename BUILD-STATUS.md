@@ -82,12 +82,25 @@ The whole change is additive — 482 inserted lines, none deleted — so a store
 summaries behaves exactly as it did before, and existing segments are folded by a
 background task rather than by a rewrite at startup.
 
-**One query has a ceiling.** PromQL reads its whole window in one pass, so every sample of
-every matching series is resident at once and neither `limit` nor the series cap bounded
-it — measured at roughly 850 MB for a single query against weeks of high-cardinality
-metrics, and 3.46 GB for four at once, which the kernel ended. `limits.max_query_samples`
-derives from the memory limit and refuses past it, naming the limit rather than truncating
-the answer.
+**One query has a ceiling.** A PromQL read that holds its window keeps every sample of
+every matching series resident at once, and neither `limit` nor the series cap bounded it
+— measured at roughly 850 MB for a single query against weeks of high-cardinality metrics,
+and 3.46 GB for four at once, which the kernel ended. `limits.max_query_samples` derives
+from the memory limit and refuses past it, naming the limit rather than truncating the
+answer. The folded path is held to the same allowance, counted in accumulators rather than
+samples, so neither shape can be used to get around it.
+
+**A chart is folded too.** Folding used to be reserved for a wide *window*, and a chart has
+a narrow one: two hundred and fifty points at `rate(...[15m])` across a day. The span was
+therefore read in one piece, and a day of histogram buckets — 2.37 million records — went
+over the allowance, so a dashboard panel answered at one hour and returned `400` at
+twenty-four. The rule is now the span as well as the window, which is what decides whether
+holding it is affordable. Assigning a sample to the points it serves is done by bisecting
+the point list rather than testing every point, without which hundreds of points would cost
+hundreds of comparisons per sample; that cost is the reason the old path was capped at
+eight points, and the cap is gone. An expression is only folded when every sample it needs
+comes from a `rate` or `increase` — a bare selector wants the newest sample in a lookback,
+which no fold carries, so folding it would drop the operand and answer confidently wrong.
 
 **Known gap:** the four per-segment structures are still all resident. Loading them on
 demand behind a cache bounded by the process's memory limit is the remaining fix; sharing

@@ -215,7 +215,7 @@ and a wrong chart is worse than an error that says what happened.
 A dashboard asks two different shapes of question. A chart wants many points over a
 window sized to its step. A total or a quantile wants **one** number over the whole
 period, which compiles to `rate(metric[P])` with `P` the period itself — 24 hours, 30
-days, 90 days.
+days, 90 days. Both are folded, for the same reason and in the same way.
 
 The second shape used to be impossible: the evaluator read storage once and kept every
 sample resident, so one Laravel app's request histogram over 24 hours was twelve million
@@ -240,8 +240,31 @@ Nothing about the API changes — the same PromQL in, the same response out. Res
 identical to the unfolded path: verified over 21,168 values across 72 instant and range
 queries on the same store.
 
-`limits.max_query_samples` still bounds the shapes that are not foldable, which is where
-it was always meant to apply.
+### A chart is the same problem, spread out
+
+A chart's own window is narrow, but its span is not: two hundred and fifty points at
+`rate(metric[15m])` across a day still needs every sample in that day, and reading the
+span in one piece means holding all of them. A day of one app's request histogram is 2.37
+million records, over the allowance — which is why a panel used to answer at one hour and
+return `400` at twenty-four while looking like the same panel.
+
+So the rule is the span as well as the window: a query reaching back more than two hours
+is folded, whatever its window. Nothing else changes — a sample is folded into each of the
+points whose window covers it, found by bisecting the point list rather than by testing
+every point, so hundreds of points cost what a handful used to.
+
+### What is not folded
+
+A fold holds a window's first and last sample and the increase between them, which answers
+`rate` and `increase` exactly and answers nothing else. A selector standing on its own —
+`up`, or the right-hand side of `errors / requests` — wants the newest sample within a
+lookback, and no fold carries it. Such an expression is read the ordinary way however wide
+its span, because folding it would drop that operand and return a confident wrong number
+instead of an error.
+
+`limits.max_query_samples` bounds both paths. The ordinary read is measured in samples
+held; the folded read is measured in accumulators held, one per series per point per call.
+Neither shape can be used to get around the other's limit.
 
 ## What happens when every read slot is busy
 
@@ -355,7 +378,7 @@ Security:
   ingest       token required
   query        token required
   admin        token required
-  identity     open on / and /status: telemetryd 0.54.0, storage format 1,
+  identity     open on / and /status: telemetryd 0.55.0, storage format 1,
                three signals. Never the deployment. Not a setting.
 ```
 
