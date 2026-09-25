@@ -239,8 +239,12 @@ impl TlsListener {
                     // between the SYN and the accept, or a momentary descriptor
                     // shortage. Logging and continuing is what the trait asks for;
                     // returning would silently stop serving.
+                    // Backed off, not retried at once: out of descriptors, `accept` fails
+                    // again immediately, and retrying in a loop spun a core at 100% until
+                    // one freed up.
                     Err(error) => {
                         tracing::debug!(%error, "accepting a TCP connection failed");
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         continue;
                     }
                 };

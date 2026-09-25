@@ -33,6 +33,10 @@ telemetryd-server = { path = "crates/server", version = "0.61.1" }
 tokio = { version = "1.53", features = ["rt-multi-thread", "net", "signal", "fs", "sync", "time", "macros", "io-util"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "matched-path", "ws", "form"] }
 tower = { version = "0.5", features = ["util"] }
+# Already in the tree through axum, at these versions. Named directly to serve
+# connections with a timer — see crates/server/src/connections.rs.
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio", "service"] }
 tower-http = { version = "0.7", features = ["trace", "limit", "timeout", "catch-panic"] }
 http-body-util = "0.1"
 

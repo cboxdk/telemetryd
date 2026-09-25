@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod browser;
+mod connections;
 pub mod debug;
 pub mod error;
 pub mod export;
@@ -357,7 +358,7 @@ pub async fn serve_state(state: AppState) -> Result<()> {
     // whole serve future in a timeout would have exited a healthy process after
     // `shutdown_grace` seconds of ordinary uptime.
     let (signalled, mut wait_for_signal) = tokio::sync::watch::channel(false);
-    let serving = axum::serve(bound, router(state)).with_graceful_shutdown(async move {
+    let serving = connections::serve(bound, router(state), async move {
         shutdown_signal().await;
         let _ = signalled.send(true);
     });
@@ -369,7 +370,7 @@ pub async fn serve_state(state: AppState) -> Result<()> {
     };
 
     tokio::select! {
-        result = serving => result.map_err(|e| telemetryd_core::Error::io("serving HTTP", e))?,
+        () = serving => {}
         () = deadline => tracing::warn!(
             grace_seconds = grace.as_secs(),
             "connections were still open when server.shutdown_grace elapsed; \

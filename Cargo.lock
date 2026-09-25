@@ -2530,6 +2530,8 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "humantime",
+ "hyper",
+ "hyper-util",
  "jsonwebtoken",
  "rcgen",
  "rustls",
