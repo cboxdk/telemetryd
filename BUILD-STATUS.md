@@ -125,6 +125,15 @@ refuses to start unless ingest, query and admin are each guarded by a token or b
 ID, names the surfaces that are open and prints tokens for them; the Docker entrypoint
 generates tokens for whichever surfaces were not given one.
 
+**Grafana connects to all three datasources.** Checked against a real Grafana 12.2
+container: "Save & test" passes for Prometheus, Loki and Tempo; Explore shows log lines
+with their attributes; the trace view opens; the Tempo query builder's tag list is
+filled. Each needed something the API did not do — Loki's `categorize-labels` shape and
+an instant `/query`, Tempo's `/api/v2/traces` in protobuf and scoped v2 tags,
+Prometheus's POST bodies and error envelope — and one bug only the real client found:
+Grafana dereferences a trace's instrumentation scope without a nil check, so omitting an
+empty one crashed its trace view on every trace.
+
 **One query has a ceiling.** A PromQL read that holds its window keeps every sample of
 every matching series resident at once, and neither `limit` nor the series cap bounded it
 — measured at roughly 850 MB for a single query against weeks of high-cardinality metrics,

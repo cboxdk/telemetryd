@@ -158,10 +158,11 @@ rest and reports the refusal through OTLP's own `partialSuccess` field.
 
 | Endpoint | Used by | Notes |
 |---|---|---|
-| `GET /loki/api/v1/labels` | `LokiSource::probe()`, label discovery | Must answer `{"status":"success"}` — the UI uses this to decide the URL *is* a log backend |
+| `GET /loki/api/v1/labels` | `LokiSource::probe()`, label discovery | Must answer `{"status":"success"}` — the UI uses this to decide the URL *is* a log backend. `query` scopes the names |
 | `GET /loki/api/v1/query_range` | `LokiSource::query()` | `query`, `start`/`end` in **nanoseconds**, `limit`, `direction=backward`. `limit` defaults to 100 and is **clamped to 5,000** |
-| `GET /loki/api/v1/label/{name}/values` | `LokiSource::labelValues()` | optional `start`/`end` |
-| `GET /loki/api/v1/series` | — | Not used by the UI; implemented anyway, it is cheap and useful |
+| `GET /loki/api/v1/query` | Grafana's "Save & test" | An instant query. `vector(1)+vector(1)` and other literal-only expressions are evaluated; a log query is answered over the hour before `time`; metric LogQL is refused by name |
+| `GET /loki/api/v1/label/{name}/values` | `LokiSource::labelValues()` | optional `start`/`end`; `query` scopes the values to the streams that selector matches |
+| `GET /loki/api/v1/series` | — | Not used by the UI; implemented anyway, it is cheap and useful. Every `match[]` counts, as a union |
 | `GET /loki/api/v1/tail` | — | WebSocket live tail. **telemetryd's own feature**, not a UI requirement |
 
 ### Response shape
@@ -183,6 +184,14 @@ matched and the read came back empty.
 
 Two attributes that sanitise to one key — `order.id` and `order_id` on one record — keep
 the first, deterministically.
+
+**Grafana gets categorised labels.** With the request header
+`X-Loki-Response-Encoding-Flags: categorize-labels` — which Grafana always sends —
+`data` carries `"encodingFlags":["categorize-labels"]` ahead of `result`, and an entry's
+third element is `{"structuredMetadata":{…},"parsed":{…}}`: record attributes in the
+first, fields a `| json` or `| logfmt` stage extracted in the second. Grafana's reader for
+the flat shape takes exactly two elements, so before this any line with attributes
+failed to parse there. Without the header the flat shape below is unchanged.
 
 **Entries carry structured metadata.** Each `values` element is
 `[timestamp, line]` or `[timestamp, line, {…}]`. The third element is where
@@ -227,7 +236,9 @@ default, `{service_name=~".+"}`, satisfies this.
 |---|---|---|
 | `GET /api/search/tags` | `TempoSource::probe()`, tag discovery | Must return `tagNames` (or `scopes`) — the UI's backend-recognition check |
 | `GET /api/search` | `TempoSource::search()` | `q` = **TraceQL**, `start`/`end` in **seconds**, `limit`, **clamped to 1,000** |
-| `GET /api/traces/{traceID}` | `TempoSource::trace()` | Returns `{"batches":[…]}` in OTLP `resourceSpans` shape |
+| `GET /api/traces/{traceID}` | `TempoSource::trace()` | Returns `{"batches":[…]}` in OTLP `resourceSpans` shape; with `Accept: application/protobuf`, a `tempopb.Trace` |
+| `GET /api/v2/traces/{traceID}` | Grafana's trace view | `tempopb.TraceByIDResponse` with `Accept: application/protobuf` — what Grafana asks for and decodes whatever the content type — else `{"trace":{"resourceSpans":[…]}}` |
+| `GET /api/v2/search/tags` | Grafana's query builder | `{"scopes":[{"name":"resource"|"span"|"intrinsic","tags":[…]}]}`; `scope` narrows to one |
 | `GET /api/v2/search/tag/{name}/values` | `TempoSource::tagValues()` | **v2**, with an optional `q` filter. Returns `{"tagValues":[{"type","value"}]}` |
 
 Two corrections our first plan got wrong, both found by reading the connector:
@@ -263,9 +274,15 @@ spelling, `.service.name` still reaches the `service_name` label.
 
 ## Prometheus
 
-`/api/v1/query` and `/api/v1/query_range` read their parameters from the URL and, on a
-POST, from an `application/x-www-form-urlencoded` body, as Prometheus does; where both
-carry a key the body wins. Grafana's Prometheus datasource sends POST by default.
+`/api/v1/query`, `/api/v1/query_range`, `/api/v1/labels` and `/api/v1/series` read their
+parameters from the URL and, on a POST, from an `application/x-www-form-urlencoded`
+body, as Prometheus does; where both carry a key the body wins. Grafana's Prometheus
+datasource sends POST by default. Every `match[]` counts — on the label endpoints too,
+where it scopes names and values to the series some selector matches.
+
+Errors on `/api/v1/*` use Prometheus's envelope, `{"status":"error","errorType":…,
+"error":"…"}`, with telemetryd's `code`, `hint`, `feature` and `docs` alongside — which
+Prometheus clients ignore — so Grafana shows the message rather than a parse error.
 
 | Endpoint | Used by | Notes |
 |---|---|---|
@@ -321,6 +338,7 @@ Driven by what `PromqlCompiler` actually generates:
   out of scope and the panel returned `400`.
 - `histogram_quantile(0.95, sum by (le, …) (rate(sel[5m])))`
 - arithmetic against scalars: `expr * 60`
+- `vector(s)`, a scalar as a one-element vector — Grafana's Loki health check uses it
 - **`offset`**, **`or` between vectors**, and **`clamp_min`** — required by the
   compiler's counter-increase form:
   `clamp_min(sel - (sel offset 5m or sel * 0), 0)`. Our first plan listed all three as
