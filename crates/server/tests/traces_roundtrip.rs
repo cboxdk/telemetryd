@@ -579,3 +579,91 @@ async fn logs_and_traces_coexist_without_interfering() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(logs["data"]["result"][0]["values"][0][1], "a log line");
 }
+
+/// A search row describes the trace, not the part of it the query matched. Matching
+/// the database span used to name the row after it and time it at its 10 ms.
+#[tokio::test]
+async fn a_search_row_describes_the_whole_trace() {
+    let harness = Harness::new();
+    harness.post_traces(&trace_payload()).await;
+
+    let query = urlencode(r#"{ span.db.system = "mysql" }"#);
+    let (status, response) = harness
+        .get(&format!("/api/search?q={query}&{}", window()))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let summary = &response["traces"][0];
+    assert_eq!(summary["rootTraceName"], "POST /checkout", "{response}");
+    assert!((summary["durationMs"].as_f64().unwrap() - 150.0).abs() < 1.0);
+    // The span set is still what matched.
+    assert_eq!(summary["spanSets"][0]["matched"], 1);
+    assert_eq!(summary["spanSets"][0]["spans"][0]["name"], "SELECT orders");
+}
+
+/// `minDuration` and `maxDuration` bound the trace, as in Tempo — here 200 ms made of two
+/// 10 ms spans, which a per-span bound got backwards both ways.
+#[tokio::test]
+async fn search_duration_bounds_apply_to_the_trace() {
+    let harness = Harness::new();
+    let span = |id: &str, parent: Option<&str>, from: u64, to: u64| {
+        let mut span = json!({
+            "traceId": TRACE,
+            "spanId": id,
+            "name": id,
+            "startTimeUnixNano": (NOW_NANOS + from * MS).to_string(),
+            "endTimeUnixNano": (NOW_NANOS + to * MS).to_string(),
+        });
+        if let Some(parent) = parent {
+            span["parentSpanId"] = json!(parent);
+        }
+        span
+    };
+    harness
+        .post_traces(&json!({"resourceSpans": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "checkout"}}
+            ]},
+            "scopeSpans": [{"spans": [
+                span(ROOT_SPAN, None, 0, 10),
+                span("aaaaaaaaaaaaaaaa", Some(ROOT_SPAN), 190, 200),
+            ]}]
+        }]}))
+        .await;
+
+    let found = |bounds: &str| {
+        let path = format!("/api/search?q={}&{}&{bounds}", urlencode("{}"), window());
+        let harness = &harness;
+        async move {
+            let (status, response) = harness.get(&path).await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+            response["traces"].as_array().unwrap().len()
+        }
+    };
+    assert_eq!(found("minDuration=100ms").await, 1);
+    assert_eq!(found("maxDuration=50ms").await, 0);
+    assert_eq!(found("minDuration=150ms&maxDuration=250ms").await, 1);
+}
+
+/// An exporter that retries a batch it was not sure had landed sends every span twice.
+/// Each is one span, in the search and in the trace.
+#[tokio::test]
+async fn a_span_sent_twice_is_one_span() {
+    let harness = Harness::new();
+    harness.post_traces(&trace_payload()).await;
+    harness.post_traces(&trace_payload()).await;
+
+    let (_, response) = harness
+        .get(&format!("/api/search?q={}&{}", urlencode("{}"), window()))
+        .await;
+    assert_eq!(response["traces"][0]["spanSets"][0]["matched"], 2, "{response}");
+
+    let (status, response) = harness.get(&format!("/api/traces/{TRACE}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let spans: usize = response["batches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|batch| batch["scopeSpans"][0]["spans"].as_array().unwrap().len())
+        .sum();
+    assert_eq!(spans, 2);
+}

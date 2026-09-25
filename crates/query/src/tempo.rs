@@ -8,7 +8,7 @@
 //! upstream's own convention is the point of compatibility, however inconsistent that
 //! is across the three.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 use telemetryd_core::span::SpanRecord;
@@ -102,10 +102,12 @@ impl SearchRequest {
         })
     }
 
-    fn duration_ok(&self, span: &SpanRecord) -> bool {
-        let duration = span.duration_nanos();
-        self.min_duration_nanos.is_none_or(|min| duration >= min)
-            && self.max_duration_nanos.is_none_or(|max| duration <= max)
+    /// `minDuration` and `maxDuration` bound the *trace*, as in Tempo. They were applied
+    /// to each span, so `minDuration=2s` found every trace holding one slow span — and
+    /// missed a slow trace made of many quick ones.
+    fn duration_ok(&self, trace_nanos: u64) -> bool {
+        self.min_duration_nanos.is_none_or(|min| trace_nanos >= min)
+            && self.max_duration_nanos.is_none_or(|max| trace_nanos <= max)
     }
 }
 
@@ -347,40 +349,74 @@ fn newest(start_nanos: u64, end_nanos: u64) -> telemetryd_store::Scan<'static> {
     scan
 }
 
+/// Spans grouped by trace, each trace's spans once apiece and in start order.
+///
+/// Once apiece: an exporter that retries a batch it was not sure had landed sends the
+/// same spans twice, and they used to be counted and drawn twice.
+fn by_trace(spans: Vec<SpanRecord>) -> HashMap<String, Vec<SpanRecord>> {
+    let mut traces: HashMap<String, Vec<SpanRecord>> = HashMap::new();
+    for span in spans {
+        traces.entry(span.trace_id.clone()).or_default().push(span);
+    }
+    for spans in traces.values_mut() {
+        *spans = distinct_spans(std::mem::take(spans));
+    }
+    traces
+}
+
+fn distinct_spans(mut spans: Vec<SpanRecord>) -> Vec<SpanRecord> {
+    spans.sort_by(|a, b| {
+        a.start_nanos
+            .cmp(&b.start_nanos)
+            .then_with(|| a.span_id.cmp(&b.span_id))
+    });
+    let mut seen = std::collections::HashSet::with_capacity(spans.len());
+    spans.retain(|span| seen.insert(span.span_id.clone()));
+    spans
+}
+
 /// `GET /api/search`
+///
+/// Two reads: one for the spans the query matches, which say which traces qualify, and
+/// one for those traces whole. A result row describes the *trace* — its root span's
+/// name and service, its start, its duration — and those are facts about spans the
+/// query need not have matched. They used to come from the matched spans alone, so
+/// `{ span.db.system = "mysql" }` listed every trace under the name and duration of
+/// its database query.
 pub fn search(store: &RecordStore<SpanSchema>, request: &SearchRequest) -> Result<SearchResponse> {
     let inspected = std::sync::atomic::AtomicU32::new(0);
     let filter = |span: &SpanRecord| {
         inspected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        request.query.matches(span) && request.duration_ok(span)
+        request.query.matches(span)
+    };
+    let window = || newest(request.start_nanos, request.end_nanos);
+    let matched = by_trace(store.scan(window(), &[], &filter)?);
+
+    let whole = if matched.is_empty() {
+        HashMap::new()
+    } else {
+        by_trace(store.scan(window(), &[], &|span: &SpanRecord| {
+            matched.contains_key(&span.trace_id)
+        })?)
     };
 
-    let matched = store.scan(newest(request.start_nanos, request.end_nanos), &[], &filter)?;
-
-    // Group matches by trace, then fetch each trace's root so the summary can name it.
-    let mut by_trace: BTreeMap<String, Vec<SpanRecord>> = BTreeMap::new();
-    for span in matched {
-        by_trace
-            .entry(span.trace_id.clone())
-            .or_default()
-            .push(span);
-    }
-
-    let mut summaries: Vec<TraceSummary> = by_trace
+    let mut summaries: Vec<(u64, TraceSummary)> = matched
         .into_iter()
-        .map(|(trace_id, mut spans)| {
-            spans.sort_by_key(|s| s.start_nanos);
-            // The root of a trace may not itself have matched the query, so name the
-            // trace from the earliest matching span when it is absent. Reporting an
-            // empty name would make every result row look broken.
-            let root = spans.iter().find(|s| s.is_root()).unwrap_or(&spans[0]);
-
-            let start = spans.iter().map(|s| s.start_nanos).min().unwrap_or(0);
-            let end = spans.iter().map(|s| s.end_nanos).max().unwrap_or(start);
+        .filter_map(|(trace_id, spans)| {
+            let all = whole.get(&trace_id).map_or(spans.as_slice(), Vec::as_slice);
+            let start = all.iter().map(|s| s.start_nanos).min().unwrap_or(0);
+            let end = all.iter().map(|s| s.end_nanos).max().unwrap_or(start);
+            let duration = end.saturating_sub(start);
+            if !request.duration_ok(duration) {
+                return None;
+            }
+            // The root when the window holds it; otherwise the earliest span, so the row
+            // still names something rather than looking broken.
+            let root = all.iter().find(|s| s.is_root()).unwrap_or(&all[0]);
             #[allow(clippy::cast_precision_loss)]
-            let duration_ms = (end.saturating_sub(start)) as f64 / 1e6;
+            let duration_ms = duration as f64 / 1e6;
 
-            TraceSummary {
+            let summary = TraceSummary {
                 root_service_name: root.service_name().to_owned(),
                 root_trace_name: root.name.clone(),
                 start_time_unix_nano: start.to_string(),
@@ -399,13 +435,16 @@ pub fn search(store: &RecordStore<SpanSchema>, request: &SearchRequest) -> Resul
                         .collect(),
                 }],
                 trace_id,
-            }
+            };
+            Some((start, summary))
         })
         .collect();
 
-    // Newest first: a trace list is read from the top.
-    summaries.sort_by(|a, b| b.start_time_unix_nano.cmp(&a.start_time_unix_nano));
+    // Newest first: a trace list is read from the top. Ties by id, so equal starts do
+    // not reshuffle between refreshes now that grouping is by hash.
+    summaries.sort_by(|(a, x), (b, y)| b.cmp(a).then_with(|| x.trace_id.cmp(&y.trace_id)));
     summaries.truncate(request.limit);
+    let summaries: Vec<TraceSummary> = summaries.into_iter().map(|(_, s)| s).collect();
 
     let inspected_spans = inspected.load(std::sync::atomic::Ordering::Relaxed);
     Ok(SearchResponse {
@@ -447,9 +486,9 @@ pub fn trace(store: &RecordStore<SpanSchema>, trace_id: &str) -> Result<TraceRes
         &|span: &SpanRecord| span.trace_id == wanted,
     )?;
 
-    // One batch per distinct resource, as OTLP models it.
+    // One batch per distinct resource, as OTLP models it; each span once.
     let mut by_resource: BTreeMap<telemetryd_core::Labels, Vec<SpanRecord>> = BTreeMap::new();
-    for span in spans {
+    for span in distinct_spans(spans) {
         by_resource
             .entry(span.stream.clone())
             .or_default()
