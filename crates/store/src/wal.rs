@@ -56,6 +56,10 @@ pub struct Wal {
     unsynced_records: u64,
     appended_records: u64,
     appended_bytes: u64,
+    /// Set when a failed write could not be rolled back, so the current segment may end
+    /// in a torn frame. The next append starts a fresh segment rather than writing
+    /// behind it — replay stops at a tear, and would drop everything after.
+    poisoned: bool,
 }
 
 impl Wal {
@@ -110,6 +114,7 @@ impl Wal {
             unsynced_records: 0,
             appended_records: 0,
             appended_bytes: 0,
+            poisoned: false,
         })
     }
 
@@ -130,11 +135,14 @@ impl Wal {
 
         let frame_len = FRAME_HEADER_LEN as u64 + u64::from(len);
         // Rotate before writing, but never produce an empty segment: an oversized
-        // record still has to go somewhere.
-        if self.segment_bytes > HEADER_LEN_U64
-            && self.segment_bytes + frame_len > self.max_segment_bytes
+        // record still has to go somewhere. A poisoned segment is left behind whatever
+        // its size.
+        if self.poisoned
+            || (self.segment_bytes > HEADER_LEN_U64
+                && self.segment_bytes + frame_len > self.max_segment_bytes)
         {
             self.rotate()?;
+            self.poisoned = false;
         }
 
         let crc = crc32fast::hash(payload);
@@ -142,8 +150,13 @@ impl Wal {
         header[..4].copy_from_slice(&len.to_le_bytes());
         header[4..].copy_from_slice(&crc.to_le_bytes());
 
-        self.write_all(&header)?;
-        self.write_all(payload)?;
+        if let Err(error) = self
+            .write_all(&header)
+            .and_then(|()| self.write_all(payload))
+        {
+            self.roll_back();
+            return Err(error);
+        }
 
         self.segment_bytes += frame_len;
         self.appended_records += 1;
@@ -191,8 +204,12 @@ impl Wal {
     pub fn rotate(&mut self) -> Result<u64> {
         self.sync()?;
         let closed = self.seq;
-        self.seq += 1;
-        let (file, bytes) = open_segment(&self.dir, self.seq)?;
+        // The epoch moves only once the new file exists. It used to move first, so a
+        // failed open left appends going into the old file under the new number — and
+        // truncation, which keeps only epochs from the current one on, could then
+        // delete the file they were in.
+        let (file, bytes) = open_segment(&self.dir, closed + 1)?;
+        self.seq = closed + 1;
         self.writer = BufWriter::new(file);
         self.segment_bytes = bytes;
         tracing::debug!(dir = %self.dir.display(), seq = self.seq, "rotated WAL segment");
@@ -255,6 +272,37 @@ impl Wal {
             appended_records: self.appended_records,
             appended_bytes: self.appended_bytes,
             unsynced_records: self.unsynced_records,
+        }
+    }
+
+    /// After a failed write, leave the segment holding exactly the frames that were
+    /// complete before it.
+    ///
+    /// A frame cut short by a full disk stayed in the file, and every frame appended once
+    /// space came back sat behind it — where replay, which stops at a tear, never reached
+    /// them. Earlier complete frames may still be in the write buffer rather than the
+    /// file, so the buffer is taken apart: the disk is cut back if it holds more than the
+    /// complete frames, or given the rest of them if it holds less. If that fails too,
+    /// the segment is poisoned and the next append starts a new one.
+    fn roll_back(&mut self) {
+        let Ok(spare) = self.writer.get_ref().try_clone() else {
+            self.poisoned = true;
+            return;
+        };
+        let (mut file, buffered) =
+            std::mem::replace(&mut self.writer, BufWriter::new(spare)).into_parts();
+        let buffered = buffered.unwrap_or_default();
+        let repaired = file.metadata().and_then(|meta| {
+            let on_disk = meta.len();
+            if on_disk >= self.segment_bytes {
+                file.set_len(self.segment_bytes)
+            } else {
+                let missing = usize::try_from(self.segment_bytes - on_disk).unwrap_or(usize::MAX);
+                file.write_all(&buffered[..missing.min(buffered.len())])
+            }
+        });
+        if repaired.is_err() {
+            self.poisoned = true;
         }
     }
 
@@ -822,5 +870,87 @@ mod tests {
         }
         // Nothing is due yet, so the records are still only in the page cache.
         assert_eq!(wal.stats().unsynced_records, 5);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod rollback_tests {
+    use super::*;
+
+    const BIG: u64 = 1 << 30;
+
+    fn records(dir: &Path) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        replay(dir, |payload| {
+            out.push(payload.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    /// A frame cut short — here written by hand, as a full disk would leave it — is
+    /// taken back out, so the frames appended after it are not stranded behind a tear
+    /// replay stops at.
+    #[test]
+    fn a_torn_frame_is_rolled_back_before_the_next_append() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(tmp.path(), WalSync::Always, Duration::ZERO, BIG).unwrap();
+        wal.append(b"first").unwrap();
+        wal.append(b"second").unwrap();
+
+        // Half a frame, past the last complete one.
+        let path = wal.path();
+        let mut file = File::options().append(true).open(&path).unwrap();
+        file.write_all(&[9, 0, 0, 0, 1, 2]).unwrap();
+        drop(file);
+
+        wal.roll_back();
+        assert!(!wal.poisoned);
+        wal.append(b"third").unwrap();
+        drop(wal);
+
+        assert_eq!(
+            records(tmp.path()),
+            vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+        );
+    }
+
+    /// A segment that could not be repaired is left behind: the next append starts a
+    /// new one rather than writing after the damage.
+    #[test]
+    fn a_poisoned_segment_is_left_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(tmp.path(), WalSync::Always, Duration::ZERO, BIG).unwrap();
+        wal.append(b"before").unwrap();
+        let first = wal.current_sequence();
+        wal.poisoned = true;
+        wal.append(b"after").unwrap();
+        assert_eq!(wal.current_sequence(), first + 1);
+    }
+
+    /// The epoch moves only once the next segment exists; a failed rotation leaves the
+    /// log appending where it was, under the number it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_rotation_keeps_the_epoch() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(tmp.path(), WalSync::Always, Duration::ZERO, BIG).unwrap();
+        wal.append(b"kept").unwrap();
+        let before = wal.current_sequence();
+
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(wal.rotate().is_err());
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(wal.current_sequence(), before);
+
+        wal.append(b"still here").unwrap();
+        drop(wal);
+        assert_eq!(
+            records(tmp.path()),
+            vec![b"kept".to_vec(), b"still here".to_vec()]
+        );
     }
 }
