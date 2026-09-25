@@ -109,11 +109,13 @@ impl DataDir {
     /// meaningful if it reflects what is actually there.
     pub fn usage(&self) -> Result<DiskUsage> {
         let mut usage = DiskUsage::default();
+        // Every signal's segments, metrics' included. Metrics once had a store of
+        // their own and were skipped here after they moved into segments like the rest,
+        // so /status reported 24 bytes where 17,558 were on disk and the disk budget
+        // never saw them — a budget that cannot see the data cannot hold it.
         for signal in Signal::ALL {
             usage.wal_bytes += dir_size(&self.wal_dir(signal))?;
-            if signal.uses_record_store() {
-                usage.segment_bytes += dir_size(&self.segments_dir(signal))?;
-            }
+            usage.segment_bytes += dir_size(&self.segments_dir(signal))?;
         }
         usage.metric_bytes = dir_size(&self.root.join("metrics"))?;
         usage.tmp_bytes = dir_size(&self.tmp_dir())?;
@@ -240,9 +242,7 @@ fn create_layout(root: &Path) -> Result<()> {
     ];
     for signal in Signal::ALL {
         dirs.push(root.join("wal").join(signal.as_str()));
-        if signal.uses_record_store() {
-            dirs.push(root.join("segments").join(signal.as_str()));
-        }
+        dirs.push(root.join("segments").join(signal.as_str()));
     }
     for dir in dirs {
         fs::create_dir_all(&dir)
@@ -307,12 +307,28 @@ mod tests {
         assert!(root.join("wal/logs").is_dir());
         assert!(root.join("wal/metrics").is_dir());
         assert!(root.join("segments/traces").is_dir());
-        // Metrics do not use the record store, so they get no segments directory.
-        assert!(!root.join("segments/metrics").exists());
+        assert!(root.join("segments/metrics").is_dir());
         drop(dir);
 
         // Reopening an existing directory must not fail or reset anything.
         let _dir = DataDir::open(&root).unwrap();
+    }
+
+    /// Metric segments count towards disk usage like every other signal's. They were
+    /// skipped, so /status and the disk budget saw 24 bytes where 17,558 were stored.
+    #[test]
+    fn metric_segments_count_towards_disk_usage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        let dir = DataDir::open(&root).unwrap();
+        let before = dir.usage().unwrap().segment_bytes;
+        fs::create_dir_all(root.join("segments/metrics/0001")).unwrap();
+        fs::write(
+            root.join("segments/metrics/0001/data.parquet"),
+            vec![0u8; 17_558],
+        )
+        .unwrap();
+        assert_eq!(dir.usage().unwrap().segment_bytes, before + 17_558);
     }
 
     #[test]

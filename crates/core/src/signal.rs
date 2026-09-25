@@ -1,8 +1,7 @@
 //! The four telemetry signals telemetryd stores.
 //!
-//! Logs, traces and events share identical storage machinery and differ only in their
-//! Arrow schema; metrics use the separate chunk store. The distinction shows
-//! up here as [`Signal::uses_record_store`].
+//! Every signal shares one storage engine — write-ahead log, then Parquet segments —
+//! and they differ only in their Arrow schema.
 
 use std::fmt;
 use std::str::FromStr;
@@ -28,12 +27,6 @@ impl Signal {
             Self::Traces => "traces",
             Self::Metrics => "metrics",
         }
-    }
-
-    /// Whether this signal is stored as WAL → Parquet segments (as opposed to the
-    /// metric chunk store).
-    pub fn uses_record_store(self) -> bool {
-        !matches!(self, Self::Metrics)
     }
 }
 
