@@ -728,15 +728,15 @@ impl Snapshot {
             }
             let mut of_series = HashMap::new();
             let mut keys: Vec<Labels> = Vec::new();
+            // Found by hash, not by walking the groups so far: that walk made this
+            // O(series × groups), thirty-three seconds at thirty thousand series.
+            let mut positions: HashMap<Labels, usize> = HashMap::new();
             for labels in series.iter().map(|s| &s.labels).chain(stripped) {
                 let key = group_key(labels, &grouping);
-                let position = keys
-                    .iter()
-                    .position(|existing| *existing == key)
-                    .unwrap_or_else(|| {
-                        keys.push(key);
-                        keys.len() - 1
-                    });
+                let position = *positions.entry(key).or_insert_with_key(|key| {
+                    keys.push(key.clone());
+                    keys.len() - 1
+                });
                 of_series.insert(labels.storage_id(), position);
             }
             grouped.push(GroupIndex {
@@ -1782,10 +1782,14 @@ fn aggregate(op: AggregateOp, grouping: &Grouping, vector: &InstantVector) -> In
 
 /// Two label sets are the same series for matching when they differ at most in name.
 fn same_series(a: &Labels, b: &Labels) -> bool {
-    let name = telemetryd_core::METRIC_NAME_LABEL;
-    a.iter()
-        .filter(|(key, _)| *key != name)
-        .eq(b.iter().filter(|(key, _)| *key != name))
+    unnamed(a).eq(unnamed(b))
+}
+
+/// A label set's pairs without the metric name.
+fn unnamed(labels: &Labels) -> impl Iterator<Item = (&str, &str)> {
+    labels
+        .iter()
+        .filter(|(key, _)| *key != telemetryd_core::METRIC_NAME_LABEL)
 }
 
 fn binary(op: BinaryOp, left: Value, right: Value) -> Value {
@@ -1796,14 +1800,29 @@ fn binary(op: BinaryOp, left: Value, right: Value) -> Value {
             let left = left.into_vector();
             let right = right.into_vector();
             let mut samples = left.samples;
-            // Matched as Prometheus matches: on every label but the name.
+            // Matched as Prometheus matches: on every label but the name. Looked up by a
+            // hash of those labels and confirmed, rather than by walking the left side
+            // for every right-hand element — five seconds a step at 22,000 series.
+            let mut present: HashMap<u64, Vec<usize>> = HashMap::with_capacity(samples.len());
+            for (index, (labels, _)) in samples.iter().enumerate() {
+                present
+                    .entry(Labels::fingerprint_of(unnamed(labels)))
+                    .or_default()
+                    .push(index);
+            }
             for (labels, value) in right.samples {
-                if !samples
+                let fingerprint = Labels::fingerprint_of(unnamed(&labels));
+                let candidates = present.entry(fingerprint).or_default();
+                if candidates
                     .iter()
-                    .any(|(existing, _)| same_series(existing, &labels))
+                    .any(|&index| same_series(&samples[index].0, &labels))
                 {
-                    samples.push((labels, value));
+                    continue;
                 }
+                // It joins the lookup too: a right-hand element was always compared with
+                // the ones already taken from the right, not only with the left side.
+                candidates.push(samples.len());
+                samples.push((labels, value));
             }
             Value::Vector(InstantVector { samples })
         }
@@ -1823,15 +1842,19 @@ fn binary(op: BinaryOp, left: Value, right: Value) -> Value {
         // Vector-to-vector: match on identical label sets, as PromQL's default
         // one-to-one matching does. Series present on only one side drop out.
         (op, Value::Vector(left), Value::Vector(right)) => {
+            // The first right-hand element with each label set, found by hash — a search
+            // of the right side per left element was O(n·m).
+            let mut by_labels: HashMap<&Labels, f64> = HashMap::with_capacity(right.samples.len());
+            for (labels, value) in &right.samples {
+                by_labels.entry(labels).or_insert(*value);
+            }
             let samples = left
                 .samples
                 .into_iter()
                 .filter_map(|(labels, value)| {
-                    right
-                        .samples
-                        .iter()
-                        .find(|(other, _)| *other == labels)
-                        .map(|(_, other)| (labels, apply(op, value, *other)))
+                    by_labels
+                        .get(&labels)
+                        .map(|other| (labels, apply(op, value, *other)))
                 })
                 .collect();
             Value::Vector(InstantVector { samples })
@@ -2593,6 +2616,59 @@ mod tests {
             .eval(&crate::promql::parse(query).unwrap(), at)
             .unwrap()
             .into_vector()
+    }
+
+    fn labelled(pairs: &[(&str, &str)]) -> Labels {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    /// `or` keeps the left side, and adds from the right what matches nothing already
+    /// taken — on every label but the name, and against earlier right-hand elements too.
+    #[test]
+    fn or_matches_on_everything_but_the_name() {
+        let left = InstantVector {
+            samples: vec![(labelled(&[("__name__", "a"), ("pod", "1")]), 1.0)],
+        };
+        let right = InstantVector {
+            samples: vec![
+                (labelled(&[("__name__", "b"), ("pod", "1")]), 10.0),
+                (labelled(&[("pod", "2")]), 20.0),
+                (labelled(&[("__name__", "c"), ("pod", "2")]), 30.0),
+                (labelled(&[("pod", "3")]), 40.0),
+            ],
+        };
+        let Value::Vector(union) = binary(BinaryOp::Or, Value::Vector(left), Value::Vector(right))
+        else {
+            panic!("a union of vectors is a vector");
+        };
+        let values: Vec<f64> = union.samples.iter().map(|(_, value)| *value).collect();
+        assert_eq!(values, [1.0, 20.0, 40.0]);
+    }
+
+    /// One-to-one matching takes the first right-hand element with the same labels.
+    #[test]
+    fn vector_arithmetic_matches_identical_label_sets() {
+        let left = InstantVector {
+            samples: vec![
+                (labelled(&[("pod", "1")]), 6.0),
+                (labelled(&[("pod", "9")]), 1.0),
+            ],
+        };
+        let right = InstantVector {
+            samples: vec![
+                (labelled(&[("pod", "1")]), 3.0),
+                (labelled(&[("pod", "1")]), 2.0),
+            ],
+        };
+        let Value::Vector(quotient) =
+            binary(BinaryOp::Div, Value::Vector(left), Value::Vector(right))
+        else {
+            panic!("vector arithmetic is a vector");
+        };
+        assert_eq!(quotient.samples, vec![(labelled(&[("pod", "1")]), 2.0)]);
     }
 
     fn value_for(vector: &InstantVector, app: &str) -> Option<f64> {
