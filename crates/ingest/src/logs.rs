@@ -136,6 +136,9 @@ pub struct DecodeContext<'a> {
     pub ingest: &'a IngestConfig,
     /// Used when a record carries no usable timestamp of its own.
     pub now_nanos: u64,
+    /// The memory requests in flight share, which decoding draws from. `None` decodes
+    /// against this request's own budget alone.
+    pub pool: Option<&'a std::sync::Arc<crate::pool::MemoryPool>>,
 }
 
 /// Decode an `ExportLogsServiceRequest`.
@@ -157,7 +160,7 @@ pub fn decode(
 /// Every limit, rejection reason and counter lives below this line, which is what stops
 /// the two encodings drifting: there is one conversion, not one per encoding.
 pub fn convert_data(data: &LogsData, ctx: DecodeContext<'_>) -> Decoded<LogRecord> {
-    let mut decoded = Decoded::bounded(ctx.limits);
+    let mut decoded = Decoded::bounded(ctx.limits).drawing_from(ctx.pool);
 
     for resource_logs in &data.resource_logs {
         let mut resource_labels = Labels::new();
@@ -367,6 +370,7 @@ mod tests {
 
     fn ctx<'a>(limits: &'a LimitsConfig, ingest: &'a IngestConfig) -> DecodeContext<'a> {
         DecodeContext {
+            pool: None,
             limits,
             ingest,
             now_nanos: NOW,

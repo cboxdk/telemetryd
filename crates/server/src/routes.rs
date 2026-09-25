@@ -104,6 +104,10 @@ pub struct LimitsStatus {
     pub when_series_full: &'static str,
     pub max_log_line_bytes: u64,
     pub ingest_queue_depth: u32,
+    /// After `0` was resolved: what ingest requests in flight may hold between them.
+    pub ingest_memory_bytes: u64,
+    /// What they hold now.
+    pub ingest_memory_in_use_bytes: u64,
     /// After `0` was resolved. An operator who set `0` cannot read the number in force
     /// off the configuration file, and this is where they look instead.
     pub query_concurrency: usize,
@@ -195,6 +199,8 @@ pub async fn status(State(state): State<AppState>) -> Result<Response, ApiError>
                 },
                 max_log_line_bytes: config.limits.max_log_line_bytes.as_u64(),
                 ingest_queue_depth: config.limits.ingest_queue_depth,
+                ingest_memory_bytes: state.ingest_memory.capacity() as u64,
+                ingest_memory_in_use_bytes: state.ingest_memory.in_use() as u64,
                 query_concurrency: state.query_concurrency(),
                 export_concurrency: state.export_concurrency(),
             },

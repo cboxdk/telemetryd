@@ -126,6 +126,7 @@ max_log_line_bytes      = "256KiB"
 max_attrs_per_record    = 128
 max_decoded_bytes       = "128MiB"   # most one ingest request may expand to once decoded → 413
 ingest_queue_depth      = 8192       # backpressure: full queue → 429 with Retry-After
+ingest_memory           = 0          # bytes ingest in flight may hold → 429 with Retry-After; 0 = derive
 query_concurrency       = 0          # reads at once; 0 = derive from the memory limit
 export_concurrency      = 0          # exports at once; 0 = derive (one costs ~25 queries)
 

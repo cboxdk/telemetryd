@@ -14,6 +14,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = telemetryd_ingest::remote_write::decode(
         data,
         WriteContext {
+            pool: None,
             limits: &limits,
             default_app: "fuzz",
             // The server's default. A fuzzer that hands the decoder an unbounded

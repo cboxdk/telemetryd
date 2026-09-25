@@ -51,6 +51,9 @@ pub struct AppState {
     /// excess would be the unbounded buffering the setting exists to prevent, just
     /// moved somewhere less visible.
     ingest_permits: Arc<Semaphore>,
+    /// The memory ingest requests in flight hold between them. See
+    /// [`telemetryd_ingest::pool`].
+    pub ingest_memory: Arc<telemetryd_ingest::pool::MemoryPool>,
     /// The read side's equivalent of `ingest_permits`, and separate from it: a burst of
     /// dashboards must not be able to shut out writes, and a write burst must not close
     /// the API you would use to look at it.
@@ -233,6 +236,12 @@ impl AppState {
             usize::try_from(config.limits.resolved_query_concurrency()).unwrap_or(64);
         let export_concurrency =
             usize::try_from(config.limits.resolved_export_concurrency()).unwrap_or(4);
+        let ingest_memory = usize::try_from(
+            config
+                .limits
+                .resolved_ingest_memory(config.server.max_body_bytes.as_u64()),
+        )
+        .unwrap_or(usize::MAX);
         let oidc = Arc::new(crate::oidc::Oidc::new(config.auth.oidc.clone()));
 
         let credentials = Arc::new(std::sync::RwLock::new(Arc::new(Credentials::resolve(
@@ -253,6 +262,7 @@ impl AppState {
             started: Instant::now(),
             started_at: OffsetDateTime::now_utc(),
             ingest_permits: Arc::new(Semaphore::new(queue_depth)),
+            ingest_memory: telemetryd_ingest::pool::MemoryPool::new(ingest_memory),
             query_permits: Arc::new(Semaphore::new(query_concurrency)),
             export_permits: Arc::new(Semaphore::new(export_concurrency)),
             query_concurrency,

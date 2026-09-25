@@ -769,6 +769,15 @@ pub struct LimitsConfig {
     /// Backpressure threshold: a full queue returns 429 with `Retry-After` rather than
     /// buffering without bound.
     pub ingest_queue_depth: u32,
+    /// Memory ingest requests in flight may hold between them — bodies, decompressed
+    /// bodies and decoded records. `0` sizes it from the memory this process is allowed
+    /// to use.
+    ///
+    /// The queue depth counts requests and `max_decoded_bytes` bounds one; neither
+    /// bounds their product. Past this a request is refused with `429` and
+    /// `Retry-After`. Never less than one request of the largest size the other limits
+    /// allow, so a refusal is always a wait.
+    pub ingest_memory: ByteSize,
 
     /// Read requests that may run at once. `0` sizes it from the memory this process is
     /// allowed to use.
@@ -812,6 +821,7 @@ impl Default for LimitsConfig {
             max_attrs_per_record: 128,
             max_decoded_bytes: ByteSize::mib(128),
             ingest_queue_depth: 8192,
+            ingest_memory: ByteSize::b(0),
             query_concurrency: 0,
             export_concurrency: 0,
         }
@@ -884,6 +894,13 @@ const EXPORT_COST_BYTES: u64 = 160 * 1024 * 1024;
 /// have read that as continuing pressure, which is one of the reasons this is decided
 /// once at startup instead.
 const READ_BUDGET_FRACTION: u64 = 4;
+
+/// Share of the memory limit ingest requests in flight may hold between them.
+///
+/// A quarter, like the read side's: the write buffer, the resident manifests and the
+/// series tracker take the rest, and a burst of large batches is transient in the same
+/// way a burst of queries is.
+const INGEST_BUDGET_FRACTION: u64 = 4;
 
 /// What one counted series costs the process, all in.
 ///
@@ -991,6 +1008,24 @@ impl LimitsConfig {
             return self.max_series_per_app;
         }
         self.resolved_max_series()
+    }
+
+    /// The memory ingest requests in flight may hold, resolving `0`.
+    ///
+    /// Never below what one request of the largest size may hold — its body twice,
+    /// compressed and not, and its records — or a batch the other limits accept would be
+    /// refused for good.
+    #[must_use]
+    pub fn resolved_ingest_memory(&self, max_body_bytes: u64) -> u64 {
+        let one_request = max_body_bytes
+            .saturating_mul(2)
+            .saturating_add(self.max_decoded_bytes.as_u64());
+        let wanted = if self.ingest_memory.as_u64() == 0 {
+            memory_limit_bytes() / INGEST_BUDGET_FRACTION
+        } else {
+            self.ingest_memory.as_u64()
+        };
+        wanted.max(one_request)
     }
 
     /// The number of concurrent queries in force, resolving `0`.

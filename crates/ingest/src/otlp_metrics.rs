@@ -150,6 +150,8 @@ pub struct MetricContext<'a> {
     pub limits: &'a LimitsConfig,
     pub ingest: &'a IngestConfig,
     pub now_nanos: u64,
+    /// The memory requests in flight share, which decoding draws from.
+    pub pool: Option<&'a std::sync::Arc<crate::pool::MemoryPool>>,
 }
 
 /// Rewrite an OTLP metric name into a valid Prometheus name.
@@ -254,7 +256,7 @@ pub fn decode(
 
 /// Convert an already-parsed payload. See [`crate::logs::convert_data`] for why.
 pub fn convert_data(data: &MetricsData, ctx: MetricContext<'_>) -> Decoded<MetricSample> {
-    let mut decoded = Decoded::bounded(ctx.limits);
+    let mut decoded = Decoded::bounded(ctx.limits).drawing_from(ctx.pool);
 
     for resource_metrics in &data.resource_metrics {
         let mut resource_labels = Labels::new();
@@ -538,6 +540,7 @@ mod tests {
         decode(
             json.as_bytes(),
             MetricContext {
+                pool: None,
                 limits: &limits,
                 ingest: &ingest,
                 now_nanos: NOW,
@@ -797,6 +800,7 @@ mod tests {
         let limits = LimitsConfig::default();
         let ingest = IngestConfig::default();
         let ctx = MetricContext {
+            pool: None,
             limits: &limits,
             ingest: &ingest,
             now_nanos: 1_750_000_000_000_000_000,

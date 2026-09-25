@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 
 use axum::Json;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -175,7 +175,7 @@ pub async fn otlp_logs(
     State(state): State<AppState>,
     identity: Option<axum::Extension<ClientIdentity>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, ApiError> {
     let identity = identity.map(|axum::Extension(identity)| identity);
     // Bound concurrent ingest. A rejected request is a signal the producer can act on
@@ -189,14 +189,16 @@ pub async fn otlp_logs(
         return Err(telemetryd_core::Error::Overloaded.into());
     };
 
+    let (body, mut held) = receive(&state, &headers, body, "logs").await?;
     let encoding = encoding(&headers);
-    let body = decompress(&state, &headers, &body, "logs", &[])?;
+    let body = decompress(&state, &headers, &body, "logs", &[], &mut held)?;
 
     let mut decoded = {
         let limits = state.config.limits.clone();
         let ingest = state.config.ingest.clone();
         let now = telemetryd_store::now_nanos();
         let ctx = DecodeContext {
+            pool: Some(&state.ingest_memory),
             limits: &limits,
             ingest: &ingest,
             now_nanos: now,
@@ -250,7 +252,7 @@ pub async fn otlp_logs(
         state.publish_tail(&decoded.records);
 
         let store = std::sync::Arc::clone(&state.store);
-        let records = decoded.records.clone();
+        let records = std::mem::take(&mut decoded.records);
 
         // The store is synchronous and fsyncs; running it on the async runtime would
         // stall every other connection on this worker.
@@ -297,7 +299,7 @@ pub async fn otlp_traces(
     State(state): State<AppState>,
     identity: Option<axum::Extension<ClientIdentity>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, ApiError> {
     let identity = identity.map(|axum::Extension(identity)| identity);
     // Bound concurrent ingest. A rejected request is a signal the producer can act on
@@ -311,14 +313,18 @@ pub async fn otlp_traces(
         return Err(telemetryd_core::Error::Overloaded.into());
     };
 
+    let (body, mut held) = receive(&state, &headers, body, "traces").await?;
     let encoding = encoding(&headers);
-    let body = decompress(&state, &headers, &body, "traces", &[])?;
+    let body = decompress(&state, &headers, &body, "traces", &[], &mut held)?;
 
     let mut decoded = {
         let limits = state.config.limits.clone();
         let ingest = state.config.ingest.clone();
         let now = telemetryd_store::now_nanos();
-        let ctx = traces::context(&limits, &ingest, now);
+        let ctx = DecodeContext {
+            pool: Some(&state.ingest_memory),
+            ..traces::context(&limits, &ingest, now)
+        };
         match encoding {
             Wire::Protobuf => telemetryd_ingest::otlp_protobuf::traces(&body)
                 .map(|data| traces::convert_data(&data, ctx))
@@ -351,7 +357,7 @@ pub async fn otlp_traces(
 
     if !decoded.records.is_empty() {
         let store = std::sync::Arc::clone(&state.store);
-        let records = decoded.records.clone();
+        let records = std::mem::take(&mut decoded.records);
 
         let admitted = crate::fatal::storage(
             tokio::task::spawn_blocking(move || store.append_spans(&records)).await,
@@ -396,7 +402,7 @@ pub async fn otlp_metrics(
     State(state): State<AppState>,
     identity: Option<axum::Extension<ClientIdentity>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, ApiError> {
     let identity = identity.map(|axum::Extension(identity)| identity);
     // Bound concurrent ingest. A rejected request is a signal the producer can act on
@@ -410,14 +416,16 @@ pub async fn otlp_metrics(
         return Err(telemetryd_core::Error::Overloaded.into());
     };
 
+    let (body, mut held) = receive(&state, &headers, body, "metrics").await?;
     let encoding = encoding(&headers);
-    let body = decompress(&state, &headers, &body, "metrics", &[])?;
+    let body = decompress(&state, &headers, &body, "metrics", &[], &mut held)?;
 
     let decoded = {
         let limits = state.config.limits.clone();
         let ingest = state.config.ingest.clone();
         let now = telemetryd_store::now_nanos();
         let ctx = otlp_metrics::MetricContext {
+            pool: Some(&state.ingest_memory),
             limits: &limits,
             ingest: &ingest,
             now_nanos: now,
@@ -454,7 +462,7 @@ pub async fn remote_write(
     State(state): State<AppState>,
     identity: Option<axum::Extension<ClientIdentity>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, ApiError> {
     let identity = identity.map(|axum::Extension(identity)| identity);
     if is_remote_write_v2(&headers) {
@@ -477,31 +485,37 @@ pub async fn remote_write(
             "telemetryd_ingest_rejected_total",
             &[("signal", "metrics"), ("reason", "queue_full")],
         );
-        // 503 where OTLP gets 429. Prometheus retries a 429 only when
-        // `retry_on_http_429` is set, and otherwise drops the samples as if they were
-        // malformed; every 5xx is retried. The same `Retry-After` rides along.
-        let mut busy = ApiError::from(telemetryd_core::Error::Overloaded).into_response();
-        *busy.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
-        return Ok(busy);
+        return Ok(remote_write_answer(
+            telemetryd_core::Error::Overloaded.into(),
+        ));
     };
 
     // Prometheus sends `Content-Encoding: snappy`, and that snappy is the payload's
     // own framing rather than a transport coding — `remote_write::decode` owns it. So
     // it passes through here untouched, while a gzip added by a proxy in front of us
     // is still undone.
-    let body = decompress(
+    let (body, mut held) = match receive(&state, &headers, body, "metrics").await {
+        Ok(received) => received,
+        Err(error) => return Ok(remote_write_answer(error)),
+    };
+    let body = match decompress(
         &state,
         &headers,
         &body,
         "metrics",
         compression::REMOTE_WRITE_PASSTHROUGH,
-    )?;
+        &mut held,
+    ) {
+        Ok(body) => body,
+        Err(error) => return Ok(remote_write_answer(error)),
+    };
 
     let decoded = {
         let limits = state.config.limits.clone();
         remote_write::decode(
             &body,
             remote_write::WriteContext {
+                pool: Some(&state.ingest_memory),
                 limits: &limits,
                 default_app: telemetryd_core::record::UNKNOWN_APP,
                 max_decompressed: usize::try_from(state.config.server.max_body_bytes.as_u64())
@@ -574,7 +588,7 @@ async fn store_samples(
     let mut stored = 0;
     if !decoded.records.is_empty() {
         let store = std::sync::Arc::clone(&state.store);
-        let records = decoded.records.clone();
+        let records = std::mem::take(&mut decoded.records);
 
         let admitted = crate::fatal::storage(
             tokio::task::spawn_blocking(move || store.append_samples(&records)).await,
@@ -632,6 +646,69 @@ struct StoredSamples {
     summary: Option<String>,
 }
 
+/// Read a request's body, having first held its size in the ingest memory pool.
+///
+/// The body used to be read by the extractor, in full, before the handler ran — so
+/// before the queue was consulted, and before anything counted what it held. Held first,
+/// a body that arrives while the pool is empty never reaches memory at one; one sent
+/// without a length is held at the most it may be.
+async fn receive(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: Body,
+    signal: &'static str,
+) -> Result<(Bytes, telemetryd_ingest::pool::Reservation), ApiError> {
+    let max_body =
+        usize::try_from(state.config.server.max_body_bytes.as_u64()).unwrap_or(usize::MAX);
+    let expected = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok()?.parse::<usize>().ok())
+        .map_or(max_body, |length| length.min(max_body));
+    // Never more than the pool holds: it is sized to fit the largest body and all it
+    // may become, so this is only ever a wait.
+    let Some(held) = state.ingest_memory.reserve(expected) else {
+        reject(state, signal, "memory_full");
+        return Err(telemetryd_core::Error::Overloaded.into());
+    };
+    let body = axum::body::to_bytes(body, max_body)
+        .await
+        .map_err(|error| {
+            let too_long = std::iter::successors(
+                Some(&error as &(dyn std::error::Error + 'static)),
+                |error| error.source(),
+            )
+            .any(<dyn std::error::Error>::is::<http_body_util::LengthLimitError>);
+            if too_long {
+                reject(state, signal, "body_too_large");
+                ApiError::from(Error::LimitExceeded {
+                    limit: "server.max_body_bytes",
+                    detail: format!(
+                        "this request body is larger than {}; send smaller batches",
+                        state.config.server.max_body_bytes
+                    ),
+                })
+            } else {
+                ApiError::from(Error::BadRequest(format!(
+                    "the request body could not be read: {error}"
+                )))
+            }
+        })?;
+    Ok((body, held))
+}
+
+/// A refusal as Prometheus's remote_write sender needs it.
+///
+/// 503 where OTLP gets 429: Prometheus retries a 429 only when `retry_on_http_429` is
+/// set, and otherwise drops the samples as if they were malformed; every 5xx is retried.
+/// The same `Retry-After` rides along. Anything else is answered as it would be anywhere.
+fn remote_write_answer(error: ApiError) -> Response {
+    let mut response = error.into_response();
+    if response.status() == StatusCode::TOO_MANY_REQUESTS {
+        *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+    }
+    response
+}
+
 /// Undo `Content-Encoding` before the body reaches a decoder.
 ///
 /// OTLP/HTTP makes gzip part of the specification, and every OpenTelemetry SDK
@@ -650,6 +727,7 @@ fn decompress<'a>(
     body: &'a Bytes,
     signal: &'static str,
     already_handled: &[&str],
+    held: &mut telemetryd_ingest::pool::Reservation,
 ) -> Result<Cow<'a, [u8]>, ApiError> {
     let Some(value) = headers.get(header::CONTENT_ENCODING) else {
         return Ok(Cow::Borrowed(body));
@@ -680,6 +758,12 @@ fn decompress<'a>(
     })?;
 
     if let Cow::Owned(bytes) = &decoded {
+        // Held once it exists. The copy is at most `max_body_bytes`, so what this lets
+        // through unheld is bounded by the requests reading at once.
+        if !held.grow(bytes.len()) {
+            reject(state, signal, "memory_full");
+            return Err(telemetryd_core::Error::Overloaded.into());
+        }
         tracing::debug!(
             signal,
             encoding = encoding.as_str(),
@@ -701,6 +785,10 @@ fn within_budget<T>(
     signal: &'static str,
     decoded: &telemetryd_ingest::Decoded<T>,
 ) -> Result<(), Error> {
+    if decoded.starved() {
+        reject(state, signal, "memory_full");
+        return Err(telemetryd_core::Error::Overloaded);
+    }
     if !decoded.over_budget() {
         return Ok(());
     }

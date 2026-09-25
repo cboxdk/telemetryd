@@ -33,6 +33,8 @@ pub struct WriteContext<'a> {
     /// so the transport layer passes it through — which means this is the only place
     /// its expansion can be bounded.
     pub max_decompressed: usize,
+    /// The memory requests in flight share, which decoding draws from.
+    pub pool: Option<&'a std::sync::Arc<crate::pool::MemoryPool>>,
 }
 
 /// Decompress and decode a `remote_write` request.
@@ -71,7 +73,7 @@ pub fn decode(compressed: &[u8], ctx: WriteContext<'_>) -> Result<Decoded<Metric
         }
     };
 
-    let mut decoded = Decoded::bounded(ctx.limits);
+    let mut decoded = Decoded::bounded(ctx.limits).drawing_from(ctx.pool);
     let mut reader = Reader::new(&decompressed);
 
     while let Some((field, wire)) = reader.next_field()? {
@@ -327,6 +329,7 @@ mod tests {
         decode(
             payload,
             WriteContext {
+                pool: None,
                 limits: &limits,
                 default_app: "unknown",
                 max_decompressed: 16 * 1024 * 1024,
@@ -464,6 +467,7 @@ mod tests {
         let decoded = decode(
             &payload,
             WriteContext {
+                pool: None,
                 limits: &limits,
                 default_app: "unknown",
                 max_decompressed: 16 * 1024 * 1024,
@@ -492,6 +496,7 @@ mod tests {
         let outcome = decode(
             &payload,
             WriteContext {
+                pool: None,
                 limits: &limits,
                 default_app: "test",
                 max_decompressed: 16 * 1024 * 1024,
@@ -554,6 +559,7 @@ mod tests {
             let result = decode(
                 &payload,
                 WriteContext {
+                    pool: None,
                     limits: &limits,
                     default_app: "unknown",
                     max_decompressed: 16 * 1024 * 1024,

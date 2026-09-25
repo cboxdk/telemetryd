@@ -101,7 +101,7 @@ pub fn decode(
 
 /// Convert an already-parsed payload. See [`crate::logs::convert_data`] for why.
 pub fn convert_data(data: &TracesData, ctx: DecodeContext<'_>) -> Decoded<SpanRecord> {
-    let mut decoded = Decoded::bounded(ctx.limits);
+    let mut decoded = Decoded::bounded(ctx.limits).drawing_from(ctx.pool);
 
     for resource_spans in &data.resource_spans {
         let mut resource_labels = Labels::new();
@@ -325,6 +325,7 @@ pub fn context<'a>(
     now_nanos: u64,
 ) -> DecodeContext<'a> {
     DecodeContext {
+        pool: None,
         limits,
         ingest,
         now_nanos,

@@ -22,6 +22,7 @@ pub mod otlp;
 pub mod otlp_encode;
 pub mod otlp_metrics;
 pub mod otlp_protobuf;
+pub mod pool;
 pub mod protobuf;
 pub mod remote_read;
 pub mod remote_write;
@@ -112,6 +113,11 @@ pub struct Decoded<T> {
     budget: usize,
     /// What it has expanded to so far.
     used: usize,
+    /// What `used` is drawn from, shared with every other request in flight.
+    reservation: Option<pool::Reservation>,
+    /// Set when the shared pool could not cover a record, though this request's own
+    /// budget could: the server is busy, not the request too big.
+    starved: bool,
 }
 
 impl<T> Default for Decoded<T> {
@@ -123,9 +129,15 @@ impl<T> Default for Decoded<T> {
             truncated_bodies: 0,
             budget: usize::MAX,
             used: 0,
+            reservation: None,
+            starved: false,
         }
     }
 }
+
+/// How much is taken from the shared pool at a time while decoding. Large enough that
+/// a request takes a handful of steps, small enough that a small one takes little.
+const RESERVE_STEP: usize = 256 * 1024;
 
 /// Refuse a JSON body that would parse into far more than it is.
 ///
@@ -210,6 +222,14 @@ impl<T> Decoded<T> {
         }
     }
 
+    /// Draw what this request decodes to from `pool`, shared with every other request
+    /// in flight. See [`pool`].
+    #[must_use]
+    pub fn drawing_from(mut self, pool: Option<&std::sync::Arc<pool::MemoryPool>>) -> Self {
+        self.reservation = pool.and_then(|pool| pool.reserve(0));
+        self
+    }
+
     /// Keep a decoded record, unless the request has outgrown its budget.
     ///
     /// Past the budget records are dropped as they are produced rather than collected and
@@ -234,8 +254,31 @@ impl<T> Decoded<T> {
     }
 
     fn charge(&mut self, bytes: usize) -> bool {
+        if self.starved {
+            return false;
+        }
         self.used = self.used.saturating_add(bytes);
-        self.used <= self.budget
+        if self.used > self.budget {
+            return false;
+        }
+        if let Some(reservation) = &mut self.reservation
+            && self.used > reservation.bytes()
+        {
+            let step = (self.used - reservation.bytes()).max(RESERVE_STEP);
+            if !reservation.grow(step) && !reservation.grow(self.used - reservation.bytes()) {
+                self.starved = true;
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether decoding stopped because the memory shared by requests in flight ran
+    /// out. What was kept is incomplete; the request is to be refused with a status
+    /// that says to retry.
+    #[must_use]
+    pub fn starved(&self) -> bool {
+        self.starved
     }
 
     /// Whether the request decoded to more than it may hold.

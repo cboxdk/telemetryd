@@ -28,6 +28,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = telemetryd_ingest::logs::convert_data(
             &payload,
             DecodeContext {
+                pool: None,
                 limits: &limits,
                 ingest: &ingest,
                 now_nanos: now,
@@ -39,6 +40,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = telemetryd_ingest::traces::convert_data(
             &payload,
             DecodeContext {
+                pool: None,
                 limits: &limits,
                 ingest: &ingest,
                 now_nanos: now,
@@ -50,6 +52,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = telemetryd_ingest::otlp_metrics::convert_data(
             &payload,
             MetricContext {
+                pool: None,
                 limits: &limits,
                 ingest: &ingest,
                 now_nanos: now,

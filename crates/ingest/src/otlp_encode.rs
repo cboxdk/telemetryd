@@ -510,6 +510,7 @@ mod tests {
         let decoded = crate::logs::decode(
             &body,
             crate::logs::DecodeContext {
+                pool: None,
                 limits: &limits,
                 ingest: &ingest,
                 now_nanos: 0,
@@ -566,6 +567,7 @@ mod tests {
         let decoded = crate::traces::decode(
             &body,
             crate::logs::DecodeContext {
+                pool: None,
                 limits: &limits,
                 ingest: &ingest,
                 now_nanos: 0,

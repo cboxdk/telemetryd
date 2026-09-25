@@ -902,6 +902,7 @@ mod equivalence {
 
         let (limits, ingest) = context();
         let ctx = DecodeContext {
+            pool: None,
             limits: &limits,
             ingest: &ingest,
             now_nanos: timestamp,
@@ -997,6 +998,7 @@ mod equivalence {
         let decoded = crate::logs::convert_data(
             &logs(&wire).unwrap(),
             DecodeContext {
+                pool: None,
                 limits: &limits,
                 ingest: &ingest,
                 now_nanos: timestamp,
@@ -1052,6 +1054,7 @@ mod equivalence {
         let decoded = crate::otlp_metrics::convert_data(
             &data,
             crate::otlp_metrics::MetricContext {
+                pool: None,
                 limits: &limits,
                 ingest: &ingest,
                 now_nanos: 1,

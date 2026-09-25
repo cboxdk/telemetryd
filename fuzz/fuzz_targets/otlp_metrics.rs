@@ -15,6 +15,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = telemetryd_ingest::otlp_metrics::decode(
         data,
         telemetryd_ingest::otlp_metrics::MetricContext {
+            pool: None,
             limits: &limits,
             ingest: &ingest,
             now_nanos: 1_760_000_000_000_000_000,
