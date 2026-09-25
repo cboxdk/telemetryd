@@ -99,6 +99,25 @@ is a `500` for that request rather than an outage; work that changes what is sto
 still stops the process on a panic, on purpose, so the write-ahead log restores a
 consistent store on restart.
 
+**A request is bounded by what it becomes, not what it is.** The body limit bounds
+what arrives. Before this, a few kilobytes could expand past the machine: resource
+attributes are copied into every record they describe (73 KB decoded to 138 MB), a
+histogram bucket carries its own copy of the series' labels (108 KB to 216 MB), and a
+rejected `remote_write` series left a message per sample (106 KB to 346 MB, answered
+`204`). Every ingest route now charges records and rejections as it decodes, against
+`limits.max_decoded_bytes`, and refuses the whole request with `413` past it. The parse
+before that is charged too — protobuf in bytes for the whole request rather than a
+count per parent field, JSON by a one-pass object count — because an empty record is
+two or three bytes on the wire and a few hundred once parsed.
+
+The read side got the same treatment. A query's regular expressions are bounded in
+size and number; Tempo search reads the newest 100,000 spans instead of every span in
+the window; a range query's answer is bounded like its read; the parallel scan checks
+the sample ceiling it used to skip; `/debug` takes a query slot; a made-up HTTP method
+is counted as `other` instead of becoming a series in `/metrics`; and a read keeps its
+query slot until it finishes, so a timed-out request no longer frees its slot while its
+scan runs on.
+
 **One query has a ceiling.** A PromQL read that holds its window keeps every sample of
 every matching series resident at once, and neither `limit` nor the series cap bounded it
 — measured at roughly 850 MB for a single query against weeks of high-cardinality metrics,

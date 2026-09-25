@@ -118,6 +118,7 @@ max_label_name_bytes    = 128
 max_label_value_bytes   = 2048
 max_log_line_bytes      = "256KiB"
 max_attrs_per_record    = 128
+max_decoded_bytes       = "128MiB"   # most one ingest request may expand to once decoded → 413
 ingest_queue_depth      = 8192       # backpressure: full queue → 429 with Retry-After
 query_concurrency       = 0          # reads at once; 0 = derive from the memory limit
 export_concurrency      = 0          # exports at once; 0 = derive (one costs ~25 queries)
@@ -382,7 +383,7 @@ Security:
   ingest       token required
   query        token required
   admin        token required
-  identity     open on / and /status: telemetryd 0.56.0, storage format 1,
+  identity     open on / and /status: telemetryd 0.57.0, storage format 1,
                three signals. Never the deployment. Not a setting.
 ```
 
