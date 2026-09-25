@@ -76,10 +76,13 @@ impl Maintenance {
                 // The sweep walks every counted series under a write lock, which blocks
                 // ingest for as long as it takes. Off the async workers, like every other
                 // store call.
-                match tokio::task::spawn_blocking(move || store.reclaim_idle_series()).await {
+                match crate::fatal::storage(
+                    tokio::task::spawn_blocking(move || store.reclaim_idle_series()).await,
+                    "reclaiming idle series",
+                ) {
                     Ok(0) => {}
                     Ok(freed) => tracing::debug!(freed, "reclaimed idle series"),
-                    Err(e) => tracing::error!(error = %e, "series reclaim task panicked"),
+                    Err(e) => tracing::error!(error = %e, "series reclaim did not finish"),
                 }
             }
         }));
@@ -99,15 +102,17 @@ impl Maintenance {
                 ticker.tick().await;
                 let store = Arc::clone(&store);
                 // Reading segments is blocking file I/O, like every other store call.
-                match tokio::task::spawn_blocking(move || {
-                    store.backfill_metric_folds(FOLD_BACKFILL_PER_TICK)
-                })
-                .await
-                {
+                match crate::fatal::storage(
+                    tokio::task::spawn_blocking(move || {
+                        store.backfill_metric_folds(FOLD_BACKFILL_PER_TICK)
+                    })
+                    .await,
+                    "summarising older segments",
+                ) {
                     Ok(Ok(0)) => {}
                     Ok(Ok(written)) => tracing::debug!(written, "summarised older segments"),
                     Ok(Err(e)) => tracing::warn!(error = %e, "could not summarise a segment"),
-                    Err(e) => tracing::error!(error = %e, "fold backfill task panicked"),
+                    Err(e) => tracing::error!(error = %e, "fold backfill did not finish"),
                 }
             }
         }));
@@ -145,24 +150,29 @@ impl Maintenance {
                 // Deleting it would lose telemetry that never reached anywhere,
                 // and nothing downstream would ever know it existed.
                 let protected = reaper_relay.clone();
-                let result = tokio::task::spawn_blocking(move || match protected {
-                    Some(relay) => {
-                        let mut ids = std::collections::BTreeSet::new();
-                        for signal in [
-                            telemetryd_core::Signal::Logs,
-                            telemetryd_core::Signal::Traces,
-                            telemetryd_core::Signal::Metrics,
-                        ] {
-                            ids.extend(relay.undelivered(&store, signal));
+                let result = crate::fatal::storage(
+                    tokio::task::spawn_blocking(move || match protected {
+                        Some(relay) => {
+                            let mut ids = std::collections::BTreeSet::new();
+                            for signal in [
+                                telemetryd_core::Signal::Logs,
+                                telemetryd_core::Signal::Traces,
+                                telemetryd_core::Signal::Metrics,
+                            ] {
+                                ids.extend(relay.undelivered(&store, signal));
+                            }
+                            store.run_retention_protecting(
+                                telemetryd_store::retention::Undelivered {
+                                    ids: Some(&ids),
+                                    drop_when_full: relay.drops_when_full(),
+                                },
+                            )
                         }
-                        store.run_retention_protecting(telemetryd_store::retention::Undelivered {
-                            ids: Some(&ids),
-                            drop_when_full: relay.drops_when_full(),
-                        })
-                    }
-                    None => store.run_retention(),
-                })
-                .await;
+                        None => store.run_retention(),
+                    })
+                    .await,
+                    "running retention",
+                );
                 match result {
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => tracing::error!(error = %e, "retention pass failed"),
@@ -207,7 +217,10 @@ impl Maintenance {
                 // pull against each other, and a busy relay would fall behind with no
                 // way back.
                 let batch = if saturated >= 2 { 256 } else { 32 };
-                let result = tokio::task::spawn_blocking(move || relay.ship(&store, batch)).await;
+                let result = crate::fatal::storage(
+                    tokio::task::spawn_blocking(move || relay.ship(&store, batch)).await,
+                    "relaying records",
+                );
                 match result {
                     Ok(Ok(0)) => saturated = 0,
                     Ok(Ok(shipped)) => {
@@ -284,7 +297,10 @@ impl Maintenance {
                 loop {
                     ticker.tick().await;
                     let store = Arc::clone(&store);
-                    let result = tokio::task::spawn_blocking(move || store.maybe_sync()).await;
+                    let result = crate::fatal::storage(
+                        tokio::task::spawn_blocking(move || store.maybe_sync()).await,
+                        "syncing the write-ahead log",
+                    );
                     if let Ok(Err(e)) = result {
                         tracing::warn!(error = %e, "background write-ahead log sync failed");
                     }
@@ -301,7 +317,10 @@ impl Maintenance {
                 loop {
                     ticker.tick().await;
                     let store = Arc::clone(&store);
-                    let result = tokio::task::spawn_blocking(move || store.maybe_seal()).await;
+                    let result = crate::fatal::storage(
+                        tokio::task::spawn_blocking(move || store.maybe_seal()).await,
+                        "sealing a segment",
+                    );
                     if let Ok(Err(e)) = result {
                         // Sealing failing is serious but not fatal: the records are
                         // still in the WAL and still queryable from the buffer.

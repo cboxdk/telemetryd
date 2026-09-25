@@ -188,9 +188,10 @@ pub async fn otlp_logs(
 
         // The store is synchronous and fsyncs; running it on the async runtime would
         // stall every other connection on this worker.
-        let admitted = tokio::task::spawn_blocking(move || store.append_logs(&records))
-            .await
-            .map_err(|e| Error::Config(format!("ingest task panicked: {e}")))??;
+        let admitted = crate::fatal::storage(
+            tokio::task::spawn_blocking(move || store.append_logs(&records)).await,
+            "appending logs",
+        )??;
         decoded.note_series_rejections(admitted.rejected, admitted.reason);
 
         // Counted here, after the store has spoken, rather than before it.
@@ -284,9 +285,10 @@ pub async fn otlp_traces(
         let store = std::sync::Arc::clone(&state.store);
         let records = decoded.records.clone();
 
-        let admitted = tokio::task::spawn_blocking(move || store.append_spans(&records))
-            .await
-            .map_err(|e| Error::Config(format!("ingest task panicked: {e}")))??;
+        let admitted = crate::fatal::storage(
+            tokio::task::spawn_blocking(move || store.append_spans(&records)).await,
+            "appending spans",
+        )??;
         decoded.note_series_rejections(admitted.rejected, admitted.reason);
 
         // Counted here, after the store has spoken, rather than before it.
@@ -458,9 +460,10 @@ async fn store_samples(
         let store = std::sync::Arc::clone(&state.store);
         let records = decoded.records.clone();
 
-        let admitted = tokio::task::spawn_blocking(move || store.append_samples(&records))
-            .await
-            .map_err(|e| Error::Config(format!("ingest task panicked: {e}")))??;
+        let admitted = crate::fatal::storage(
+            tokio::task::spawn_blocking(move || store.append_samples(&records)).await,
+            "appending metric samples",
+        )??;
         decoded.note_series_rejections(admitted.rejected, admitted.reason);
 
         // Counted here, after the store has spoken, rather than before it.

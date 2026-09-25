@@ -128,7 +128,11 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
-panic = "abort"
+# Unwind, not abort. A panic in a request handler becomes a 500 for that request through
+# `CatchPanicLayer`; with abort it ended the process for every client, and a single
+# malformed query parameter was enough. Storage work is the exception and still stops the
+# process on a panic, deliberately, in `telemetryd_server::fatal`.
+panic = "unwind"
 
 [profile.dist]
 inherits = "release"
