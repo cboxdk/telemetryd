@@ -165,6 +165,30 @@ pub fn parse_time(raw: &str) -> Result<u64> {
     crate::loki::parse_time(raw)
 }
 
+/// The instants a range query is evaluated at: `start`, then every `step` up to `end`.
+///
+/// Computed once and used by both the load and the step loop, so they cannot disagree —
+/// that disagreement once indexed past the end of an array and took the server down.
+/// Each instant is `start + i·step` rather than a running sum: a step near `u64::MAX`
+/// used to wrap the running sum back below `end`, and the loop then counted down one
+/// nanosecond at a time until memory ran out. And the grid is Prometheus's own: it stops
+/// at the last step that fits, rather than adding an extra point at an unaligned `end`.
+fn step_grid(start: u64, end: u64, step_nanos: u64) -> Result<Vec<u64>> {
+    let intervals = (end - start) / step_nanos.max(1);
+    let steps = usize::try_from(intervals)
+        .ok()
+        .and_then(|n| n.checked_add(1))
+        .filter(|n| *n <= MAX_STEPS)
+        .ok_or_else(|| {
+            Error::BadRequest(format!(
+                "that range and step would need {} points per series; the limit is \
+                 {MAX_STEPS}. Widen `step` or narrow the range.",
+                intervals.saturating_add(1)
+            ))
+        })?;
+    Ok((0..steps as u64).map(|i| start + i * step_nanos).collect())
+}
+
 /// `step` is seconds, or a duration string.
 pub fn parse_step(raw: &str) -> Result<Duration> {
     let raw = raw.trim();
@@ -174,7 +198,11 @@ pub fn parse_step(raw: &str) -> Result<Duration> {
                 "`step` must be a positive number of seconds".to_owned(),
             ));
         }
-        return Ok(Duration::from_secs_f64(seconds));
+        // `try_`, not the plain form: `step=1e300` is a finite positive number and the
+        // plain conversion panics on it, which in a release build ends the process.
+        return Duration::try_from_secs_f64(seconds).map_err(|_| {
+            Error::BadRequest(format!("`step` of {raw} seconds is too large to represent"))
+        });
     }
     match crate::lexer::tokenize(raw)?.first().map(|s| &s.token) {
         Some(crate::lexer::Token::Duration(nanos)) if *nanos > 0 => {
@@ -262,27 +290,7 @@ pub fn range(
         None => Duration::from_secs(60),
     };
     let step_nanos = u64::try_from(step.as_nanos()).unwrap_or(u64::MAX).max(1);
-
-    let steps = usize::try_from((end - start) / step_nanos).unwrap_or(usize::MAX) + 1;
-    if steps > MAX_STEPS {
-        return Err(Error::BadRequest(format!(
-            "that range and step would need {steps} points per series; \
-             the limit is {MAX_STEPS}. Widen `step` or narrow the range."
-        )));
-    }
-
-    // The step timestamps, computed before loading: they decide both whether the window
-    // can be folded and, if it is, which points the fold produces values for. Computing
-    // them afterwards is what let a folded load and the step loop disagree.
-    let mut timestamps = Vec::new();
-    let mut cursor = start;
-    loop {
-        timestamps.push(cursor);
-        if cursor >= end {
-            break;
-        }
-        cursor = (cursor + step_nanos).min(end);
-    }
+    let timestamps = step_grid(start, end, step_nanos)?;
 
     // Load once, evaluate every step from memory.
     let mut snapshot = Snapshot::load_at(store, &expr, &timestamps, max_samples)?;
@@ -297,8 +305,7 @@ pub fn range(
     // ordered lookup pays for comparing whole label sets on every one. Order is restored
     // below, where it costs one sort instead of one per insert.
     let mut series: HashMap<Labels, Vec<(f64, String)>> = HashMap::new();
-    let mut at = start;
-    loop {
+    for &at in &timestamps {
         if let Value::Vector(vector) = snapshot.eval(&expr, at)? {
             for (labels, value) in vector.samples {
                 series
@@ -307,10 +314,6 @@ pub fn range(
                     .push((to_seconds(at), format_value(value)));
             }
         }
-        if at >= end {
-            break;
-        }
-        at = (at + step_nanos).min(end);
     }
 
     let mut series: Vec<(Labels, Vec<(f64, String)>)> = series.into_iter().collect();
@@ -402,6 +405,30 @@ pub fn meta_range(params: &MetaParams, now_nanos: u64) -> Result<(u64, u64)> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// `step=1e300` is a finite positive number, and converting it used to panic; in a
+    /// release build that ended the process. It is a 400 now.
+    #[test]
+    fn a_step_too_large_to_represent_is_refused() {
+        assert!(parse_step("1e300").is_err());
+        assert!(parse_step("1e11").is_ok(), "large but representable");
+    }
+
+    /// A step near `u64::MAX` wrapped the running sum back below `end`, and the loop then
+    /// counted down one nanosecond at a time until memory ran out. The grid is computed as
+    /// `start + i·step` now, and a count past the limit is refused before allocating.
+    #[test]
+    fn the_step_grid_cannot_wrap_or_run_away() {
+        let start = 1_700_000_000_000_000_000u64;
+        let end = start + 1_000_000_000;
+        assert_eq!(step_grid(start, end, u64::MAX).unwrap(), vec![start]);
+        assert!(step_grid(0, 1_000_000_000_000_000_000, 1).is_err());
+
+        // Prometheus's grid: the last point is the last whole step, not an extra one at
+        // an unaligned end.
+        assert_eq!(step_grid(0, 25, 10).unwrap(), vec![0, 10, 20]);
+        assert_eq!(step_grid(0, 20, 10).unwrap(), vec![0, 10, 20]);
+    }
 
     const NOW: u64 = 1_750_000_000_000_000_000;
 

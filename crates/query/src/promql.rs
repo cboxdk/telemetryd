@@ -208,6 +208,7 @@ pub fn parse(input: &str) -> Result<Expr> {
         input,
         tokens,
         pos: 0,
+        depth: 0,
     };
     let expr = parser.parse_expr()?;
     if parser.pos < parser.tokens.len() {
@@ -216,20 +217,47 @@ pub fn parse(input: &str) -> Result<Expr> {
     Ok(expr)
 }
 
+/// How deep an expression may nest, counting parentheses, unary minus, function and
+/// aggregation arguments, and every link in a chain of binary operators.
+///
+/// Parsing, evaluating, cloning and dropping an expression all recurse on its tree, on a
+/// thread with a two-megabyte stack. Two thousand `(` — a two-kilobyte URL — overflowed
+/// that stack, and an overflow aborts the process: one request from anyone holding a
+/// query token took the server down. Real queries nest a handful of levels; the limit is
+/// generous for them and far below where the stack runs out.
+const MAX_DEPTH: usize = 128;
+
 struct Parser<'a> {
     input: &'a str,
     tokens: Vec<Spanned>,
     pos: usize,
+    /// The nesting depth reached so far. Checked as it grows rather than measured on the
+    /// finished tree, because a tree too deep to evaluate is also too deep to drop.
+    depth: usize,
 }
 
 impl Parser<'_> {
+    fn deeper(&mut self) -> Result<()> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(Error::BadRequest(format!(
+                "this PromQL expression nests more than {MAX_DEPTH} levels deep, counting \
+                 parentheses, function arguments and chained operators; split it up"
+            )));
+        }
+        Ok(())
+    }
+
     /// `or` binds loosest, matching PromQL.
     fn parse_expr(&mut self) -> Result<Expr> {
+        let base = self.depth;
+        self.deeper()?;
         let mut left = self.parse_additive()?;
         loop {
             match self.peek() {
                 Some(Token::Ident(word)) if word == "or" => {
                     self.pos += 1;
+                    self.deeper()?;
                     let right = self.parse_additive()?;
                     left = Expr::Binary {
                         op: BinaryOp::Or,
@@ -244,20 +272,28 @@ impl Parser<'_> {
                         "only `or` is supported for vector matching",
                     ));
                 }
-                _ => return Ok(left),
+                _ => {
+                    self.depth = base;
+                    return Ok(left);
+                }
             }
         }
     }
 
     fn parse_additive(&mut self) -> Result<Expr> {
+        let base = self.depth;
         let mut left = self.parse_multiplicative()?;
         loop {
             let op = match self.peek() {
                 Some(Token::Plus) => BinaryOp::Add,
                 Some(Token::Minus) => BinaryOp::Sub,
-                _ => return Ok(left),
+                _ => {
+                    self.depth = base;
+                    return Ok(left);
+                }
             };
             self.pos += 1;
+            self.deeper()?;
             let right = self.parse_multiplicative()?;
             left = Expr::Binary {
                 op,
@@ -268,6 +304,7 @@ impl Parser<'_> {
     }
 
     fn parse_multiplicative(&mut self) -> Result<Expr> {
+        let base = self.depth;
         let mut left = self.parse_unary()?;
         loop {
             let op = match self.peek() {
@@ -275,9 +312,13 @@ impl Parser<'_> {
                 Some(Token::Slash) => BinaryOp::Div,
                 Some(Token::Percent) => BinaryOp::Mod,
                 Some(Token::Caret) => BinaryOp::Pow,
-                _ => return Ok(left),
+                _ => {
+                    self.depth = base;
+                    return Ok(left);
+                }
             };
             self.pos += 1;
+            self.deeper()?;
             let right = self.parse_unary()?;
             left = Expr::Binary {
                 op,
@@ -290,7 +331,11 @@ impl Parser<'_> {
     fn parse_unary(&mut self) -> Result<Expr> {
         if self.peek() == Some(&Token::Minus) {
             self.pos += 1;
-            return Ok(Expr::Negate(Box::new(self.parse_unary()?)));
+            let base = self.depth;
+            self.deeper()?;
+            let inner = self.parse_unary()?;
+            self.depth = base;
+            return Ok(Expr::Negate(Box::new(inner)));
         }
         self.parse_atom()
     }
@@ -688,6 +733,25 @@ impl Expr {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// Each of these used to overflow the stack and abort the process. Now each is a
+    /// plain refusal, and a realistically nested query still parses.
+    #[test]
+    fn deep_nesting_is_refused_instead_of_overflowing_the_stack() {
+        let parens = format!("{}1{}", "(".repeat(2_000), ")".repeat(2_000));
+        let minus = format!("{}1", "-".repeat(16_000));
+        let chain = vec!["1"; 16_000].join("-");
+        let calls = format!("{}x{}", "abs(".repeat(2_000), ")".repeat(2_000));
+        for query in [&parens, &minus, &chain, &calls] {
+            let err = parse(query).expect_err("nested far too deep");
+            assert!(err.to_string().contains("nests more than"), "{err}");
+        }
+
+        let fine = format!("{}sum(rate(x[5m])){}", "(".repeat(100), ")".repeat(100));
+        parse(&fine).expect("a hundred levels is still a query");
+        let long = vec!["a"; 100].join(" + ");
+        parse(&long).expect("a hundred terms is still a query");
+    }
 
     fn selector_of(expr: &Expr) -> &Selector {
         match expr {
