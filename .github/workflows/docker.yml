@@ -69,7 +69,7 @@ jobs:
       # The tag's own Dockerfile and scripts, not whatever main holds by the time this
       # runs: a `workflow_run` checks out the default branch unless told otherwise, so
       # an image could be built for one release by the next one's recipe.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ steps.tag.outputs.tag }}
 
