@@ -420,31 +420,32 @@ nested parentheses used to exhaust it and end the process.
 does not pass `end`, exactly as Prometheus does. Earlier versions added one more point
 at an `end` that did not fall on a step.
 
-#### `rate` and `increase` do not extrapolate
+#### `rate` and `increase` extrapolate as Prometheus does
 
-The one place a supported function answers differently from Prometheus, and it is
-deliberate rather than missing.
+Both are Prometheus's `extrapolatedRate`: the increase the samples show, scaled out to the
+window's edges only as far as the series plausibly existed. A gap to an edge longer than
+1.1 average scrape intervals means the series started or stopped inside the window, so
+the extrapolation reaches half an interval past the sample and no further; and a counter
+is never extrapolated below zero. `rate` divides the result by the whole range.
 
-telemetryd divides the counter's delta by the time actually spanned by the samples.
-Prometheus divides by the whole range, after extrapolating the observed rate outwards
-towards the window edges. When the window is well covered the two agree exactly; when it
-is not, they do not. Measured against a counter rising by a true 10/s:
+Checked against Prometheus 3.15.0's own engine through `promtool test rules`, over a
+counter adding 150 per 15 s scrape, evaluated at one hour:
 
-| Samples in a `[5m]` window | telemetryd `rate` | Prometheus `rate` | telemetryd `increase` | Prometheus `increase` |
-|---|---|---|---|---|
-| 21, spanning the full 300 s | 10.00/s | 10.00/s | 3000 | 3000 |
-| 7, spanning only 60 s | 10.00/s | 2.17/s | 3000 | 650 |
+| Series | Prometheus `increase[1h]` | telemetryd since 0.61.0 | telemetryd before |
+|---|---|---|---|
+| present all hour | 36,000 | 36,000 | 36,000 |
+| born one minute before the end | 600 | 600 | 36,000 |
+| born ten minutes before the end, at 5,000 | 6,075 | 6,075 | 36,000 |
+| stopped forty minutes early | 24,075 | 24,075 | 36,000 |
+| reset halfway | 35,849.37 | 35,849.37 | 35,849.37 |
 
-Where you meet this is a **series that has not existed for the whole window** — the first
-minutes after a deploy, or a metric that only appears under load. telemetryd reports the
-rate the counter was actually moving at; Prometheus reports the average across a window
-the series did not exist for, which is why `increase` there famously returns fractions of
-a request.
-
-Neither is wrong, and telemetryd's answer is usually the one a person wanted. It is
-recorded here because a dashboard built against Prometheus and pointed at telemetryd will
-show different numbers for a new series, and that difference should not have to be
-discovered.
+Twelve such cases, `rate` and `increase` over `[1m]`, `[5m]` and `[1h]`, agree to twelve
+significant digits and are a test in the repository. Before 0.61.0 telemetryd divided the
+increase by the time the samples spanned and multiplied by the window, which described a
+series that had not existed all window at the rate it moved at while it did — and so
+overstated every period total for a new or departed series, up to sixty-fold in the
+cases above. A dashboard's `increase` over a day now reads what Prometheus's reads,
+fractions of a request included.
 
 `histogram_quantile` matches Prometheus exactly, including returning the highest finite
 bound when the quantile falls in the `+Inf` bucket. Verified against a known distribution.

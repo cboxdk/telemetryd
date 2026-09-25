@@ -164,6 +164,7 @@ struct Fold {
     seen: u32,
     first_nanos: u64,
     last_nanos: u64,
+    first_value: f64,
     last_value: f64,
     increase: f64,
 }
@@ -172,6 +173,7 @@ impl Fold {
     fn add(&mut self, timestamp: u64, value: f64) {
         if self.seen == 0 {
             self.first_nanos = timestamp;
+            self.first_value = value;
         } else {
             // The same counter-reset rule the windowed form uses: a drop means the
             // process restarted, so the new value *is* the increase.
@@ -187,74 +189,139 @@ impl Fold {
     }
 
     /// The same answer [`rate_over`] gives for the same samples.
-    fn finish(&self, range_nanos: u64, per_second: bool) -> Option<f64> {
-        if self.seen < 2 {
-            return None;
-        }
-        let observed_nanos = self.last_nanos.saturating_sub(self.first_nanos);
-        if observed_nanos == 0 {
-            return None;
-        }
-        #[allow(clippy::cast_precision_loss)]
-        let per_second_rate = self.increase / (observed_nanos as f64 / NANOS_PER_SECOND);
-        Some(if per_second {
-            per_second_rate
-        } else {
-            #[allow(clippy::cast_precision_loss)]
-            let window_seconds = range_nanos as f64 / NANOS_PER_SECOND;
-            per_second_rate * window_seconds
-        })
+    fn finish(&self, window: Window, per_second: bool) -> Option<f64> {
+        extrapolate(
+            Observed {
+                seen: u64::from(self.seen),
+                first_nanos: self.first_nanos,
+                last_nanos: self.last_nanos,
+                first_value: self.first_value,
+                increase: self.increase,
+            },
+            window,
+            per_second,
+        )
     }
 }
 
-/// `rate`/`increase` over one already-selected window.
+/// The window a range selector covers at one evaluation: `(floor, at]`, offset applied.
+#[derive(Debug, Clone, Copy)]
+struct Window {
+    floor: u64,
+    at: u64,
+}
+
+impl Window {
+    fn ending(at_nanos: u64, range_nanos: u64, offset_nanos: u64) -> Self {
+        let at = at_nanos.saturating_sub(offset_nanos);
+        Self {
+            floor: at.saturating_sub(range_nanos),
+            at,
+        }
+    }
+}
+
+/// What a window's samples come to, before extrapolation: however they were gathered —
+/// walked row by row, folded as they streamed past, or read from a segment's summary.
+#[derive(Debug, Clone, Copy)]
+struct Observed {
+    seen: u64,
+    first_nanos: u64,
+    last_nanos: u64,
+    first_value: f64,
+    /// Counter resets already applied.
+    increase: f64,
+}
+
+/// Prometheus's `extrapolatedRate`, for counters.
 ///
-/// Shared by the prepared pass and the per-step path so the two cannot disagree: the
-/// counter-reset handling and the observed-span division are subtle enough that a second
-/// copy would eventually be a second answer.
+/// The samples rarely sit on the window's edges, so the increase they show is scaled out
+/// to cover the window — but only as far as the series plausibly existed. A gap to an
+/// edge longer than 1.1 average scrape intervals means the series started or stopped
+/// inside the window, and the extrapolation reaches only half an interval past the
+/// sample. A counter is never extrapolated below zero: when the first value says it began
+/// closer than that, it began there.
 ///
-/// Counter resets are handled the way Prometheus does: a drop between consecutive samples
-/// means the process restarted, so the new value is the increase rather than a negative
-/// delta. The rate is computed over the span actually **observed** rather than the nominal
-/// window, because a range selector is half-open and a series scraped exactly on the
-/// boundary contributes one fewer interval than it appears to.
+/// This replaced dividing the increase by the observed span and multiplying by the whole
+/// window, which gave a series born one minute before the end of an hour sixty times its
+/// real increase — the number every period total and error-budget panel read.
+fn extrapolate(observed: Observed, window: Window, per_second: bool) -> Option<f64> {
+    // One sample cannot describe a change.
+    if observed.seen < 2 {
+        return None;
+    }
+    let seconds = |nanos: u64| {
+        #[allow(clippy::cast_precision_loss)]
+        let value = nanos as f64 / NANOS_PER_SECOND;
+        value
+    };
+    let sampled = seconds(observed.last_nanos.saturating_sub(observed.first_nanos));
+    if sampled <= 0.0 {
+        // Every sample shares a timestamp; there is no elapsed time to scale by, and
+        // inventing one would report an arbitrary rate.
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let average_interval = sampled / (observed.seen - 1) as f64;
+    let threshold = average_interval * 1.1;
+
+    let mut to_start = seconds(observed.first_nanos.saturating_sub(window.floor));
+    if to_start >= threshold {
+        to_start = average_interval / 2.0;
+    }
+    if observed.increase > 0.0 && observed.first_value >= 0.0 {
+        let to_zero = sampled * (observed.first_value / observed.increase);
+        to_start = to_start.min(to_zero);
+    }
+    let mut to_end = seconds(window.at.saturating_sub(observed.last_nanos));
+    if to_end >= threshold {
+        to_end = average_interval / 2.0;
+    }
+
+    let extrapolated = observed.increase * (sampled + to_start + to_end) / sampled;
+    Some(if per_second {
+        extrapolated / seconds(window.at.saturating_sub(window.floor))
+    } else {
+        extrapolated
+    })
+}
+
 /// The same arithmetic as [`rate_over`], applied to a summary instead of to rows.
 ///
 /// It has to be the same: the two paths answer the same query, and a store that has
 /// summarised half its segments would otherwise report a step at the boundary. The
 /// summary already carries the counter-reset handling and the join across segments, so
-/// what is left here is the division `rate_over` does at the end.
+/// what is left is the extrapolation `rate_over` ends in.
 fn finish_fold(
     fold: &telemetryd_store::folds::StreamFold,
-    range_nanos: u64,
+    window: Window,
     per_second: bool,
 ) -> Option<f64> {
-    // One sample cannot describe a change, exactly as in `rate_over`.
-    if fold.seen < 2 {
-        return None;
-    }
-    let observed_nanos = fold.last_nanos.saturating_sub(fold.first_nanos);
-    if observed_nanos == 0 {
-        return None;
-    }
-    #[allow(clippy::cast_precision_loss)]
-    let per_second_rate = fold.increase / (observed_nanos as f64 / NANOS_PER_SECOND);
-    Some(if per_second {
-        per_second_rate
-    } else {
-        #[allow(clippy::cast_precision_loss)]
-        let window_seconds = range_nanos as f64 / NANOS_PER_SECOND;
-        per_second_rate * window_seconds
-    })
+    extrapolate(
+        Observed {
+            seen: fold.seen,
+            first_nanos: fold.first_nanos,
+            last_nanos: fold.last_nanos,
+            first_value: fold.first_value,
+            increase: fold.increase,
+        },
+        window,
+        per_second,
+    )
 }
 
-fn rate_over(window: &[(u64, f64)], range_nanos: u64, per_second: bool) -> Option<f64> {
-    // One point cannot describe a change.
-    if window.len() < 2 {
-        return None;
-    }
+/// `rate`/`increase` over one already-selected window.
+///
+/// Shared by the prepared pass and the per-step path so the two cannot disagree; both,
+/// and the two fold paths, end in [`extrapolate`].
+///
+/// Counter resets are handled the way Prometheus does: a drop between consecutive samples
+/// means the process restarted, so the new value is the increase rather than a negative
+/// delta.
+fn rate_over(samples: &[(u64, f64)], window: Window, per_second: bool) -> Option<f64> {
+    let (&(first_nanos, first_value), &(last_nanos, _)) = (samples.first()?, samples.last()?);
     let mut increase = 0.0;
-    for pair in window.windows(2) {
+    for pair in samples.windows(2) {
         let (previous, current) = (pair[0].1, pair[1].1);
         increase += if current < previous {
             current
@@ -262,21 +329,17 @@ fn rate_over(window: &[(u64, f64)], range_nanos: u64, per_second: bool) -> Optio
             current - previous
         };
     }
-    let observed_nanos = window[window.len() - 1].0.saturating_sub(window[0].0);
-    if observed_nanos == 0 {
-        // Every sample shares a timestamp; there is no elapsed time to divide by, and
-        // inventing one would report an arbitrary rate.
-        return None;
-    }
-    #[allow(clippy::cast_precision_loss)]
-    let per_second_rate = increase / (observed_nanos as f64 / NANOS_PER_SECOND);
-    Some(if per_second {
-        per_second_rate
-    } else {
-        #[allow(clippy::cast_precision_loss)]
-        let window_seconds = range_nanos as f64 / NANOS_PER_SECOND;
-        per_second_rate * window_seconds
-    })
+    extrapolate(
+        Observed {
+            seen: samples.len() as u64,
+            first_nanos,
+            last_nanos,
+            first_value,
+            increase,
+        },
+        window,
+        per_second,
+    )
 }
 
 /// Every `rate`/`increase` call in an expression, with what it is applied to.
@@ -460,7 +523,8 @@ impl Snapshot {
                     return Ok(None);
                 };
                 for (series, summary) in folded {
-                    let Some(value) = finish_fold(&summary, range_nanos, *per_second) else {
+                    let window = Window::ending(*at_nanos, range_nanos, offset_nanos);
+                    let Some(value) = finish_fold(&summary, window, *per_second) else {
                         continue;
                     };
                     let at_index = if let Some(at_index) = index.get(&series) {
@@ -724,10 +788,12 @@ impl Snapshot {
         let mut prepared = Vec::new();
         for (call, (selector, range, per_second)) in calls.iter().enumerate() {
             let range_nanos = duration_nanos(*range);
+            let offset_nanos = duration_nanos(selector.offset.unwrap_or(Duration::ZERO));
             let mut by_step: Vec<Vec<(usize, f64)>> = vec![Vec::new(); points.len()];
             for (index, per_point) in folds[call].iter().enumerate() {
                 for (point, fold) in per_point.iter().enumerate() {
-                    if let Some(value) = fold.finish(range_nanos, *per_second) {
+                    let window = Window::ending(points[point], range_nanos, offset_nanos);
+                    if let Some(value) = fold.finish(window, *per_second) {
                         by_step[point].push((index, value));
                     }
                 }
@@ -1038,23 +1104,6 @@ impl Snapshot {
         InstantVector { samples }
     }
 
-    /// `rate` and `increase` over a range window.
-    ///
-    /// Counter resets are handled the way Prometheus does: a drop between consecutive
-    /// samples means the process restarted, so the new value is the increase rather
-    /// than a negative delta. Without this every deploy would show as a large negative
-    /// rate.
-    ///
-    /// The rate is computed over the span actually **observed** (last sample minus
-    /// first), not over the nominal window. This matters: a range selector is
-    /// half-open, `(t-range, t]`, so a series scraped exactly on the window boundary
-    /// contributes one fewer interval than it looks like it should. Dividing by the
-    /// nominal window in that case reports half the true rate — a number that is
-    /// wrong in the ordinary case, not just the sparse one.
-    ///
-    /// `increase` is then that rate extrapolated across the window, which is what
-    /// Prometheus reports and what makes `increase(x[1h])` comparable between series
-    /// scraped at different intervals.
     /// Evaluate every `rate`/`increase` in the expression for every step, once per series.
     ///
     /// Called by the range handler before stepping. An instant query has one step and
@@ -1101,7 +1150,8 @@ impl Snapshot {
                     while start < end && samples[start].0 <= floor {
                         start += 1;
                     }
-                    if let Some(value) = rate_over(&samples[start..end], range_nanos, per_second) {
+                    let window = Window { floor, at };
+                    if let Some(value) = rate_over(&samples[start..end], window, per_second) {
                         by_step[step].push((index, value));
                     }
                 }
@@ -1117,6 +1167,9 @@ impl Snapshot {
         self.prepared_steps = steps.to_vec();
     }
 
+    /// `rate` and `increase` over a range window: [`rate_over`] on the samples in
+    /// `(at - range, at]`, offset applied, or the step's prepared answer when there is
+    /// one.
     fn rate(
         &self,
         selector: &Selector,
@@ -1153,7 +1206,7 @@ impl Snapshot {
             let end = series.samples.partition_point(|(ts, _)| *ts <= at);
             if let Some(value) = rate_over(
                 &series.samples[start..end],
-                duration_nanos(range),
+                Window { floor, at },
                 per_second,
             ) {
                 samples.push((self.stripped[index].clone(), value));
@@ -1694,15 +1747,15 @@ mod fold_tests {
             (30 * 1_000_000_000, 2.0),
             (40 * 1_000_000_000, 11.0),
         ];
-        let range_nanos = 60 * 1_000_000_000;
+        let window = Window::ending(60 * 1_000_000_000, 60 * 1_000_000_000, 0);
 
-        let windowed = rate_over(&points, range_nanos, true).unwrap();
+        let windowed = rate_over(&points, window, true).unwrap();
 
         let mut fold = Fold::default();
         for (ts, value) in &points {
             fold.add(*ts, *value);
         }
-        let folded = fold.finish(range_nanos, true).unwrap();
+        let folded = fold.finish(window, true).unwrap();
 
         assert!(
             (windowed - folded).abs() < 1e-9,
@@ -1710,32 +1763,33 @@ mod fold_tests {
         );
     }
 
-    /// `increase` scales by the nominal window where `rate` divides by the observed span,
-    /// and both forms have to make the same choice.
+    /// `increase` and `rate` extrapolate the same way, and both forms have to make the
+    /// same choice — including the zero clamp, which needs the first value the fold keeps.
     #[test]
     fn folding_matches_the_windowed_form_for_increase() {
         let points: Vec<(u64, f64)> = (1..=5u32)
             .map(|i| (u64::from(i) * 10 * 1_000_000_000, f64::from(i) * 3.0))
             .collect();
-        let range_nanos = 120 * 1_000_000_000;
+        let window = Window::ending(120 * 1_000_000_000, 120 * 1_000_000_000, 0);
 
-        let windowed = rate_over(&points, range_nanos, false).unwrap();
+        let windowed = rate_over(&points, window, false).unwrap();
         let mut fold = Fold::default();
         for (ts, value) in &points {
             fold.add(*ts, *value);
         }
-        assert!((windowed - fold.finish(range_nanos, false).unwrap()).abs() < 1e-9);
+        assert!((windowed - fold.finish(window, false).unwrap()).abs() < 1e-9);
     }
 
     /// One point cannot describe a change, and neither form may invent one.
     #[test]
     fn a_single_sample_yields_nothing_either_way() {
         let one = [(10 * 1_000_000_000u64, 1.0)];
-        assert!(rate_over(&one, 60 * 1_000_000_000, true).is_none());
+        let window = Window::ending(60 * 1_000_000_000, 60 * 1_000_000_000, 0);
+        assert!(rate_over(&one, window, true).is_none());
 
         let mut fold = Fold::default();
         fold.add(one[0].0, one[0].1);
-        assert!(fold.finish(60 * 1_000_000_000, true).is_none());
+        assert!(fold.finish(window, true).is_none());
     }
 
     /// Samples sharing one timestamp leave no elapsed time to divide by; inventing one
@@ -1743,13 +1797,14 @@ mod fold_tests {
     #[test]
     fn a_zero_span_yields_nothing_either_way() {
         let same = [(10 * 1_000_000_000u64, 1.0), (10 * 1_000_000_000, 4.0)];
-        assert!(rate_over(&same, 60 * 1_000_000_000, true).is_none());
+        let window = Window::ending(60 * 1_000_000_000, 60 * 1_000_000_000, 0);
+        assert!(rate_over(&same, window, true).is_none());
 
         let mut fold = Fold::default();
         for (ts, value) in same {
             fold.add(ts, value);
         }
-        assert!(fold.finish(60 * 1_000_000_000, true).is_none());
+        assert!(fold.finish(window, true).is_none());
     }
 }
 
@@ -2161,10 +2216,11 @@ mod tests {
     }
 
     #[test]
-    fn rate_is_computed_over_the_observed_span_not_the_nominal_window() {
+    fn rate_is_extrapolated_across_the_excluded_edge() {
         // A range selector is half-open, so the sample sitting exactly on the window
-        // start is excluded. Dividing by the nominal 60s here would report 0.5/sec for
-        // a counter that plainly advances at 1/sec.
+        // start is excluded. The increase the two remaining samples show is extrapolated
+        // back to the edge, so a counter that plainly advances at 1/sec reads 1/sec rather
+        // than 0.5.
         let snapshot = Snapshot::from_samples(vec![
             sample("requests", "checkout", T0, 0.0),
             sample("requests", "checkout", T0 + 30 * SECOND, 30.0),
@@ -2180,8 +2236,10 @@ mod tests {
     }
 
     #[test]
-    fn increase_extrapolates_the_rate_across_the_window() {
-        // 1/sec observed, asked for a 120s window, so 120.
+    fn increase_does_not_extrapolate_a_counter_below_zero() {
+        // A counter at 0 when first seen started there. The window reaches a minute
+        // further back, and this used to scale the rate across it and answer 120 for a
+        // counter that has counted 60. Prometheus answers 60.
         let snapshot = Snapshot::from_samples(vec![
             sample("requests", "checkout", T0, 0.0),
             sample("requests", "checkout", T0 + 30 * SECOND, 30.0),
@@ -2189,10 +2247,72 @@ mod tests {
         ]);
         let vector = eval(&snapshot, "increase(requests[120s])", T0 + 60 * SECOND);
         assert!(
-            (value_for(&vector, "checkout").unwrap() - 120.0).abs() < 1e-6,
+            (value_for(&vector, "checkout").unwrap() - 60.0).abs() < 1e-6,
             "got {:?}",
             value_for(&vector, "checkout")
         );
+    }
+
+    /// Golden values from Prometheus 3.15.0's own engine, via `promtool test rules` over
+    /// the same series: 15 s scrapes, values in promtool's expanding notation, evaluated
+    /// at one hour unless noted. Each is what `extrapolatedRate` answers; the ones marked
+    /// were wrong before, by the factor shown.
+    #[test]
+    fn rate_and_increase_match_prometheus() {
+        /// Consecutive scrapes: first slot, first value, how many.
+        type Run = (u64, f64, u64);
+        const STEP: u64 = 15;
+        // A counter adding 150 per scrape, in runs.
+        let series: [(&str, &[Run]); 6] = [
+            ("full", &[(0, 0.0, 241)]),
+            ("born", &[(236, 0.0, 5)]),
+            ("reset", &[(0, 0.0, 101), (101, 0.0, 140)]),
+            ("stopped", &[(0, 0.0, 161)]),
+            ("high", &[(0, 100_000.0, 241)]),
+            ("mid", &[(200, 5_000.0, 41)]),
+        ];
+        let mut samples = Vec::new();
+        for (name, runs) in series {
+            for &(first_slot, start, slots) in runs {
+                for i in 0..slots {
+                    #[allow(clippy::cast_precision_loss)]
+                    let value = start + 150.0 * i as f64;
+                    samples.push(sample(
+                        name,
+                        "golden",
+                        T0 + (first_slot + i) * STEP * SECOND,
+                        value,
+                    ));
+                }
+            }
+        }
+        let snapshot = Snapshot::from_samples(samples);
+
+        let hour = T0 + 3_600 * SECOND;
+        let cases: [(&str, u64, f64); 12] = [
+            ("increase(full[1h])", hour, 36_000.0),
+            ("rate(full[1h])", hour, 10.0),
+            // Born a minute before the end: 36,000 before, sixty times too many.
+            ("increase(born[1h])", hour, 600.0),
+            ("rate(born[1h])", hour, 0.166_666_666_666_666_66),
+            ("increase(reset[1h])", hour, 35_849.372_384_937_24),
+            // Stopped forty minutes early: 36,000 before.
+            ("increase(stopped[1h])", hour, 24_075.000_000_000_004),
+            ("increase(high[1h])", hour, 36_000.0),
+            // Born ten minutes before the end, already at 5,000: 36,000 before.
+            ("increase(mid[1h])", hour, 6_075.0),
+            ("rate(full[5m])", hour, 9.999_999_999_999_998),
+            ("increase(born[5m])", hour, 600.0),
+            ("increase(reset[5m])", T0 + 1_510 * SECOND, 3_000.0),
+            ("increase(full[1m])", hour, 600.0),
+        ];
+        for (query, at, expected) in cases {
+            let got = value_for(&eval(&snapshot, query, at), "golden").unwrap();
+            assert!(
+                (got - expected).abs() <= expected.abs() * 1e-12,
+                "{query}: telemetryd {got}, Prometheus {expected}"
+            );
+        }
     }
 
     #[test]
@@ -2221,7 +2341,8 @@ mod tests {
         ]);
 
         // A window wide enough to hold all four samples: +50, then the reset
-        // contributes its post-reset value of 10, then +15. That is 75 over 60s.
+        // contributes its post-reset value of 10, then +15 — 75 over 60 s of samples,
+        // extrapolated the 10 s back to the window's edge: 87.5 over 70 s.
         let rate = value_for(
             &eval(&snapshot, "rate(requests[70s])", T0 + 60 * SECOND),
             "checkout",
