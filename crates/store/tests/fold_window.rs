@@ -192,3 +192,37 @@ fn a_staleness_marker_survives_sealing_and_stays_out_of_the_summary() {
     assert_eq!(fold.seen, 4, "the marker is not a sample");
     assert!((fold.increase - 30.0).abs() < 1e-9, "got {}", fold.increase);
 }
+
+/// A segment retention deletes after a query listed it is gone, not an error: the
+/// summary shortcut declines and the ordinary scan answers from what is left. It used
+/// to fail the query with a 500.
+#[test]
+fn a_segment_deleted_under_the_shortcut_declines_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&config(dir.path())).unwrap();
+    for minute in 1..=12u64 {
+        #[allow(clippy::cast_precision_loss)]
+        let value = minute as f64;
+        store
+            .metrics()
+            .append(&[sample("/a", minute * 60, value)])
+            .unwrap();
+        if minute % 5 == 0 {
+            store.metrics().seal_now().unwrap();
+        }
+    }
+    store.metrics().seal_now().ok();
+
+    // A window that straddles the first segment, so the shortcut must read it whole.
+    let straddled = store
+        .metrics()
+        .segments()
+        .into_iter()
+        .min_by_key(|s| s.manifest.min_time_nanos)
+        .unwrap();
+    std::fs::remove_dir_all(&straddled.dir).unwrap();
+    let answer = store
+        .metrics()
+        .fold_window(90 * 1_000_000_000, 13 * 60 * 1_000_000_000, &[], 4);
+    assert!(matches!(answer, Ok(None)), "{answer:?}");
+}

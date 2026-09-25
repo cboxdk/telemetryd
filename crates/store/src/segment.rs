@@ -525,6 +525,13 @@ impl Segment {
     }
 }
 
+/// Whether an error reading a segment means it is no longer there — deleted by
+/// retention between being listed and being opened. The data was meant to go.
+#[must_use]
+pub(crate) fn is_gone(error: &Error) -> bool {
+    matches!(error, Error::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound)
+}
+
 fn segment_corrupt(path: &Path, error: &dyn std::fmt::Display) -> Error {
     Error::WalCorrupt {
         path: path.to_path_buf(),

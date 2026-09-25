@@ -379,19 +379,19 @@ impl Store {
         };
 
         for candidate in &plan.by_age {
-            if self.delete_segment(candidate)? {
+            if self.try_delete(candidate) {
                 report.deleted_by_age += 1;
                 report.bytes_freed += candidate.bytes;
             }
         }
         for candidate in &plan.by_budget {
-            if self.delete_segment(candidate)? {
+            if self.try_delete(candidate) {
                 report.deleted_by_budget += 1;
                 report.bytes_freed += candidate.bytes;
             }
         }
         for candidate in &plan.undelivered_dropped {
-            if self.delete_segment(candidate)? {
+            if self.try_delete(candidate) {
                 report.dropped_undelivered += 1;
                 report.bytes_freed += candidate.bytes;
             }
@@ -463,6 +463,23 @@ impl Store {
 
         *lock(&self.reaper) = report.clone();
         Ok(report)
+    }
+
+    /// Delete one segment the plan chose, saying so if it cannot be. One failed delete
+    /// used to end the pass, leaving every later candidate — the rest of what the budget
+    /// needed freed — for the next one.
+    fn try_delete(&self, candidate: &Candidate) -> bool {
+        match self.delete_segment(candidate) {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                tracing::error!(
+                    segment = %candidate.id,
+                    %error,
+                    "could not delete a segment retention chose; the next pass tries again"
+                );
+                false
+            }
+        }
     }
 
     fn delete_segment(&self, candidate: &Candidate) -> Result<bool> {

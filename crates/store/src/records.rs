@@ -1258,8 +1258,14 @@ impl<S: RecordSchema> RecordStore<S> {
                 continue;
             }
             if segment.manifest.streams.is_empty() {
-                // Pre-dictionary segment: the only way to know is to read it.
-                for record in segment.read::<S>()? {
+                // Pre-dictionary segment: the only way to know is to read it — unless
+                // retention deleted it since it was listed.
+                let records = match segment.read::<S>() {
+                    Ok(records) => records,
+                    Err(error) if crate::segment::is_gone(&error) => continue,
+                    Err(error) => return Err(error),
+                };
+                for record in records {
                     let ts = S::timestamp(&record);
                     if ts >= start_nanos
                         && ts <= end_nanos

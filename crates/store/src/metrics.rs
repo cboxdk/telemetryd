@@ -64,7 +64,15 @@ impl crate::RecordStore<MetricSchema> {
             for (id, at, value) in rows {
                 folds[id].add(at, value);
             }
-            crate::folds::StreamFolds(folds).write(&segment.dir)?;
+            // One segment that cannot take its file — deleted by retention while this
+            // ran, a full disk — is skipped, not the end of the backfill for every other.
+            // The write is atomic, so a half file is never left for a reader to trust.
+            if let Err(error) = crate::folds::StreamFolds(folds).write(&segment.dir) {
+                if !crate::segment::is_gone(&error) && segment.dir.exists() {
+                    tracing::warn!(segment = %segment.manifest.id, %error, "could not write a segment's summaries");
+                }
+                continue;
+            }
             segment.mark_folds_written();
             written += 1;
         }
@@ -178,7 +186,13 @@ impl crate::RecordStore<MetricSchema> {
             // Straddles an edge, or predates summaries: read this one segment. Reading the
             // *segment* rather than a time range matters — a range scan would also touch
             // its neighbours, which the loop has already taken from their summaries.
-            let rows = segment.read::<MetricSchema>()?;
+            // Deleted by retention since it was listed: decline, and the ordinary scan
+            // answers from what is left. It used to fail the query.
+            let rows = match segment.read::<MetricSchema>() {
+                Ok(rows) => rows,
+                Err(error) if crate::segment::is_gone(&error) => return Ok(None),
+                Err(error) => return Err(error),
+            };
             if !fold_rows(
                 rows.into_iter(),
                 start_nanos,
