@@ -20,10 +20,28 @@ use telemetryd_core::Signal;
 pub struct Candidate {
     pub signal: Signal,
     pub id: String,
-    /// Newest event in the segment. Retention is judged on this: a segment is only
-    /// expired once *everything* in it is past the window.
+    /// Newest event in the segment, as [`judged_time`] reads it. Retention is judged on
+    /// this: a segment is only expired once *everything* in it is past the window.
     pub max_time_nanos: u64,
     pub bytes: u64,
+}
+
+/// The time a segment is aged by: its newest event, unless that event claims to be
+/// newer than the segment itself.
+///
+/// Ingest accepts timestamps up to the year 2100, because a clock can be wrong and
+/// the record is still worth keeping. Judged on its own claim, one such record would
+/// keep its whole segment — every honest record beside it — past retention and ahead
+/// of everything else when the disk budget picks what goes, for as long as the
+/// claim is in the future. Nothing can be newer than the moment it was written down,
+/// so the segment's creation caps it: a record from a skewed clock is kept one
+/// retention window from when it arrived. Backfilled data is unaffected — its events
+/// are older than the segment, and the older of the two is the event.
+pub fn judged_time(max_time_nanos: u64, created_at_nanos: u64) -> u64 {
+    if created_at_nanos == 0 {
+        return max_time_nanos;
+    }
+    max_time_nanos.min(created_at_nanos)
 }
 
 /// What the reaper decided to do, and why.
@@ -205,6 +223,37 @@ mod tests {
         days.iter()
             .map(|(signal, d)| (*signal, Duration::from_secs(d * 24 * 3600)))
             .collect()
+    }
+
+    #[test]
+    fn a_record_from_the_future_is_aged_from_when_it_arrived() {
+        let year_2099 = 4_070_908_800_000_000_000;
+        // Written eight days ago by a host whose clock said 2099.
+        let skewed = Candidate {
+            max_time_nanos: judged_time(year_2099, NOW - 8 * DAY),
+            ..candidate("skewed", Signal::Logs, 0, 100)
+        };
+        let honest = candidate("honest", Signal::Logs, DAY, 100);
+        let plan = plan(
+            &[skewed, honest],
+            NOW,
+            &retention(&[(Signal::Logs, 7)]),
+            u64::MAX,
+            0,
+            Undelivered::default(),
+        );
+        assert_eq!(
+            plan.by_age
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            ["skewed"]
+        );
+
+        // Backfill keeps the age of its events, not the day it was imported.
+        assert_eq!(judged_time(NOW - 30 * DAY, NOW), NOW - 30 * DAY);
+        // A manifest with no creation time falls back to the events.
+        assert_eq!(judged_time(year_2099, 0), year_2099);
     }
 
     #[test]

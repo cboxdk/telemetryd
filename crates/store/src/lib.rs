@@ -314,7 +314,10 @@ impl Store {
             .map(|segment| Candidate {
                 signal: segment.manifest.signal,
                 id: segment.manifest.id.clone(),
-                max_time_nanos: segment.manifest.max_time_nanos,
+                max_time_nanos: retention::judged_time(
+                    segment.manifest.max_time_nanos,
+                    segment.manifest.created_at_nanos,
+                ),
                 bytes: segment.manifest.bytes,
             })
             .collect();
