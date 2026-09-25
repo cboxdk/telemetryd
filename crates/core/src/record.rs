@@ -86,28 +86,30 @@ impl Labels {
         self.0.keys().map(String::as_str)
     }
 
-    /// Stable identity for this label set, used as a series/stream key.
+    /// A 64-bit identity for this label set, for the in-memory tables that key series
+    /// by it — the cardinality count above all.
     ///
-    /// FNV-1a over the sorted pairs with an explicit separator so `{ab="c"}` and
-    /// `{a="bc"}` cannot collide by concatenation.
+    /// Keyed SipHash, seeded once per process, over the pairs as `str` hashes them — each
+    /// followed by a byte UTF-8 never contains, so no pair can run into the next. It was
+    /// unkeyed FNV-1a with `0x01`/`0x02` separators, and those bytes are legal inside a
+    /// label value: `{a="x\u{2}b\u{1}y"}` and `{a="x", b="y"}` hashed alike on purpose,
+    /// and a producer could mint series the cardinality limit counted as one it had
+    /// already seen. With the key unknown outside the process, a collision can no longer
+    /// be constructed, only met by chance — and every table that must be exact confirms
+    /// equality rather than trusting this.
+    ///
+    /// Never persisted, which is what lets it be seeded: it means nothing to another
+    /// process.
     pub fn fingerprint(&self) -> u64 {
-        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        const PRIME: u64 = 0x0000_0100_0000_01b3;
-
-        let mut hash = OFFSET;
-        let mut feed = |bytes: &[u8]| {
-            for byte in bytes {
-                hash ^= u64::from(*byte);
-                hash = hash.wrapping_mul(PRIME);
-            }
-        };
+        use std::hash::{BuildHasher, Hash, Hasher};
+        static SEED: std::sync::OnceLock<std::collections::hash_map::RandomState> =
+            std::sync::OnceLock::new();
+        let mut hasher = SEED.get_or_init(Default::default).build_hasher();
         for (name, value) in self.0.iter() {
-            feed(name.as_bytes());
-            feed(&[0x01]);
-            feed(value.as_bytes());
-            feed(&[0x02]);
+            name.as_str().hash(&mut hasher);
+            value.as_str().hash(&mut hasher);
         }
-        hash
+        hasher.finish()
     }
 
     /// Render in the `{a="1", b="2"}` form both LogQL and PromQL use.
@@ -341,6 +343,21 @@ mod tests {
         let a: Labels = [("ab".to_owned(), "c".to_owned())].into_iter().collect();
         let b: Labels = [("a".to_owned(), "bc".to_owned())].into_iter().collect();
         assert_ne!(a.fingerprint(), b.fingerprint());
+
+        // And the separators cannot be forged from inside a value. These two hashed the
+        // same bytes when the separators were 0x01 and 0x02.
+        let forged: Labels = [("a".to_owned(), "x\u{2}b\u{1}y".to_owned())]
+            .into_iter()
+            .collect();
+        let honest: Labels = [
+            ("a".to_owned(), "x".to_owned()),
+            ("b".to_owned(), "y".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        assert_ne!(forged.fingerprint(), honest.fingerprint());
+        // Stable within the process, which is all anything relies on.
+        assert_eq!(honest.fingerprint(), honest.clone().fingerprint());
     }
 
     #[test]

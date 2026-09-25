@@ -549,15 +549,17 @@ fn stream_folds<S: RecordSchema>(
     // One probe: a signal either has counter values or it does not.
     S::counter_value(records.first()?)?;
 
-    let index: std::collections::HashMap<u64, usize> = streams
+    // Keyed by the label set itself: a fingerprint is a hash, and two streams sharing
+    // one would have had their counters folded into one summary.
+    let index: std::collections::HashMap<&Labels, usize> = streams
         .iter()
         .enumerate()
-        .map(|(id, labels)| (labels.fingerprint(), id))
+        .map(|(id, labels)| (labels, id))
         .collect();
 
     let mut ordered: Vec<(usize, u64, f64)> = Vec::with_capacity(records.len());
     for record in records {
-        if let Some(&id) = index.get(&S::index_labels(record).fingerprint())
+        if let Some(&id) = index.get(S::index_labels(record))
             && let Some(value) = S::counter_value(record)
         {
             ordered.push((id, S::timestamp(record), value));
@@ -576,16 +578,16 @@ fn stream_statistics<S: RecordSchema>(
     records: &[S::Record],
     streams: &[Labels],
 ) -> (Vec<(u64, u64)>, Vec<u64>) {
-    let index: std::collections::HashMap<u64, usize> = streams
+    let index: std::collections::HashMap<&Labels, usize> = streams
         .iter()
         .enumerate()
-        .map(|(id, labels)| (labels.fingerprint(), id))
+        .map(|(id, labels)| (labels, id))
         .collect();
 
     let mut bounds = vec![(u64::MAX, u64::MIN); streams.len()];
     let mut rows = vec![0u64; streams.len()];
     for record in records {
-        if let Some(&id) = index.get(&S::index_labels(record).fingerprint()) {
+        if let Some(&id) = index.get(S::index_labels(record)) {
             let at = S::timestamp(record);
             bounds[id].0 = bounds[id].0.min(at);
             bounds[id].1 = bounds[id].1.max(at);

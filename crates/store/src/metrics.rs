@@ -46,15 +46,15 @@ impl crate::RecordStore<MetricSchema> {
                 continue;
             };
             let mut rows: Vec<(usize, u64, f64)> = Vec::with_capacity(records.len());
-            let index: std::collections::HashMap<u64, usize> = segment
+            let index: std::collections::HashMap<&Labels, usize> = segment
                 .manifest
                 .streams
                 .iter()
                 .enumerate()
-                .map(|(id, labels)| (labels.fingerprint(), id))
+                .map(|(id, labels)| (labels, id))
                 .collect();
             for record in &records {
-                if let Some(&id) = index.get(&record.series.fingerprint()) {
+                if let Some(&id) = index.get(&record.series) {
                     rows.push((id, record.timestamp_nanos, record.value));
                 }
             }
