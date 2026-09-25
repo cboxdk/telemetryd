@@ -15,10 +15,12 @@ bodies. The threat model treats stored data as sensitive by default.
 
 ## The short version
 
-**It fails closed on exposure.** telemetryd refuses to start on a non-loopback address
-with no token configured — including `0.0.0.0` and `[::]`, which are the binds that
-actually expose people. Overridable with `--insecure`, which warns on every start and
-shows in `/status`.
+**It fails closed on exposure, surface by surface.** telemetryd refuses to start on a
+non-loopback address unless writing, reading and the admin pages each have a token of
+their own — or Cbox ID guards them — including on `0.0.0.0` and `[::]`, which are the
+binds that actually expose people. One token is not enough: before 0.58.0 an ingest
+token alone started the server with every read and export open to anyone. Overridable
+with `--insecure`, which warns on every start and shows in `/status`.
 
 **Two independent bearer tokens.** `ingest_token` guards writes, `query_token` guards
 reads plus `/status` and `/metrics`. Both accept a list so a token can be rotated

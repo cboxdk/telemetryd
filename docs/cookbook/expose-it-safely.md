@@ -6,8 +6,11 @@ description: "telemetryd refuses to start exposed without a token. Here is how t
 
 # Expose it beyond localhost
 
-telemetryd **refuses to start** on a non-loopback address with no token configured —
-including `0.0.0.0` and `[::]`, which are the binds that actually expose people.
+telemetryd **refuses to start** on a non-loopback address unless every surface has a
+token — `ingest_token` for writing, `query_token` for reading (which also guards the
+admin pages unless `admin_token` is set) — or Cbox ID is on. That includes `0.0.0.0` and
+`[::]`, which are the binds that actually expose people. The error names the surfaces
+that are open and prints tokens to paste for them.
 
 That is not an inconvenience to work around. Telemetry routinely contains email
 addresses, session identifiers, API tokens in stack traces, and request bodies. An

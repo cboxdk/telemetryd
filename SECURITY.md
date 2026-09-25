@@ -16,9 +16,10 @@ addresses, IP addresses, session identifiers, API tokens in stack traces, reques
 bodies. The threat model treats the stored data as sensitive by default.
 
 **Fails closed on exposure.** telemetryd refuses to start on a non-loopback address
-with no authentication token configured. This includes `0.0.0.0` and `[::]`, which are
-the binds that actually expose an instance; treating "unspecified" as "probably fine"
-is how data ends up public. The refusal can be overridden with `--insecure`, which
+unless every surface — ingest, query and admin — is guarded by its own token or by Cbox
+ID. This includes `0.0.0.0` and `[::]`, which are the binds that actually expose an
+instance; treating "unspecified" as "probably fine" is how data ends up public. Versions
+before 0.58.0 accepted any single token, which left the other surfaces open. The refusal can be overridden with `--insecure`, which
 logs a warning on every start and is reported as `insecure: true` in `/status`.
 
 **Three independent bearer tokens.** `ingest_token` guards the write endpoints,

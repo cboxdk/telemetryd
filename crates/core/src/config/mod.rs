@@ -253,6 +253,27 @@ impl Config {
         )]
     }
 
+    /// The surfaces that would answer anyone: no token of their own and no Cbox ID.
+    ///
+    /// Admin falls back to the query token and ingest also accepts relay clients, the same
+    /// rules the server's guard applies — kept in step with `telemetryd_server::auth`, since
+    /// a surface this calls guarded and the guard serves openly is the bug this prevents.
+    #[must_use]
+    pub fn unguarded_surfaces(&self) -> Vec<&'static str> {
+        let oidc = self.auth.oidc.is_enabled();
+        let mut open = Vec::new();
+        if self.auth.ingest_token.is_empty() && self.relay.client.is_empty() && !oidc {
+            open.push("ingest");
+        }
+        if self.auth.query_token.is_empty() && !oidc {
+            open.push("query");
+        }
+        if self.auth.admin_token.is_empty() && self.auth.query_token.is_empty() && !oidc {
+            open.push("admin");
+        }
+        open
+    }
+
     /// Cross-field rules. Run at load time rather than at first use, so a bad
     /// configuration fails at startup instead of at 3am on the first query.
     pub fn validate(&self) -> Result<()> {
@@ -260,11 +281,23 @@ impl Config {
         // otherwise is a server that quietly keeps speaking plain HTTP.
         self.validate_server_tls()?;
 
-        // Fail closed on an exposed bind.
+        // Fail closed on an exposed bind — surface by surface.
+        //
+        // This used to ask only whether *any* token was set, while a surface with no
+        // token of its own is served to anyone. So an exposed instance with just an
+        // ingest token started, and every log, trace and metric could be read and
+        // exported by whoever found the port; with just a query token, anyone could
+        // write. A leaked write token was meant not to open reads, and here no token
+        // at all opened them.
         let exposed = !self.server.listen.ip().is_loopback();
-        let unauthenticated = self.auth.ingest_token.is_empty() && self.auth.query_token.is_empty();
-        if exposed && unauthenticated && !self.server.insecure {
-            return Err(Error::Config(exposed_bind_message(self.server.listen)));
+        if exposed && !self.server.insecure {
+            let open = self.unguarded_surfaces();
+            if !open.is_empty() {
+                return Err(Error::Config(exposed_bind_message(
+                    self.server.listen,
+                    &open,
+                )));
+            }
         }
 
         let segment = self.storage.segment_duration.get();
@@ -377,21 +410,42 @@ fn is_loopback(url: &str) -> bool {
 /// It is long on purpose. This is the one error most likely to be hit by someone
 /// trying the product for the first time, and "unauthorized bind" with no remedy
 /// would send them straight to `--insecure` — the worst of the three fixes.
-fn exposed_bind_message(listen: SocketAddr) -> String {
+fn exposed_bind_message(listen: SocketAddr, open: &[&str]) -> String {
     // Written as an explicit line list rather than one continued string literal:
     // `\` continuations swallow the leading indentation of the next line, which
     // silently flattens the numbered steps that make this message readable.
-    let lines = [
-        format!("refusing to listen on {listen} with no authentication token configured."),
+    let surfaces = match open {
+        [one] => format!("the {one} surface"),
+        [init @ .., last] => format!("the {} and {last} surfaces", init.join(", ")),
+        [] => "nothing".to_owned(),
+    };
+    let mut tokens = Vec::new();
+    if open.contains(&"ingest") {
+        tokens.push(format!(
+            "       TELEMETRYD_AUTH_INGEST_TOKEN={}",
+            suggest_token()
+        ));
+    }
+    // A query token also guards admin, so one line covers both.
+    if open.contains(&"query") || open.contains(&"admin") {
+        tokens.push(format!(
+            "       TELEMETRYD_AUTH_QUERY_TOKEN={}",
+            suggest_token()
+        ));
+    }
+    let mut lines = vec![
+        format!("refusing to listen on {listen} with {surfaces} open to anyone."),
         String::new(),
         "This address is reachable from outside this machine, and telemetry data".to_owned(),
-        "routinely contains emails, tokens and stack traces.".to_owned(),
+        "routinely contains emails, tokens and stack traces. Every surface needs its".to_owned(),
+        "own token: one for writing does not protect reading, or the other way round.".to_owned(),
         String::new(),
         "Pick one:".to_owned(),
         String::new(),
-        "  1. Set a token (recommended):".to_owned(),
-        format!("       TELEMETRYD_AUTH_INGEST_TOKEN={}", suggest_token()),
-        format!("       TELEMETRYD_AUTH_QUERY_TOKEN={}", suggest_token()),
+        "  1. Set the missing tokens (recommended):".to_owned(),
+    ];
+    lines.extend(tokens);
+    lines.extend([
         String::new(),
         "  2. Bind to loopback and put a reverse proxy in front, which is also".to_owned(),
         "     how you get TLS, if telemetryd is not terminating it:".to_owned(),
@@ -399,7 +453,7 @@ fn exposed_bind_message(listen: SocketAddr) -> String {
         String::new(),
         "  3. Accept the risk explicitly, e.g. on a trusted private network:".to_owned(),
         "       --insecure".to_owned(),
-    ];
+    ]);
     lines.join("\n")
 }
 
@@ -655,13 +709,41 @@ mod tests {
     }
 
     #[test]
-    fn exposed_bind_is_allowed_with_a_token_or_with_insecure() {
+    fn an_exposed_bind_needs_every_surface_guarded() {
+        let token = |raw: &str| serde_json::from_str(&format!("\"{raw}\"")).unwrap();
         let mut config = Config::default();
         config.server.listen = "0.0.0.0:4319".parse().unwrap();
 
-        config.auth.ingest_token = serde_json::from_str(r#""a-token""#).unwrap();
+        // One token used to be enough to start, and every other surface answered anyone:
+        // with only an ingest token, all telemetry could be read and exported.
+        config.auth.ingest_token = token("write-only");
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("query and admin surfaces"), "{err}");
+        assert!(
+            err.contains("TELEMETRYD_AUTH_QUERY_TOKEN="),
+            "offers the missing token: {err}"
+        );
+        assert!(
+            !err.contains("TELEMETRYD_AUTH_INGEST_TOKEN="),
+            "not the one already set: {err}"
+        );
+
+        // And the other way round: a read token alone leaves writing open.
+        config.auth = AuthConfig::default();
+        config.auth.query_token = token("read-only");
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("the ingest surface"), "{err}");
+
+        // Both set is enough: admin falls back to the query token, as the guard does.
+        config.auth.ingest_token = token("write");
         config.validate().unwrap();
 
+        // Cbox ID guards every surface on its own.
+        config.auth = AuthConfig::default();
+        config.auth.oidc.issuer = "https://id.example".to_owned();
+        config.validate().unwrap();
+
+        // And the explicit opt-out still works.
         config.auth = AuthConfig::default();
         config.server.insecure = true;
         config.validate().unwrap();
