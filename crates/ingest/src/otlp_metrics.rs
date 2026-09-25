@@ -216,13 +216,14 @@ pub fn decode(
     body: &[u8],
     ctx: MetricContext<'_>,
 ) -> Result<Decoded<MetricSample>, serde_json::Error> {
+    crate::json_objects_within(body)?;
     let data: MetricsData = serde_json::from_slice(body)?;
     Ok(convert_data(&data, ctx))
 }
 
 /// Convert an already-parsed payload. See [`crate::logs::convert_data`] for why.
 pub fn convert_data(data: &MetricsData, ctx: MetricContext<'_>) -> Decoded<MetricSample> {
-    let mut decoded = Decoded::default();
+    let mut decoded = Decoded::bounded(ctx.limits);
 
     for resource_metrics in &data.resource_metrics {
         let mut resource_labels = Labels::new();
@@ -255,7 +256,7 @@ fn convert_metric(
     decoded: &mut Decoded<MetricSample>,
 ) {
     if metric.name.trim().is_empty() {
-        decoded.rejections.push(Rejection::new(
+        decoded.refuse(Rejection::new(
             RejectReason::MissingMetricName,
             "metric has no name".to_owned(),
         ));
@@ -306,11 +307,11 @@ fn push_number(
     add_attributes(&mut series, &point.attributes);
 
     if let Err(rejection) = check_limits(&series, ctx) {
-        decoded.rejections.push(rejection);
+        decoded.refuse(rejection);
         return;
     }
 
-    decoded.records.push(MetricSample {
+    decoded.keep(MetricSample {
         timestamp_nanos,
         series,
         value: point.value(),
@@ -333,7 +334,7 @@ fn push_histogram(
     let mut base = base_series(name, resource, app, ctx);
     add_attributes(&mut base, &point.attributes);
     if let Err(rejection) = check_limits(&base, ctx) {
-        decoded.rejections.push(rejection);
+        decoded.refuse(rejection);
         return;
     }
 
@@ -354,7 +355,7 @@ fn push_histogram(
         series.insert("le", bound);
 
         #[allow(clippy::cast_precision_loss)]
-        decoded.records.push(MetricSample {
+        decoded.keep(MetricSample {
             timestamp_nanos,
             series,
             value: cumulative as f64,
@@ -365,7 +366,7 @@ fn push_histogram(
     if let Some(sum) = point.sum {
         let mut series = base.clone();
         series.insert(METRIC_NAME_LABEL, format!("{name}_sum"));
-        decoded.records.push(MetricSample {
+        decoded.keep(MetricSample {
             timestamp_nanos,
             series,
             value: sum,
@@ -377,7 +378,7 @@ fn push_histogram(
         let mut series = base;
         series.insert(METRIC_NAME_LABEL, format!("{name}_count"));
         #[allow(clippy::cast_precision_loss)]
-        decoded.records.push(MetricSample {
+        decoded.keep(MetricSample {
             timestamp_nanos,
             series,
             value: count as f64,

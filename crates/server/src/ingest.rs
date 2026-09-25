@@ -154,6 +154,8 @@ pub async fn otlp_logs(
         }
     };
 
+    within_budget(&state, "logs", &decoded)?;
+
     // Before the tail, before storage, before the per-app counters: everything
     // downstream must see the identity the credential proved, never the one the
     // payload asked for.
@@ -267,6 +269,8 @@ pub async fn otlp_traces(
         }
     };
 
+    within_budget(&state, "traces", &decoded)?;
+
     if decoded.rescaled_timestamps > 0 {
         state.metrics.add(
             "telemetryd_ingest_timestamps_rescaled_total",
@@ -368,6 +372,7 @@ pub async fn otlp_metrics(
         }
     };
 
+    within_budget(&state, "metrics", &decoded)?;
     let mut decoded = decoded;
     stamp(
         &state,
@@ -427,6 +432,7 @@ pub async fn remote_write(
         })?
     };
 
+    within_budget(&state, "metrics", &decoded)?;
     let mut decoded = decoded;
     stamp(
         &state,
@@ -555,6 +561,30 @@ fn decompress<'a>(
         );
     }
     Ok(decoded)
+}
+
+/// Refuse a request whose decoded records outgrew `limits.max_decoded_bytes`.
+///
+/// Refused whole, with `413`: what was kept is incomplete by then, and storing part of a
+/// batch while acknowledging it would be a silent loss. A client that sees `413` can split
+/// the batch; one that sees `200` has no reason to look.
+fn within_budget<T>(
+    state: &AppState,
+    signal: &'static str,
+    decoded: &telemetryd_ingest::Decoded<T>,
+) -> Result<(), Error> {
+    if !decoded.over_budget() {
+        return Ok(());
+    }
+    reject(state, signal, "decoded_too_large");
+    Err(Error::LimitExceeded {
+        limit: "limits.max_decoded_bytes",
+        detail: format!(
+            "this {signal} request expanded to more than {} once decoded; send smaller \
+             batches, or fewer attributes shared across many records",
+            state.config.limits.max_decoded_bytes
+        ),
+    })
 }
 
 fn reject(state: &AppState, signal: &'static str, reason: &'static str) {

@@ -71,6 +71,10 @@ pub(super) const ENV_KEYS: &[(&str, &str)] = &[
         "limits.max_attrs_per_record",
     ),
     (
+        "TELEMETRYD_LIMITS_MAX_DECODED_BYTES",
+        "limits.max_decoded_bytes",
+    ),
+    (
         "TELEMETRYD_LIMITS_INGEST_QUEUE_DEPTH",
         "limits.ingest_queue_depth",
     ),

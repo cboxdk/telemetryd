@@ -71,7 +71,7 @@ pub fn decode(compressed: &[u8], ctx: WriteContext<'_>) -> Result<Decoded<Metric
         }
     };
 
-    let mut decoded = Decoded::default();
+    let mut decoded = Decoded::bounded(ctx.limits);
     let mut reader = Reader::new(&decompressed);
 
     while let Some((field, wire)) = reader.next_field()? {
@@ -156,7 +156,7 @@ fn read_timeseries(
         Ok(series) => series,
         Err(rejection) => {
             for _ in &samples {
-                decoded.rejections.push(rejection.clone());
+                decoded.refuse(rejection.clone());
             }
             return Ok(());
         }
@@ -164,14 +164,14 @@ fn read_timeseries(
 
     for (timestamp_millis, value) in samples {
         let Some(timestamp_nanos) = millis_to_nanos(timestamp_millis) else {
-            decoded.rejections.push(Rejection::new(
+            decoded.refuse(Rejection::new(
                 RejectReason::InvalidTimestamp,
                 format!("sample timestamp {timestamp_millis} is not a plausible time"),
             ));
             continue;
         };
 
-        decoded.records.push(MetricSample {
+        decoded.keep(MetricSample {
             timestamp_nanos,
             series: series.clone(),
             value,

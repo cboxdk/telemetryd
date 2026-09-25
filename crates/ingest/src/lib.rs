@@ -99,6 +99,10 @@ pub struct Decoded<T> {
     /// Bodies that exceeded `max_log_line_bytes` and were truncated rather than
     /// dropped.
     pub truncated_bodies: u64,
+    /// What this request may still expand to, from `limits.max_decoded_bytes`.
+    budget: usize,
+    /// What it has expanded to so far.
+    used: usize,
 }
 
 impl<T> Default for Decoded<T> {
@@ -108,11 +112,139 @@ impl<T> Default for Decoded<T> {
             rejections: Vec::new(),
             rescaled_timestamps: 0,
             truncated_bodies: 0,
+            budget: usize::MAX,
+            used: 0,
         }
     }
 }
 
+/// Refuse a JSON body that would parse into far more than it is.
+///
+/// `{},` is three bytes and the log record it parses into is nearly three hundred, so a
+/// body of empty objects expands a hundredfold before any limit on records can see it.
+/// Real OTLP JSON spends twenty bytes or more per object — keys, quotes, values — so
+/// allowing one object per eight bytes admits every real payload and refuses the floods.
+/// Counted in one pass over the bytes, before anything is allocated.
+///
+/// # Errors
+/// A JSON error naming the count, reported by the caller as an undecodable payload.
+pub fn json_objects_within(body: &[u8]) -> Result<(), serde_json::Error> {
+    let allowance = (body.len() / 8).clamp(10_000, 900_000);
+    let mut objects = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &byte in body {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => {
+                objects += 1;
+                if objects > allowance {
+                    return Err(<serde_json::Error as serde::de::Error>::custom(format!(
+                        "this {}-byte body holds more than {allowance} JSON objects, which \
+                         would parse into far more memory than it arrived as; split the batch",
+                        body.len()
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// What a decoded record costs to hold, for [`Decoded::keep`].
+pub trait DecodedBytes {
+    fn decoded_bytes(&self) -> usize;
+}
+
+impl DecodedBytes for telemetryd_core::LogRecord {
+    fn decoded_bytes(&self) -> usize {
+        self.size_estimate()
+    }
+}
+
+impl DecodedBytes for telemetryd_core::SpanRecord {
+    fn decoded_bytes(&self) -> usize {
+        self.size_estimate()
+    }
+}
+
+impl DecodedBytes for telemetryd_core::MetricSample {
+    fn decoded_bytes(&self) -> usize {
+        self.size_estimate()
+    }
+}
+
 impl<T> Decoded<T> {
+    /// An empty result that will hold at most `limits.max_decoded_bytes`.
+    ///
+    /// The body limit bounds what arrives, not what it becomes: resource attributes are
+    /// copied into every record they describe, and a histogram bucket carries its own copy
+    /// of the series' labels. Measured before this existed, 73 KB of JSON decoded to 138 MB
+    /// and 108 KB to 216 MB. Charging as records are produced keeps what is held bounded
+    /// even when the request is not.
+    #[must_use]
+    pub fn bounded(limits: &telemetryd_core::config::LimitsConfig) -> Self {
+        Self {
+            budget: usize::try_from(limits.max_decoded_bytes.as_u64()).unwrap_or(usize::MAX),
+            ..Self::default()
+        }
+    }
+
+    /// Keep a decoded record, unless the request has outgrown its budget.
+    ///
+    /// Past the budget records are dropped as they are produced rather than collected and
+    /// counted afterwards — collecting them is the allocation the budget exists to stop.
+    /// The caller then refuses the whole request; see [`Self::over_budget`].
+    pub fn keep(&mut self, record: T)
+    where
+        T: DecodedBytes,
+    {
+        if self.charge(record.decoded_bytes()) {
+            self.records.push(record);
+        }
+    }
+
+    /// Record a rejection, charged like a record: a rejection's detail can name the
+    /// label that caused it, and one per sample was the costliest shape of all.
+    pub fn refuse(&mut self, rejection: Rejection) {
+        let size = std::mem::size_of::<Rejection>() + rejection.detail.len();
+        if self.charge(size) {
+            self.rejections.push(rejection);
+        }
+    }
+
+    fn charge(&mut self, bytes: usize) -> bool {
+        self.used = self.used.saturating_add(bytes);
+        self.used <= self.budget
+    }
+
+    /// Whether the request decoded to more than it may hold.
+    ///
+    /// What was kept is then incomplete, so it must not be stored: refusing the request as
+    /// a whole is the one answer a client can act on, where storing part of it would be a
+    /// silent loss.
+    #[must_use]
+    pub fn over_budget(&self) -> bool {
+        self.used > self.budget
+    }
+
+    /// What the request expanded to, for the message that refuses it.
+    #[must_use]
+    pub fn decoded_bytes(&self) -> usize {
+        self.used
+    }
+
     pub fn accepted(&self) -> usize {
         self.records.len()
     }
@@ -217,6 +349,27 @@ mod tests {
         assert!(
             summary.contains("900000"),
             "should include a concrete example: {summary}"
+        );
+    }
+
+    /// A body of empty objects parses a hundredfold larger than it is; a real payload of
+    /// the same size, and braces inside strings, must still pass.
+    #[test]
+    fn a_json_flood_is_counted_before_it_is_parsed() {
+        let flood = format!(r#"{{"resourceLogs":[{}]}}"#, vec!["{}"; 200_000].join(","));
+        assert!(crate::json_objects_within(flood.as_bytes()).is_err());
+
+        let record = r#"{"timeUnixNano":"1700000000000000000","body":{"stringValue":"GET /api {id} took 12ms"},"attributes":[{"key":"http.route","value":{"stringValue":"/api/{id}"}}]}"#;
+        let real = format!(
+            r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{}]}}]}}]}}"#,
+            vec![record; 20_000].join(",")
+        );
+        assert!(crate::json_objects_within(real.as_bytes()).is_ok());
+
+        let braces = format!(r#"{{"body":"{}"}}"#, "{".repeat(100_000));
+        assert!(
+            crate::json_objects_within(braces.as_bytes()).is_ok(),
+            "braces in a string are not objects"
         );
     }
 }

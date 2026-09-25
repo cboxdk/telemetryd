@@ -757,6 +757,15 @@ pub struct LimitsConfig {
     pub max_label_value_bytes: u32,
     pub max_log_line_bytes: ByteSize,
     pub max_attrs_per_record: u32,
+    /// How much one ingest request may expand to once decoded into records.
+    ///
+    /// The body limit bounds what arrives, not what it becomes. Resource attributes are
+    /// copied into every record they describe, and a histogram bucket carries its own
+    /// copy of the series' labels, so a few kilobytes of JSON — a few hundred bytes
+    /// gzipped — decoded to over a hundred megabytes, and a full-size body to more
+    /// memory than the machine had. Past this the request is refused with `413` rather
+    /// than stored in part.
+    pub max_decoded_bytes: ByteSize,
     /// Backpressure threshold: a full queue returns 429 with `Retry-After` rather than
     /// buffering without bound.
     pub ingest_queue_depth: u32,
@@ -801,6 +810,7 @@ impl Default for LimitsConfig {
             max_label_value_bytes: 2048,
             max_log_line_bytes: ByteSize::kib(256),
             max_attrs_per_record: 128,
+            max_decoded_bytes: ByteSize::mib(128),
             ingest_queue_depth: 8192,
             query_concurrency: 0,
             export_concurrency: 0,

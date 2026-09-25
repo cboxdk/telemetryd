@@ -146,6 +146,7 @@ pub fn decode(
     body: &[u8],
     ctx: DecodeContext<'_>,
 ) -> Result<Decoded<LogRecord>, serde_json::Error> {
+    crate::json_objects_within(body)?;
     let data: LogsData = serde_json::from_slice(body)?;
     Ok(convert_data(&data, ctx))
 }
@@ -156,7 +157,7 @@ pub fn decode(
 /// Every limit, rejection reason and counter lives below this line, which is what stops
 /// the two encodings drifting: there is one conversion, not one per encoding.
 pub fn convert_data(data: &LogsData, ctx: DecodeContext<'_>) -> Decoded<LogRecord> {
-    let mut decoded = Decoded::default();
+    let mut decoded = Decoded::bounded(ctx.limits);
 
     for resource_logs in &data.resource_logs {
         let mut resource_labels = Labels::new();
@@ -185,8 +186,8 @@ pub fn convert_data(data: &LogsData, ctx: DecodeContext<'_>) -> Decoded<LogRecor
 
             for record in &scope_logs.log_records {
                 match convert(record, &scope_labels, &scope_attributes, ctx, &mut decoded) {
-                    Ok(converted) => decoded.records.push(converted),
-                    Err(rejection) => decoded.rejections.push(rejection),
+                    Ok(converted) => decoded.keep(converted),
+                    Err(rejection) => decoded.refuse(rejection),
                 }
             }
         }

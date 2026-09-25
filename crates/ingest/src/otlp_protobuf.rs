@@ -59,29 +59,57 @@ use crate::traces::{ResourceSpans, ScopeSpans, SpanEventJson, SpanJson, StatusJs
 /// the configuration knows about. Attribute values in practice nest once or twice.
 const MAX_VALUE_DEPTH: u32 = 16;
 
-/// Elements one request may materialise in any single repeated field.
+/// How much one request may expand to while it is parsed, relative to its size.
 ///
-/// `server.max_body_bytes` was assumed to bound the memory a request costs, and it does
-/// not: it bounds the *body*. An empty protobuf message is two bytes, so a 16 MiB body
-/// holds eight million of them — measured at 801 MB of resident memory, from one request
-/// that answered `200`. The equivalent JSON is sixteen bytes per container and reached
-/// 111 MB, so this is a pre-existing shape that the denser encoding made an order of
-/// magnitude worse.
+/// `server.max_body_bytes` bounds the *body*, not what it becomes. An empty protobuf
+/// message is two bytes and the struct it parses into is up to three hundred: a 2 MB
+/// request of empty records measured 623 MB resident, and a full-size one would be
+/// several gigabytes. A count per repeated field did not stop it — the cap was per
+/// parent, so ten scopes of a hundred thousand records each passed.
 ///
-/// A hundred thousand is far above any real batch — `laravel-telemetry` sends hundreds —
-/// and far below the eight million it takes to hurt. Past it the request is refused
-/// rather than truncated: a silently shortened batch is the failure this project rejects
-/// everywhere else.
-const MAX_REPEATED: usize = 100_000;
+/// So the parse is charged in bytes, for the whole request. Real payloads expand about
+/// tenfold here — an attribute of twenty bytes becomes a two-hundred-byte struct — and a
+/// hostile one well over a hundredfold. The allowance sits between them, with a ceiling so
+/// the largest body cannot claim more than a single request should.
+const EXPANSION: usize = 32;
+const MIN_PARSED_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PARSED_BYTES: usize = 256 * 1024 * 1024;
 
-/// Refuse a repeated field that has grown past what any real producer sends.
-fn bounded(len: usize, field: &str) -> Result<()> {
-    if len >= MAX_REPEATED {
-        return Err(Error::BadRequest(format!(
-            "{field} exceeds {MAX_REPEATED} elements in one request; split the batch"
-        )));
-    }
-    Ok(())
+thread_local! {
+    /// What the request being parsed on this thread has cost so far, and may cost.
+    /// Parsing is synchronous and one request at a time per thread, so this is the
+    /// request's own budget; it is reset at each entry point.
+    /// Starts at the ceiling so code that parses a fragment without an entry point — a
+    /// test, a fuzz target — is still bounded, never refused outright.
+    static PARSED: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, MAX_PARSED_BYTES)) };
+}
+
+fn start(body: &[u8]) {
+    let allowance = body
+        .len()
+        .saturating_mul(EXPANSION)
+        .clamp(MIN_PARSED_BYTES, MAX_PARSED_BYTES);
+    PARSED.with(|parsed| parsed.set((0, allowance)));
+}
+
+/// Charge one parsed element of type `T` to the request.
+fn charge<T>(field: &str) -> Result<()> {
+    PARSED.with(|parsed| {
+        let (used, allowance) = parsed.get();
+        let used = used.saturating_add(std::mem::size_of::<T>());
+        parsed.set((used, allowance));
+        if used > allowance {
+            return Err(Error::LimitExceeded {
+                limit: "request size once parsed",
+                detail: format!(
+                    "{field} took this request past {allowance} bytes of parsed structure; \
+                     split the batch"
+                ),
+            });
+        }
+        Ok(())
+    })
 }
 
 /// Hex, lowercase. Trace and span ids are raw bytes on the wire and hex strings in JSON;
@@ -146,6 +174,7 @@ fn any_value(reader: &mut Reader<'_>, depth: u32) -> Result<AnyValue> {
                 while let Some((inner, inner_wire)) = nested.next_field()? {
                     if inner == 1 && inner_wire == WireType::LengthDelimited {
                         let mut item = nested.message()?;
+                        charge::<AnyValue>("array values")?;
                         values.push(any_value(&mut item, depth + 1)?);
                     } else {
                         nested.skip(inner_wire)?;
@@ -159,6 +188,7 @@ fn any_value(reader: &mut Reader<'_>, depth: u32) -> Result<AnyValue> {
                 while let Some((inner, inner_wire)) = nested.next_field()? {
                     if inner == 1 && inner_wire == WireType::LengthDelimited {
                         let mut item = nested.message()?;
+                        charge::<KeyValue>("kvlist values")?;
                         values.push(key_value(&mut item, depth + 1)?);
                     } else {
                         nested.skip(inner_wire)?;
@@ -194,6 +224,7 @@ fn key_value(reader: &mut Reader<'_>, depth: u32) -> Result<KeyValue> {
 /// Read a `repeated KeyValue` field into an existing vector.
 fn push_attribute(reader: &mut Reader<'_>, into: &mut Vec<KeyValue>) -> Result<()> {
     let mut nested = reader.message()?;
+    charge::<KeyValue>("attributes")?;
     into.push(key_value(&mut nested, 0)?);
     Ok(())
 }
@@ -228,13 +259,14 @@ fn scope(reader: &mut Reader<'_>) -> Result<InstrumentationScope> {
 
 /// Decode an `ExportLogsServiceRequest` into the shape the JSON decoder produces.
 pub fn logs(body: &[u8]) -> Result<LogsData> {
+    start(body);
     let mut reader = Reader::new(body);
     let mut data = LogsData::default();
     while let Some((field, wire)) = reader.next_field()? {
         match (field, wire) {
             (1, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
-                bounded(data.resource_logs.len(), "resource_logs")?;
+                charge::<ResourceLogs>("resource_logs")?;
                 data.resource_logs.push(resource_logs(&mut nested)?);
             }
             _ => reader.skip(wire)?,
@@ -253,7 +285,7 @@ fn resource_logs(reader: &mut Reader<'_>) -> Result<ResourceLogs> {
             }
             (2, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
-                bounded(out.scope_logs.len(), "scope_logs")?;
+                charge::<ScopeLogs>("scope_logs")?;
                 out.scope_logs.push(scope_logs(&mut nested)?);
             }
             _ => reader.skip(wire)?,
@@ -272,7 +304,7 @@ fn scope_logs(reader: &mut Reader<'_>) -> Result<ScopeLogs> {
             }
             (2, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
-                bounded(out.log_records.len(), "log_records")?;
+                charge::<LogRecordJson>("log_records")?;
                 out.log_records.push(log_record(&mut nested)?);
             }
             _ => reader.skip(wire)?,
@@ -315,13 +347,14 @@ fn log_record(reader: &mut Reader<'_>) -> Result<LogRecordJson> {
 
 /// Decode an `ExportTraceServiceRequest`.
 pub fn traces(body: &[u8]) -> Result<TracesData> {
+    start(body);
     let mut reader = Reader::new(body);
     let mut data = TracesData::default();
     while let Some((field, wire)) = reader.next_field()? {
         match (field, wire) {
             (1, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
-                bounded(data.resource_spans.len(), "resource_spans")?;
+                charge::<ResourceSpans>("resource_spans")?;
                 data.resource_spans.push(resource_spans(&mut nested)?);
             }
             _ => reader.skip(wire)?,
@@ -340,7 +373,7 @@ fn resource_spans(reader: &mut Reader<'_>) -> Result<ResourceSpans> {
             }
             (2, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
-                bounded(out.scope_spans.len(), "scope_spans")?;
+                charge::<ScopeSpans>("scope_spans")?;
                 out.scope_spans.push(scope_spans(&mut nested)?);
             }
             _ => reader.skip(wire)?,
@@ -359,7 +392,7 @@ fn scope_spans(reader: &mut Reader<'_>) -> Result<ScopeSpans> {
             }
             (2, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
-                bounded(out.spans.len(), "spans")?;
+                charge::<SpanJson>("spans")?;
                 out.spans.push(span(&mut nested)?);
             }
             _ => reader.skip(wire)?,
@@ -387,6 +420,7 @@ fn span(reader: &mut Reader<'_>) -> Result<SpanJson> {
             (9, WireType::LengthDelimited) => push_attribute(reader, &mut out.attributes)?,
             (11, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
+                charge::<SpanEventJson>("span events")?;
                 out.events.push(span_event(&mut nested)?);
             }
             (15, WireType::LengthDelimited) => {
@@ -438,13 +472,14 @@ fn status(reader: &mut Reader<'_>) -> Result<StatusJson> {
 /// leaves the metric with no data points and produces the same outcome as the JSON path
 /// gives for the same payload: nothing stored, and no claim that something was.
 pub fn metrics(body: &[u8]) -> Result<MetricsData> {
+    start(body);
     let mut reader = Reader::new(body);
     let mut data = MetricsData::default();
     while let Some((field, wire)) = reader.next_field()? {
         match (field, wire) {
             (1, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
-                bounded(data.resource_metrics.len(), "resource_metrics")?;
+                charge::<ResourceMetrics>("resource_metrics")?;
                 data.resource_metrics.push(resource_metrics(&mut nested)?);
             }
             _ => reader.skip(wire)?,
@@ -463,7 +498,7 @@ fn resource_metrics(reader: &mut Reader<'_>) -> Result<ResourceMetrics> {
             }
             (2, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
-                bounded(out.scope_metrics.len(), "scope_metrics")?;
+                charge::<ScopeMetrics>("scope_metrics")?;
                 out.scope_metrics.push(scope_metrics(&mut nested)?);
             }
             _ => reader.skip(wire)?,
@@ -482,7 +517,7 @@ fn scope_metrics(reader: &mut Reader<'_>) -> Result<ScopeMetrics> {
             }
             (2, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
-                bounded(out.metrics.len(), "metrics")?;
+                charge::<MetricJson>("metrics")?;
                 out.metrics.push(metric(&mut nested)?);
             }
             _ => reader.skip(wire)?,
@@ -525,6 +560,7 @@ fn number_points(reader: &mut Reader<'_>) -> Result<Vec<NumberPoint>> {
         match (field, wire) {
             (1, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
+                charge::<NumberPoint>("data points")?;
                 points.push(number_point(&mut nested)?);
             }
             _ => reader.skip(wire)?,
@@ -539,6 +575,7 @@ fn sum(reader: &mut Reader<'_>) -> Result<SumData> {
         match (field, wire) {
             (1, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
+                charge::<NumberPoint>("data points")?;
                 out.data_points.push(number_point(&mut nested)?);
             }
             (3, WireType::Varint) => out.is_monotonic = reader.varint()? != 0,
@@ -570,6 +607,7 @@ fn histogram_points(reader: &mut Reader<'_>) -> Result<Vec<HistogramPoint>> {
         match (field, wire) {
             (1, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
+                charge::<HistogramPoint>("data points")?;
                 points.push(histogram_point(&mut nested)?);
             }
             _ => reader.skip(wire)?,
@@ -592,12 +630,14 @@ fn histogram_point(reader: &mut Reader<'_>) -> Result<HistogramPoint> {
             (6, WireType::LengthDelimited) => {
                 let mut packed = reader.message()?;
                 while !packed.is_empty() {
+                    charge::<FlexU64>("bucket counts")?;
                     out.bucket_counts.push(FlexU64::Number(packed.fixed64()?));
                 }
             }
             (7, WireType::LengthDelimited) => {
                 let mut packed = reader.message()?;
                 while !packed.is_empty() {
+                    charge::<f64>("explicit bounds")?;
                     out.explicit_bounds.push(packed.double()?);
                 }
             }
@@ -639,19 +679,41 @@ mod tests {
 
     #[test]
     fn a_wide_batch_is_refused_before_it_allocates() {
-        // Depth had a guard; width did not. An empty protobuf message is two bytes, so a
-        // body inside `server.max_body_bytes` holds eight million of them — measured at
-        // 801 MB resident, from one request that answered `200`. The body limit bounds
-        // the body, and that was being read as bounding the memory.
-        let hostile: Vec<u8> = [0x0a, 0x00].repeat(MAX_REPEATED + 1);
-        let error = logs(&hostile).unwrap_err();
-        assert!(error.to_string().contains("resource_logs"), "{error}");
+        // An empty log record is two bytes on the wire and several hundred once parsed. A
+        // cap of a hundred thousand per repeated field did not bound that — it was per
+        // parent, so ten scopes of 99,999 each passed and measured 623 MB resident from a
+        // 2 MB body. The parse is charged in bytes for the whole request now.
+        fn field(tag: u8, payload: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag];
+            let mut len = payload.len();
+            loop {
+                let byte = u8::try_from(len & 0x7f).unwrap();
+                len >>= 7;
+                if len == 0 {
+                    out.push(byte);
+                    break;
+                }
+                out.push(byte | 0x80);
+            }
+            out.extend_from_slice(payload);
+            out
+        }
+        let batch = |records: usize| {
+            let scope = [0x12, 0x00].repeat(records);
+            field(0x0a, &field(0x12, &scope))
+        };
+
+        // Fifty thousand is half the old per-field cap, and far past this body's share.
+        let error = logs(&batch(50_000)).unwrap_err();
         assert!(error.to_string().contains("split the batch"), "{error}");
 
-        // Refused, not truncated: a silently shortened batch is the failure mode this
-        // project rejects everywhere else.
-        let fine: Vec<u8> = [0x0a, 0x00].repeat(16);
-        assert_eq!(logs(&fine).unwrap().resource_logs.len(), 16);
+        // Refused, not truncated — and an ordinary batch is untouched.
+        assert_eq!(
+            logs(&batch(16)).unwrap().resource_logs[0].scope_logs[0]
+                .log_records
+                .len(),
+            16
+        );
     }
 
     #[test]

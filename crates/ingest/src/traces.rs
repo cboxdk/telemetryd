@@ -81,13 +81,14 @@ pub fn decode(
     body: &[u8],
     ctx: DecodeContext<'_>,
 ) -> Result<Decoded<SpanRecord>, serde_json::Error> {
+    crate::json_objects_within(body)?;
     let data: TracesData = serde_json::from_slice(body)?;
     Ok(convert_data(&data, ctx))
 }
 
 /// Convert an already-parsed payload. See [`crate::logs::convert_data`] for why.
 pub fn convert_data(data: &TracesData, ctx: DecodeContext<'_>) -> Decoded<SpanRecord> {
-    let mut decoded = Decoded::default();
+    let mut decoded = Decoded::bounded(ctx.limits);
 
     for resource_spans in &data.resource_spans {
         let mut resource_labels = Labels::new();
@@ -112,8 +113,8 @@ pub fn convert_data(data: &TracesData, ctx: DecodeContext<'_>) -> Decoded<SpanRe
 
             for span in &scope_spans.spans {
                 match convert(span, &scope_labels, &scope_attributes, ctx, &mut decoded) {
-                    Ok(record) => decoded.records.push(record),
-                    Err(rejection) => decoded.rejections.push(rejection),
+                    Ok(record) => decoded.keep(record),
+                    Err(rejection) => decoded.refuse(rejection),
                 }
             }
         }
@@ -263,6 +264,23 @@ fn build_stream_labels(inherited: &Labels, ctx: DecodeContext<'_>) -> Result<Lab
                 ctx.limits.max_labels_per_series
             ),
         ));
+    }
+    // The same lengths logs and metrics enforce. Spans skipped them, so a
+    // hundred-kilobyte `service.name` was refused on `/v1/logs` and stored on
+    // `/v1/traces` — as a stream label, carried in every segment's dictionary.
+    for (name, value) in stream.iter() {
+        if name.len() > ctx.limits.max_label_name_bytes as usize {
+            return Err(Rejection::new(
+                RejectReason::LabelNameTooLong,
+                format!("label name {name:?} exceeds max_label_name_bytes"),
+            ));
+        }
+        if value.len() > ctx.limits.max_label_value_bytes as usize {
+            return Err(Rejection::new(
+                RejectReason::LabelValueTooLong,
+                format!("value of label {name:?} exceeds max_label_value_bytes"),
+            ));
+        }
     }
     Ok(stream)
 }
@@ -471,5 +489,27 @@ mod tests {
             let decoded = decode_str(json);
             assert!(decoded.records.is_empty(), "{json}");
         }
+    }
+
+    /// Logs and metrics refused an overlong label value and spans stored it, as a stream
+    /// label carried in every segment's dictionary.
+    #[test]
+    fn a_span_with_an_overlong_stream_label_is_refused_like_a_log() {
+        let long = "s".repeat(LimitsConfig::default().max_label_value_bytes as usize + 1);
+        let json = REALISTIC.replace("\"checkout\"", &format!("\"{long}\""));
+        let decoded = decode_str(&json);
+        assert!(
+            decoded.records.is_empty(),
+            "stored {} spans",
+            decoded.records.len()
+        );
+        assert!(
+            decoded
+                .rejections
+                .iter()
+                .all(|r| r.reason == RejectReason::LabelValueTooLong),
+            "{:?}",
+            decoded.rejections
+        );
     }
 }
