@@ -67,6 +67,32 @@ pub fn shared(labels: Labels) -> Labels {
     labels
 }
 
+/// [`shared`], for a set given as borrowed pairs in name order.
+///
+/// A set the table already holds is returned without allocating one, which is the
+/// common case when segments are loaded: the same streams appear in every segment
+/// covering the hours they were written in.
+#[must_use]
+pub fn shared_pairs(pairs: &[(&str, &str)]) -> Labels {
+    let fingerprint = Labels::fingerprint_of(pairs.iter().copied());
+    {
+        let table = table()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(canonical) = table.get(&fingerprint)
+            && canonical.iter().eq(pairs.iter().copied())
+        {
+            return canonical.shared_with();
+        }
+    }
+    shared(
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect(),
+    )
+}
+
 /// How many distinct label sets are being shared. For `/status` and for tests.
 #[must_use]
 pub fn distinct() -> usize {
@@ -118,6 +144,18 @@ mod tests {
         let mut third = second.clone();
         third.insert("extra", "value");
         assert!(!first.shares_storage_with(&third));
+    }
+
+    /// Borrowed pairs find the set already shared, and make it when there is none.
+    #[test]
+    fn pairs_find_the_shared_set() {
+        let first = shared(labels(77));
+        let found = shared_pairs(&[("app", "checkout"), ("route", "/r/77")]);
+        assert!(first.shares_storage_with(&found));
+
+        let made = shared_pairs(&[("app", "checkout"), ("route", "/r/78")]);
+        assert_eq!(made, labels(78));
+        assert!(made.shares_storage_with(&shared(labels(78))));
     }
 
     #[test]

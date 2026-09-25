@@ -14,8 +14,11 @@ telemetryd-data/
 ├── LOCK         # advisory lock — one writer per directory, enforced
 ├── wal/{logs,traces,metrics}/NNNNNNNN.wal
 ├── segments/{logs,traces,metrics}/<id>/
-│   ├── data.parquet
-│   ├── manifest.json    # time bounds, label index, stream dictionary
+│   ├── data.parquet     # rows, sorted by time, in row groups of 65,536
+│   ├── manifest.json    # id, time bounds, label index
+│   ├── streams.bin      # stream dictionary: each series' labels, bounds and rows
+│   ├── folds.bin        # counter summaries (metrics)
+│   ├── text.bloom       # trigram index (logs)
 │   └── keys.bloom       # exact-match filter (traces)
 └── tmp/         # staging; segments become visible via rename(2)
 ```
@@ -73,6 +76,25 @@ telemetryd ignores it, and deleting it costs speed rather than correctness: a ba
 task writes it again. It is deliberately a separate file rather than part of the
 manifest, so that it is read when a query needs the numbers and stays off the heap
 otherwise.
+
+## Segment format
+
+Segments carry a format version in their manifest, and a build refuses to open a store
+holding a version it does not know rather than read it wrongly.
+
+Format 3, from 0.64.0, moved the stream dictionary out of `manifest.json` into
+`streams.bin`: every distinct label name and value written once, each stream a list of
+indices into them, zstd-compressed and checksummed. The manifest used to spell out every
+stream's labels in full; on a metric segment with twelve thousand series that was five
+megabytes of JSON beside six hundred kilobytes of data. The same segment is now 54 KB of
+manifest and dictionary together, and loads in half the time.
+
+0.64.0 reads format 2 as before and rewrites those segments as format 3 in the
+background, sixteen every thirty seconds, logging each batch. **This makes the upgrade
+one-way:** an earlier build refuses to start on a store holding a format 3 segment, with
+an error naming the version it found. To move back to an earlier release, restore the
+data directory from a backup taken before upgrading — see
+[Back up and restore](../cookbook/back-up-and-restore.md).
 
 ## Retention
 

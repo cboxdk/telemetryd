@@ -2571,6 +2571,7 @@ dependencies = [
  "telemetryd-core",
  "tempfile",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

@@ -26,6 +26,12 @@ const SERIES_RECLAIM_TICK: Duration = Duration::from_secs(60);
 /// clears a week of hourly segments within the hour while staying invisible.
 const FOLD_BACKFILL_PER_TICK: usize = 8;
 
+/// Segments sealed by an older build to rewrite in the current format per tick.
+///
+/// Each is a dictionary encoded and two small files written — milliseconds — so a week
+/// of segments is through within a quarter of an hour.
+const UPGRADE_PER_TICK: usize = 16;
+
 /// How often to look for segments still missing their summaries.
 const FOLD_BACKFILL_TICK: Duration = Duration::from_secs(30);
 
@@ -88,23 +94,29 @@ impl Maintenance {
         }));
     }
 
-    /// Give old segments the counter summaries that make a long window cheap.
+    /// Bring old segments up to date: the counter summaries that make a long window
+    /// cheap, and the current on-disk format.
     ///
     /// Segments sealed before summaries existed carry none, and queries over them fall
-    /// back to reading every row. Without this the speed-up would arrive only as those
-    /// segments aged out — a week, on a week's retention.
+    /// back to reading every row; segments of the previous format carry their stream
+    /// dictionary as JSON eight times the size of their data. Without this either
+    /// would be put right only as those segments aged out — a week, on a week's
+    /// retention.
     fn spawn_fold_backfill(tasks: &mut Vec<tokio::task::JoinHandle<()>>, store: &Arc<Store>) {
         let store = Arc::clone(store);
         tasks.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(FOLD_BACKFILL_TICK);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Whether segments were rewritten since the last time none were, so the end
+            // of an upgrade's rewrite is said once — it is when a live backup is safe again.
+            let mut rewriting = false;
             loop {
                 ticker.tick().await;
-                let store = Arc::clone(&store);
+                let summarising = Arc::clone(&store);
                 // Reading segments is blocking file I/O, like every other store call.
                 match crate::fatal::storage(
                     tokio::task::spawn_blocking(move || {
-                        store.backfill_metric_folds(FOLD_BACKFILL_PER_TICK)
+                        summarising.backfill_metric_folds(FOLD_BACKFILL_PER_TICK)
                     })
                     .await,
                     "summarising older segments",
@@ -113,6 +125,27 @@ impl Maintenance {
                     Ok(Ok(written)) => tracing::debug!(written, "summarised older segments"),
                     Ok(Err(e)) => tracing::warn!(error = %e, "could not summarise a segment"),
                     Err(e) => tracing::error!(error = %e, "fold backfill did not finish"),
+                }
+
+                let upgrading = Arc::clone(&store);
+                match crate::fatal::storage(
+                    tokio::task::spawn_blocking(move || {
+                        upgrading.upgrade_segments(UPGRADE_PER_TICK)
+                    })
+                    .await,
+                    "rewriting older segments",
+                ) {
+                    Ok(Ok(0)) => {
+                        if std::mem::take(&mut rewriting) {
+                            tracing::info!("every segment is in the current format");
+                        }
+                    }
+                    Ok(Ok(upgraded)) => {
+                        rewriting = true;
+                        tracing::info!(upgraded, "rewrote older segments in the current format");
+                    }
+                    Ok(Err(e)) => tracing::warn!(error = %e, "could not rewrite a segment"),
+                    Err(e) => tracing::error!(error = %e, "segment rewrite did not finish"),
                 }
             }
         }));

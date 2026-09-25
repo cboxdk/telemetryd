@@ -704,6 +704,26 @@ impl<S: RecordSchema> RecordStore<S> {
         lock_read(&self.catalogue).clone()
     }
 
+    /// Rewrite up to `limit` segments of the previous format as the current one.
+    ///
+    /// Returns how many were rewritten. A segment retention removed meanwhile is passed
+    /// over; any other failure ends the pass, to be tried again on the next.
+    pub fn upgrade_segments(&self, limit: usize) -> Result<usize> {
+        let mut upgraded = 0;
+        for segment in self.segments() {
+            if upgraded >= limit {
+                break;
+            }
+            match segment.upgrade() {
+                Ok(true) => upgraded += 1,
+                Ok(false) => {}
+                Err(error) if crate::segment::is_gone(&error) || !segment.dir.exists() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(upgraded)
+    }
+
     /// Drop a segment from the catalogue and delete it from disk. Used by retention.
     pub fn remove_segment(&self, id: &str) -> Result<bool> {
         let removed = {

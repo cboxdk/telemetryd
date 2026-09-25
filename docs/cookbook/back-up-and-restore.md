@@ -35,6 +35,14 @@ built for crash recovery rather than for backups. Backups get it for free.
 manifest never change. A copy either catches a segment or does not; it cannot catch
 one half-updated.
 
+The one exception is the first quarter of an hour after upgrading to 0.64.0 from an
+earlier release, while segments of the previous format are rewritten in the current one
+(see [Segment format](../core-concepts/storage.md#segment-format)). Each rewrite adds
+`streams.bin` and then replaces `manifest.json`, and a copy landing between the two can
+hold the new manifest without its dictionary; that segment then loads as unreadable. Take
+the backup before upgrading, or after the log says `every segment is in the current
+format`.
+
 **Segments are published by atomic rename.** A segment is written to `tmp/` and moved
 into place in one step. A copy taken mid-seal sees the staging directory, which has no
 manifest, and a directory without a readable manifest is skipped on load and cleaned up

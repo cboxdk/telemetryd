@@ -213,17 +213,25 @@ fn a_segment_from_before_these_fields_existed_still_reads() {
 
     let dir = victim.parent().unwrap();
 
-    // Strip the manifest back to the fields an older build wrote, and delete the
-    // sidecar it would not have produced.
+    // Write the manifest back as an older build wrote it — format 2, the stream
+    // dictionary inline, no per-stream bounds or rows — and delete the sidecars it
+    // would not have produced.
+    let segment = store
+        .segments()
+        .into_iter()
+        .find(|segment| segment.dir == dir)
+        .unwrap();
+    assert!(
+        !segment.manifest.stream_bounds.is_empty(),
+        "the bounds should be there to leave out, or this test has stopped testing anything"
+    );
     let manifest_path = dir.join("manifest.json");
     let raw = std::fs::read_to_string(&manifest_path).unwrap();
     let mut manifest: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    let object = manifest.as_object_mut().unwrap();
-    assert!(
-        object.remove("stream_bounds").is_some(),
-        "the field should be there to remove, or this test has stopped testing anything"
-    );
+    manifest["format_version"] = 2.into();
+    manifest["streams"] = serde_json::to_value(&segment.manifest.streams).unwrap();
     std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+    std::fs::remove_file(dir.join("streams.bin")).unwrap();
     let sidecar = dir.join("text.bloom");
     assert!(sidecar.exists(), "expected a trigram sidecar to remove");
     std::fs::remove_file(&sidecar).unwrap();

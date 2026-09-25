@@ -101,13 +101,21 @@ impl Labels {
     /// Never persisted, which is what lets it be seeded: it means nothing to another
     /// process.
     pub fn fingerprint(&self) -> u64 {
+        Self::fingerprint_of(self.iter())
+    }
+
+    /// [`Self::fingerprint`] of the set these pairs would make, without making it.
+    ///
+    /// The pairs must come in name order, as a set iterates them. It lets a table be
+    /// asked whether it already holds a set before one is allocated to ask with.
+    pub fn fingerprint_of<'a>(pairs: impl Iterator<Item = (&'a str, &'a str)>) -> u64 {
         use std::hash::{BuildHasher, Hash, Hasher};
         static SEED: std::sync::OnceLock<std::collections::hash_map::RandomState> =
             std::sync::OnceLock::new();
         let mut hasher = SEED.get_or_init(Default::default).build_hasher();
-        for (name, value) in self.0.iter() {
-            name.as_str().hash(&mut hasher);
-            value.as_str().hash(&mut hasher);
+        for (name, value) in pairs {
+            name.hash(&mut hasher);
+            value.hash(&mut hasher);
         }
         hasher.finish()
     }

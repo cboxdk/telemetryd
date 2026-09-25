@@ -30,7 +30,14 @@ use crate::schema::RecordSchema;
 use crate::trigram::TrigramIndex;
 
 /// Bumped when a sealed segment written by an older build can no longer be read.
-pub const SEGMENT_FORMAT_VERSION: u32 = 2;
+///
+/// 3 moved the stream dictionary out of `manifest.json` into `streams.bin`; see
+/// the `dictionary` module. A build before it refuses to open a store holding one.
+pub const SEGMENT_FORMAT_VERSION: u32 = 3;
+
+/// The format before the dictionary moved out, still read — and rewritten as the
+/// current one by [`Segment::upgrade`].
+pub const DICTIONARY_IN_MANIFEST: u32 = 2;
 
 /// Above this many distinct values, a label stops being tracked individually.
 ///
@@ -69,7 +76,9 @@ pub struct SegmentManifest {
     /// Interning them here is what makes label matching cost one evaluation per
     /// *stream* instead of one per *row*. A segment holding a million rows across
     /// fifty streams evaluates the matchers fifty times.
-    #[serde(default)]
+    ///
+    /// Written to `streams.bin`, not the manifest, from format 3 on.
+    #[serde(default, skip_serializing)]
     pub streams: Vec<Labels>,
     /// `(min, max)` event time per entry of `streams`, in the same order.
     ///
@@ -82,15 +91,15 @@ pub struct SegmentManifest {
     /// Per-stream bounds let the collector's cutoff apply to the streams the query
     /// actually selected. Empty on segments written before this existed, which fall back
     /// to the whole-segment range.
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub stream_bounds: Vec<(u64, u64)>,
     /// Rows contributed by each entry of `streams`, in the same order.
     ///
     /// A segment holds every app that was writing when it sealed, so `rows` alone
     /// cannot answer "which app is filling my disk" — the question an operator has
     /// when the budget alarm fires. Empty on segments written before this existed.
-    #[serde(default)]
-    pub stream_rows: Vec<u64>,
+    #[serde(default, skip_serializing)]
+    pub stream_rows: Vec<u32>,
 }
 
 impl SegmentManifest {
@@ -282,6 +291,8 @@ pub struct Segment {
     /// evaluation point per segment. Only two things create the file — sealing and the
     /// backfill — and both set this, so it cannot go stale under us.
     has_folds: Arc<AtomicBool>,
+    /// Set once [`Self::upgrade`] has rewritten, or is rewriting, this segment's files.
+    upgraded: Arc<AtomicBool>,
     /// Parquet footer, parsed once and reused.
     ///
     /// Segments are immutable, so their metadata can never go stale. Re-reading and
@@ -291,6 +302,48 @@ pub struct Segment {
 }
 
 impl Segment {
+    /// Rewrite a segment of the previous format as the current one: its dictionary into
+    /// `streams.bin`, then a manifest without it. Returns whether there was anything to do.
+    ///
+    /// The dictionary is written first and the manifest replaced atomically after it, so
+    /// a crash between the two leaves the old manifest, still whole, and an unused file
+    /// the next attempt overwrites. The segment in memory is unchanged either way: it
+    /// already holds everything both files say.
+    pub fn upgrade(&self) -> Result<bool> {
+        if self.manifest.format_version != DICTIONARY_IN_MANIFEST
+            || self.upgraded.swap(true, Ordering::Relaxed)
+        {
+            return Ok(false);
+        }
+        let outcome = crate::dictionary::write(
+            &self.dir,
+            self.manifest.min_time_nanos,
+            &self.manifest.streams,
+            &self.manifest.stream_bounds,
+            &self.manifest.stream_rows,
+        )
+        .and_then(|()| {
+            let manifest = SegmentManifest {
+                format_version: SEGMENT_FORMAT_VERSION,
+                ..self.manifest.clone()
+            };
+            let staged = self.dir.join("manifest.partial");
+            write_manifest(&staged, &manifest)?;
+            fs::rename(&staged, self.dir.join(MANIFEST_FILE)).map_err(|e| {
+                Error::io(
+                    format!("publishing {}", self.dir.join(MANIFEST_FILE).display()),
+                    e,
+                )
+            })?;
+            sync_dir(&self.dir)
+        });
+        if outcome.is_err() {
+            // Tried again on the next pass; a segment retention took meanwhile is not.
+            self.upgraded.store(false, Ordering::Relaxed);
+        }
+        outcome.map(|()| true)
+    }
+
     /// Whether a previous read of this segment failed.
     #[must_use]
     pub fn is_unreadable(&self) -> bool {
@@ -353,20 +406,48 @@ impl Segment {
             }
         };
 
-        // Share the stream dictionary with every other segment holding the same sets.
-        // Done here rather than at use because this is the only moment the copies exist
-        // as separate allocations — one line later they would already be resident.
-        for stream in &mut manifest.streams {
-            *stream = crate::intern::shared(std::mem::take(stream));
+        match manifest.format_version {
+            SEGMENT_FORMAT_VERSION => match crate::dictionary::read(dir, manifest.min_time_nanos) {
+                Ok(dictionary) => {
+                    manifest.streams = dictionary.streams;
+                    manifest.stream_bounds = dictionary.bounds;
+                    manifest.stream_rows = dictionary.rows;
+                }
+                Err(problem) => {
+                    // Without its dictionary no row can be attributed to a series, so
+                    // the segment cannot answer anything truthfully.
+                    tracing::error!(
+                        path = %dir.display(),
+                        %problem,
+                        "ignoring a segment whose stream dictionary cannot be read; its data \
+                         cannot be attributed. Delete the directory to stop this being reported."
+                    );
+                    return Ok(None);
+                }
+            },
+            DICTIONARY_IN_MANIFEST => {
+                // Share the stream dictionary with every other segment holding the same
+                // sets. Done here rather than at use because this is the only moment the
+                // copies exist as separate allocations — one line later they would
+                // already be resident.
+                for stream in &mut manifest.streams {
+                    *stream = crate::intern::shared(std::mem::take(stream));
+                }
+            }
+            found => {
+                return Err(Error::StorageVersionMismatch {
+                    path: dir.to_path_buf(),
+                    found,
+                    expected: SEGMENT_FORMAT_VERSION,
+                });
+            }
         }
-
-        if manifest.format_version != SEGMENT_FORMAT_VERSION {
-            return Err(Error::StorageVersionMismatch {
-                path: dir.to_path_buf(),
-                found: manifest.format_version,
-                expected: SEGMENT_FORMAT_VERSION,
-            });
-        }
+        // Held for the life of the segment, so held exactly: a vector grown while
+        // parsing keeps up to half again its length in spare capacity, across hundreds of
+        // segments.
+        manifest.streams.shrink_to_fit();
+        manifest.stream_bounds.shrink_to_fit();
+        manifest.stream_rows.shrink_to_fit();
         if !dir.join(DATA_FILE).is_file() {
             tracing::warn!(
                 path = %dir.display(),
@@ -384,6 +465,7 @@ impl Segment {
             has_folds: Arc::new(AtomicBool::new(
                 dir.join(crate::folds::FOLDS_FILE).is_file(),
             )),
+            upgraded: Arc::new(AtomicBool::new(false)),
             metadata: Arc::new(OnceLock::new()),
         }))
     }
@@ -630,7 +712,7 @@ fn stream_folds<S: RecordSchema>(
 fn stream_statistics<S: RecordSchema>(
     records: &[S::Record],
     streams: &[Labels],
-) -> (Vec<(u64, u64)>, Vec<u64>) {
+) -> (Vec<(u64, u64)>, Vec<u32>) {
     let index: std::collections::HashMap<&Labels, usize> = streams
         .iter()
         .enumerate()
@@ -638,13 +720,13 @@ fn stream_statistics<S: RecordSchema>(
         .collect();
 
     let mut bounds = vec![(u64::MAX, u64::MIN); streams.len()];
-    let mut rows = vec![0u64; streams.len()];
+    let mut rows = vec![0u32; streams.len()];
     for record in records {
         if let Some(&id) = index.get(S::index_labels(record)) {
             let at = S::timestamp(record);
             bounds[id].0 = bounds[id].0.min(at);
             bounds[id].1 = bounds[id].1.max(at);
-            rows[id] += 1;
+            rows[id] = rows[id].saturating_add(1);
         }
     }
     (bounds, rows)
@@ -815,6 +897,13 @@ fn write_staged<S: RecordSchema>(
         stream_bounds,
         stream_rows,
     };
+    crate::dictionary::write(
+        staging,
+        manifest.min_time_nanos,
+        &manifest.streams,
+        &manifest.stream_bounds,
+        &manifest.stream_rows,
+    )?;
     write_manifest(&staging.join(MANIFEST_FILE), &manifest)?;
     let wrote_folds = folds.is_some();
     if let Some(folds) = &folds {
@@ -867,6 +956,7 @@ fn write_staged<S: RecordSchema>(
         text,
         unreadable: Arc::new(AtomicBool::new(false)),
         has_folds: Arc::new(AtomicBool::new(wrote_folds)),
+        upgraded: Arc::new(AtomicBool::new(false)),
         metadata: Arc::new(OnceLock::new()),
     })
 }
@@ -1046,6 +1136,70 @@ mod tests {
             stream_bounds: Vec::new(),
             stream_rows: Vec::new(),
         }
+    }
+
+    /// A segment of the previous format — its dictionary inside the manifest — is read
+    /// as it always was, and rewritten as the current format with nothing lost.
+    #[test]
+    fn a_previous_format_segment_is_read_and_upgraded() {
+        use telemetryd_core::{MetricKind, MetricSample};
+        let dir = tempfile::tempdir().unwrap();
+        let (segments_dir, tmp_dir) = (dir.path().join("segments"), dir.path().join("tmp"));
+        fs::create_dir_all(&segments_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let records: Vec<MetricSample> = (0..100u64)
+            .map(|at| MetricSample {
+                series: labels(&[
+                    ("__name__", "x_total"),
+                    ("pod", if at % 3 == 0 { "a" } else { "b" }),
+                ]),
+                timestamp_nanos: 1_000 + at,
+                value: 1.0,
+                kind: MetricKind::Counter,
+            })
+            .collect();
+        let sealed = seal::<crate::MetricSchema>(
+            &records,
+            SealOptions {
+                segments_dir: &segments_dir,
+                tmp_dir: &tmp_dir,
+                compression: Compression::Zstd,
+                now_nanos: 1,
+                sequence: 1,
+                wal_sequence: 0,
+            },
+        )
+        .unwrap();
+        assert!(sealed.dir.join(crate::dictionary::FILE).is_file());
+        let manifest_json = fs::read_to_string(sealed.dir.join(MANIFEST_FILE)).unwrap();
+        let manifest_value: serde_json::Value = serde_json::from_str(&manifest_json).unwrap();
+        assert!(
+            manifest_value.get("streams").is_none(),
+            "no dictionary in the manifest"
+        );
+
+        // Rewind it to how the previous format wrote it.
+        let mut legacy = serde_json::to_value(&sealed.manifest).unwrap();
+        legacy["format_version"] = DICTIONARY_IN_MANIFEST.into();
+        legacy["streams"] = serde_json::to_value(&sealed.manifest.streams).unwrap();
+        legacy["stream_bounds"] = serde_json::to_value(&sealed.manifest.stream_bounds).unwrap();
+        legacy["stream_rows"] = serde_json::to_value(&sealed.manifest.stream_rows).unwrap();
+        fs::write(sealed.dir.join(MANIFEST_FILE), legacy.to_string()).unwrap();
+        fs::remove_file(sealed.dir.join(crate::dictionary::FILE)).unwrap();
+
+        let old = Segment::load(&sealed.dir).unwrap().unwrap();
+        assert_eq!(old.manifest.format_version, DICTIONARY_IN_MANIFEST);
+        assert_eq!(old.manifest.streams, sealed.manifest.streams);
+        assert!(old.upgrade().unwrap(), "rewritten");
+        assert!(!old.upgrade().unwrap(), "once");
+
+        let new = Segment::load(&sealed.dir).unwrap().unwrap();
+        assert_eq!(new.manifest.format_version, SEGMENT_FORMAT_VERSION);
+        assert_eq!(new.manifest.streams, sealed.manifest.streams);
+        assert_eq!(new.manifest.stream_bounds, sealed.manifest.stream_bounds);
+        assert_eq!(new.manifest.stream_rows, sealed.manifest.stream_rows);
+        assert_eq!(new.read::<crate::MetricSchema>().unwrap().len(), 100);
+        assert!(!sealed.dir.join("manifest.partial").exists());
     }
 
     /// A segment is written in row groups a time range can skip, and a read over a

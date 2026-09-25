@@ -8,6 +8,7 @@
 pub mod bloom;
 pub mod cardinality;
 pub mod datadir;
+mod dictionary;
 pub mod folds;
 pub mod intern;
 pub mod logs;
@@ -596,12 +597,13 @@ impl Store {
                     continue;
                 }
                 for (labels, rows) in manifest.streams.iter().zip(&manifest.stream_rows) {
+                    let rows = u64::from(*rows);
                     let usage = apps.entry(app_of(labels).to_owned()).or_default();
                     usage.series += 1;
                     usage.rows += rows;
                     if let Some(share) = manifest
                         .bytes
-                        .saturating_mul(*rows)
+                        .saturating_mul(rows)
                         .checked_div(manifest.rows)
                     {
                         usage.estimated_bytes += share;
@@ -633,6 +635,20 @@ impl Store {
             self.cardinality.reclaimed_series(),
             self.cardinality.evicted_series(),
         )
+    }
+
+    /// Rewrite up to `limit` segments sealed by an older build in the current format.
+    ///
+    /// A metric segment's manifest used to carry its whole stream dictionary as JSON —
+    /// five megabytes where the data was six hundred kilobytes. Without this the space
+    /// would come back only as those segments aged out. Returns how many were rewritten.
+    pub fn upgrade_segments(&self, limit: usize) -> Result<usize> {
+        let mut upgraded = self.metrics.upgrade_segments(limit)?;
+        upgraded += self.logs.upgrade_segments(limit.saturating_sub(upgraded))?;
+        upgraded += self
+            .traces
+            .upgrade_segments(limit.saturating_sub(upgraded))?;
+        Ok(upgraded)
     }
 
     /// Write counter summaries for metric segments that predate them.

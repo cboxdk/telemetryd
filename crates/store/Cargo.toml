@@ -21,6 +21,7 @@ serde_json.workspace = true
 arrow.workspace = true
 parquet.workspace = true
 postcard.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 mimalloc = { workspace = true }
