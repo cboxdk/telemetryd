@@ -164,6 +164,28 @@ Remote-Write 2.0 is a `415`, not a `204` over nothing stored. A protobuf export 
 protobuf answer. Span links are stored and served. The table is in
 [COMPATIBILITY.md](COMPATIBILITY.md#what-the-answer-tells-a-sender).
 
+**Answers match upstream where they used to differ.** Checked against the upstreams'
+own engines rather than their documentation — Prometheus 3.15.0 through `promtool test
+rules`, Tempo's TraceQL source — and each case is a test:
+
+- `rate` and `increase` are Prometheus's `extrapolatedRate`. **Period totals over series
+  that did not exist the whole window drop to the true value** — a counter born a minute
+  before the end of an hour used to read sixty times its increase. Dashboards showing
+  "requests today" for a new or departed series will show smaller, correct numbers.
+- Staleness markers end a series instead of reading as NaN; `__name__` is kept where
+  Prometheus keeps it, and two metrics that collapse to one label set are refused;
+  `^` binds tightest and to the right; a scalar answers `resultType: scalar`;
+  `histogram_quantile` handles its edge cases as `BucketQuantile` does; `NaN`, `Inf`,
+  `.5`, hex and `offset -5m` parse.
+- LogQL: RFC 3339 zone offsets are honoured, a parsed field colliding with a stream label
+  is `_extracted` for filters and response alike, and `__error__` is set on lines `| json`
+  cannot parse.
+- TraceQL and Tempo search: `!~`, anchored regexes, absent attributes matching only
+  `= nil`, unknown bare words refused, `statusMessage`; search rows describe the whole
+  trace and duration bounds apply to it; a span stored twice is returned once.
+- A label set's fingerprint is keyed per process and cannot be forged from inside a
+  label value, and no table turns a fingerprint into a stream id without checking.
+
 **Known gap:** the four per-segment structures are still all resident. Loading them on
 demand behind a cache bounded by the process's memory limit is the remaining fix; sharing
 reduced the dominant term but did not make it independent of how much is stored.
