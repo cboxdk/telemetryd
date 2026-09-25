@@ -230,6 +230,8 @@ impl<'a> Lexer<'a> {
             b'"' | b'\'' => self.lex_quoted(ch),
             b'`' => self.lex_raw(),
             b'0'..=b'9' => self.lex_number(),
+            // `.5` is a number, as it is in PromQL.
+            b'.' if self.peek(1).is_some_and(|next| next.is_ascii_digit()) => self.lex_number(),
             // A leading `.` starts an identifier: TraceQL spells an unscoped attribute
             // `.service.name`, meaning "look in span attributes, then resource". The
             // lookahead must exclude digits so `.5` stays a number.
@@ -318,6 +320,23 @@ impl<'a> Lexer<'a> {
 
     fn lex_number(&mut self) -> Result<Token> {
         let start = self.pos;
+        // Hexadecimal, `0x1F`, as PromQL accepts.
+        if self.bytes[self.pos] == b'0'
+            && matches!(self.peek(1), Some(b'x' | b'X'))
+            && self.peek(2).is_some_and(|c| c.is_ascii_hexdigit())
+        {
+            self.pos += 2;
+            while self.peek(0).is_some_and(|c| c.is_ascii_hexdigit()) {
+                self.pos += 1;
+            }
+            #[allow(clippy::cast_precision_loss)]
+            return u64::from_str_radix(&self.input[start + 2..self.pos], 16)
+                .map(|value| Token::Number(value as f64))
+                .map_err(|_| {
+                    let text = self.input[start..self.pos].to_owned();
+                    self.error(format!("{text:?} is not a valid number"))
+                });
+        }
         while self
             .peek(0)
             .is_some_and(|c| c.is_ascii_digit() || c == b'.' || c == b'e' || c == b'E')
@@ -582,11 +601,11 @@ mod tests {
         // The lookahead is what keeps these correct.
         assert_eq!(tokens("1.5"), vec![Token::Number(1.5)]);
         assert_eq!(tokens("1.5h"), vec![Token::Duration(5_400_000_000_000)]);
-        // A leading dot starts an identifier only before a name character. `.5` is
-        // therefore still rejected rather than becoming an attribute called "5" —
-        // a bare leading-dot decimal has never been accepted here, and allowing the
-        // TraceQL attribute form deliberately did not change that.
-        assert!(tokenize(".5").is_err());
+        // A leading dot starts an identifier only before a name character, so `.5`
+        // never becomes an attribute called "5". It is the number PromQL reads it as.
+        assert_eq!(tokens(".5"), vec![Token::Number(0.5)]);
+        assert_eq!(tokens("0x1F"), vec![Token::Number(31.0)]);
+        assert_eq!(tokens("0X10"), vec![Token::Number(16.0)]);
         // A trailing dot is not part of the identifier, and `.` is not a token on its
         // own — so this is a syntax error rather than a silently truncated name.
         assert!(tokenize("foo.").is_err());

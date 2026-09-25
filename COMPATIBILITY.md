@@ -402,7 +402,13 @@ Driven by what `PromqlCompiler` actually generates:
 - `vector(s)`, a scalar as a one-element vector — Grafana's Loki health check uses it
 - a query that is a scalar, `1+1`, answers `resultType: scalar` with a bare
   `[time, "value"]` pair as an instant query, and one unlabelled series over a range
-- **`offset`**, **`or` between vectors**, and **`clamp_min`** — required by the
+- numbers as PromQL spells them: `0.5`, `.5`, `1e3`, `0x1F`, `NaN`, `Inf`, `+Inf`, `-Inf`
+  — `NaN` and `Inf` are numbers in any case, never metric names
+- operator precedence and associativity as in PromQL: `^` binds tightest and to the
+  right, then unary minus, then `*` `/` `%`, then `+` `-`, then `or`
+- **`offset`**, including a negative one — `offset -5m` reads five minutes after the
+  evaluation time, as Prometheus 3 allows
+- **`or` between vectors**, and **`clamp_min`** — with `offset`, required by the
   compiler's counter-increase form:
   `clamp_min(sel - (sel offset 5m or sel * 0), 0)`. Our first plan listed all three as
   out of scope; they are not.
@@ -471,8 +477,13 @@ after one leaves. An ordinary NaN — a gauge that is momentarily undefined — 
 value. Checked against Prometheus 3.15.0's answers for the same series. Before 0.61.0
 markers were served as NaN.
 
-`histogram_quantile` matches Prometheus exactly, including returning the highest finite
-bound when the quantile falls in the `+Inf` bucket. Verified against a known distribution.
+`histogram_quantile` is Prometheus's `BucketQuantile`, edge cases included: a histogram
+with no `+Inf` bucket, fewer than two buckets or no observations is NaN; buckets that
+share a bound are summed; a count lower than the bucket below it is raised to it; a
+quantile in a lowest bucket bounded at or below zero is that bound; and a quantile in the
+`+Inf` bucket is the highest finite bound. Checked against all 64 answers Prometheus
+3.15.0 gives for eight such histograms at eight quantiles. Before 0.61.0 several of them
+answered a number, or nothing, where Prometheus answers NaN.
 
 ---
 

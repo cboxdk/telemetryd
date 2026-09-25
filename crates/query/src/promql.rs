@@ -53,8 +53,58 @@ pub struct Selector {
     pub matchers: Vec<LabelMatcher>,
     /// `[5m]` — present makes this a range vector.
     pub range: Option<Duration>,
-    /// `offset 5m` — shifts the evaluation time backwards.
-    pub offset: Option<Duration>,
+    /// `offset 5m` looks back five minutes; `offset -5m` looks ahead.
+    pub offset: Offset,
+}
+
+/// How far a selector shifts its evaluation time.
+///
+/// Signed, because Prometheus 3 allows `offset -5m`: the value five minutes *after* the
+/// evaluation time, which is how a panel lines tomorrow's forecast up against today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Offset {
+    pub nanos: u64,
+    pub ahead: bool,
+}
+
+impl Offset {
+    #[must_use]
+    pub fn back(duration: Duration) -> Self {
+        Self {
+            nanos: u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
+            ahead: false,
+        }
+    }
+
+    /// The time a selector evaluated at `at_nanos` reads.
+    #[must_use]
+    pub fn apply(self, at_nanos: u64) -> u64 {
+        if self.ahead {
+            at_nanos.saturating_add(self.nanos)
+        } else {
+            at_nanos.saturating_sub(self.nanos)
+        }
+    }
+
+    /// How far before the evaluation time this reaches.
+    #[must_use]
+    pub fn behind(self) -> Duration {
+        if self.ahead {
+            Duration::ZERO
+        } else {
+            Duration::from_nanos(self.nanos)
+        }
+    }
+
+    /// How far after the evaluation time this reaches.
+    #[must_use]
+    pub fn beyond(self) -> Duration {
+        if self.ahead {
+            Duration::from_nanos(self.nanos)
+        } else {
+            Duration::ZERO
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,6 +385,15 @@ impl Parser<'_> {
     /// Unary minus binds looser than `^` and tighter than `*`: `-2^2` is `-(2^2)`, -4,
     /// as in PromQL and in arithmetic.
     fn parse_unary(&mut self) -> Result<Expr> {
+        // Unary plus changes nothing and is allowed, as in PromQL: `+Inf`, `2 * +1`.
+        if self.peek() == Some(&Token::Plus) {
+            self.pos += 1;
+            let base = self.depth;
+            self.deeper()?;
+            let inner = self.parse_unary()?;
+            self.depth = base;
+            return Ok(inner);
+        }
         if self.peek() == Some(&Token::Minus) {
             self.pos += 1;
             let base = self.depth;
@@ -387,6 +446,18 @@ impl Parser<'_> {
             Some(Token::LeftBrace) => {
                 let matchers = self.parse_matchers()?;
                 self.finish_selector(matchers)
+            }
+            // `NaN` and `Inf` are numbers in any case, as Prometheus lexes them — never
+            // metric names, which is how they used to be read.
+            Some(Token::Ident(name))
+                if name.eq_ignore_ascii_case("nan") || name.eq_ignore_ascii_case("inf") =>
+            {
+                self.pos += 1;
+                Ok(Expr::Number(if name.eq_ignore_ascii_case("nan") {
+                    f64::NAN
+                } else {
+                    f64::INFINITY
+                }))
             }
             Some(Token::Ident(name)) => self.parse_ident_atom(&name),
             _ => Err(self.unexpected("a metric selector, function call or number")),
@@ -584,14 +655,18 @@ impl Parser<'_> {
             range = Some(Duration::from_nanos(nanos));
         }
 
-        let mut offset = None;
+        let mut offset = Offset::default();
         if matches!(self.peek(), Some(Token::Ident(word)) if word == "offset") {
             self.pos += 1;
+            let ahead = self.peek() == Some(&Token::Minus);
+            if ahead {
+                self.pos += 1;
+            }
             let Some(Token::Duration(nanos)) = self.peek().cloned() else {
                 return Err(self.unexpected("a duration after `offset`"));
             };
             self.pos += 1;
-            offset = Some(Duration::from_nanos(nanos));
+            offset = Offset { nanos, ahead };
         }
 
         if self.peek() == Some(&Token::At) {
@@ -729,12 +804,23 @@ impl Expr {
         let mut widest = DEFAULT_LOOKBACK;
         self.walk(&mut |expr| {
             if let Self::Selector(selector) = expr {
-                let needed = selector.range.unwrap_or(DEFAULT_LOOKBACK)
-                    + selector.offset.unwrap_or(Duration::ZERO);
+                let needed = selector.range.unwrap_or(DEFAULT_LOOKBACK) + selector.offset.behind();
                 widest = widest.max(needed);
             }
         });
         widest
+    }
+
+    /// How far past the last evaluation time any part of this expression reads — a
+    /// negative `offset`'s reach. Zero for everything else.
+    pub fn required_lookahead(&self) -> Duration {
+        let mut furthest = Duration::ZERO;
+        self.walk(&mut |expr| {
+            if let Self::Selector(selector) = expr {
+                furthest = furthest.max(selector.offset.beyond());
+            }
+        });
+        furthest
     }
 
     fn walk(&self, visit: &mut impl FnMut(&Self)) {
@@ -814,7 +900,7 @@ mod tests {
         let expr = parse("http_requests_total[5m] offset 1h").unwrap();
         let selector = selector_of(&expr);
         assert_eq!(selector.range, Some(Duration::from_secs(300)));
-        assert_eq!(selector.offset, Some(Duration::from_secs(3600)));
+        assert_eq!(selector.offset, Offset::back(Duration::from_secs(3600)));
     }
 
     #[test]
@@ -891,7 +977,7 @@ mod tests {
         assert!(
             expr.selectors()
                 .iter()
-                .any(|s| s.offset == Some(Duration::from_secs(300))),
+                .any(|s| s.offset == Offset::back(Duration::from_secs(300))),
             "the offset must survive parsing"
         );
     }

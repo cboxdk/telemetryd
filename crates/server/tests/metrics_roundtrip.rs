@@ -731,3 +731,34 @@ async fn a_scalar_is_answered_as_a_scalar() {
     assert_eq!(result[0]["metric"], serde_json::json!({}));
     assert_eq!(result[0]["values"][2][1], "2");
 }
+
+/// `offset -1m` reads a minute past the evaluation time, so the store read has to reach
+/// that far too. Reading only up to the evaluation time would still find a sample
+/// within the lookback — the older one — and answer it without complaint.
+#[tokio::test]
+async fn a_negative_offset_reads_past_the_evaluation_time() {
+    let harness = Harness::new();
+    let at = |seconds: u64| i64::try_from(seconds * 1000).unwrap();
+    let payload = remote_write_payload(
+        &[("__name__", "queue_depth"), ("app", "checkout")],
+        &[
+            (1.0, at(NOW_SECONDS - 120)),
+            (2.0, at(NOW_SECONDS - 60)),
+            (3.0, at(NOW_SECONDS)),
+        ],
+    );
+    assert_eq!(
+        harness.post_remote_write(payload).await,
+        StatusCode::NO_CONTENT
+    );
+
+    let query = urlencode("queue_depth offset -1m");
+    let (status, response) = harness
+        .get(&format!(
+            "/api/v1/query?query={query}&time={}",
+            NOW_SECONDS - 60
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["data"]["result"][0]["value"][1], "3", "{response}");
+}

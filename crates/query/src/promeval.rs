@@ -20,7 +20,7 @@ use telemetryd_core::{Error, LabelMatcher, Labels, MetricSample, Result};
 use telemetryd_store::RecordStore;
 use telemetryd_store::metrics::MetricSchema;
 
-use crate::promql::{AggregateOp, BinaryOp, Expr, Function, Grouping, Selector};
+use crate::promql::{AggregateOp, BinaryOp, Expr, Function, Grouping, Offset, Selector};
 
 const NANOS_PER_SECOND: f64 = 1e9;
 
@@ -223,8 +223,8 @@ struct Window {
 }
 
 impl Window {
-    fn ending(at_nanos: u64, range_nanos: u64, offset_nanos: u64) -> Self {
-        let at = at_nanos.saturating_sub(offset_nanos);
+    fn ending(at_nanos: u64, range_nanos: u64, offset: Offset) -> Self {
+        let at = offset.apply(at_nanos);
         Self {
             floor: at.saturating_sub(range_nanos),
             at,
@@ -435,7 +435,7 @@ fn collect_rate_calls<'a>(expr: &'a Expr, out: &mut Vec<(&'a Selector, Duration,
 struct PreparedRate {
     matchers: Vec<telemetryd_core::LabelMatcher>,
     range: Duration,
-    offset: Duration,
+    offset: Offset,
     per_second: bool,
     /// `by_step[s]` holds `(series index, value)` for every series with a value at step
     /// `s`. Indices, not labels: the label set is attached when the vector is handed to
@@ -526,13 +526,12 @@ impl Snapshot {
         let mut prepared = Vec::with_capacity(calls.len());
 
         for (selector, range, per_second) in calls {
-            let offset = selector.offset.unwrap_or(Duration::ZERO);
+            let offset = selector.offset;
             let range_nanos = duration_nanos(*range);
-            let offset_nanos = duration_nanos(offset);
             let mut by_step: Vec<Vec<(usize, f64)>> = vec![Vec::new(); points.len()];
 
             for (point, at_nanos) in points.iter().enumerate() {
-                let at = at_nanos.saturating_sub(offset_nanos);
+                let at = offset.apply(*at_nanos);
                 let floor = at.saturating_sub(range_nanos);
                 // The selector's own matchers, not the pushdown shared by every selector:
                 // the pushdown is only what all of them have in common, so `x{code="500"}`
@@ -544,7 +543,7 @@ impl Snapshot {
                     return Ok(None);
                 };
                 for (series, summary) in folded {
-                    let window = Window::ending(*at_nanos, range_nanos, offset_nanos);
+                    let window = Window::ending(*at_nanos, range_nanos, offset);
                     let Some(value) = finish_fold(&summary, window, *per_second) else {
                         continue;
                     };
@@ -784,7 +783,7 @@ impl Snapshot {
                     if !wanted[index][call] {
                         continue;
                     }
-                    let offset = duration_nanos(selector.offset.unwrap_or(Duration::ZERO));
+                    let offset = selector.offset;
                     let range_nanos = duration_nanos(*range);
                     // A sample at `s` belongs to the points `p` where
                     // `p - offset - range < s <= p - offset`. Both bounds rise with `p`,
@@ -795,9 +794,9 @@ impl Snapshot {
                     // the work of a hundred comparisons to find three.
                     let (lo, hi) = if ordered {
                         (
-                            points.partition_point(|p| at_nanos > p.saturating_sub(offset)),
+                            points.partition_point(|p| at_nanos > offset.apply(*p)),
                             points.partition_point(|p| {
-                                at_nanos > p.saturating_sub(offset).saturating_sub(range_nanos)
+                                at_nanos > offset.apply(*p).saturating_sub(range_nanos)
                             }),
                         )
                     } else {
@@ -805,7 +804,7 @@ impl Snapshot {
                     };
                     let per_point = &mut folds[call][index];
                     for point in lo..hi {
-                        let at = points[point].saturating_sub(offset);
+                        let at = offset.apply(points[point]);
                         let floor = at.saturating_sub(range_nanos);
                         if at_nanos > floor && at_nanos <= at {
                             per_point[point].add(at_nanos, sample.value);
@@ -851,6 +850,7 @@ impl Snapshot {
         let lookback = expr.required_lookback();
         let first = points.iter().copied().min().unwrap_or(0);
         let last = points.iter().copied().max().unwrap_or(0);
+        let through = last.saturating_add(duration_nanos(expr.required_lookahead()));
         let asked_from = first.saturating_sub(duration_nanos(lookback));
 
         // Clamped to what the store actually holds. A ninety-day window against seven
@@ -872,16 +872,15 @@ impl Snapshot {
         }
 
         let (labels, folds) =
-            Self::accumulate_folds(store, &calls, points, pushdown, from, last, max_samples)?;
+            Self::accumulate_folds(store, &calls, points, pushdown, from, through, max_samples)?;
 
         let mut prepared = Vec::new();
         for (call, (selector, range, per_second)) in calls.iter().enumerate() {
             let range_nanos = duration_nanos(*range);
-            let offset_nanos = duration_nanos(selector.offset.unwrap_or(Duration::ZERO));
             let mut by_step: Vec<Vec<(usize, f64)>> = vec![Vec::new(); points.len()];
             for (index, per_point) in folds[call].iter().enumerate() {
                 for (point, fold) in per_point.iter().enumerate() {
-                    let window = Window::ending(points[point], range_nanos, offset_nanos);
+                    let window = Window::ending(points[point], range_nanos, selector.offset);
                     if let Some(value) = fold.finish(window, *per_second) {
                         by_step[point].push((index, value));
                     }
@@ -890,7 +889,7 @@ impl Snapshot {
             prepared.push(PreparedRate {
                 matchers: selector.matchers.clone(),
                 range: *range,
-                offset: selector.offset.unwrap_or(Duration::ZERO),
+                offset: selector.offset,
                 per_second: *per_second,
                 by_step,
             });
@@ -942,7 +941,13 @@ impl Snapshot {
         max_samples: u64,
     ) -> Result<Self> {
         let start_nanos = points.iter().copied().min().unwrap_or(0);
-        let end_nanos = points.iter().copied().max().unwrap_or(0);
+        // Through the furthest a negative `offset` reaches past the last point.
+        let end_nanos = points
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(duration_nanos(expr.required_lookahead()));
         let lookback = expr.required_lookback();
         let from = start_nanos.saturating_sub(duration_nanos(lookback));
 
@@ -1190,7 +1195,7 @@ impl Snapshot {
 
     /// The most recent sample per matching series within the lookback window.
     fn instant(&self, selector: &Selector, at_nanos: u64) -> InstantVector {
-        let at = at_nanos.saturating_sub(duration_nanos(selector.offset.unwrap_or(Duration::ZERO)));
+        let at = selector.offset.apply(at_nanos);
         let floor = at.saturating_sub(duration_nanos(crate::promql::DEFAULT_LOOKBACK));
 
         let mut samples = Vec::new();
@@ -1235,7 +1240,7 @@ impl Snapshot {
             return;
         }
         for (selector, range, per_second) in rate_calls(expr) {
-            let offset = selector.offset.unwrap_or(Duration::ZERO);
+            let offset = selector.offset;
             if self.prepared.iter().any(|p| {
                 p.matchers == selector.matchers
                     && p.range == range
@@ -1246,7 +1251,6 @@ impl Snapshot {
             }
             let mut by_step: Vec<Vec<(usize, f64)>> = vec![Vec::new(); steps.len()];
             let range_nanos = duration_nanos(range);
-            let offset_nanos = duration_nanos(offset);
 
             for index in self.matching(selector) {
                 let samples = &self.series[index].samples;
@@ -1255,7 +1259,7 @@ impl Snapshot {
                 // sample vector exactly once.
                 let (mut start, mut end) = (0usize, 0usize);
                 for (step, at_nanos) in steps.iter().enumerate() {
-                    let at = at_nanos.saturating_sub(offset_nanos);
+                    let at = offset.apply(*at_nanos);
                     let floor = at.saturating_sub(range_nanos);
                     while end < samples.len() && samples[end].0 <= at {
                         end += 1;
@@ -1297,7 +1301,7 @@ impl Snapshot {
             p.matchers == selector.matchers
                 && p.range == range
                 && p.per_second == per_second
-                && p.offset == selector.offset.unwrap_or(Duration::ZERO)
+                && p.offset == selector.offset
         }) && let Ok(step) = self.prepared_steps.binary_search(&at_nanos)
             && let Some(at_step) = prepared.by_step.get(step)
         {
@@ -1309,7 +1313,7 @@ impl Snapshot {
             };
         }
 
-        let at = at_nanos.saturating_sub(duration_nanos(selector.offset.unwrap_or(Duration::ZERO)));
+        let at = selector.offset.apply(at_nanos);
         let floor = at.saturating_sub(duration_nanos(range));
 
         let mut samples = Vec::new();
@@ -1658,23 +1662,6 @@ fn apply(op: BinaryOp, a: f64, b: f64) -> f64 {
 
 /// Linear interpolation over cumulative histogram buckets.
 fn histogram_quantile(quantile: f64, vector: &InstantVector) -> InstantVector {
-    if !(0.0..=1.0).contains(&quantile) {
-        // Prometheus returns +Inf/-Inf outside [0,1]; matching that beats erroring on
-        // a dashboard that briefly computes a nonsense quantile.
-        let value = if quantile < 0.0 {
-            f64::NEG_INFINITY
-        } else {
-            f64::INFINITY
-        };
-        return InstantVector {
-            samples: vector
-                .samples
-                .iter()
-                .map(|(labels, _)| (without_le(labels), value))
-                .collect(),
-        };
-    }
-
     // Group buckets by everything except `le`.
     let mut histograms: HashMap<Labels, Vec<(f64, f64)>> = HashMap::new();
     for (labels, count) in &vector.samples {
@@ -1698,40 +1685,107 @@ fn histogram_quantile(quantile: f64, vector: &InstantVector) -> InstantVector {
 
     let mut samples: Vec<(Labels, f64)> = histograms
         .into_iter()
-        .filter_map(|(labels, mut buckets)| {
-            buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
-            let total = buckets.last()?.1;
-            if total <= 0.0 {
-                return None;
-            }
-
-            let wanted = quantile * total;
-            let mut previous_bound = 0.0;
-            let mut previous_count = 0.0;
-
-            for (bound, count) in buckets {
-                if count >= wanted {
-                    if bound.is_infinite() {
-                        // The last finite bound is the best answer available.
-                        return Some((labels, previous_bound));
-                    }
-                    let span = count - previous_count;
-                    let position = if span > 0.0 {
-                        (wanted - previous_count) / span
-                    } else {
-                        0.0
-                    };
-                    return Some((labels, previous_bound + (bound - previous_bound) * position));
-                }
-                previous_bound = bound;
-                previous_count = count;
-            }
-            Some((labels, previous_bound))
-        })
+        .map(|(labels, buckets)| (labels, bucket_quantile(quantile, buckets)))
         .collect();
     samples.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     InstantVector { samples }
+}
+
+/// Prometheus's `BucketQuantile`, edge cases included — each of them used to answer a
+/// number where Prometheus answers NaN, or nothing where it answers NaN:
+///
+/// - a histogram without a `+Inf` bucket is incomplete and has no quantile;
+/// - buckets sharing a bound are one bucket, their counts summed;
+/// - a bucket counting fewer than the one below it is raised to it, since cumulative
+///   counts cannot fall, and differences within 1e-12 relative are rounding;
+/// - fewer than two buckets, or no observations, is NaN rather than a missing series;
+/// - a quantile in the lowest bucket, when that bucket's bound is at or below zero,
+///   is the bound itself rather than an interpolation from zero.
+// Exact comparisons throughout, as Prometheus makes them: equal bounds are one bucket,
+// equal counts need no correction, and only `nearly_equal` allows a tolerance.
+#[allow(clippy::float_cmp)]
+fn bucket_quantile(quantile: f64, mut buckets: Vec<(f64, f64)>) -> f64 {
+    if quantile.is_nan() {
+        return f64::NAN;
+    }
+    // Outside [0, 1], ±Inf: a dashboard briefly computing a nonsense quantile gets an
+    // answer rather than an error.
+    if quantile < 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if quantile > 1.0 {
+        return f64::INFINITY;
+    }
+    buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
+    if buckets
+        .last()
+        .is_none_or(|(bound, _)| *bound != f64::INFINITY)
+    {
+        return f64::NAN;
+    }
+
+    buckets.dedup_by(|later, earlier| {
+        let same = later.0 == earlier.0;
+        if same {
+            earlier.1 += later.1;
+        }
+        same
+    });
+    let mut previous = buckets[0].1;
+    for bucket in buckets.iter_mut().skip(1) {
+        if bucket.1 == previous {
+            continue;
+        }
+        if nearly_equal(previous, bucket.1, 1e-12) || bucket.1 < previous {
+            bucket.1 = previous;
+            continue;
+        }
+        previous = bucket.1;
+    }
+
+    if buckets.len() < 2 {
+        return f64::NAN;
+    }
+    let observations = buckets[buckets.len() - 1].1;
+    if observations == 0.0 {
+        return f64::NAN;
+    }
+    let mut rank = quantile * observations;
+    let last = buckets.len() - 1;
+    let b = buckets[..last]
+        .iter()
+        .position(|(_, count)| *count >= rank)
+        .unwrap_or(last);
+    if b == last {
+        return buckets[last - 1].0;
+    }
+    if b == 0 && buckets[0].0 <= 0.0 {
+        return buckets[0].0;
+    }
+    let (end, mut count) = buckets[b];
+    let mut start = 0.0;
+    if b > 0 {
+        start = buckets[b - 1].0;
+        count -= buckets[b - 1].1;
+        rank -= buckets[b - 1].1;
+    }
+    start + (end - start) * (rank / count)
+}
+
+/// Prometheus's `almost.Equal`: relative difference within `epsilon`, scaled by the
+/// smallest normal number when either side is zero.
+#[allow(clippy::float_cmp)]
+fn nearly_equal(a: f64, b: f64, epsilon: f64) -> bool {
+    if a == b {
+        return true;
+    }
+    let sum = a.abs() + b.abs();
+    let difference = (a - b).abs();
+    if a == 0.0 || b == 0.0 || sum < f64::MIN_POSITIVE {
+        return difference < epsilon * f64::MIN_POSITIVE;
+    }
+    difference / sum.min(f64::MAX) < epsilon
 }
 
 fn without_le(labels: &Labels) -> Labels {
@@ -1878,7 +1932,7 @@ mod fold_tests {
             (30 * 1_000_000_000, 2.0),
             (40 * 1_000_000_000, 11.0),
         ];
-        let window = Window::ending(60 * 1_000_000_000, 60 * 1_000_000_000, 0);
+        let window = Window::ending(60 * 1_000_000_000, 60 * 1_000_000_000, Offset::default());
 
         let windowed = rate_over(&points, window, true).unwrap();
 
@@ -1901,7 +1955,7 @@ mod fold_tests {
         let points: Vec<(u64, f64)> = (1..=5u32)
             .map(|i| (u64::from(i) * 10 * 1_000_000_000, f64::from(i) * 3.0))
             .collect();
-        let window = Window::ending(120 * 1_000_000_000, 120 * 1_000_000_000, 0);
+        let window = Window::ending(120 * 1_000_000_000, 120 * 1_000_000_000, Offset::default());
 
         let windowed = rate_over(&points, window, false).unwrap();
         let mut fold = Fold::default();
@@ -1915,7 +1969,7 @@ mod fold_tests {
     #[test]
     fn a_single_sample_yields_nothing_either_way() {
         let one = [(10 * 1_000_000_000u64, 1.0)];
-        let window = Window::ending(60 * 1_000_000_000, 60 * 1_000_000_000, 0);
+        let window = Window::ending(60 * 1_000_000_000, 60 * 1_000_000_000, Offset::default());
         assert!(rate_over(&one, window, true).is_none());
 
         let mut fold = Fold::default();
@@ -1928,7 +1982,7 @@ mod fold_tests {
     #[test]
     fn a_zero_span_yields_nothing_either_way() {
         let same = [(10 * 1_000_000_000u64, 1.0), (10 * 1_000_000_000, 4.0)];
-        let window = Window::ending(60 * 1_000_000_000, 60 * 1_000_000_000, 0);
+        let window = Window::ending(60 * 1_000_000_000, 60 * 1_000_000_000, Offset::default());
         assert!(rate_over(&same, window, true).is_none());
 
         let mut fold = Fold::default();
@@ -2494,7 +2548,7 @@ mod tests {
             fold.add(u64::from(i) * STEP, f64::from(i) * 10.0);
         }
         fold.add(9 * STEP, stale);
-        let window = Window::ending(150 * SECOND, 300 * SECOND, 0);
+        let window = Window::ending(150 * SECOND, 300 * SECOND, Offset::default());
         assert!((fold.finish(window, false).unwrap() - 85.0).abs() < 1e-9);
     }
 
@@ -2525,6 +2579,174 @@ mod tests {
                 "{query}: got {value:?}, Prometheus says {expected}"
             );
         }
+    }
+
+    /// What Prometheus 3.15.0 answers for `histogram_quantile(q, b_bucket)` over the
+    /// histograms in `histogram_quantile_matches_prometheus_at_the_edges`, copied from
+    /// `promtool test rules`: quantile, histogram, answer.
+    const PROMETHEUS_QUANTILES: [(f64, &str, f64); 64] = [
+        (0.5, "dup", 0.4),
+        (0.5, "neg", -1.0),
+        (0.5, "noinf", f64::NAN),
+        (0.5, "nonmono", 0.075_000_000_000_000_01),
+        (0.5, "normal", 0.5),
+        (0.5, "onlyinf", f64::NAN),
+        (0.5, "tail", 0.5),
+        (0.5, "zero", f64::NAN),
+        (0.95, "dup", 0.5),
+        (0.95, "neg", 0.749_999_999_999_999_8),
+        (0.95, "noinf", f64::NAN),
+        (0.95, "nonmono", 0.924_999_999_999_999_9),
+        (0.95, "normal", 1.0),
+        (0.95, "onlyinf", f64::NAN),
+        (0.95, "tail", 0.5),
+        (0.95, "zero", f64::NAN),
+        (0.25, "dup", 0.150_000_000_000_000_02),
+        (0.25, "neg", -1.0),
+        (0.25, "noinf", f64::NAN),
+        (0.25, "nonmono", 0.037_500_000_000_000_006),
+        (0.25, "normal", 0.25),
+        (0.25, "onlyinf", f64::NAN),
+        (0.25, "tail", 0.5),
+        (0.25, "zero", f64::NAN),
+        (1.5, "dup", f64::INFINITY),
+        (1.5, "neg", f64::INFINITY),
+        (1.5, "noinf", f64::INFINITY),
+        (1.5, "nonmono", f64::INFINITY),
+        (1.5, "normal", f64::INFINITY),
+        (1.5, "onlyinf", f64::INFINITY),
+        (1.5, "tail", f64::INFINITY),
+        (1.5, "zero", f64::INFINITY),
+        (-0.5, "dup", f64::NEG_INFINITY),
+        (-0.5, "neg", f64::NEG_INFINITY),
+        (-0.5, "noinf", f64::NEG_INFINITY),
+        (-0.5, "nonmono", f64::NEG_INFINITY),
+        (-0.5, "normal", f64::NEG_INFINITY),
+        (-0.5, "onlyinf", f64::NEG_INFINITY),
+        (-0.5, "tail", f64::NEG_INFINITY),
+        (-0.5, "zero", f64::NEG_INFINITY),
+        (f64::NAN, "dup", f64::NAN),
+        (f64::NAN, "neg", f64::NAN),
+        (f64::NAN, "noinf", f64::NAN),
+        (f64::NAN, "nonmono", f64::NAN),
+        (f64::NAN, "normal", f64::NAN),
+        (f64::NAN, "onlyinf", f64::NAN),
+        (f64::NAN, "tail", f64::NAN),
+        (f64::NAN, "zero", f64::NAN),
+        (0.0, "dup", 0.0),
+        (0.0, "neg", -1.0),
+        (0.0, "noinf", f64::NAN),
+        (0.0, "nonmono", 0.0),
+        (0.0, "normal", 0.0),
+        (0.0, "onlyinf", f64::NAN),
+        (0.0, "tail", 0.0),
+        (0.0, "zero", f64::NAN),
+        (1.0, "dup", 0.5),
+        (1.0, "neg", 1.0),
+        (1.0, "noinf", f64::NAN),
+        (1.0, "nonmono", 1.0),
+        (1.0, "normal", 1.0),
+        (1.0, "onlyinf", f64::NAN),
+        (1.0, "tail", 0.5),
+        (1.0, "zero", f64::NAN),
+    ];
+
+    /// `histogram_quantile`'s edge cases, against all 64 answers Prometheus 3.15.0 gives
+    /// for eight histograms at eight quantiles via `promtool test rules`: no `+Inf`
+    /// bucket, only `+Inf`, no observations, counts that fall, one bound spelled two
+    /// ways, bounds below zero, and quantiles outside [0, 1] or NaN.
+    #[test]
+    fn histogram_quantile_matches_prometheus_at_the_edges() {
+        let histograms: [(&str, &[(&str, f64)]); 8] = [
+            ("noinf", &[("0.1", 5.0), ("0.5", 10.0)]),
+            ("onlyinf", &[("+Inf", 10.0)]),
+            ("zero", &[("0.1", 0.0), ("+Inf", 0.0)]),
+            (
+                "nonmono",
+                &[("0.1", 10.0), ("0.5", 8.0), ("1", 15.0), ("+Inf", 15.0)],
+            ),
+            (
+                "dup",
+                &[("0.1", 2.0), ("0.5", 3.0), ("0.50", 3.0), ("+Inf", 10.0)],
+            ),
+            (
+                "neg",
+                &[("-1", 5.0), ("0", 8.0), ("1", 10.0), ("+Inf", 10.0)],
+            ),
+            (
+                "normal",
+                &[("0.1", 1.0), ("0.5", 5.0), ("1", 9.0), ("+Inf", 10.0)],
+            ),
+            ("tail", &[("0.1", 1.0), ("0.5", 2.0), ("+Inf", 10.0)]),
+        ];
+        let mut samples = Vec::new();
+        for (h, buckets) in histograms {
+            for &(le, count) in buckets {
+                let mut s = sample("b_bucket", "x", T0, count);
+                s.series.insert("h", h);
+                s.series.insert("le", le);
+                samples.push(s);
+            }
+        }
+        let snapshot = Snapshot::from_samples(samples);
+
+        for (quantile, h, want) in PROMETHEUS_QUANTILES {
+            let query =
+                crate::promql::parse(&format!("histogram_quantile({quantile}, b_bucket)")).unwrap();
+            let vector = snapshot.eval(&query, T0).unwrap().into_vector();
+            let got = vector
+                .samples
+                .iter()
+                .find(|(labels, _)| labels.get("h") == Some(h))
+                .map(|(_, value)| *value);
+            let agrees = got.is_some_and(|got| {
+                (got.is_nan() && want.is_nan())
+                    || got == want
+                    || (got - want).abs() <= want.abs() * 1e-12
+            });
+            assert!(
+                agrees,
+                "q={quantile} {h}: telemetryd {got:?}, Prometheus {want}"
+            );
+        }
+    }
+
+    /// Number spellings and a negative `offset`, against Prometheus 3.15.0 via
+    /// `promtool test rules`. `NaN` and `Inf` used to be read as metric names, `.5` and
+    /// `0x10` were syntax errors, and `offset -1m` was refused.
+    #[test]
+    fn literals_and_negative_offsets_read_as_promql_does() {
+        let mut samples = Vec::new();
+        for i in 0..=40u32 {
+            samples.push(sample(
+                "c",
+                "x",
+                T0 + u64::from(i) * 15 * SECOND,
+                f64::from(i) * 10.0,
+            ));
+        }
+        let snapshot = Snapshot::from_samples(samples);
+        let value = |query: &str, at: u64| -> f64 {
+            match snapshot
+                .eval(&crate::promql::parse(query).unwrap(), at)
+                .unwrap()
+            {
+                Value::Scalar(value) => value,
+                Value::Vector(vector) => vector.samples[0].1,
+            }
+        };
+        assert_eq!(value(".5 * 2", T0), 1.0);
+        assert_eq!(value("0x10 + 1", T0), 17.0);
+        assert_eq!(value("+Inf", T0), f64::INFINITY);
+        assert_eq!(value("-Inf", T0), f64::NEG_INFINITY);
+        assert!(value("nan", T0).is_nan());
+        assert!(value("NaN", T0).is_nan());
+
+        // Ahead of the evaluation time, and behind it.
+        assert_eq!(value("c offset -1m", T0 + 120 * SECOND), 120.0);
+        assert_eq!(value("c offset 1m", T0 + 120 * SECOND), 40.0);
+        let ahead = value("increase(c[1m] offset -2m)", T0 + 180 * SECOND);
+        assert!((ahead - 40.0).abs() < 1e-9, "got {ahead}");
     }
 
     #[test]
