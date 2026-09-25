@@ -13,6 +13,20 @@ use crate::record::Labels;
 /// The label carrying the metric name, as in Prometheus.
 pub const METRIC_NAME_LABEL: &str = "__name__";
 
+/// Prometheus's staleness marker: a NaN with this exact bit pattern, written when a
+/// target disappears or a series stops being exported. It is not a value. It says the
+/// series ended here, and `remote_write` delivers it like any other sample.
+pub const STALE_MARKER_BITS: u64 = 0x7ff0_0000_0000_0002;
+
+/// Whether a sample is a staleness marker rather than a value.
+///
+/// Compared by bits: every NaN is unequal to every other, and an ordinary NaN — a gauge
+/// that is momentarily undefined — is a value and must stay one.
+#[must_use]
+pub fn is_stale_marker(value: f64) -> bool {
+    value.to_bits() == STALE_MARKER_BITS
+}
+
 /// What kind of series this is.
 ///
 /// Kept because it changes how a value should be *read*, not how it is stored: a

@@ -656,3 +656,37 @@ async fn remote_write_that_stores_nothing_says_so() {
         StatusCode::NO_CONTENT
     );
 }
+
+/// Prometheus writes a staleness marker when a target disappears. It was stored and
+/// served as NaN, so `sum(up)` over a fleet read NaN for five minutes after any one
+/// target left — the panel blank exactly when someone would look at it.
+#[tokio::test]
+async fn a_target_that_left_is_absent_rather_than_nan() {
+    let harness = Harness::new();
+    let millis = |seconds: u64| i64::try_from(seconds * 1000).unwrap();
+    let stale = f64::from_bits(0x7ff0_0000_0000_0002);
+    let now = NOW_SECONDS;
+    for (instance, samples) in [
+        ("a", vec![(1.0, millis(now - 60)), (1.0, millis(now - 30))]),
+        (
+            "b",
+            vec![(1.0, millis(now - 60)), (stale, millis(now - 30))],
+        ),
+    ] {
+        let payload = remote_write_payload(
+            &[("__name__", "up"), ("app", "fleet"), ("instance", instance)],
+            &samples,
+        );
+        assert_eq!(
+            harness.post_remote_write(payload).await,
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    let query = urlencode("sum(up)");
+    let (status, response) = harness
+        .get(&format!("/api/v1/query?query={query}&time={now}"))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["data"]["result"][0]["value"][1], "1", "{response}");
+}

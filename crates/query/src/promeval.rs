@@ -171,6 +171,10 @@ struct Fold {
 
 impl Fold {
     fn add(&mut self, timestamp: u64, value: f64) {
+        // Not a sample: the series ended here. See `rate_over`.
+        if telemetryd_core::is_stale_marker(value) {
+            return;
+        }
         if self.seen == 0 {
             self.first_nanos = timestamp;
             self.first_value = value;
@@ -319,19 +323,29 @@ fn finish_fold(
 /// means the process restarted, so the new value is the increase rather than a negative
 /// delta.
 fn rate_over(samples: &[(u64, f64)], window: Window, per_second: bool) -> Option<f64> {
-    let (&(first_nanos, first_value), &(last_nanos, _)) = (samples.first()?, samples.last()?);
-    let mut increase = 0.0;
-    for pair in samples.windows(2) {
-        let (previous, current) = (pair[0].1, pair[1].1);
+    // Staleness markers are left out, as Prometheus leaves them out of every range
+    // vector: they say where a series ended, and read as values their NaN made the whole
+    // window NaN — `sum(rate(...))` blank for five minutes whenever one target left.
+    let mut live = samples
+        .iter()
+        .copied()
+        .filter(|(_, value)| !telemetryd_core::is_stale_marker(*value));
+    let (first_nanos, first_value) = live.next()?;
+    let (mut seen, mut last_nanos, mut previous, mut increase) =
+        (1u64, first_nanos, first_value, 0.0);
+    for (timestamp, current) in live {
         increase += if current < previous {
             current
         } else {
             current - previous
         };
+        previous = current;
+        last_nanos = timestamp;
+        seen += 1;
     }
     extrapolate(
         Observed {
-            seen: samples.len() as u64,
+            seen,
             first_nanos,
             last_nanos,
             first_value,
@@ -1097,7 +1111,10 @@ impl Snapshot {
                 continue;
             }
             let (ts, value) = series.samples[end - 1];
-            if ts > floor {
+            // A series whose newest sample is a staleness marker has ended, and is absent
+            // rather than NaN — which is what lets `sum(up)` go on adding up the targets
+            // that remain instead of reading NaN for the lookback after one leaves.
+            if ts > floor && !telemetryd_core::is_stale_marker(value) {
                 samples.push((self.stripped[index].clone(), value));
             }
         }
@@ -2313,6 +2330,58 @@ mod tests {
                 "{query}: telemetryd {got}, Prometheus {expected}"
             );
         }
+    }
+
+    /// Prometheus's staleness markers, against Prometheus 3.15.0's answers from
+    /// `promtool test rules` over the same series (15 s scrapes; `stale` in promtool's
+    /// notation writes the real marker). They were stored and served as NaN: `sum(up)`
+    /// read NaN for the lookback after one target left, and `rate` over a window
+    /// holding a marker was NaN.
+    #[test]
+    fn a_staleness_marker_ends_a_series_rather_than_being_a_value() {
+        const STEP: u64 = 15 * SECOND;
+        let stale = f64::from_bits(telemetryd_core::metric::STALE_MARKER_BITS);
+        let mut samples = Vec::new();
+        for i in 0..=20 {
+            samples.push(sample("up", "one", T0 + i * STEP, 1.0));
+        }
+        for i in 0..=4 {
+            samples.push(sample("up", "two", T0 + i * STEP, 1.0));
+        }
+        samples.push(sample("up", "two", T0 + 5 * STEP, stale));
+        for i in 0..=8u32 {
+            samples.push(sample(
+                "c",
+                "one",
+                T0 + u64::from(i) * STEP,
+                f64::from(i) * 10.0,
+            ));
+        }
+        samples.push(sample("c", "one", T0 + 9 * STEP, stale));
+        let snapshot = Snapshot::from_samples(samples);
+
+        let sum = |at| eval(&snapshot, "sum(up)", at).samples[0].1;
+        assert_eq!(sum(T0 + 50 * SECOND), 2.0);
+        assert_eq!(
+            sum(T0 + 120 * SECOND),
+            1.0,
+            "the departed target is absent, not NaN"
+        );
+        assert_eq!(eval(&snapshot, "up", T0 + 120 * SECOND).samples.len(), 1);
+
+        let increase = eval(&snapshot, "increase(c[5m])", T0 + 150 * SECOND).samples[0].1;
+        assert!((increase - 85.0).abs() < 1e-9, "got {increase}");
+        let rate = eval(&snapshot, "rate(c[1m])", T0 + 135 * SECOND).samples[0].1;
+        assert!((rate - 0.666_666_666_666_666_6).abs() < 1e-12, "got {rate}");
+
+        // The fold takes the same view as the window.
+        let mut fold = Fold::default();
+        for i in 0..=8u32 {
+            fold.add(u64::from(i) * STEP, f64::from(i) * 10.0);
+        }
+        fold.add(9 * STEP, stale);
+        let window = Window::ending(150 * SECOND, 300 * SECOND, 0);
+        assert!((fold.finish(window, false).unwrap() - 85.0).abs() < 1e-9);
     }
 
     #[test]

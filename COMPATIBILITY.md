@@ -447,6 +447,17 @@ overstated every period total for a new or departed series, up to sixty-fold in 
 cases above. A dashboard's `increase` over a day now reads what Prometheus's reads,
 fractions of a request included.
 
+#### Staleness markers end a series
+
+When a target disappears Prometheus writes a staleness marker — a NaN with one particular
+bit pattern — and `remote_write` delivers it like any sample. telemetryd stores it as it
+arrives and reads it as Prometheus does: an instant selector whose newest sample is a
+marker returns nothing for that series, and range functions leave markers out. So
+`sum(up)` adds up the targets that remain rather than reading NaN for the five minutes
+after one leaves. An ordinary NaN — a gauge that is momentarily undefined — is still a
+value. Checked against Prometheus 3.15.0's answers for the same series. Before 0.61.0
+markers were served as NaN.
+
 `histogram_quantile` matches Prometheus exactly, including returning the highest finite
 bound when the quantile falls in the `+Inf` bucket. Verified against a known distribution.
 

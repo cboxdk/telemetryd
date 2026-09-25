@@ -158,6 +158,12 @@ impl crate::RecordStore<MetricSchema> {
                     let Some(fold) = precomputed.get(stream).filter(|f| f.seen > 0) else {
                         continue;
                     };
+                    // A summary sealed before staleness markers were skipped may have
+                    // folded one in, and its NaN cannot be taken back out. The rows can:
+                    // decline, and the ordinary scan leaves the marker out.
+                    if fold.increase.is_nan() || fold.last_value.is_nan() {
+                        return Ok(None);
+                    }
                     let key = note(&mut by_series, &mut order, labels);
                     if let Some(entry) = by_series.get_mut(&key) {
                         if !entry.precedes(fold.first_nanos) {

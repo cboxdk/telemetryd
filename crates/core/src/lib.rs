@@ -18,7 +18,7 @@ pub mod span;
 pub use config::Config;
 pub use error::{Error, Result};
 pub use matcher::{LabelMatcher, MatchOp, matches_all};
-pub use metric::{METRIC_NAME_LABEL, MetricKind, MetricSample};
+pub use metric::{METRIC_NAME_LABEL, MetricKind, MetricSample, is_stale_marker};
 pub use record::{APP_LABEL, LEVEL_LABEL, Labels, LogRecord, Severity, UNKNOWN_APP};
 pub use secret::{ClientTokens, Secret, TokenSet};
 pub use signal::Signal;

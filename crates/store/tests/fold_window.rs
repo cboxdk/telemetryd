@@ -146,3 +146,49 @@ fn the_shortcut_is_taken_only_when_it_saves_work() {
         "a chart pays for each edge segment at every point, so it can afford none"
     );
 }
+
+/// A staleness marker is a NaN with one particular bit pattern, and that pattern is the
+/// whole of its meaning. It has to survive sealing into Parquet as itself — an ordinary
+/// NaN would read back as a value — and a segment's summary must not fold it in, or its
+/// NaN would make every increase across that segment NaN.
+#[test]
+fn a_staleness_marker_survives_sealing_and_stays_out_of_the_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&config(dir.path())).unwrap();
+    let stale = f64::from_bits(telemetryd_core::metric::STALE_MARKER_BITS);
+
+    for minute in 1..=4u64 {
+        #[allow(clippy::cast_precision_loss)]
+        let value = minute as f64 * 10.0;
+        store
+            .metrics()
+            .append(&[sample("/a", minute * 60, value)])
+            .unwrap();
+    }
+    store
+        .metrics()
+        .append(&[sample("/a", 5 * 60, stale)])
+        .unwrap();
+    let segment = store.metrics().seal_now().unwrap().expect("a segment");
+
+    let rows = segment
+        .read::<telemetryd_store::metrics::MetricSchema>()
+        .unwrap();
+    let marker = rows
+        .iter()
+        .find(|row| row.timestamp_nanos == 300 * 1_000_000_000);
+    assert_eq!(
+        marker.map(|row| row.value.to_bits()),
+        Some(telemetryd_core::metric::STALE_MARKER_BITS),
+        "the marker came back as itself"
+    );
+
+    let folded = store
+        .metrics()
+        .fold_window(0, 10 * 60 * 1_000_000_000, &[], 4)
+        .unwrap()
+        .expect("one summarised segment");
+    let (_, fold) = &folded[0];
+    assert_eq!(fold.seen, 4, "the marker is not a sample");
+    assert!((fold.increase - 30.0).abs() < 1e-9, "got {}", fold.increase);
+}

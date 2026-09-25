@@ -78,6 +78,11 @@ impl Default for StreamFold {
 impl StreamFold {
     /// Add one sample. Samples must arrive in ascending time order.
     pub fn add(&mut self, timestamp: u64, value: f64) {
+        // A staleness marker ends a series; it is not a sample of it. Folded in, its NaN
+        // would poison every increase it touched.
+        if telemetryd_core::is_stale_marker(value) {
+            return;
+        }
         if self.seen == 0 {
             self.first_nanos = timestamp;
             self.first_value = value;
