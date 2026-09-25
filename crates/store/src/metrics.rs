@@ -93,17 +93,10 @@ impl crate::RecordStore<MetricSchema> {
         start_nanos: u64,
         end_nanos: u64,
         matchers: &[telemetryd_core::LabelMatcher],
+        whole_reads_allowed: usize,
     ) -> Result<Option<Vec<(Labels, crate::folds::StreamFold)>>> {
         use crate::folds::StreamFold;
         use std::collections::HashMap;
-
-        // How many segments would have to be read row by row. Reading one is cheap and
-        // reading many is not: each is read *whole*, because a time-range scan would also
-        // touch the neighbours already taken from summaries. Past a handful the single
-        // pruned scan the store has always used is faster, and falling back to it is what
-        // keeps a store whose segments are not summarised yet from being slower than one
-        // that never had summaries at all — measured at thirty seconds against five.
-        const READ_WHOLE_LIMIT: usize = 4;
 
         // Keyed by the label set itself, not by the allocation behind it. Segments
         // normally share one, so a pointer would do — but "normally" is not a property to
@@ -131,18 +124,38 @@ impl crate::RecordStore<MetricSchema> {
             return Ok(None);
         }
 
-        let needs_rows = segments
-            .iter()
-            .filter(|segment| {
-                let m = &segment.manifest;
-                m.min_time_nanos <= end_nanos
-                    && m.max_time_nanos > start_nanos
-                    && !(m.min_time_nanos > start_nanos
-                        && m.max_time_nanos <= end_nanos
-                        && segment.has_folds())
-            })
-            .count();
-        if needs_rows > READ_WHOLE_LIMIT {
+        let mut needs_rows = 0usize;
+        let mut summarised = 0usize;
+        for segment in &segments {
+            let m = &segment.manifest;
+            if m.min_time_nanos > end_nanos || m.max_time_nanos <= start_nanos {
+                continue;
+            }
+            if m.min_time_nanos > start_nanos
+                && m.max_time_nanos <= end_nanos
+                && segment.has_folds()
+            {
+                summarised += 1;
+            } else {
+                needs_rows += 1;
+            }
+        }
+
+        // Nothing in this window is answerable from a summary, which is what a window
+        // narrower than a segment looks like: a chart's fifteen minutes sits inside one
+        // segment rather than containing any. Taking the shortcut anyway would read those
+        // segments *whole* to answer a quarter of an hour, once per point — measured at a
+        // thirty-second timeout on a panel the ordinary sliced scan answers in under two.
+        if summarised == 0 {
+            return Ok(None);
+        }
+        // Each segment the window does not contain whole is read *whole*, because a
+        // time-range scan would also touch the neighbours already taken from summaries.
+        // The caller says how many such reads it can afford: one evaluation point can
+        // carry a handful, two hundred and fifty can carry none, and a window narrower
+        // than a segment contains nothing and so is answered entirely by reading — which
+        // is the ordinary scan's job, done better.
+        if needs_rows > whole_reads_allowed {
             // Decline. The caller then takes the ordinary pruned scan it has always taken,
             // untouched, so a store whose segments are not summarised yet is never slower
             // than one that never had summaries at all. Replacing that scan with a second

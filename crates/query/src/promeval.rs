@@ -431,6 +431,13 @@ impl Snapshot {
         points: &[u64],
         pushdown: &[telemetryd_core::LabelMatcher],
     ) -> Result<Option<Self>> {
+        // What the shortcut may spend on segments the window does not contain whole. One
+        // point can afford a handful; a chart asking for two hundred and fifty pays for
+        // each of them once per point, so it can afford none and falls to the ordinary
+        // sliced scan instead — which is the right way to read a window narrower than a
+        // segment anyway.
+        let whole_reads = 4usize.checked_div(points.len()).unwrap_or(0);
+
         let mut labels: Vec<Labels> = Vec::new();
         let mut index: HashMap<Labels, usize> = HashMap::new();
         let mut prepared = Vec::with_capacity(calls.len());
@@ -444,7 +451,7 @@ impl Snapshot {
             for (point, at_nanos) in points.iter().enumerate() {
                 let at = at_nanos.saturating_sub(offset_nanos);
                 let floor = at.saturating_sub(range_nanos);
-                let Some(folded) = store.fold_window(floor, at, pushdown)? else {
+                let Some(folded) = store.fold_window(floor, at, pushdown, whole_reads)? else {
                     return Ok(None);
                 };
                 for (series, summary) in folded {

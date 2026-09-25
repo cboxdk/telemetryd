@@ -68,7 +68,7 @@ fn summaries_agree_with_walking_every_row() {
 
     let folded = store
         .metrics()
-        .fold_window(0, 31 * 60 * 1_000_000_000, &[])
+        .fold_window(0, 31 * 60 * 1_000_000_000, &[], 4)
         .unwrap()
         .expect("six segments is within the read-whole limit, so summaries answer this");
     assert_eq!(folded.len(), 1, "one stream: {folded:?}");
@@ -89,5 +89,60 @@ fn summaries_agree_with_walking_every_row() {
         (fold.increase - expected_increase).abs() < 1e-9,
         "increase {} vs expected {expected_increase}",
         fold.increase
+    );
+}
+
+/// Three rules decide whether the shortcut is worth taking, and all three matter.
+///
+/// A window narrower than a segment contains none, so summaries have nothing to add and
+/// taking the shortcut would mean reading whole segments to answer a quarter of an hour.
+/// A window that does contain segments still has two edges that must be read, and a chart
+/// pays for those at every one of its points. Getting either wrong turned a dashboard
+/// panel from a refusal into a thirty-second timeout.
+#[test]
+fn the_shortcut_is_taken_only_when_it_saves_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&config(dir.path())).unwrap();
+
+    for minute in 1..=30u64 {
+        #[allow(clippy::cast_precision_loss)]
+        let value = minute as f64 * 5.0;
+        store
+            .metrics()
+            .append(&[sample("/a", minute * 60, value)])
+            .unwrap();
+        if minute % 5 == 0 {
+            store.metrics().seal_now().unwrap();
+        }
+    }
+    store.metrics().seal_now().ok();
+    let folds = &store.metrics();
+
+    // Three minutes inside one five-minute segment: nothing is contained whole, so the
+    // shortcut is declined however much budget it is given.
+    let (narrow_from, narrow_to) = (11 * 60 * 1_000_000_000, 14 * 60 * 1_000_000_000);
+    assert!(
+        folds
+            .fold_window(narrow_from, narrow_to, &[], 4)
+            .unwrap()
+            .is_none(),
+        "a window narrower than a segment has nothing to take from summaries"
+    );
+
+    // Most of the span, with both ends landing mid-segment: those two must be read.
+    let (wide_from, wide_to) = (150 * 1_000_000_000, 28 * 60 * 1_000_000_000);
+    assert!(
+        folds
+            .fold_window(wide_from, wide_to, &[], 4)
+            .unwrap()
+            .is_some(),
+        "one evaluation point can afford to read the two edge segments"
+    );
+    assert!(
+        folds
+            .fold_window(wide_from, wide_to, &[], 0)
+            .unwrap()
+            .is_none(),
+        "a chart pays for each edge segment at every point, so it can afford none"
     );
 }
