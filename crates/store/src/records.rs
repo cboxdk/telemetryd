@@ -16,6 +16,7 @@
 //! manifest records the actual event-time bounds, which can span more than the
 //! window, and query pruning uses those.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -152,6 +153,15 @@ struct Buffer<S: RecordSchema> {
     records: usize,
     bytes: usize,
     opened_at: Instant,
+    /// One copy of each label set buffered, by fingerprint.
+    ///
+    /// A decoder builds a fresh label map for every record — OTLP carries the resource
+    /// and point attributes on each — so a series scraped every fifteen seconds held a
+    /// copy of its labels per sample, and the buffer was charged for each. On telemetry1
+    /// that came to 1,258 bytes a sample, a 256 MiB buffer full in nineteen minutes, and
+    /// three segments an hour where one was configured. Records now share the first
+    /// copy of their set, and the buffer is charged for it once.
+    series: HashMap<u64, Labels>,
 }
 
 /// A frozen run of buffered records, with the time bounds a query prunes on.
@@ -182,14 +192,36 @@ impl<S: RecordSchema> Buffer<S> {
             records: 0,
             bytes: 0,
             opened_at: Instant::now(),
+            series: HashMap::new(),
         }
     }
 
     fn push(&mut self, record: S::Record) {
+        let fingerprint = S::index_labels(&record).fingerprint();
+        self.push_fingerprinted(record, fingerprint);
+    }
+
+    /// [`Self::push`], with the label set's fingerprint worked out beforehand — outside
+    /// the lock this is called under.
+    fn push_fingerprinted(&mut self, mut record: S::Record, fingerprint: u64) {
         let ts = S::timestamp(&record);
         self.active_min = self.active_min.min(ts);
         self.active_max = self.active_max.max(ts);
-        self.bytes += S::size_estimate(&record);
+        let mut bytes = S::size_estimate(&record);
+        match self.series.entry(fingerprint) {
+            std::collections::hash_map::Entry::Occupied(held) => {
+                let labels = S::index_labels_mut(&mut record);
+                // Equal, not merely the same fingerprint: a collision keeps its own set.
+                if held.get() == labels {
+                    bytes = bytes.saturating_sub(telemetryd_core::sizing::labels_bytes(labels));
+                    *labels = held.get().shared_with();
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(S::index_labels(&record).shared_with());
+            }
+        }
+        self.bytes += bytes;
         self.active.push(record);
         self.records += 1;
         if self.active.len() >= CHUNK_RECORDS {
@@ -250,6 +282,7 @@ impl<S: RecordSchema> Buffer<S> {
         }
         self.records = 0;
         self.bytes = 0;
+        self.series.clear();
         Chunk {
             records,
             min_nanos,
@@ -435,7 +468,8 @@ impl<S: RecordSchema> RecordStore<S> {
         let replayed = wal::replay_from(wal_dir, sealed_through, |payload| {
             match S::decode_wal(payload) {
                 Ok(record) => {
-                    buffer.bytes += S::size_estimate(&record);
+                    // `push` counts its size. Counting it here as well charged every
+                    // replayed record twice, and a restart sealed early for it.
                     buffer.push(record);
                     Ok(())
                 }
@@ -509,6 +543,19 @@ impl<S: RecordSchema> RecordStore<S> {
             return Ok(());
         }
         let failing = lock(&self.seal_failed_at).is_some();
+        // Encoded and fingerprinted before the lock: every writer and every seal waits
+        // on it, and neither piece of work needs it.
+        let payloads = records
+            .iter()
+            .map(|record| {
+                postcard::to_stdvec(record)
+                    .map_err(|e| Error::Config(format!("encoding a {} record: {e}", S::SIGNAL)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let fingerprints: Vec<u64> = records
+            .iter()
+            .map(|record| S::index_labels(record).fingerprint())
+            .collect();
 
         let should_seal = {
             let mut writer = lock(&self.writer);
@@ -524,11 +571,12 @@ impl<S: RecordSchema> RecordStore<S> {
                     S::SIGNAL
                 )));
             }
-            for record in records {
-                let payload = postcard::to_stdvec(record)
-                    .map_err(|e| Error::Config(format!("encoding a {} record: {e}", S::SIGNAL)))?;
-                writer.wal.append(&payload)?;
-                writer.buffer.push(record.clone());
+            for ((record, payload), fingerprint) in records.iter().zip(&payloads).zip(&fingerprints)
+            {
+                writer.wal.append(payload)?;
+                writer
+                    .buffer
+                    .push_fingerprinted(record.clone(), *fingerprint);
             }
             writer.buffer.bytes as u64 >= self.settings.max_segment_bytes
         };
@@ -1441,6 +1489,44 @@ mod tests {
             .scan(Scan::range(0, u64::MAX), &[], &|_| true)
             .unwrap()
             .len()
+    }
+
+    /// Records of one stream share its labels in the buffer and are charged for them
+    /// once, however many separate copies the decoder handed in — and a restart charges
+    /// what was buffered the same again, not twice.
+    #[test]
+    fn a_stream_is_charged_once_and_shared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open(tmp.path());
+        let one = LogSchema::size_estimate(&record(0));
+        let labels = telemetryd_core::sizing::labels_bytes(&record(0).stream);
+        store
+            .append(&(0..100).map(record).collect::<Vec<_>>())
+            .unwrap();
+        let bytes = store.status().buffered_bytes;
+        // Each record's own size, less its labels for every one after the first. The
+        // bodies differ in length by a byte or two, so allow for them.
+        let expected = (100 * one - 99 * labels) as u64;
+        assert!(
+            bytes.abs_diff(expected) < 200,
+            "{bytes} buffered, expected about {expected}"
+        );
+
+        let chunks = lock(&store.writer).buffer.snapshot();
+        let records: Vec<&LogRecord> = chunks.iter().flat_map(|c| c.records.iter()).collect();
+        assert!(
+            records
+                .iter()
+                .all(|r| r.stream.shares_storage_with(&records[0].stream))
+        );
+
+        drop(store);
+        let reopened = open(tmp.path());
+        assert_eq!(
+            reopened.status().buffered_bytes,
+            bytes,
+            "replay charges the same"
+        );
     }
 
     /// A query in the middle of a seal — records out of the buffer, segment not yet

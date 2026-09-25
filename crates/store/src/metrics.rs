@@ -566,6 +566,10 @@ impl RecordSchema for MetricSchema {
         &record.series
     }
 
+    fn index_labels_mut(record: &mut Self::Record) -> &mut Labels {
+        &mut record.series
+    }
+
     fn size_estimate(record: &Self::Record) -> usize {
         record.size_estimate()
     }

@@ -106,6 +106,9 @@ pub trait RecordSchema: Send + Sync + 'static {
     /// these are what a selector can prune on without opening the Parquet file.
     fn index_labels(record: &Self::Record) -> &Labels;
 
+    /// The same labels, to replace with a shared copy of an equal set.
+    fn index_labels_mut(record: &mut Self::Record) -> &mut Labels;
+
     /// Approximate heap cost, used to decide when a buffer is full.
     fn size_estimate(record: &Self::Record) -> usize;
 
