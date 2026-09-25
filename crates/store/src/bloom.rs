@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use telemetryd_core::{Error, Result};
+use telemetryd_core::Result;
 
 /// Target false-positive rate at the sizing below.
 const BITS_PER_KEY: usize = 10;
@@ -74,8 +74,7 @@ impl Bloom {
         bytes.extend_from_slice(MAGIC);
         bytes.extend_from_slice(&self.hashes.to_le_bytes());
         bytes.extend_from_slice(&self.bits);
-        std::fs::write(&path, &bytes)
-            .map_err(|e| Error::io(format!("writing {}", path.display()), e))
+        crate::sidecar::write(&path, &bytes)
     }
 
     /// Load a filter, or `None` when the segment has none.
@@ -84,7 +83,7 @@ impl Bloom {
     /// error: the filter is an optimisation, and refusing to serve a query because a
     /// sidecar is damaged would turn a slow answer into no answer.
     pub fn read(dir: &Path) -> Option<Self> {
-        let bytes = std::fs::read(dir.join(FILE)).ok()?;
+        let bytes = crate::sidecar::read(&dir.join(FILE))?;
         if bytes.len() < 8 || &bytes[..4] != MAGIC {
             return None;
         }

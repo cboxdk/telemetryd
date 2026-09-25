@@ -16,6 +16,7 @@ pub mod records;
 pub mod retention;
 pub mod schema;
 pub mod segment;
+mod sidecar;
 pub mod spans;
 pub mod topk;
 pub mod trigram;

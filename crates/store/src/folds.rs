@@ -36,7 +36,7 @@
 
 use std::path::Path;
 
-use telemetryd_core::{Error, Result};
+use telemetryd_core::Result;
 
 /// File name inside a segment directory.
 pub const FOLDS_FILE: &str = "folds.bin";
@@ -161,7 +161,7 @@ impl StreamFolds {
             out.extend_from_slice(&fold.last_value.to_le_bytes());
             out.extend_from_slice(&fold.increase.to_le_bytes());
         }
-        std::fs::write(&path, out).map_err(|e| Error::io(format!("writing {}", path.display()), e))
+        crate::sidecar::write(&path, &out)
     }
 
     /// Read a segment's summaries, or `None` when it has none.
@@ -171,7 +171,7 @@ impl StreamFolds {
     /// an old segment into a failed query.
     #[must_use]
     pub fn read(dir: &Path) -> Option<Self> {
-        let raw = std::fs::read(dir.join(FOLDS_FILE)).ok()?;
+        let raw = crate::sidecar::read(&dir.join(FOLDS_FILE))?;
         if raw.len() < 16 || &raw[0..4] != MAGIC {
             return None;
         }
@@ -291,8 +291,9 @@ mod tests {
             .write(dir.path())
             .unwrap();
         let path = dir.path().join(FOLDS_FILE);
+        // Cut into the contents, not just the checksum trailer behind them.
         let raw = std::fs::read(&path).unwrap();
-        std::fs::write(&path, &raw[..raw.len() - 8]).unwrap();
+        std::fs::write(&path, &raw[..raw.len() - 20]).unwrap();
         assert!(StreamFolds::read(dir.path()).is_none());
 
         std::fs::write(&path, b"not a folds file at all").unwrap();

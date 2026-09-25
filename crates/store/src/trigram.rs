@@ -25,7 +25,7 @@
 
 use std::path::Path;
 
-use telemetryd_core::{Error, Result};
+use telemetryd_core::Result;
 
 /// Bits per distinct trigram. Lower than the key filter's ten: there are far more
 /// trigrams than trace ids, and a false positive here is cheap — one segment read that
@@ -151,8 +151,7 @@ impl TrigramIndex {
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&self.hashes.to_le_bytes());
         out.extend_from_slice(&self.bits);
-        let path = dir.join(FILE);
-        std::fs::write(&path, &out).map_err(|e| Error::io(format!("writing {}", path.display()), e))
+        crate::sidecar::write(&dir.join(FILE), &out)
     }
 
     /// Load a filter, or `None` if it is missing or damaged.
@@ -161,7 +160,7 @@ impl TrigramIndex {
     /// every segment, which is exactly the behaviour that existed before this file did.
     #[must_use]
     pub fn read(dir: &Path) -> Option<Self> {
-        let raw = std::fs::read(dir.join(FILE)).ok()?;
+        let raw = crate::sidecar::read(&dir.join(FILE))?;
         if raw.len() < 8 || &raw[..4] != MAGIC {
             return None;
         }

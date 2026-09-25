@@ -705,6 +705,33 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
     fs::create_dir_all(&staging)
         .map_err(|e| Error::io(format!("creating {}", staging.display()), e))?;
 
+    // Whatever fails from here on leaves nothing behind. A failed seal used to leave
+    // its staging directory, and a seal failing on every append — a full disk — filled
+    // `tmp/` with them until the disk budget counted them and retention deleted sealed
+    // segments to make room.
+    let written = write_staged::<S>(
+        records,
+        &options,
+        &id,
+        &staging,
+        (index, bloom, text),
+        (min_time, max_time),
+    );
+    if written.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    written
+}
+
+/// Everything a seal writes once its staging directory exists, through to publishing it.
+fn write_staged<S: RecordSchema>(
+    records: &[S::Record],
+    options: &SealOptions<'_>,
+    id: &str,
+    staging: &Path,
+    (index, bloom, text): (LabelIndexBuilder, Option<Bloom>, Option<TrigramIndex>),
+    (min_time, max_time): (u64, u64),
+) -> Result<Segment> {
     let (batch, streams) = S::to_batch(records)?;
     // Shared with every other segment holding the same sets, exactly as `load` does.
     //
@@ -723,7 +750,7 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
     let manifest = SegmentManifest {
         format_version: SEGMENT_FORMAT_VERSION,
         signal: S::SIGNAL,
-        id: id.clone(),
+        id: id.to_owned(),
         min_time_nanos: min_time,
         max_time_nanos: max_time,
         rows: records.len() as u64,
@@ -738,20 +765,20 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
     write_manifest(&staging.join(MANIFEST_FILE), &manifest)?;
     let wrote_folds = folds.is_some();
     if let Some(folds) = &folds {
-        folds.write(&staging)?;
+        folds.write(staging)?;
     }
     if let Some(bloom) = &bloom {
-        bloom.write(&staging)?;
+        bloom.write(staging)?;
     }
     if let Some(text) = &text {
-        text.write(&staging)?;
+        text.write(staging)?;
     }
 
     // Sync the staging directory so the rename cannot be reordered ahead of the file
     // contents on a crash.
-    sync_dir(&staging)?;
+    sync_dir(staging)?;
 
-    let final_dir = options.segments_dir.join(&id);
+    let final_dir = options.segments_dir.join(id);
     if final_dir.exists() {
         fs::remove_dir_all(&final_dir).map_err(|e| {
             Error::io(
@@ -760,7 +787,7 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
             )
         })?;
     }
-    fs::rename(&staging, &final_dir).map_err(|e| {
+    fs::rename(staging, &final_dir).map_err(|e| {
         Error::io(
             format!(
                 "publishing segment {} -> {}",
