@@ -232,6 +232,9 @@ impl SegmentManifest {
 /// find one row; large enough that per-batch overhead stays amortised.
 const SCAN_BATCH_ROWS: usize = 8192;
 
+/// The most threads a store's segments are loaded on at startup.
+const MAX_LOAD_THREADS: usize = 8;
+
 /// Rows per Parquet row group in a sealed segment.
 const ROW_GROUP_ROWS: usize = 65_536;
 
@@ -1086,15 +1089,47 @@ pub fn scan(segments_dir: &Path) -> Result<Vec<Segment>> {
         Err(e) => return Err(Error::io(format!("reading {}", segments_dir.display()), e)),
     };
 
-    let mut segments = Vec::new();
+    let mut dirs = Vec::new();
     for entry in entries {
         let entry =
             entry.map_err(|e| Error::io(format!("reading {}", segments_dir.display()), e))?;
         let path = entry.path();
-        if !path.is_dir() {
-            continue;
+        if path.is_dir() {
+            dirs.push(path);
         }
-        if let Some(segment) = Segment::load(&path)? {
+    }
+
+    // Loaded on several threads. Each load is a manifest parsed, a dictionary decoded and
+    // its streams interned — independent work, and a restart waits for all of it: five
+    // hundred segments one after another were most of eight seconds before the server
+    // answered anything.
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .clamp(1, MAX_LOAD_THREADS)
+        .min(dirs.len().max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let loaded: std::sync::Mutex<Vec<Result<Option<Segment>>>> =
+        std::sync::Mutex::new(Vec::with_capacity(dirs.len()));
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                let mut mine = Vec::new();
+                while let Some(dir) = dirs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    mine.push(Segment::load(dir));
+                }
+                loaded
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend(mine);
+            });
+        }
+    });
+    let mut segments = Vec::with_capacity(dirs.len());
+    for outcome in loaded
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        if let Some(segment) = outcome? {
             segments.push(segment);
         }
     }
