@@ -21,7 +21,7 @@
 use serde_json::{Map, Value, json};
 use telemetryd_core::metric::{METRIC_NAME_LABEL, MetricKind, MetricSample};
 use telemetryd_core::record::{LogRecord, Severity};
-use telemetryd_core::span::{SpanKind, SpanRecord, SpanStatus};
+use telemetryd_core::span::{SpanKind, SpanLink, SpanRecord, SpanStatus};
 use telemetryd_core::{Labels, span::SpanEvent};
 
 /// Stream labels that ingest produced by sanitising a dotted OTLP convention.
@@ -177,6 +177,24 @@ fn encode_events(events: &[SpanEvent]) -> Value {
     )
 }
 
+fn encode_links(links: &[SpanLink]) -> Value {
+    Value::Array(
+        links
+            .iter()
+            .map(|link| {
+                let mut entry = Map::new();
+                entry.insert("traceId".into(), json!(link.trace_id));
+                entry.insert("spanId".into(), json!(link.span_id));
+                if !link.trace_state.is_empty() {
+                    entry.insert("traceState".into(), json!(link.trace_state));
+                }
+                entry.insert("attributes".into(), attributes(&link.attributes, false));
+                Value::Object(entry)
+            })
+            .collect(),
+    )
+}
+
 /// `{"resourceSpans":[…]}`, ready to POST at `/v1/traces`.
 #[must_use]
 pub fn encode_spans(records: &[SpanRecord]) -> Value {
@@ -210,6 +228,9 @@ pub fn encode_spans(records: &[SpanRecord]) -> Value {
                     }
                     if !record.events.is_empty() {
                         span.insert("events".into(), encode_events(&record.events));
+                    }
+                    if !record.links.is_empty() {
+                        span.insert("links".into(), encode_links(&record.links));
                     }
                     Value::Object(span)
                 })
@@ -423,6 +444,7 @@ mod tests {
             stream: labels(&[("app", "checkout")]),
             attributes: Labels::default(),
             events: Vec::new(),
+            links: Vec::new(),
         };
         let encoded = encode_spans(&[span]);
         let out = &encoded["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
@@ -529,6 +551,12 @@ mod tests {
                 time_nanos: 1_760_000_000_050_000_000,
                 name: "retry".into(),
                 attributes: labels(&[("attempt", "2")]),
+            }],
+            links: vec![SpanLink {
+                trace_id: "0af7651916cd43dd8448eb211c80319c".into(),
+                span_id: "b7ad6b7169203331".into(),
+                trace_state: "congo=t61rcWkgMzE".into(),
+                attributes: labels(&[("messaging.batch", "true")]),
             }],
         };
         let body = serde_json::to_vec(&encode_spans(std::slice::from_ref(&original))).unwrap();

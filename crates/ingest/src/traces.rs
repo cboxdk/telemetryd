@@ -9,7 +9,7 @@ use serde::Deserialize;
 use telemetryd_core::Labels;
 use telemetryd_core::config::{IngestConfig, LimitsConfig};
 use telemetryd_core::record::{APP_LABEL, UNKNOWN_APP, sanitize_label_name};
-use telemetryd_core::span::{SpanEvent, SpanKind, SpanRecord, SpanStatus};
+use telemetryd_core::span::{SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus};
 
 use crate::logs::{DecodeContext, normalize_timestamp};
 use crate::otlp::{
@@ -57,7 +57,20 @@ pub struct SpanJson {
     pub end_time_unix_nano: FlexU64,
     pub attributes: Vec<KeyValue>,
     pub events: Vec<SpanEventJson>,
+    pub links: Vec<SpanLinkJson>,
     pub status: Option<StatusJson>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SpanLinkJson {
+    #[serde(alias = "trace_id")]
+    pub trace_id: String,
+    #[serde(alias = "span_id")]
+    pub span_id: String,
+    #[serde(alias = "trace_state")]
+    pub trace_state: String,
+    pub attributes: Vec<KeyValue>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -230,7 +243,27 @@ fn convert(
         stream,
         attributes,
         events,
+        links: links(&raw.links),
     })
+}
+
+/// A link names a span elsewhere; one whose ids do not parse points at nothing and is
+/// left out, rather than costing the span it hangs off.
+fn links(raw: &[SpanLinkJson]) -> Vec<SpanLink> {
+    raw.iter()
+        .filter_map(|link| {
+            let trace_id = normalize_id(&link.trace_id)?;
+            let span_id = normalize_id(&link.span_id)?;
+            let mut attributes = Labels::new();
+            extend_attributes(&mut attributes, &link.attributes);
+            Some(SpanLink {
+                trace_id,
+                span_id,
+                trace_state: link.trace_state.clone(),
+                attributes,
+            })
+        })
+        .collect()
 }
 
 /// Spans get `app` plus the configured promotions, but no `level` — severity is a log

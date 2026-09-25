@@ -49,7 +49,9 @@ use crate::otlp_metrics::{
     ResourceMetrics, ScopeMetrics, SumData, UncountedPoints,
 };
 use crate::protobuf::{Reader, WireType};
-use crate::traces::{ResourceSpans, ScopeSpans, SpanEventJson, SpanJson, StatusJson, TracesData};
+use crate::traces::{
+    ResourceSpans, ScopeSpans, SpanEventJson, SpanJson, SpanLinkJson, StatusJson, TracesData,
+};
 
 /// Guard against a hostile nesting depth in `AnyValue`, which is recursive through
 /// `array_value` and `kvlist_value`.
@@ -428,6 +430,11 @@ fn span(reader: &mut Reader<'_>) -> Result<SpanJson> {
                 charge::<SpanEventJson>("span events")?;
                 out.events.push(span_event(&mut nested)?);
             }
+            (13, WireType::LengthDelimited) => {
+                let mut nested = reader.message()?;
+                charge::<SpanLinkJson>("span links")?;
+                out.links.push(span_link(&mut nested)?);
+            }
             (15, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
                 out.status = Some(status(&mut nested)?);
@@ -445,6 +452,20 @@ fn span_event(reader: &mut Reader<'_>) -> Result<SpanEventJson> {
             (1, WireType::Fixed64) => out.time_unix_nano = FlexU64::Number(reader.fixed64()?),
             (2, WireType::LengthDelimited) => reader.string()?.clone_into(&mut out.name),
             (3, WireType::LengthDelimited) => push_attribute(reader, &mut out.attributes)?,
+            _ => reader.skip(wire)?,
+        }
+    }
+    Ok(out)
+}
+
+fn span_link(reader: &mut Reader<'_>) -> Result<SpanLinkJson> {
+    let mut out = SpanLinkJson::default();
+    while let Some((field, wire)) = reader.next_field()? {
+        match (field, wire) {
+            (1, WireType::LengthDelimited) => out.trace_id = hex(reader.bytes()?),
+            (2, WireType::LengthDelimited) => out.span_id = hex(reader.bytes()?),
+            (3, WireType::LengthDelimited) => reader.string()?.clone_into(&mut out.trace_state),
+            (4, WireType::LengthDelimited) => push_attribute(reader, &mut out.attributes)?,
             _ => reader.skip(wire)?,
         }
     }

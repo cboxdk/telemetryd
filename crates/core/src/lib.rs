@@ -22,7 +22,7 @@ pub use metric::{METRIC_NAME_LABEL, MetricKind, MetricSample};
 pub use record::{APP_LABEL, LEVEL_LABEL, Labels, LogRecord, Severity, UNKNOWN_APP};
 pub use secret::{ClientTokens, Secret, TokenSet};
 pub use signal::Signal;
-pub use span::{SpanEvent, SpanKind, SpanRecord, SpanStatus};
+pub use span::{SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus};
 
 /// Crate version, surfaced by `/status`, `telemetryd version` and the `User-Agent`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

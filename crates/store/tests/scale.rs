@@ -110,6 +110,7 @@ fn span(ts: u64, trace_id: &str) -> SpanRecord {
         stream,
         attributes: Labels::new(),
         events: Vec::new(),
+        links: Vec::new(),
     }
 }
 

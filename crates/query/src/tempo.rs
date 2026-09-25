@@ -285,6 +285,8 @@ pub struct SpanJson {
     pub status: StatusJson,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<EventJson>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<LinkJson>,
 }
 
 #[derive(Debug, Serialize)]
@@ -292,6 +294,18 @@ pub struct StatusJson {
     pub code: i32,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub message: String,
+}
+
+/// A link to another span, in the same id spelling as the span itself.
+#[derive(Debug, Serialize)]
+pub struct LinkJson {
+    #[serde(rename = "traceId")]
+    pub trace_id: String,
+    #[serde(rename = "spanId")]
+    pub span_id: String,
+    #[serde(rename = "traceState", skip_serializing_if = "String::is_empty")]
+    pub trace_state: String,
+    pub attributes: Vec<TempoKeyValue>,
 }
 
 #[derive(Debug, Serialize)]
@@ -492,6 +506,16 @@ fn to_span_json(span: &SpanRecord) -> SpanJson {
                 time_unix_nano: event.time_nanos.to_string(),
                 name: event.name.clone(),
                 attributes: key_values(event.attributes.iter()),
+            })
+            .collect(),
+        links: span
+            .links
+            .iter()
+            .map(|link| LinkJson {
+                trace_id: link.trace_id.clone(),
+                span_id: link.span_id.clone(),
+                trace_state: link.trace_state.clone(),
+                attributes: key_values(link.attributes.iter()),
             })
             .collect(),
     }
@@ -839,6 +863,16 @@ impl SpanJson {
                 pb::message(&mut encoded, 3, &kv.to_protobuf());
             }
             pb::message(&mut out, 11, &encoded);
+        }
+        for link in &self.links {
+            let mut encoded = Vec::new();
+            pb::bytes(&mut encoded, 1, &pb::hex(&link.trace_id));
+            pb::bytes(&mut encoded, 2, &pb::hex(&link.span_id));
+            pb::string(&mut encoded, 3, &link.trace_state);
+            for kv in &link.attributes {
+                pb::message(&mut encoded, 4, &kv.to_protobuf());
+            }
+            pb::message(&mut out, 13, &encoded);
         }
         let mut status = Vec::new();
         pb::string(&mut status, 2, &self.status.message);

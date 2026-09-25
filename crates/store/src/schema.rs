@@ -109,6 +109,16 @@ pub trait RecordSchema: Send + Sync + 'static {
     /// Approximate heap cost, used to decide when a buffer is full.
     fn size_estimate(record: &Self::Record) -> usize;
 
+    /// Decode one write-ahead log record.
+    ///
+    /// The log's encoding is positional, so a record type that grows a field cannot
+    /// read what an older binary wrote. A schema whose record changed shape overrides
+    /// this to fall back to the old shape, rather than letting replay after an upgrade
+    /// skip records that were acknowledged before it.
+    fn decode_wal(payload: &[u8]) -> postcard::Result<Self::Record> {
+        postcard::from_bytes(payload)
+    }
+
     /// A high-cardinality identifier that queries look up by exact value.
     ///
     /// `Some` builds a per-segment Bloom filter over it, which is what makes

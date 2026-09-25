@@ -505,6 +505,7 @@ mod tests {
             stream,
             attributes,
             events: Vec::new(),
+            links: Vec::new(),
         }
     }
 

@@ -1879,7 +1879,7 @@ async fn a_trace_comes_back_as_the_protobuf_grafana_decodes() {
     let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
     let batch = format!(
         r#"{{"resourceSpans":[{{"resource":{{"attributes":[{{"key":"service.name","value":{{"stringValue":"shop"}}}}]}},"scopeSpans":[{{"spans":[
-          {{"traceId":"{trace_id}","spanId":"00f067aa0ba902b7","name":"POST /checkout","kind":2,"startTimeUnixNano":"{now}","endTimeUnixNano":"{end}","attributes":[{{"key":"http.method","value":{{"stringValue":"POST"}}}}],"status":{{"code":2,"message":"declined"}},"events":[{{"timeUnixNano":"{now}","name":"exception"}}]}},
+          {{"traceId":"{trace_id}","spanId":"00f067aa0ba902b7","name":"POST /checkout","kind":2,"startTimeUnixNano":"{now}","endTimeUnixNano":"{end}","attributes":[{{"key":"http.method","value":{{"stringValue":"POST"}}}}],"status":{{"code":2,"message":"declined"}},"events":[{{"timeUnixNano":"{now}","name":"exception"}}],"links":[{{"traceId":"0af7651916cd43dd8448eb211c80319c","spanId":"b7ad6b7169203331","traceState":"congo=t61rcWkgMzE","attributes":[{{"key":"link.kind","value":{{"stringValue":"caused_by"}}}}]}}]}},
           {{"traceId":"{trace_id}","spanId":"aaaaaaaaaaaaaaaa","parentSpanId":"00f067aa0ba902b7","name":"SELECT","kind":3,"startTimeUnixNano":"{now}","endTimeUnixNano":"{end}"}}]}}]}}]}}"#,
         end = now + 150_000_000
     );
@@ -1948,6 +1948,17 @@ async fn a_trace_comes_back_as_the_protobuf_grafana_decodes() {
     assert_eq!(child.parent_span_id, root.span_id);
     assert_eq!(root.events.len(), 1);
     assert!(root.attributes.iter().any(|kv| kv.key == "http.method"));
+    // Links come back whole: Grafana draws them as jumps to the linked trace.
+    assert_eq!(root.links.len(), 1);
+    assert_eq!(root.links[0].trace_id, "0af7651916cd43dd8448eb211c80319c");
+    assert_eq!(root.links[0].span_id, "b7ad6b7169203331");
+    assert_eq!(root.links[0].trace_state, "congo=t61rcWkgMzE");
+    assert!(
+        root.links[0]
+            .attributes
+            .iter()
+            .any(|kv| kv.key == "link.kind")
+    );
 
     // v1 answers protobuf too when asked, and JSON otherwise, as before.
     let v1 = harness
@@ -1959,6 +1970,10 @@ async fn a_trace_comes_back_as_the_protobuf_grafana_decodes() {
     assert_eq!(v1.headers()[header::CONTENT_TYPE], "application/protobuf");
     let (_, _, json) = harness.get(&format!("/api/traces/{trace_id}")).await;
     assert!(json.contains("\"batches\""), "{json}");
+    assert!(
+        json.contains(r#""links":[{"traceId":"0af7651916cd43dd8448eb211c80319c""#),
+        "{json}"
+    );
 }
 
 /// Grafana reads only `scopes` from the v2 tag listing and never falls back once the

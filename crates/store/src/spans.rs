@@ -9,7 +9,9 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, StringArray, UInt32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use telemetryd_core::span::{SpanEvent, SpanKind, SpanRecord, SpanStatus};
+use telemetryd_core::span::{
+    SpanEvent, SpanKind, SpanLink, SpanRecord, SpanRecordWithoutLinks, SpanStatus,
+};
 use telemetryd_core::{Error, Labels, Result, Signal};
 
 use crate::schema::arrow_util::{
@@ -43,6 +45,9 @@ impl RecordSchema for SpanSchema {
             Field::new("stream_id", DataType::UInt32, false),
             Field::new("attributes", DataType::Utf8, false),
             Field::new("events", DataType::Utf8, false),
+            // Added after the first release. Segments written before it lack the
+            // column and read back as spans without links — see `materialize`.
+            Field::new("links", DataType::Utf8, false),
         ])
     }
 
@@ -67,6 +72,7 @@ impl RecordSchema for SpanSchema {
             StringArray::from_iter_values(records.iter().map(|s| labels_to_json(&s.attributes)));
         let events =
             StringArray::from_iter_values(records.iter().map(|s| encode_events(&s.events)));
+        let links = StringArray::from_iter_values(records.iter().map(|s| encode_links(&s.links)));
 
         let columns: Vec<ArrayRef> = vec![
             Arc::new(starts),
@@ -82,6 +88,7 @@ impl RecordSchema for SpanSchema {
             Arc::new(stream_ids),
             Arc::new(attributes),
             Arc::new(events),
+            Arc::new(links),
         ];
 
         let batch = RecordBatch::try_new(Self::arrow_schema(), columns)
@@ -135,6 +142,9 @@ impl RecordSchema for SpanSchema {
         let stream_ids = u32_column(batch, "stream_id")?;
         let attributes = string_column(batch, "attributes")?;
         let events = string_column(batch, "events")?;
+        // Optional: a segment sealed before links were stored has no such column, and
+        // its spans have no links rather than being unreadable.
+        let links = string_column(batch, "links").ok();
         let apps = string_column(batch, "app")?;
 
         let mut out = Vec::with_capacity(rows.len());
@@ -162,6 +172,9 @@ impl RecordSchema for SpanSchema {
                 stream,
                 attributes: labels_from_json(attributes.value(row)),
                 events: decode_events(events.value(row)),
+                links: links
+                    .map(|links| decode_links(links.value(row)))
+                    .unwrap_or_default(),
             });
         }
         Ok(out)
@@ -212,6 +225,17 @@ impl RecordSchema for SpanSchema {
         record.size_estimate()
     }
 
+    /// Spans grew `links` in 0.60.0. A span an older binary logged is the current
+    /// record up to that field, and the decoder runs out of bytes where it would start
+    /// — which is exactly when the older shape is the right reading.
+    fn decode_wal(payload: &[u8]) -> postcard::Result<Self::Record> {
+        postcard::from_bytes::<SpanRecord>(payload).or_else(|current| {
+            postcard::from_bytes::<SpanRecordWithoutLinks>(payload)
+                .map(SpanRecord::from)
+                .map_err(|_| current)
+        })
+    }
+
     /// Trace id. Fetching a trace by id is the most common trace query and the one
     /// nothing else can prune, so it gets the Bloom filter.
     fn exact_key(record: &Self::Record) -> Option<&str> {
@@ -254,6 +278,18 @@ fn decode_events(raw: &str) -> Vec<SpanEvent> {
     serde_json::from_str(raw).unwrap_or_default()
 }
 
+/// Links travel the way events do, for the same reason.
+fn encode_links(links: &[SpanLink]) -> String {
+    if links.is_empty() {
+        return "[]".to_owned();
+    }
+    serde_json::to_string(links).unwrap_or_else(|_| "[]".to_owned())
+}
+
+fn decode_links(raw: &str) -> Vec<SpanLink> {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -293,7 +329,80 @@ mod tests {
                     .into_iter()
                     .collect(),
             }],
+            links: vec![SpanLink {
+                trace_id: format!("{:032x}", i + 1000),
+                span_id: format!("{:016x}", i + 1000),
+                trace_state: String::new(),
+                attributes: [("link_kind".to_owned(), "caused_by".to_owned())]
+                    .into_iter()
+                    .collect(),
+            }],
         }
+    }
+
+    #[test]
+    fn a_segment_sealed_before_links_reads_back_without_them() {
+        let records: Vec<SpanRecord> = (0..4).map(span).collect();
+        let (batch, streams) = SpanSchema::to_batch(&records).unwrap();
+        let without = batch
+            .project(&(0..batch.num_columns() - 1).collect::<Vec<_>>())
+            .unwrap();
+        assert!(without.column_by_name("links").is_none());
+
+        let back = materialize_all::<SpanSchema>(&without, &streams);
+        assert_eq!(back.len(), 4);
+        assert!(back.iter().all(|span| span.links.is_empty()));
+        assert_eq!(back[2].events, records[2].events);
+    }
+
+    /// The shape 0.59.0 wrote to the write-ahead log, field for field.
+    #[derive(serde::Serialize)]
+    struct LoggedBeforeLinks<'a> {
+        trace_id: &'a str,
+        span_id: &'a str,
+        parent_span_id: &'a Option<String>,
+        name: &'a str,
+        kind: SpanKind,
+        start_nanos: u64,
+        end_nanos: u64,
+        status: SpanStatus,
+        status_message: &'a str,
+        stream: &'a Labels,
+        attributes: &'a Labels,
+        events: &'a [SpanEvent],
+    }
+
+    #[test]
+    fn a_span_logged_by_the_previous_release_replays() {
+        let span = span(3);
+        let old = postcard::to_stdvec(&LoggedBeforeLinks {
+            trace_id: &span.trace_id,
+            span_id: &span.span_id,
+            parent_span_id: &span.parent_span_id,
+            name: &span.name,
+            kind: span.kind,
+            start_nanos: span.start_nanos,
+            end_nanos: span.end_nanos,
+            status: span.status,
+            status_message: &span.status_message,
+            stream: &span.stream,
+            attributes: &span.attributes,
+            events: &span.events,
+        })
+        .unwrap();
+
+        let back = SpanSchema::decode_wal(&old).unwrap();
+        assert_eq!(
+            back,
+            SpanRecord {
+                links: Vec::new(),
+                ..span.clone()
+            }
+        );
+
+        // And the current shape still reads as itself, links included.
+        let current = postcard::to_stdvec(&span).unwrap();
+        assert_eq!(SpanSchema::decode_wal(&current).unwrap(), span);
     }
 
     #[test]

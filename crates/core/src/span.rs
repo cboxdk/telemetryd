@@ -137,6 +137,17 @@ pub struct SpanEvent {
     pub attributes: Labels,
 }
 
+/// A link from a span to a span in another trace, or elsewhere in its own: the
+/// batch that fanned in, the request that caused the job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpanLink {
+    pub trace_id: String,
+    pub span_id: String,
+    /// W3C `tracestate` of the linked span, verbatim; empty when none was sent.
+    pub trace_state: String,
+    pub attributes: Labels,
+}
+
 /// One span, after decoding and limit enforcement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpanRecord {
@@ -157,6 +168,52 @@ pub struct SpanRecord {
     /// deliberately not part of the stream.
     pub attributes: Labels,
     pub events: Vec<SpanEvent>,
+    /// Last on purpose: the write-ahead log encodes fields in order without names,
+    /// and a record written before links existed is everything up to here. See
+    /// [`SpanRecordWithoutLinks`].
+    pub links: Vec<SpanLink>,
+}
+
+/// A span as the write-ahead log held it before links were stored.
+///
+/// The log's encoding carries no field names or lengths, so a record written by an
+/// older binary cannot be read as the current [`SpanRecord`] — the decoder runs out of
+/// bytes where `links` would start. Replay falls back to this shape rather than
+/// dropping spans that were acknowledged before an upgrade.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SpanRecordWithoutLinks {
+    trace_id: String,
+    span_id: String,
+    parent_span_id: Option<String>,
+    name: String,
+    kind: SpanKind,
+    start_nanos: u64,
+    end_nanos: u64,
+    status: SpanStatus,
+    status_message: String,
+    stream: Labels,
+    attributes: Labels,
+    events: Vec<SpanEvent>,
+}
+
+impl From<SpanRecordWithoutLinks> for SpanRecord {
+    fn from(old: SpanRecordWithoutLinks) -> Self {
+        Self {
+            trace_id: old.trace_id,
+            span_id: old.span_id,
+            parent_span_id: old.parent_span_id,
+            name: old.name,
+            kind: old.kind,
+            start_nanos: old.start_nanos,
+            end_nanos: old.end_nanos,
+            status: old.status,
+            status_message: old.status_message,
+            stream: old.stream,
+            attributes: old.attributes,
+            events: old.events,
+            links: Vec::new(),
+        }
+    }
 }
 
 impl SpanRecord {
@@ -201,6 +258,17 @@ impl SpanRecord {
                 .iter()
                 .map(|e| string_bytes(&e.name) + labels_bytes(&e.attributes))
                 .sum::<usize>()
+            + vec_bytes::<SpanLink>(self.links.len())
+            + self
+                .links
+                .iter()
+                .map(|l| {
+                    string_bytes(&l.trace_id)
+                        + string_bytes(&l.span_id)
+                        + string_bytes(&l.trace_state)
+                        + labels_bytes(&l.attributes)
+                })
+                .sum::<usize>()
     }
 }
 
@@ -227,6 +295,7 @@ mod tests {
             stream,
             attributes: Labels::new(),
             events: Vec::new(),
+            links: Vec::new(),
         }
     }
 

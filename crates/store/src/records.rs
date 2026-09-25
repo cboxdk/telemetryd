@@ -413,7 +413,7 @@ impl<S: RecordSchema> RecordStore<S> {
 
         let mut buffer = Buffer::<S>::new();
         let replayed = wal::replay_from(wal_dir, sealed_through, |payload| {
-            match postcard::from_bytes::<S::Record>(payload) {
+            match S::decode_wal(payload) {
                 Ok(record) => {
                     buffer.bytes += S::size_estimate(&record);
                     buffer.push(record);
