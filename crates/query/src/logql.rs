@@ -93,9 +93,11 @@ impl LogQuery {
 impl LineFilter {
     fn new(op: LineOp, pattern: String) -> Result<Self> {
         let regex = match op {
-            LineOp::Matches | LineOp::NotMatches => Some(Regex::new(&pattern).map_err(|e| {
-                Error::BadRequest(format!("invalid regular expression {pattern:?}: {e}"))
-            })?),
+            LineOp::Matches | LineOp::NotMatches => Some(
+                telemetryd_core::matcher::compile_regex(&pattern).map_err(|e| {
+                    Error::BadRequest(format!("invalid regular expression {pattern:?}: {e}"))
+                })?,
+            ),
             _ => None,
         };
         Ok(Self { op, pattern, regex })

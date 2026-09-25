@@ -831,3 +831,33 @@ fn per_app_usage_is_reported_and_attributed() {
         "expected bytes to track rows (3:1), got {big} against {small}"
     );
 }
+
+/// The sample ceiling has to hold however many threads read.
+///
+/// The sequential walk checks its collector after each segment. The parallel workers
+/// did not check at all, so with `query_parallelism` above one a query the ceiling should
+/// have refused collected everything first — measured at 889,200 rows against a ceiling
+/// of 200,001 — and was refused only after the memory was spent, if at all.
+#[test]
+fn the_ceiling_holds_across_parallel_workers() {
+    let harness = Harness::new();
+    {
+        let store = harness.logs();
+        for segment in 0..8u64 {
+            let batch: Vec<LogRecord> = (0..500u64)
+                .map(|i| log(1_000_000_000 * (segment * 1_000 + i + 1), "app", "line"))
+                .collect();
+            store.append(&batch).unwrap();
+            store.seal_now().unwrap();
+        }
+    }
+    let store = harness.logs_with_parallelism(4);
+
+    let refused = store.query_bounded(0, u64::MAX, &[], &|_| true, 1_000);
+    assert!(refused.is_err(), "4,000 rows passed a ceiling of 1,000");
+
+    let fits = store
+        .query_bounded(0, u64::MAX, &[], &|_| true, 10_000)
+        .unwrap();
+    assert_eq!(fits.len(), 4_000);
+}

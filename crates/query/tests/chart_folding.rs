@@ -290,3 +290,37 @@ fn late_data_is_not_read_as_a_counter_reset() {
     let end = 180 * 60 * SECOND;
     assert_eq!(compare(&store, rows, "increase(late_total[3h])", &[end]), 1);
 }
+
+/// What a range query returns is bounded like what it reads. Two series scraped every
+/// thirty seconds are fourteen hundred samples to load, and at a three-second step they
+/// are fourteen thousand points to return — each held, formatted and serialised.
+#[test]
+fn the_answer_is_bounded_like_the_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&config(dir.path())).unwrap();
+    for sample in &samples() {
+        store
+            .metrics()
+            .append(std::slice::from_ref(sample))
+            .unwrap();
+    }
+    store.metrics().seal_now().ok();
+
+    let params = |step: &str| -> telemetryd_query::prometheus::RangeParams {
+        serde_json::from_value(serde_json::json!({
+            "query": "probe",
+            "start": "30",
+            "end": "21600",
+            "step": step,
+        }))
+        .unwrap()
+    };
+    let now = 21_600 * SECOND;
+
+    let err = telemetryd_query::prometheus::range(store.metrics(), &params("3"), now, 5_000)
+        .expect_err("14,400 points against an allowance of 5,000");
+    assert!(err.to_string().contains("would return more than"), "{err}");
+
+    telemetryd_query::prometheus::range(store.metrics(), &params("60"), now, 5_000)
+        .expect("720 points fit");
+}

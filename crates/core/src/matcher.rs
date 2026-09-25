@@ -123,7 +123,29 @@ impl Eq for LabelMatcher {}
 /// much as the anchors — `^a|b$` without it parses as `(^a)|(b$)`, which would match
 /// far more than the user wrote.
 fn compile_anchored(pattern: &str) -> Result<Regex> {
-    Regex::new(&format!("^(?:{pattern})$"))
+    compile_regex(&format!("^(?:{pattern})$"))
+}
+
+/// How much memory one compiled user regex may take.
+///
+/// The library's default is ten megabytes, and a seven-character pattern such as
+/// `\w{200}` reaches twenty: it is the repetition count, not the pattern's length, that
+/// sets the size. A query can carry many matchers, so the default let a URL of a few
+/// kilobytes ask for gigabytes. Real label and line patterns compile to a few kilobytes.
+pub const MAX_REGEX_BYTES: usize = 256 * 1024;
+
+/// Compile a regex taken from a request, within [`MAX_REGEX_BYTES`].
+///
+/// Every regex a client supplies — label matchers, LogQL line filters, TraceQL
+/// attributes — goes through here, so the bound cannot be forgotten by one of them.
+///
+/// # Errors
+/// A `400` when the pattern is invalid or compiles to more than the bound.
+pub fn compile_regex(pattern: &str) -> Result<Regex> {
+    regex::RegexBuilder::new(pattern)
+        .size_limit(MAX_REGEX_BYTES)
+        .dfa_size_limit(4 * MAX_REGEX_BYTES)
+        .build()
         .map_err(|e| Error::BadRequest(format!("invalid regular expression {pattern:?}: {e}")))
 }
 
@@ -311,5 +333,14 @@ mod tests {
         ];
         assert!(!matches_all(&with_miss, &l));
         assert!(matches_all(&[], &l), "no matchers selects everything");
+    }
+
+    /// A seven-character pattern compiled to twenty megabytes under the library default;
+    /// it is the repetition count that sets the size, not the length of what was typed.
+    #[test]
+    fn a_regex_is_bounded_by_what_it_compiles_to() {
+        assert!(LabelMatcher::new("a", MatchOp::Regex, r"\w{2000}").is_err());
+        assert!(LabelMatcher::new("a", MatchOp::Regex, "GET|POST|PUT|DELETE").is_ok());
+        assert!(compile_regex(r"(?i)timeout|refused").is_ok());
     }
 }

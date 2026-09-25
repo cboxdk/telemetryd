@@ -305,8 +305,20 @@ pub fn range(
     // ordered lookup pays for comparing whole label sets on every one. Order is restored
     // below, where it costs one sort instead of one per insert.
     let mut series: HashMap<Labels, Vec<(f64, String)>> = HashMap::new();
+    // The answer is bounded like the read: every point returned is held, formatted and
+    // serialised, and the loaded samples were never the only cost. A handful of series
+    // multiplied by a fan-out and eleven thousand steps turned 200 input samples into
+    // 3.4 MB of JSON; production-sized inputs would have been gigabytes.
+    let mut emitted: u64 = 0;
     for &at in &timestamps {
         if let Value::Vector(vector) = snapshot.eval(&expr, at)? {
+            emitted += vector.samples.len() as u64;
+            if max_samples != 0 && emitted > max_samples {
+                return Err(Error::BadRequest(format!(
+                    "this query would return more than {max_samples} points; widen `step`, \
+                     narrow the range, or aggregate with `sum by (…)`"
+                )));
+            }
             for (labels, value) in vector.samples {
                 series
                     .entry(labels)

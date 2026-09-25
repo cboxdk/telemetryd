@@ -165,9 +165,11 @@ impl Parser<'_> {
                     "`=~` needs a quoted pattern on the right-hand side".to_owned(),
                 ));
             };
-            Some(Regex::new(pattern).map_err(|e| {
-                Error::BadRequest(format!("invalid regular expression {pattern:?}: {e}"))
-            })?)
+            Some(
+                telemetryd_core::matcher::compile_regex(pattern).map_err(|e| {
+                    Error::BadRequest(format!("invalid regular expression {pattern:?}: {e}"))
+                })?,
+            )
         } else {
             None
         };

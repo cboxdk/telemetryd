@@ -101,8 +101,32 @@ pub struct Spanned {
 }
 
 pub fn tokenize(input: &str) -> Result<Vec<Spanned>> {
-    Lexer::new(input).run()
+    let tokens = Lexer::new(input).run()?;
+    let regexes = tokens
+        .iter()
+        .filter(|spanned| {
+            matches!(
+                spanned.token,
+                Token::RegexMatch | Token::RegexNotMatch | Token::LineRegex
+            )
+        })
+        .count();
+    if regexes > MAX_REGEXES {
+        return Err(Error::BadRequest(format!(
+            "this query uses {regexes} regular expressions; the limit is {MAX_REGEXES}. \
+             Combine alternatives into one pattern, as in `label=~\"a|b|c\"`"
+        )));
+    }
+    Ok(tokens)
 }
+
+/// How many regular expressions one query may compile.
+///
+/// Each is bounded in size by `telemetryd_core::matcher::MAX_REGEX_BYTES`, but a query
+/// can repeat them: two and a half thousand matchers fit in a URL, and at the size bound
+/// that is over half a gigabyte of compiled automata for one request. Counted here, in
+/// the tokenizer every query language shares, so no parser can skip it.
+pub const MAX_REGEXES: usize = 64;
 
 struct Lexer<'a> {
     input: &'a str,
@@ -583,5 +607,24 @@ mod tests {
         // supported" instead of "syntax error".
         assert!(tokens("foo @ 1").contains(&Token::At));
         assert!(tokens("foo[5m:1m]").contains(&Token::Colon));
+    }
+
+    /// Two and a half thousand matchers fit in a URL; at the size bound that is over half
+    /// a gigabyte of compiled automata. The tokenizer every language shares refuses past
+    /// the count, so the bound holds for PromQL, LogQL and TraceQL alike.
+    #[test]
+    fn a_query_may_compile_only_so_many_regexes() {
+        let many = (0..65)
+            .map(|i| format!("l{i}=~\"a\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let err = tokenize(&format!("{{{many}}}")).expect_err("65 regexes");
+        assert!(err.to_string().contains("regular expressions"), "{err}");
+
+        let enough = (0..64)
+            .map(|i| format!("l{i}=~\"a\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(tokenize(&format!("{{{enough}}}")).is_ok());
     }
 }

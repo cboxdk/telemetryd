@@ -769,12 +769,22 @@ impl<S: RecordSchema> RecordStore<S> {
         let next = std::sync::atomic::AtomicUsize::new(0);
         let shared = SharedCutoff::new(request.order);
         let collected = std::sync::Mutex::new(Vec::with_capacity(workers));
+        // What every worker holds between them, against `abort_over`. The sequential walk
+        // checks its one collector after each segment; the workers used not to check at
+        // all, so with `query_parallelism` above one a query the ceiling should have
+        // refused collected everything first — measured at 889,200 rows against a ceiling
+        // of 200,001 — and was refused only after the memory was spent.
+        let held = std::sync::atomic::AtomicUsize::new(0);
+        let over = std::sync::atomic::AtomicBool::new(false);
 
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 scope.spawn(|| {
                     let mut local = TopK::new(request.limit, request.order);
                     loop {
+                        if over.load(Ordering::Relaxed) {
+                            break;
+                        }
                         let index = next.fetch_add(1, Ordering::Relaxed);
                         let Some(segment) = segments.get(index) else {
                             break;
@@ -790,7 +800,14 @@ impl<S: RecordSchema> RecordStore<S> {
                             continue;
                         }
 
+                        let before = local.len();
                         self.scan_segment(segment, index, &request, matchers, extra, &mut local);
+                        let grown = local.len().saturating_sub(before);
+                        let now = held.fetch_add(grown, Ordering::Relaxed) + grown;
+                        if request.abort_over != 0 && now > request.abort_over {
+                            over.store(true, Ordering::Relaxed);
+                            break;
+                        }
                         shared.publish(&local);
                     }
                     lock(&collected).push(local);
@@ -798,6 +815,9 @@ impl<S: RecordSchema> RecordStore<S> {
             }
         });
 
+        if over.load(Ordering::Relaxed) {
+            Self::over_ceiling(&request, held.load(Ordering::Relaxed))?;
+        }
         for local in lock(&collected).drain(..) {
             collector.merge(local);
         }

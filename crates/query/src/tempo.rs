@@ -303,6 +303,22 @@ fn key_values<'a>(pairs: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<TempoK
 // Execution
 // ---------------------------------------------------------------------------
 
+/// How many spans one search, tag listing or tag-value listing may read.
+///
+/// These read every span in the window and kept all of them before trimming to `limit`:
+/// `{}` over a day was the whole day's spans in memory for one request, estimated at half
+/// a gigabyte an hour on a busy instance. They read newest first now and stop at this
+/// many, which is what Tempo does too — search answers with the most recent matches, and a
+/// tag list built from the latest spans is the list a person picking a tag wants.
+pub const MAX_SPANS_READ: usize = 100_000;
+
+fn newest(start_nanos: u64, end_nanos: u64) -> telemetryd_store::Scan<'static> {
+    let mut scan = telemetryd_store::Scan::range(start_nanos, end_nanos);
+    scan.limit = MAX_SPANS_READ;
+    scan.order = telemetryd_store::Order::Descending;
+    scan
+}
+
 /// `GET /api/search`
 pub fn search(store: &RecordStore<SpanSchema>, request: &SearchRequest) -> Result<SearchResponse> {
     let inspected = std::sync::atomic::AtomicU32::new(0);
@@ -311,7 +327,7 @@ pub fn search(store: &RecordStore<SpanSchema>, request: &SearchRequest) -> Resul
         request.query.matches(span) && request.duration_ok(span)
     };
 
-    let matched = store.query(request.start_nanos, request.end_nanos, &[], &filter)?;
+    let matched = store.scan(newest(request.start_nanos, request.end_nanos), &[], &filter)?;
 
     // Group matches by trace, then fetch each trace's root so the summary can name it.
     let mut by_trace: BTreeMap<String, Vec<SpanRecord>> = BTreeMap::new();
@@ -480,7 +496,7 @@ pub fn tags(
         .into_iter()
         .collect();
 
-    for span in store.query(start_nanos, end_nanos, &[], &|_| true)? {
+    for span in store.scan(newest(start_nanos, end_nanos), &[], &|_| true)? {
         names.extend(span.attributes.names().map(str::to_owned));
     }
     // Intrinsics are filterable, so they belong in the tag list a UI offers.
@@ -506,9 +522,11 @@ pub fn tag_values(
     let wanted = name.to_owned();
 
     let mut values: BTreeSet<String> = BTreeSet::new();
-    for span in store.query(request.start_nanos, request.end_nanos, &[], &|span| {
-        request.query.matches(span)
-    })? {
+    for span in store.scan(
+        newest(request.start_nanos, request.end_nanos),
+        &[],
+        &|span| request.query.matches(span),
+    )? {
         match wanted.as_str() {
             "name" => values.insert(span.name.clone()),
             "status" => values.insert(span.status.as_str().to_owned()),
