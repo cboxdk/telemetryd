@@ -20,6 +20,8 @@ pub enum Token {
     /// `|` — starts a parser or label-filter stage.
     Pipe,
     Equal,
+    /// `==` — PromQL's equality comparison. LogQL and TraceQL take it as `=`.
+    EqualEqual,
     NotEqual,
     RegexMatch,
     RegexNotMatch,
@@ -66,6 +68,7 @@ impl fmt::Display for Token {
             Self::Comma => f.write_str(","),
             Self::Pipe => f.write_str("|"),
             Self::Equal => f.write_str("="),
+            Self::EqualEqual => f.write_str("=="),
             Self::NotEqual => f.write_str("!="),
             Self::RegexMatch => f.write_str("=~"),
             Self::RegexNotMatch => f.write_str("!~"),
@@ -185,7 +188,7 @@ impl<'a> Lexer<'a> {
             (b'!', Some(b'=')) => Some(Token::NotEqual),
             (b'!', Some(b'~')) => Some(Token::RegexNotMatch),
             (b'=', Some(b'~')) => Some(Token::RegexMatch),
-            (b'=', Some(b'=')) => Some(Token::Equal),
+            (b'=', Some(b'=')) => Some(Token::EqualEqual),
             (b'&', Some(b'&')) => Some(Token::AndAnd),
             (b'|', Some(b'|')) => Some(Token::OrOr),
             (b'|', Some(b'=')) => Some(Token::LineContains),

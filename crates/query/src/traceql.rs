@@ -246,7 +246,7 @@ impl Parser<'_> {
 
     fn parse_op(&mut self) -> Result<CompareOp> {
         let op = match self.peek() {
-            Some(Token::Equal) => CompareOp::Equal,
+            Some(Token::Equal | Token::EqualEqual) => CompareOp::Equal,
             Some(Token::NotEqual) => CompareOp::NotEqual,
             Some(Token::RegexMatch) => CompareOp::Regex,
             Some(Token::RegexNotMatch) => CompareOp::NotRegex,

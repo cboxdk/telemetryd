@@ -375,7 +375,7 @@ impl<'a> Parser<'a> {
 
     fn expect_match_op(&mut self) -> Result<MatchOp> {
         let op = match self.peek() {
-            Some(Token::Equal) => MatchOp::Equal,
+            Some(Token::Equal | Token::EqualEqual) => MatchOp::Equal,
             Some(Token::NotEqual) => MatchOp::NotEqual,
             Some(Token::RegexMatch) => MatchOp::Regex,
             Some(Token::RegexNotMatch) => MatchOp::NotRegex,

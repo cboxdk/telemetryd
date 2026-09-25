@@ -43,6 +43,7 @@ pub enum Expr {
         op: BinaryOp,
         left: Box<Expr>,
         right: Box<Expr>,
+        modifier: BinaryModifier,
     },
     /// Unary minus.
     Negate(Box<Expr>),
@@ -146,6 +147,12 @@ impl Function {
         }
     }
 
+    /// Whether the function answers a number rather than a vector.
+    #[must_use]
+    pub fn returns_scalar(self) -> bool {
+        false
+    }
+
     /// Whether the function takes a range vector (`sel[5m]`) as its argument.
     pub fn wants_range(self) -> bool {
         matches!(self, Self::Rate | Self::Increase)
@@ -235,8 +242,19 @@ pub enum BinaryOp {
     Div,
     Mod,
     Pow,
+    Atan2,
+    Eq,
+    Ne,
+    Gt,
+    Lt,
+    Ge,
+    Le,
+    /// The left side's elements that have a match on the right.
+    And,
     /// Vector union: the left side wins, the right fills gaps.
     Or,
+    /// The left side's elements that have no match on the right.
+    Unless,
 }
 
 impl BinaryOp {
@@ -248,9 +266,73 @@ impl BinaryOp {
             Self::Div => "/",
             Self::Mod => "%",
             Self::Pow => "^",
+            Self::Atan2 => "atan2",
+            Self::Eq => "==",
+            Self::Ne => "!=",
+            Self::Gt => ">",
+            Self::Lt => "<",
+            Self::Ge => ">=",
+            Self::Le => "<=",
+            Self::And => "and",
             Self::Or => "or",
+            Self::Unless => "unless",
         }
     }
+
+    /// `==`, `!=`, `>`, `<`, `>=`, `<=`: they filter, or with `bool` answer 0 or 1.
+    #[must_use]
+    pub fn is_comparison(self) -> bool {
+        matches!(
+            self,
+            Self::Eq | Self::Ne | Self::Gt | Self::Lt | Self::Ge | Self::Le
+        )
+    }
+
+    /// `and`, `or`, `unless`: they choose elements rather than compute values.
+    #[must_use]
+    pub fn is_set(self) -> bool {
+        matches!(self, Self::And | Self::Or | Self::Unless)
+    }
+
+    /// How tightly it binds, loosest first, as in Prometheus. `^` binds tighter than
+    /// all of these and is parsed on its own.
+    fn precedence(self) -> u8 {
+        match self {
+            Self::Or => 1,
+            Self::And | Self::Unless => 2,
+            Self::Eq | Self::Ne | Self::Gt | Self::Lt | Self::Ge | Self::Le => 3,
+            Self::Add | Self::Sub => 4,
+            Self::Mul | Self::Div | Self::Mod | Self::Atan2 => 5,
+            Self::Pow => 6,
+        }
+    }
+}
+
+/// What follows a binary operator: `bool`, `on(…)`/`ignoring(…)`, and
+/// `group_left(…)`/`group_right(…)`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BinaryModifier {
+    /// A comparison answers 0 or 1 instead of filtering.
+    pub return_bool: bool,
+    /// `on` or `ignoring` and its labels. `None` matches on every label but the name.
+    pub matching: Option<Matching>,
+    /// Many-to-one or one-to-many, with the labels to copy from the "one" side.
+    pub group: Option<Group>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Matching {
+    /// `on(…)` when true, `ignoring(…)` when false.
+    pub on: bool,
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Group {
+    /// `group_left(…)`: many on the left, one on the right.
+    Left(Vec<String>),
+    /// `group_right(…)`: one on the left, many on the right.
+    Right(Vec<String>),
 }
 
 /// Parse a PromQL expression.
@@ -303,82 +385,128 @@ impl Parser<'_> {
         Ok(())
     }
 
-    /// `or` binds loosest, matching PromQL.
     fn parse_expr(&mut self) -> Result<Expr> {
+        self.parse_binary(1)
+    }
+
+    /// Binary operators by precedence climbing: `or` loosest, then `and`/`unless`,
+    /// comparisons, `+`/`-`, and `*`/`/`/`%`/`atan2`, each associating left.
+    fn parse_binary(&mut self, min_precedence: u8) -> Result<Expr> {
         let base = self.depth;
         self.deeper()?;
-        let mut left = self.parse_additive()?;
-        loop {
-            match self.peek() {
-                Some(Token::Ident(word)) if word == "or" => {
-                    self.pos += 1;
-                    self.deeper()?;
-                    let right = self.parse_additive()?;
-                    left = Expr::Binary {
-                        op: BinaryOp::Or,
-                        left: Box::new(left),
-                        right: Box::new(right),
-                    };
-                }
-                // Recognised so they can be named rather than reported as trailing junk.
-                Some(Token::Ident(word)) if word == "and" || word == "unless" => {
-                    return Err(Error::unsupported_with_hint(
-                        format!("PromQL `{word}` between vectors"),
-                        "only `or` is supported for vector matching",
-                    ));
-                }
-                _ => {
-                    self.depth = base;
-                    return Ok(left);
-                }
-            }
-        }
-    }
-
-    fn parse_additive(&mut self) -> Result<Expr> {
-        let base = self.depth;
-        let mut left = self.parse_multiplicative()?;
-        loop {
-            let op = match self.peek() {
-                Some(Token::Plus) => BinaryOp::Add,
-                Some(Token::Minus) => BinaryOp::Sub,
-                _ => {
-                    self.depth = base;
-                    return Ok(left);
-                }
-            };
-            self.pos += 1;
-            self.deeper()?;
-            let right = self.parse_multiplicative()?;
-            left = Expr::Binary {
-                op,
-                left: Box::new(left),
-                right: Box::new(right),
-            };
-        }
-    }
-
-    fn parse_multiplicative(&mut self) -> Result<Expr> {
-        let base = self.depth;
         let mut left = self.parse_unary()?;
-        loop {
-            let op = match self.peek() {
-                Some(Token::Star) => BinaryOp::Mul,
-                Some(Token::Slash) => BinaryOp::Div,
-                Some(Token::Percent) => BinaryOp::Mod,
-                _ => {
-                    self.depth = base;
-                    return Ok(left);
-                }
-            };
+        while let Some(op) = self.peek_binary_op() {
+            if op.precedence() < min_precedence {
+                break;
+            }
             self.pos += 1;
+            let modifier = self.parse_modifier(op)?;
             self.deeper()?;
-            let right = self.parse_unary()?;
+            let right = self.parse_binary(op.precedence() + 1)?;
+            check_operands(op, &modifier, &left, &right)?;
             left = Expr::Binary {
                 op,
                 left: Box::new(left),
                 right: Box::new(right),
+                modifier,
             };
+        }
+        self.depth = base;
+        Ok(left)
+    }
+
+    fn peek_binary_op(&self) -> Option<BinaryOp> {
+        Some(match self.peek()? {
+            Token::Plus => BinaryOp::Add,
+            Token::Minus => BinaryOp::Sub,
+            Token::Star => BinaryOp::Mul,
+            Token::Slash => BinaryOp::Div,
+            Token::Percent => BinaryOp::Mod,
+            Token::EqualEqual => BinaryOp::Eq,
+            Token::NotEqual => BinaryOp::Ne,
+            Token::Greater => BinaryOp::Gt,
+            Token::Less => BinaryOp::Lt,
+            Token::GreaterEqual => BinaryOp::Ge,
+            Token::LessEqual => BinaryOp::Le,
+            Token::Ident(word) => match word.as_str() {
+                "and" => BinaryOp::And,
+                "or" => BinaryOp::Or,
+                "unless" => BinaryOp::Unless,
+                "atan2" => BinaryOp::Atan2,
+                _ => return None,
+            },
+            _ => return None,
+        })
+    }
+
+    /// `bool`, then `on(…)` or `ignoring(…)`, then `group_left(…)` or `group_right(…)`.
+    fn parse_modifier(&mut self, op: BinaryOp) -> Result<BinaryModifier> {
+        let mut modifier = BinaryModifier::default();
+        if matches!(self.peek(), Some(Token::Ident(word)) if word == "bool") {
+            if !op.is_comparison() {
+                return Err(Error::BadRequest(format!(
+                    "`bool` only follows a comparison operator, not `{}`",
+                    op.as_str()
+                )));
+            }
+            self.pos += 1;
+            modifier.return_bool = true;
+        }
+        if let Some(Token::Ident(word)) = self.peek()
+            && (word == "on" || word == "ignoring")
+        {
+            let on = word == "on";
+            self.pos += 1;
+            modifier.matching = Some(Matching {
+                on,
+                labels: self.parse_label_list()?,
+            });
+            if let Some(Token::Ident(word)) = self.peek()
+                && (word == "group_left" || word == "group_right")
+            {
+                if op.is_set() {
+                    return Err(Error::BadRequest(format!(
+                        "no grouping is allowed with `{}`: it matches many to many already",
+                        op.as_str()
+                    )));
+                }
+                let left = word == "group_left";
+                self.pos += 1;
+                let labels = if self.peek() == Some(&Token::LeftParen) {
+                    self.parse_label_list()?
+                } else {
+                    Vec::new()
+                };
+                modifier.group = Some(if left {
+                    Group::Left(labels)
+                } else {
+                    Group::Right(labels)
+                });
+            }
+        } else if matches!(self.peek(), Some(Token::Ident(word)) if word == "group_left" || word == "group_right")
+        {
+            return Err(Error::BadRequest(
+                "`group_left`/`group_right` need `on(…)` or `ignoring(…)` before them".to_owned(),
+            ));
+        }
+        Ok(modifier)
+    }
+
+    /// `(a, b, c)` — the labels of `on`, `ignoring`, `group_left` and `group_right`.
+    fn parse_label_list(&mut self) -> Result<Vec<String>> {
+        self.expect(&Token::LeftParen, "`(`")?;
+        let mut labels = Vec::new();
+        loop {
+            if self.peek() == Some(&Token::RightParen) {
+                self.pos += 1;
+                return Ok(labels);
+            }
+            labels.push(self.expect_ident("a label name")?);
+            match self.peek() {
+                Some(Token::Comma) => self.pos += 1,
+                Some(Token::RightParen) => {}
+                _ => return Err(self.unexpected("`,` or `)`")),
+            }
         }
     }
 
@@ -422,6 +550,7 @@ impl Parser<'_> {
             op: BinaryOp::Pow,
             left: Box::new(base),
             right: Box::new(exponent),
+            modifier: BinaryModifier::default(),
         })
     }
 
@@ -732,6 +861,47 @@ impl Parser<'_> {
             )),
         }
     }
+}
+
+/// Whether an expression evaluates to a scalar rather than a vector, decided from its
+/// shape as Prometheus's parser decides it.
+fn is_scalar(expr: &Expr) -> bool {
+    match expr {
+        Expr::Number(_) => true,
+        Expr::Negate(inner) => is_scalar(inner),
+        Expr::Binary { left, right, .. } => is_scalar(left) && is_scalar(right),
+        Expr::Call { function, .. } => function.returns_scalar(),
+        Expr::Selector(_) | Expr::Aggregation { .. } => false,
+    }
+}
+
+/// The type rules Prometheus's parser applies to a binary operation, so an expression
+/// Prometheus refuses is refused here too rather than answered.
+fn check_operands(
+    op: BinaryOp,
+    modifier: &BinaryModifier,
+    left: &Expr,
+    right: &Expr,
+) -> Result<()> {
+    let (left_scalar, right_scalar) = (is_scalar(left), is_scalar(right));
+    if op.is_set() && (left_scalar || right_scalar) {
+        return Err(Error::BadRequest(format!(
+            "`{}` works between vectors, and one side of this one is a number",
+            op.as_str()
+        )));
+    }
+    if op.is_comparison() && left_scalar && right_scalar && !modifier.return_bool {
+        return Err(Error::BadRequest(format!(
+            "comparing two numbers needs `bool`, as in `1 {} bool 2`",
+            op.as_str()
+        )));
+    }
+    if modifier.matching.is_some() && (left_scalar || right_scalar) {
+        return Err(Error::BadRequest(
+            "`on`/`ignoring` match two vectors, and one side of this one is a number".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 impl Expr {
@@ -1089,13 +1259,86 @@ mod tests {
         assert!(err.to_string().contains('@'), "{err}");
     }
 
-    #[test]
-    fn and_and_unless_are_named_rather_than_treated_as_junk() {
-        for op in ["and", "unless"] {
-            let err = parse(&format!("up {op} down")).unwrap_err();
-            assert!(matches!(err, Error::Unsupported { .. }), "{op}");
-            assert!(err.to_string().contains(op), "{op}");
+    fn binary_parts(expr: &Expr) -> (BinaryOp, &Expr, &Expr, &BinaryModifier) {
+        match expr {
+            Expr::Binary {
+                op,
+                left,
+                right,
+                modifier,
+            } => (*op, left, right, modifier),
+            other => panic!("expected a binary operation, got {other:?}"),
         }
+    }
+
+    /// Prometheus's ladder: `or` loosest, then `and`/`unless`, comparisons, `+`/`-`,
+    /// `*`/`/`/`%`/`atan2`.
+    #[test]
+    fn set_and_comparison_operators_bind_as_in_prometheus() {
+        let first = parse("a or b and c").unwrap();
+        let (op, _, right, _) = binary_parts(&first);
+        assert_eq!(op, BinaryOp::Or);
+        assert_eq!(binary_parts(right).0, BinaryOp::And);
+
+        let second = parse("a + 1 > b unless c").unwrap();
+        let (op, left, _, _) = binary_parts(&second);
+        assert_eq!(op, BinaryOp::Unless);
+        let (op, left, _, _) = binary_parts(left);
+        assert_eq!(op, BinaryOp::Gt);
+        assert_eq!(binary_parts(left).0, BinaryOp::Add);
+
+        let third = parse("a - b atan2 c").unwrap();
+        let (op, _, right, _) = binary_parts(&third);
+        assert_eq!(op, BinaryOp::Sub);
+        assert_eq!(binary_parts(right).0, BinaryOp::Atan2);
+    }
+
+    #[test]
+    fn modifiers_parse_after_the_operator() {
+        let expr = parse("a / on(job, instance) group_left(team) b").unwrap();
+        let (op, _, _, modifier) = binary_parts(&expr);
+        assert_eq!(op, BinaryOp::Div);
+        assert_eq!(
+            modifier.matching,
+            Some(Matching {
+                on: true,
+                labels: vec!["job".into(), "instance".into()]
+            })
+        );
+        assert_eq!(modifier.group, Some(Group::Left(vec!["team".into()])));
+
+        let expr = parse("a > bool ignoring(code) b").unwrap();
+        let (op, _, _, modifier) = binary_parts(&expr);
+        assert_eq!(op, BinaryOp::Gt);
+        assert!(modifier.return_bool);
+        assert_eq!(
+            modifier.matching,
+            Some(Matching {
+                on: false,
+                labels: vec!["code".into()]
+            })
+        );
+
+        let expr = parse("a * on() group_right b").unwrap();
+        assert_eq!(binary_parts(&expr).3.group, Some(Group::Right(Vec::new())));
+    }
+
+    /// What Prometheus's parser refuses, refused here too.
+    #[test]
+    fn misused_operators_are_refused() {
+        for (query, says) in [
+            ("1 > 2", "needs `bool`"),
+            ("a + bool b", "only follows a comparison"),
+            ("a and 1", "between vectors"),
+            ("1 or a", "between vectors"),
+            ("a and on(x) group_left b", "no grouping"),
+            ("a + group_left b", "need `on(…)`"),
+            ("a + on(x) 1", "match two vectors"),
+        ] {
+            let err = parse(query).unwrap_err().to_string();
+            assert!(err.contains(says), "{query}: {err}");
+        }
+        assert!(parse("1 > bool 2").is_ok());
     }
 
     #[test]

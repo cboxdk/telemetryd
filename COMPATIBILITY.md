@@ -414,8 +414,9 @@ a range that straddles it has both. Nothing needs to be done about that beyond w
 Answers are held to Prometheus's own: `crates/query/tests/conformance/promql.json` is a
 promtool test file whose expectations Prometheus wrote, CI asks Prometheus for them again
 on every run, and telemetryd must give the same answer by each of its three read paths.
-Forty-four expressions across rates and increases with counter resets, aggregations,
-`topk`/`bottomk`, histogram quantiles, offsets, staleness, gaps and operator precedence.
+Sixty-eight expressions across rates and increases with counter resets, aggregations,
+`topk`/`bottomk`, histogram quantiles, offsets, staleness, gaps, operator precedence,
+comparisons and every kind of vector matching.
 
 Driven by what `PromqlCompiler` actually generates:
 
@@ -434,7 +435,13 @@ Driven by what `PromqlCompiler` actually generates:
 - numbers as PromQL spells them: `0.5`, `.5`, `1e3`, `0x1F`, `NaN`, `Inf`, `+Inf`, `-Inf`
   — `NaN` and `Inf` are numbers in any case, never metric names
 - operator precedence and associativity as in PromQL: `^` binds tightest and to the
-  right, then unary minus, then `*` `/` `%`, then `+` `-`, then `or`
+  right, then unary minus, then `*` `/` `%` `atan2`, then `+` `-`, then the comparisons,
+  then `and` `unless`, then `or`
+- **comparisons** `==` `!=` `>` `<` `>=` `<=`, filtering or with `bool` answering 0 or 1;
+  between two numbers they need `bool`, as in Prometheus
+- **vector matching**: `and`, `or`, `unless`, and `on(…)`/`ignoring(…)` with
+  `group_left(…)`/`group_right(…)` — including the labels copied from the "one" side, and
+  the refusals Prometheus gives for an ambiguous match
 - **`offset`**, including a negative one — `offset -5m` reads five minutes after the
   evaluation time, as Prometheus 3 allows
 - **`or` between vectors**, and **`clamp_min`** — with `offset`, required by the
@@ -444,8 +451,7 @@ Driven by what `PromqlCompiler` actually generates:
 
 *Not supported:* subqueries, the `@` modifier, `quantile`, `count_values`,
 `predict_linear`, `holt_winters`, recording and alerting rules, `/api/v1/rules`,
-`/api/v1/alerts`, exemplars, native histograms, and vector-to-vector matching beyond
-the `or` form above (`on`/`ignoring`/`group_left`).
+`/api/v1/alerts`, exemplars and native histograms.
 
 *Limits:* an expression may nest at most 128 levels deep, counting parentheses, unary
 minus, function and aggregation arguments, and each link in a chain of binary operators.

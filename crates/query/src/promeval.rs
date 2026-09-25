@@ -20,7 +20,10 @@ use telemetryd_core::{Error, LabelMatcher, Labels, MetricSample, Result};
 use telemetryd_store::RecordStore;
 use telemetryd_store::metrics::MetricSchema;
 
-use crate::promql::{AggregateOp, BinaryOp, Expr, Function, Grouping, Offset, Selector};
+use crate::promql::{
+    AggregateOp, BinaryModifier, BinaryOp, Expr, Function, Group, Grouping, Matching, Offset,
+    Selector,
+};
 
 const NANOS_PER_SECOND: f64 = 1e9;
 
@@ -803,13 +806,6 @@ impl Snapshot {
         Ok(vector)
     }
 
-    fn unnamed(&self, value: Value) -> Value {
-        match value {
-            Value::Vector(vector) => Value::Vector(self.drop_names(vector)),
-            scalar @ Value::Scalar(_) => scalar,
-        }
-    }
-
     /// Fold every sample of `[from, last]` that some point's window needs.
     ///
     /// Nothing here holds the samples: they are folded as they are read, so the memory a
@@ -1293,16 +1289,15 @@ impl Snapshot {
                 }
                 Ok(Value::Vector(self.aggregate(*op, grouping, &vector)))
             }
-            Expr::Binary { op, left, right } => {
-                let mut left = self.eval(left, at_nanos)?;
-                let mut right = self.eval(right, at_nanos)?;
-                // Arithmetic makes a new value; `or` only chooses between existing ones,
-                // so it keeps their names.
-                if *op != BinaryOp::Or {
-                    left = self.unnamed(left);
-                    right = self.unnamed(right);
-                }
-                match binary(*op, left, right) {
+            Expr::Binary {
+                op,
+                left,
+                right,
+                modifier,
+            } => {
+                let left = self.eval(left, at_nanos)?;
+                let right = self.eval(right, at_nanos)?;
+                match self.binary(*op, modifier, left, right)? {
                     Value::Vector(vector) => Ok(Value::Vector(self.distinct(vector)?)),
                     scalar @ Value::Scalar(_) => Ok(scalar),
                 }
@@ -1780,98 +1775,277 @@ fn aggregate(op: AggregateOp, grouping: &Grouping, vector: &InstantVector) -> In
     InstantVector { samples }
 }
 
-/// Two label sets are the same series for matching when they differ at most in name.
-fn same_series(a: &Labels, b: &Labels) -> bool {
-    unnamed(a).eq(unnamed(b))
-}
-
-/// A label set's pairs without the metric name.
-fn unnamed(labels: &Labels) -> impl Iterator<Item = (&str, &str)> {
-    labels
-        .iter()
-        .filter(|(key, _)| *key != telemetryd_core::METRIC_NAME_LABEL)
-}
-
-fn binary(op: BinaryOp, left: Value, right: Value) -> Value {
-    match (op, left, right) {
-        // Vector union: the left side wins, the right fills gaps. This is what makes
-        // the UI's `sel offset 5m or sel * 0` yield zero instead of nothing.
-        (BinaryOp::Or, left, right) => {
-            let left = left.into_vector();
-            let right = right.into_vector();
-            let mut samples = left.samples;
-            // Matched as Prometheus matches: on every label but the name. Looked up by a
-            // hash of those labels and confirmed, rather than by walking the left side
-            // for every right-hand element — five seconds a step at 22,000 series.
-            let mut present: HashMap<u64, Vec<usize>> = HashMap::with_capacity(samples.len());
-            for (index, (labels, _)) in samples.iter().enumerate() {
-                present
-                    .entry(Labels::fingerprint_of(unnamed(labels)))
-                    .or_default()
-                    .push(index);
-            }
-            for (labels, value) in right.samples {
-                let fingerprint = Labels::fingerprint_of(unnamed(&labels));
-                let candidates = present.entry(fingerprint).or_default();
-                if candidates
-                    .iter()
-                    .any(|&index| same_series(&samples[index].0, &labels))
-                {
-                    continue;
-                }
-                // It joins the lookup too: a right-hand element was always compared with
-                // the ones already taken from the right, not only with the left side.
-                candidates.push(samples.len());
-                samples.push((labels, value));
-            }
-            Value::Vector(InstantVector { samples })
-        }
-        (op, Value::Scalar(a), Value::Scalar(b)) => Value::Scalar(apply(op, a, b)),
-        (op, Value::Vector(mut vector), Value::Scalar(scalar)) => {
-            for (_, value) in &mut vector.samples {
-                *value = apply(op, *value, scalar);
-            }
-            Value::Vector(vector)
-        }
-        (op, Value::Scalar(scalar), Value::Vector(mut vector)) => {
-            for (_, value) in &mut vector.samples {
-                *value = apply(op, scalar, *value);
-            }
-            Value::Vector(vector)
-        }
-        // Vector-to-vector: match on identical label sets, as PromQL's default
-        // one-to-one matching does. Series present on only one side drop out.
-        (op, Value::Vector(left), Value::Vector(right)) => {
-            // The first right-hand element with each label set, found by hash — a search
-            // of the right side per left element was O(n·m).
-            let mut by_labels: HashMap<&Labels, f64> = HashMap::with_capacity(right.samples.len());
-            for (labels, value) in &right.samples {
-                by_labels.entry(labels).or_insert(*value);
-            }
-            let samples = left
-                .samples
-                .into_iter()
-                .filter_map(|(labels, value)| {
-                    by_labels
-                        .get(&labels)
-                        .map(|other| (labels, apply(op, value, *other)))
-                })
-                .collect();
-            Value::Vector(InstantVector { samples })
-        }
-    }
-}
-
-fn apply(op: BinaryOp, a: f64, b: f64) -> f64 {
+/// One operation on two numbers: the value it makes, and — for a comparison — whether
+/// the pair passes. A comparison's value is the left operand, as in Prometheus.
+fn element(op: BinaryOp, a: f64, b: f64) -> (f64, bool) {
     match op {
-        BinaryOp::Add => a + b,
-        BinaryOp::Sub => a - b,
-        BinaryOp::Mul => a * b,
-        BinaryOp::Div => a / b,
-        BinaryOp::Mod => a % b,
-        BinaryOp::Pow => a.powf(b),
-        BinaryOp::Or => a,
+        BinaryOp::Add => (a + b, true),
+        BinaryOp::Sub => (a - b, true),
+        BinaryOp::Mul => (a * b, true),
+        BinaryOp::Div => (a / b, true),
+        BinaryOp::Mod => (a % b, true),
+        BinaryOp::Pow => (a.powf(b), true),
+        BinaryOp::Atan2 => (a.atan2(b), true),
+        #[allow(clippy::float_cmp)] // `==` is exact equality in PromQL too
+        BinaryOp::Eq => (a, a == b),
+        #[allow(clippy::float_cmp)]
+        BinaryOp::Ne => (a, a != b),
+        BinaryOp::Gt => (a, a > b),
+        BinaryOp::Lt => (a, a < b),
+        BinaryOp::Ge => (a, a >= b),
+        BinaryOp::Le => (a, a <= b),
+        BinaryOp::And | BinaryOp::Or | BinaryOp::Unless => (a, true),
     }
+}
+
+/// The labels two elements are matched on: those `on(…)` names, or all but those
+/// `ignoring(…)` names — and never the metric name unless `on` names it.
+fn match_key(labels: &Labels, matching: Option<&Matching>) -> Labels {
+    let mut key = Labels::new();
+    for (name, value) in labels.iter() {
+        let keep = match matching {
+            Some(Matching { on: true, labels }) => labels.iter().any(|l| l == name),
+            Some(Matching { on: false, labels }) => {
+                name != telemetryd_core::METRIC_NAME_LABEL && !labels.iter().any(|l| l == name)
+            }
+            None => name != telemetryd_core::METRIC_NAME_LABEL,
+        };
+        if keep {
+            key.insert(name, value);
+        }
+    }
+    key
+}
+
+impl Snapshot {
+    /// A binary operation, as Prometheus evaluates one.
+    ///
+    /// Arithmetic and `bool` comparisons make new values, so they drop the metric
+    /// name; a filtering comparison and the set operators hand back elements as they
+    /// were, name included.
+    fn binary(
+        &self,
+        op: BinaryOp,
+        modifier: &BinaryModifier,
+        left: Value,
+        right: Value,
+    ) -> Result<Value> {
+        match (left, right) {
+            (Value::Scalar(a), Value::Scalar(b)) => {
+                let (value, pass) = element(op, a, b);
+                Ok(Value::Scalar(if op.is_comparison() {
+                    f64::from(u8::from(pass))
+                } else {
+                    value
+                }))
+            }
+            (Value::Vector(vector), Value::Scalar(scalar)) => Ok(Value::Vector(
+                self.vector_scalar(op, modifier.return_bool, vector, scalar, false),
+            )),
+            (Value::Scalar(scalar), Value::Vector(vector)) => Ok(Value::Vector(
+                self.vector_scalar(op, modifier.return_bool, vector, scalar, true),
+            )),
+            (Value::Vector(left), Value::Vector(right)) => Ok(Value::Vector(if op.is_set() {
+                set_operation(op, modifier.matching.as_ref(), left, right)
+            } else {
+                vector_vector(op, modifier, left, right)?
+            })),
+        }
+    }
+
+    /// A vector against a number. `scalar_first` is `2 > x` rather than `x > 2`; a
+    /// filtering comparison keeps the vector's own value either way.
+    fn vector_scalar(
+        &self,
+        op: BinaryOp,
+        return_bool: bool,
+        vector: InstantVector,
+        scalar: f64,
+        scalar_first: bool,
+    ) -> InstantVector {
+        let mut samples = Vec::with_capacity(vector.samples.len());
+        for (labels, own) in vector.samples {
+            let (a, b) = if scalar_first {
+                (scalar, own)
+            } else {
+                (own, scalar)
+            };
+            let (mut value, pass) = element(op, a, b);
+            if op.is_comparison() {
+                value = own;
+            }
+            if return_bool {
+                value = f64::from(u8::from(pass));
+            } else if !pass {
+                continue;
+            }
+            samples.push((labels, value));
+        }
+        let vector = InstantVector { samples };
+        if op.is_comparison() && !return_bool {
+            vector
+        } else {
+            self.drop_names(vector)
+        }
+    }
+}
+
+/// Two vectors, matched one to one or — with `group_left`/`group_right` — many to one,
+/// refusing the matches Prometheus refuses.
+fn vector_vector(
+    op: BinaryOp,
+    modifier: &BinaryModifier,
+    left: InstantVector,
+    right: InstantVector,
+) -> Result<InstantVector> {
+    let matching = modifier.matching.as_ref();
+    let (many, one, one_side, include) = match &modifier.group {
+        Some(Group::Right(include)) => (right, left, "left", include.as_slice()),
+        Some(Group::Left(include)) => (left, right, "right", include.as_slice()),
+        None => (left, right, "right", &[][..]),
+    };
+    let one_to_one = modifier.group.is_none();
+    let many_is_left = !matches!(modifier.group, Some(Group::Right(_)));
+
+    let mut ones: HashMap<Labels, (Labels, f64)> = HashMap::with_capacity(one.samples.len());
+    for (labels, value) in one.samples {
+        let key = match_key(&labels, matching);
+        if let Some((earlier, _)) = ones.get(&key) {
+            return Err(Error::BadRequest(format!(
+                "found duplicate series for the match group {} on the {one_side} \
+                     hand-side of the operation: [{}, {}]; many-to-many matching not \
+                     allowed: matching labels must be unique on one side",
+                key.to_selector(),
+                labels.to_selector(),
+                earlier.to_selector()
+            )));
+        }
+        ones.insert(key, (labels, value));
+    }
+
+    let mut matched: HashMap<Labels, std::collections::HashSet<Labels>> = HashMap::new();
+    let mut samples = Vec::new();
+    for (labels, value) in many.samples {
+        let key = match_key(&labels, matching);
+        let Some((one_labels, one_value)) = ones.get(&key) else {
+            continue;
+        };
+        let (a, b) = if many_is_left {
+            (value, *one_value)
+        } else {
+            (*one_value, value)
+        };
+        let (mut result, pass) = element(op, a, b);
+        if modifier.return_bool {
+            result = f64::from(u8::from(pass));
+        } else if !pass {
+            continue;
+        }
+        let metric = result_labels(&labels, one_labels, op, modifier, include);
+        let seen = matched.entry(key).or_default();
+        if one_to_one {
+            if !seen.is_empty() {
+                return Err(Error::BadRequest(
+                    "multiple matches for labels: many-to-one matching must be explicit \
+                         (group_left/group_right)"
+                        .to_owned(),
+                ));
+            }
+        } else if seen.contains(&metric) {
+            return Err(Error::BadRequest(
+                "multiple matches for labels: grouping labels must ensure unique matches"
+                    .to_owned(),
+            ));
+        }
+        seen.insert(metric.clone());
+        samples.push((metric, result));
+    }
+    Ok(InstantVector { samples })
+}
+
+/// The labels of an element two vectors made: the "many" side's, less the name when a
+/// value was computed, cut to `on`'s labels or clear of `ignoring`'s for a one-to-one
+/// match, with `group_left`/`group_right`'s labels copied from the "one" side.
+fn result_labels(
+    many: &Labels,
+    one: &Labels,
+    op: BinaryOp,
+    modifier: &BinaryModifier,
+    include: &[String],
+) -> Labels {
+    let mut out = many.clone();
+    if !op.is_comparison() || modifier.return_bool {
+        out.remove(telemetryd_core::METRIC_NAME_LABEL);
+    }
+    if modifier.group.is_none()
+        && let Some(matching) = &modifier.matching
+    {
+        let drop: Vec<String> = out
+            .names()
+            .filter(|name| matching.labels.iter().any(|l| l == name) != matching.on)
+            .map(str::to_owned)
+            .collect();
+        for name in drop {
+            out.remove(&name);
+        }
+    }
+    for name in include {
+        match one.get(name).filter(|value| !value.is_empty()) {
+            Some(value) => out.insert(name.clone(), value.to_owned()),
+            None => {
+                out.remove(name);
+            }
+        }
+    }
+    out
+}
+
+/// `and`, `or`, `unless`: elements chosen by whether their match key appears on the
+/// other side, names and values untouched.
+fn set_operation(
+    op: BinaryOp,
+    matching: Option<&Matching>,
+    left: InstantVector,
+    right: InstantVector,
+) -> InstantVector {
+    let keys = |vector: &InstantVector| -> std::collections::HashSet<Labels> {
+        vector
+            .samples
+            .iter()
+            .map(|(labels, _)| match_key(labels, matching))
+            .collect()
+    };
+    let samples = match op {
+        BinaryOp::And if left.samples.is_empty() || right.samples.is_empty() => Vec::new(),
+        BinaryOp::And => {
+            let right_keys = keys(&right);
+            left.samples
+                .into_iter()
+                .filter(|(labels, _)| right_keys.contains(&match_key(labels, matching)))
+                .collect()
+        }
+        BinaryOp::Unless => {
+            let right_keys = keys(&right);
+            left.samples
+                .into_iter()
+                .filter(|(labels, _)| !right_keys.contains(&match_key(labels, matching)))
+                .collect()
+        }
+        // `or`: every left element, and the right ones whose key the left lacks. The
+        // UI's `sel offset 5m or sel * 0` is what makes a missing series read zero.
+        _ => {
+            let left_keys = keys(&left);
+            let mut samples = left.samples;
+            samples.extend(
+                right
+                    .samples
+                    .into_iter()
+                    .filter(|(labels, _)| !left_keys.contains(&match_key(labels, matching))),
+            );
+            samples
+        }
+    };
+    InstantVector { samples }
 }
 
 /// Linear interpolation over cumulative histogram buckets.
@@ -2625,8 +2799,9 @@ mod tests {
             .collect()
     }
 
-    /// `or` keeps the left side, and adds from the right what matches nothing already
-    /// taken — on every label but the name, and against earlier right-hand elements too.
+    /// `or` keeps the left side, and adds from the right what the left has no match
+    /// for — on every label but the name. Right-hand elements are not matched against
+    /// each other, as in Prometheus.
     #[test]
     fn or_matches_on_everything_but_the_name() {
         let left = InstantVector {
@@ -2640,17 +2815,26 @@ mod tests {
                 (labelled(&[("pod", "3")]), 40.0),
             ],
         };
-        let Value::Vector(union) = binary(BinaryOp::Or, Value::Vector(left), Value::Vector(right))
+        let snapshot = Snapshot::from_samples(Vec::new());
+        let Value::Vector(union) = snapshot
+            .binary(
+                BinaryOp::Or,
+                &BinaryModifier::default(),
+                Value::Vector(left),
+                Value::Vector(right),
+            )
+            .unwrap()
         else {
             panic!("a union of vectors is a vector");
         };
         let values: Vec<f64> = union.samples.iter().map(|(_, value)| *value).collect();
-        assert_eq!(values, [1.0, 20.0, 40.0]);
+        assert_eq!(values, [1.0, 20.0, 30.0, 40.0]);
     }
 
-    /// One-to-one matching takes the first right-hand element with the same labels.
+    /// One-to-one matching refuses two right-hand elements with one match key, as
+    /// Prometheus does, rather than picking one.
     #[test]
-    fn vector_arithmetic_matches_identical_label_sets() {
+    fn vector_arithmetic_refuses_an_ambiguous_match() {
         let left = InstantVector {
             samples: vec![
                 (labelled(&[("pod", "1")]), 6.0),
@@ -2659,16 +2843,25 @@ mod tests {
         };
         let right = InstantVector {
             samples: vec![
-                (labelled(&[("pod", "1")]), 3.0),
-                (labelled(&[("pod", "1")]), 2.0),
+                (labelled(&[("__name__", "x"), ("pod", "1")]), 3.0),
+                (labelled(&[("__name__", "y"), ("pod", "1")]), 2.0),
             ],
         };
-        let Value::Vector(quotient) =
-            binary(BinaryOp::Div, Value::Vector(left), Value::Vector(right))
-        else {
-            panic!("vector arithmetic is a vector");
-        };
-        assert_eq!(quotient.samples, vec![(labelled(&[("pod", "1")]), 2.0)]);
+        let snapshot = Snapshot::from_samples(Vec::new());
+        let refused = snapshot
+            .binary(
+                BinaryOp::Div,
+                &BinaryModifier::default(),
+                Value::Vector(left),
+                Value::Vector(right),
+            )
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("many-to-many matching not allowed"),
+            "{refused}"
+        );
     }
 
     fn value_for(vector: &InstantVector, app: &str) -> Option<f64> {
