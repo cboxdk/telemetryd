@@ -15,6 +15,7 @@ pub mod loki;
 pub mod maintenance;
 pub mod metrics;
 pub mod oidc;
+pub mod params;
 pub mod prometheus;
 pub mod relay;
 pub mod routes;
@@ -87,6 +88,7 @@ pub fn router(state: AppState) -> Router {
 
     let query = Router::new()
         // Loki-compatible read APIs (M1).
+        .route("/loki/api/v1/query", get(loki::instant))
         .route("/loki/api/v1/query_range", get(loki::query_range))
         .route("/loki/api/v1/labels", get(loki::labels))
         .route("/loki/api/v1/label/{name}/values", get(loki::label_values))
@@ -95,9 +97,10 @@ pub fn router(state: AppState) -> Router {
         // Tempo-compatible read APIs (M2).
         .route("/api/echo", get(routes::echo))
         .route("/api/traces/{trace_id}", get(tempo::trace))
+        .route("/api/v2/traces/{trace_id}", get(tempo::trace_v2))
         .route("/api/search", get(tempo::search))
         .route("/api/search/tags", get(tempo::tags))
-        .route("/api/v2/search/tags", get(tempo::tags))
+        .route("/api/v2/search/tags", get(tempo::tags_v2))
         // The UI calls the v2 path; v1 is kept for older clients.
         .route("/api/v2/search/tag/{name}/values", get(tempo::tag_values))
         .route("/api/search/tag/{name}/values", get(tempo::tag_values))
@@ -112,9 +115,15 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/query_range",
             get(prometheus::range).post(prometheus::range),
         )
-        .route("/api/v1/labels", get(prometheus::labels))
+        .route(
+            "/api/v1/labels",
+            get(prometheus::labels).post(prometheus::labels),
+        )
         .route("/api/v1/label/{name}/values", get(prometheus::label_values))
-        .route("/api/v1/series", get(prometheus::series))
+        .route(
+            "/api/v1/series",
+            get(prometheus::series).post(prometheus::series),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::limit_query_concurrency,
@@ -157,6 +166,7 @@ pub fn router(state: AppState) -> Router {
         .merge(query)
         .merge(export)
         .merge(ingest)
+        .fallback(error::unimplemented)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             record_request,
@@ -166,6 +176,8 @@ pub fn router(state: AppState) -> Router {
             axum::http::StatusCode::REQUEST_TIMEOUT,
             request_timeout,
         ))
+        // Outside the timeout, so a 408 on the Prometheus API gets the envelope too.
+        .layer(axum::middleware::from_fn(error::prometheus_envelope))
         .layer(RequestBodyLimitLayer::new(max_body))
         // axum's extractors carry their own 2 MB default, which silently won whatever
         // `server.max_body_bytes` said: a 16 MiB setting rejected anything past 2 MiB,

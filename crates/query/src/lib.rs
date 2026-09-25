@@ -21,6 +21,7 @@
 pub mod lexer;
 pub mod logql;
 pub mod loki;
+pub mod meta;
 pub mod prometheus;
 pub mod promeval;
 pub mod promql;

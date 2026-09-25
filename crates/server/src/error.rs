@@ -73,3 +73,97 @@ impl IntoResponse for ApiError {
         response
     }
 }
+
+/// The Prometheus API's own error envelope, on the Prometheus API.
+///
+/// Prometheus answers `{"status":"error","errorType":"bad_data","error":"…"}`, and
+/// Grafana's Prometheus client reads `error` as a string. Ours was an object, so every
+/// refusal surfaced in Grafana as a parse error rather than the message — and a 401,
+/// 405 or timeout had no body at all. Rewritten here, on the way out, so the rest of the
+/// server keeps one error shape; the telemetryd details (`code`, `hint`, `feature`,
+/// `docs`) ride along as extra keys, which Prometheus clients ignore.
+pub async fn prometheus_envelope(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path();
+    let prometheus = path.starts_with("/api/v1/")
+        && !path.starts_with("/api/v1/export")
+        && !path.starts_with("/api/v1/write");
+    let response = next.run(request).await;
+    if !prometheus || response.status().is_success() {
+        return response;
+    }
+
+    let (mut parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, 1 << 20)
+        .await
+        .unwrap_or_default();
+    let ours: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
+    let detail = ours.as_ref().map(|v| &v["error"]);
+    let message = detail
+        .and_then(|d| d["message"].as_str())
+        .map(str::to_owned)
+        .or_else(|| {
+            let text = String::from_utf8_lossy(&bytes).trim().to_owned();
+            (!text.is_empty()).then_some(text)
+        })
+        .unwrap_or_else(|| {
+            parts
+                .status
+                .canonical_reason()
+                .unwrap_or("request failed")
+                .to_lowercase()
+        });
+    let error_type = match parts.status.as_u16() {
+        400 | 413 | 422 => "bad_data",
+        404 | 405 | 501 => "not_found",
+        408 | 504 => "timeout",
+        429 | 503 => "unavailable",
+        _ => "internal",
+    };
+    let mut envelope = serde_json::json!({
+        "status": "error",
+        "errorType": error_type,
+        "error": message,
+    });
+    if let Some(detail) = detail.and_then(serde_json::Value::as_object) {
+        for key in ["code", "feature", "hint", "docs"] {
+            if let Some(value) = detail.get(key) {
+                envelope[key] = value.clone();
+            }
+        }
+    }
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, axum::body::Body::from(envelope.to_string()))
+}
+
+/// What an API path telemetryd does not serve answers: `501` with a body that says so.
+///
+/// COMPATIBILITY.md promised this and the server sent an empty `404`, which a client
+/// shows as a blank error. Under the API prefixes a missing route is a feature this
+/// drop-in does not have yet, and saying so is the useful answer; anywhere else it is
+/// just a wrong URL.
+pub async fn unimplemented(uri: axum::http::Uri) -> Response {
+    let path = uri.path();
+    let api = ["/api/", "/loki/api/", "/prometheus/", "/otlp/"]
+        .iter()
+        .any(|prefix| path.starts_with(prefix));
+    if !api {
+        return ApiError(Error::NotFound(format!("no route for {path}"))).into_response();
+    }
+    let body = serde_json::json!({
+        "error": {
+            "code": "not_implemented",
+            "message": format!(
+                "telemetryd does not implement {path}; see COMPATIBILITY.md for what it serves"
+            ),
+            "docs": telemetryd_core::COMPATIBILITY_DOC,
+        }
+    });
+    (StatusCode::NOT_IMPLEMENTED, Json(body)).into_response()
+}

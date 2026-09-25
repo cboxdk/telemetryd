@@ -120,7 +120,7 @@ pub fn build_info() -> PromResponse<BuildInfo> {
 }
 
 /// Render a float the way Prometheus does.
-fn format_value(value: f64) -> String {
+pub(crate) fn format_value(value: f64) -> String {
     if value.is_nan() {
         "NaN".to_owned()
     } else if value.is_infinite() {
@@ -133,7 +133,7 @@ fn format_value(value: f64) -> String {
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn to_seconds(nanos: u64) -> f64 {
+pub(crate) fn to_seconds(nanos: u64) -> f64 {
     nanos as f64 / 1e9
 }
 
@@ -345,26 +345,58 @@ pub fn range(
 }
 
 /// `GET /api/v1/labels`
+///
+/// With `match[]`, only labels of series some selector matches. It was ignored, so a
+/// client scoping a metric browser to one app — laravel-telemetry-ui's schema
+/// detection does exactly that — was told about every app's labels.
 pub fn label_names(
     store: &RecordStore<MetricSchema>,
-    start_nanos: u64,
-    end_nanos: u64,
-) -> PromResponse<Vec<String>> {
-    PromResponse::success(store.label_names(start_nanos, end_nanos))
-}
-
-/// `GET /api/v1/label/{name}/values`
-pub fn label_values(
-    store: &RecordStore<MetricSchema>,
-    name: &str,
+    selectors: &[String],
     start_nanos: u64,
     end_nanos: u64,
 ) -> Result<PromResponse<Vec<String>>> {
-    Ok(PromResponse::success(store.label_values(
-        name,
-        start_nanos,
-        end_nanos,
-    )?))
+    if selectors.is_empty() {
+        return Ok(PromResponse::success(
+            store.label_names(start_nanos, end_nanos),
+        ));
+    }
+    let streams = matching_streams(store, selectors, start_nanos, end_nanos)?;
+    Ok(PromResponse::success(crate::meta::names_of(&streams)))
+}
+
+/// `GET /api/v1/label/{name}/values`, scoped by `match[]` like the names.
+pub fn label_values(
+    store: &RecordStore<MetricSchema>,
+    name: &str,
+    selectors: &[String],
+    start_nanos: u64,
+    end_nanos: u64,
+) -> Result<PromResponse<Vec<String>>> {
+    if selectors.is_empty() {
+        return Ok(PromResponse::success(store.label_values(
+            name,
+            start_nanos,
+            end_nanos,
+        )?));
+    }
+    let streams = matching_streams(store, selectors, start_nanos, end_nanos)?;
+    Ok(PromResponse::success(crate::meta::values_of(
+        &streams, name,
+    )))
+}
+
+/// Every series any selector matches — the union, as Prometheus defines `match[]`.
+fn matching_streams(
+    store: &RecordStore<MetricSchema>,
+    selectors: &[String],
+    start_nanos: u64,
+    end_nanos: u64,
+) -> Result<std::collections::BTreeSet<Labels>> {
+    let mut seen = std::collections::BTreeSet::new();
+    for selector in selectors {
+        seen.extend(store.streams(start_nanos, end_nanos, &matchers_of(selector)?)?);
+    }
+    Ok(seen)
 }
 
 /// `GET /api/v1/series`

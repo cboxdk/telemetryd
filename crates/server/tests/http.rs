@@ -572,7 +572,14 @@ async fn query_surface_rejects_missing_and_wrong_tokens() {
         );
 
         let json: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(json["error"]["code"], "unauthorized");
+        // Each API in its own error shape: Prometheus's envelope carries `code` beside a
+        // string `error`; everything else keeps the object.
+        if path.starts_with("/api/v1/") {
+            assert_eq!(json["status"], "error", "{path}: {body}");
+            assert_eq!(json["code"], "unauthorized", "{path}: {body}");
+        } else {
+            assert_eq!(json["error"]["code"], "unauthorized", "{path}: {body}");
+        }
 
         let (status, _, _) = harness.get_with_token(path, "wrong-token").await;
         assert_eq!(
@@ -1784,4 +1791,361 @@ async fn tempo_connection_check_and_readiness_answer() {
         StatusCode::OK,
         "readiness needs no token, like /healthz"
     );
+}
+
+/// Grafana always asks for categorised labels, and its reader for the flat shape takes
+/// exactly two elements per entry — so a line with attributes failed to parse and Explore
+/// showed nothing. `laravel-telemetry-ui` reads the flat third element, so without the
+/// header nothing changes.
+#[tokio::test]
+async fn log_attributes_come_back_in_the_shape_the_caller_asked_for() {
+    let harness = Harness::new(|_| {});
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let batch = format!(
+        r#"{{"resourceLogs":[{{"resource":{{"attributes":[{{"key":"service.name","value":{{"stringValue":"shop"}}}}]}},"scopeLogs":[{{"logRecords":[{{"timeUnixNano":"{now}","body":{{"stringValue":"paid"}},"attributes":[{{"key":"order.id","value":{{"stringValue":"42"}}}}]}}]}}]}}]}}"#
+    );
+    let (status, _, _) = harness
+        .request(
+            Request::post("/v1/logs")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(batch))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let uri = "/loki/api/v1/query_range?query=%7Bapp%3D%22shop%22%7D&since=1h";
+    let read = |categorize: bool| {
+        let mut request = Request::get(uri);
+        if categorize {
+            request = request.header("X-Loki-Response-Encoding-Flags", "categorize-labels");
+        }
+        request.body(Body::empty()).unwrap()
+    };
+
+    let (_, _, body) = harness.request(read(true)).await;
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        json["data"]["encodingFlags"][0], "categorize-labels",
+        "{body}"
+    );
+    let entry = &json["data"]["result"][0]["values"][0];
+    assert_eq!(entry[2]["structuredMetadata"]["order_id"], "42", "{body}");
+    let flags_at = body.find("encodingFlags").unwrap();
+    assert!(
+        flags_at < body.find("\"result\"").unwrap(),
+        "flags must precede the entries"
+    );
+
+    let (_, _, body) = harness.request(read(false)).await;
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert!(json["data"].get("encodingFlags").is_none(), "{body}");
+    assert_eq!(
+        json["data"]["result"][0]["values"][0][2]["order_id"], "42",
+        "{body}"
+    );
+}
+
+/// Grafana asks `/api/v2/traces/{id}` with `Accept: application/protobuf` and decodes
+/// the body as `tempopb.TraceByIDResponse` whatever its content type, falling back to
+/// v1 only on a 404. There was no v2 and v1 answered JSON, so every trace failed to
+/// open. Checked by reading the answer back through our own OTLP decoder, which is
+/// independent code: `tempopb.Trace` is byte for byte OTLP `TracesData`.
+#[tokio::test]
+async fn a_trace_comes_back_as_the_protobuf_grafana_decodes() {
+    let harness = Harness::new(|_| {});
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+    let batch = format!(
+        r#"{{"resourceSpans":[{{"resource":{{"attributes":[{{"key":"service.name","value":{{"stringValue":"shop"}}}}]}},"scopeSpans":[{{"spans":[
+          {{"traceId":"{trace_id}","spanId":"00f067aa0ba902b7","name":"POST /checkout","kind":2,"startTimeUnixNano":"{now}","endTimeUnixNano":"{end}","attributes":[{{"key":"http.method","value":{{"stringValue":"POST"}}}}],"status":{{"code":2,"message":"declined"}},"events":[{{"timeUnixNano":"{now}","name":"exception"}}]}},
+          {{"traceId":"{trace_id}","spanId":"aaaaaaaaaaaaaaaa","parentSpanId":"00f067aa0ba902b7","name":"SELECT","kind":3,"startTimeUnixNano":"{now}","endTimeUnixNano":"{end}"}}]}}]}}]}}"#,
+        end = now + 150_000_000
+    );
+    let (status, _, _) = harness
+        .request(
+            Request::post("/v1/traces")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(batch))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let fetch = |path: String| {
+        Request::get(path)
+            .header(header::ACCEPT, "application/protobuf")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let response = harness
+        .router
+        .clone()
+        .oneshot(fetch(format!("/api/v2/traces/{trace_id}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "application/protobuf"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+
+    // TraceByIDResponse { trace = 1 }: strip the wrapper, then decode the Trace.
+    assert_eq!(body[0], 0x0a, "field 1, length-delimited");
+    let mut at = 1;
+    let mut len = 0usize;
+    let mut shift = 0;
+    loop {
+        let byte = body[at];
+        at += 1;
+        len |= usize::from(byte & 0x7f) << shift;
+        shift += 7;
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    let data = telemetryd_ingest::otlp_protobuf::traces(&body[at..at + len]).unwrap();
+    // Every ScopeSpans carries a scope, even an empty one: Grafana dereferences it without
+    // a nil check, and leaving it out crashed its trace view on every trace.
+    assert!(
+        data.resource_spans
+            .iter()
+            .flat_map(|r| r.scope_spans.iter())
+            .all(|s| s.scope.is_some()),
+        "every ScopeSpans carries its scope"
+    );
+    let spans: Vec<_> = data
+        .resource_spans
+        .iter()
+        .flat_map(|r| r.scope_spans.iter().flat_map(|s| s.spans.iter()))
+        .collect();
+    assert_eq!(spans.len(), 2);
+    let root = spans.iter().find(|s| s.name == "POST /checkout").unwrap();
+    let child = spans.iter().find(|s| s.name == "SELECT").unwrap();
+    assert_eq!(root.trace_id, trace_id);
+    assert_eq!(child.parent_span_id, root.span_id);
+    assert_eq!(root.events.len(), 1);
+    assert!(root.attributes.iter().any(|kv| kv.key == "http.method"));
+
+    // v1 answers protobuf too when asked, and JSON otherwise, as before.
+    let v1 = harness
+        .router
+        .clone()
+        .oneshot(fetch(format!("/api/traces/{trace_id}")))
+        .await
+        .unwrap();
+    assert_eq!(v1.headers()[header::CONTENT_TYPE], "application/protobuf");
+    let (_, _, json) = harness.get(&format!("/api/traces/{trace_id}")).await;
+    assert!(json.contains("\"batches\""), "{json}");
+}
+
+/// Grafana reads only `scopes` from the v2 tag listing and never falls back once the
+/// call succeeds, so the v1 shape there left its autocomplete empty.
+#[tokio::test]
+async fn v2_tags_are_grouped_by_scope() {
+    let harness = Harness::new(|_| {});
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let batch = format!(
+        r#"{{"resourceSpans":[{{"resource":{{"attributes":[{{"key":"service.name","value":{{"stringValue":"shop"}}}}]}},"scopeSpans":[{{"spans":[{{"traceId":"4bf92f3577b34da6a3ce929d0e0e4736","spanId":"00f067aa0ba902b7","name":"GET","startTimeUnixNano":"{now}","endTimeUnixNano":"{now}","attributes":[{{"key":"http.route","value":{{"stringValue":"/"}}}}]}}]}}]}}]}}"#
+    );
+    harness
+        .request(
+            Request::post("/v1/traces")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(batch))
+                .unwrap(),
+        )
+        .await;
+
+    let (_, _, body) = harness.get("/api/v2/search/tags").await;
+    let json: Value = serde_json::from_str(&body).unwrap();
+    let scope = |name: &str| {
+        json["scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == name)
+            .map(|s| s["tags"].clone())
+    };
+    assert!(
+        scope("span")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "http.route"),
+        "{body}"
+    );
+    assert!(
+        scope("intrinsic")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "duration"),
+        "{body}"
+    );
+    assert!(scope("resource").is_some(), "{body}");
+
+    let (_, _, body) = harness.get("/api/v2/search/tags?scope=span").await;
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["scopes"].as_array().unwrap().len(), 1, "{body}");
+
+    // v1 keeps its flat shape for the clients that read it.
+    let (_, _, body) = harness.get("/api/search/tags").await;
+    assert!(body.contains("\"tagNames\""), "{body}");
+}
+
+/// Grafana's Loki datasource checks the connection by evaluating `vector(1)+vector(1)`
+/// on `/loki/api/v1/query` and expecting a single point with the value 2. There was no
+/// such route, so the datasource could not be added.
+#[tokio::test]
+async fn the_loki_health_check_evaluates() {
+    let harness = Harness::new(|_| {});
+    let (status, _, body) = harness
+        .get("/loki/api/v1/query?query=vector(1)%2Bvector(1)&time=1700000000000000000")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["data"]["resultType"], "vector", "{body}");
+    assert_eq!(
+        json["data"]["result"].as_array().unwrap().len(),
+        1,
+        "{body}"
+    );
+    assert_eq!(json["data"]["result"][0]["value"][1], "2", "{body}");
+
+    // A log query is answered as streams; metric LogQL is still refused by name.
+    let (status, _, body) = harness
+        .get("/loki/api/v1/query?query=%7Bapp%3D%22x%22%7D")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("\"streams\""), "{body}");
+    let (status, _, body) = harness
+        .get("/loki/api/v1/query?query=count_over_time(%7Bapp%3D%22x%22%7D%5B5m%5D)")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// Prometheus clients read `error` as a string in `{"status":"error",…}`. Ours was an
+/// object, so Grafana showed a parse error instead of the message, and a 401 or 405 came
+/// with no body at all. Paths telemetryd does not serve answer 501 with a body, as
+/// COMPATIBILITY.md says, instead of an empty 404.
+#[tokio::test]
+async fn prometheus_errors_use_prometheus_envelope() {
+    let harness = Harness::new(with_query_token);
+
+    let (status, _, body) = harness
+        .get_with_token("/api/v1/query?query=sum(", "query-secret")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["status"], "error", "{body}");
+    assert_eq!(json["errorType"], "bad_data", "{body}");
+    assert!(json["error"].is_string(), "{body}");
+
+    let (status, _, body) = harness.get("/api/v1/query?query=1").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert!(json["error"].is_string(), "a 401 carries a message: {body}");
+
+    let (status, _, body) = harness
+        .get_with_token("/api/v1/metadata", "query-secret")
+        .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        json["error"].as_str().unwrap().contains("/api/v1/metadata"),
+        "{body}"
+    );
+
+    // Loki and Tempo keep their shape; an unknown path there is a 501 with a body too.
+    let (status, _, body) = harness
+        .get_with_token("/loki/api/v1/index/stats", "query-secret")
+        .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert!(body.contains("not_implemented"), "{body}");
+}
+
+/// `match[]` scopes Prometheus's label endpoints and `query` scopes Loki's; both were
+/// ignored, and a repeated `match[]` either failed or kept only the last. A client
+/// scoping its metric browser to one app — laravel-telemetry-ui's schema detection —
+/// was told about every app.
+#[tokio::test]
+async fn label_endpoints_are_scoped_by_their_selectors() {
+    let harness = Harness::new(|_| {});
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    for (app, label) in [("alpha", "region"), ("beta", "zone")] {
+        let metrics = format!(
+            r#"{{"resourceMetrics":[{{"resource":{{"attributes":[{{"key":"service.name","value":{{"stringValue":"{app}"}}}}]}},"scopeMetrics":[{{"metrics":[{{"name":"up","gauge":{{"dataPoints":[{{"timeUnixNano":"{now}","asDouble":1,"attributes":[{{"key":"{label}","value":{{"stringValue":"x"}}}}]}}]}}}}]}}]}}]}}"#
+        );
+        let logs = format!(
+            r#"{{"resourceLogs":[{{"resource":{{"attributes":[{{"key":"service.name","value":{{"stringValue":"{app}"}}}}]}},"scopeLogs":[{{"logRecords":[{{"timeUnixNano":"{now}","body":{{"stringValue":"hi"}}}}]}}]}}]}}"#
+        );
+        for (path, body) in [("/v1/metrics", metrics), ("/v1/logs", logs)] {
+            let (status, _, _) = harness
+                .request(
+                    Request::post(path)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+        }
+    }
+    let values = |body: &str| -> Vec<String> {
+        let json: Value = serde_json::from_str(body).unwrap();
+        json["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    let (_, _, all) = harness.get("/api/v1/label/app/values").await;
+    assert_eq!(values(&all), ["alpha", "beta"], "unscoped sees both");
+    let (_, _, one) = harness
+        .get("/api/v1/label/app/values?match[]=%7Bapp%3D%22alpha%22%7D")
+        .await;
+    assert_eq!(values(&one), ["alpha"], "{one}");
+    let (_, _, names) = harness
+        .get("/api/v1/labels?match[]=%7Bapp%3D%22beta%22%7D")
+        .await;
+    assert!(
+        values(&names).contains(&"zone".to_owned())
+            && !values(&names).contains(&"region".to_owned()),
+        "{names}"
+    );
+
+    // Two selectors are their union, not the last one.
+    let (_, _, both) = harness
+        .get("/api/v1/series?match[]=%7Bapp%3D%22alpha%22%7D&match[]=%7Bapp%3D%22beta%22%7D")
+        .await;
+    let json: Value = serde_json::from_str(&both).unwrap();
+    assert_eq!(json["data"].as_array().unwrap().len(), 2, "{both}");
+
+    let (_, _, loki) = harness
+        .get("/loki/api/v1/label/app/values?query=%7Bapp%3D%22alpha%22%7D")
+        .await;
+    assert_eq!(values(&loki), ["alpha"], "{loki}");
+    let (_, _, loki) = harness
+        .get("/loki/api/v1/series?match[]=%7Bapp%3D%22alpha%22%7D&match[]=%7Bapp%3D%22beta%22%7D")
+        .await;
+    let json: Value = serde_json::from_str(&loki).unwrap();
+    assert_eq!(json["data"].as_array().unwrap().len(), 2, "{loki}");
 }

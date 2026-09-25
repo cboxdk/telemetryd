@@ -1,9 +1,7 @@
 //! Prometheus-compatible query handlers.
 
-use std::collections::HashMap;
-
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
 use telemetryd_core::Error;
 use telemetryd_query::prometheus::{self, InstantParams, MetaParams, RangeParams};
@@ -111,19 +109,18 @@ pub async fn range(
     Ok(Json(response).into_response())
 }
 
-/// `GET /api/v1/labels`
+/// `GET,POST /api/v1/labels`
 pub async fn labels(
     State(state): State<AppState>,
-    Query(params): Query<MetaParams>,
+    pairs: crate::params::Pairs,
 ) -> Result<Response, ApiError> {
-    let (start, end) = prometheus::meta_range(&params, telemetryd_store::now_nanos())?;
-
+    let (start, end, selectors) = meta(&pairs)?;
     let store = std::sync::Arc::clone(&state.store);
-    let response =
-        crate::auth::spawn_read(move || prometheus::label_names(store.metrics(), start, end))
-            .await
-            .map_err(|e| Error::Config(format!("query task panicked: {e}")))?;
-
+    let response = crate::auth::spawn_read(move || {
+        prometheus::label_names(store.metrics(), &selectors, start, end)
+    })
+    .await
+    .map_err(|e| Error::Config(format!("query task panicked: {e}")))??;
     Ok(Json(response).into_response())
 }
 
@@ -131,48 +128,40 @@ pub async fn labels(
 pub async fn label_values(
     State(state): State<AppState>,
     Path(name): Path<String>,
-    Query(params): Query<MetaParams>,
+    pairs: crate::params::Pairs,
 ) -> Result<Response, ApiError> {
-    let (start, end) = prometheus::meta_range(&params, telemetryd_store::now_nanos())?;
-
+    let (start, end, selectors) = meta(&pairs)?;
     let store = std::sync::Arc::clone(&state.store);
     let response = crate::auth::spawn_read(move || {
-        prometheus::label_values(store.metrics(), &name, start, end)
+        prometheus::label_values(store.metrics(), &name, &selectors, start, end)
     })
     .await
     .map_err(|e| Error::Config(format!("query task panicked: {e}")))??;
-
     Ok(Json(response).into_response())
 }
 
-/// `GET /api/v1/series`
-///
-/// The axum extractor fixes the hasher, so the signature cannot be generic over it.
-#[allow(clippy::implicit_hasher)]
+/// `GET,POST /api/v1/series`
 pub async fn series(
     State(state): State<AppState>,
-    Query(raw): Query<HashMap<String, String>>,
+    pairs: crate::params::Pairs,
 ) -> Result<Response, ApiError> {
-    let selectors: Vec<String> = ["match[]", "match"]
-        .iter()
-        .filter_map(|key| raw.get(*key))
-        .filter(|value| !value.trim().is_empty())
-        .cloned()
-        .collect();
-
-    let params = MetaParams {
-        start: raw.get("start").cloned(),
-        end: raw.get("end").cloned(),
-        matches: None,
-    };
-    let (start, end) = prometheus::meta_range(&params, telemetryd_store::now_nanos())?;
-
+    let (start, end, selectors) = meta(&pairs)?;
     let store = std::sync::Arc::clone(&state.store);
     let response = crate::auth::spawn_read(move || {
         prometheus::series(store.metrics(), &selectors, start, end)
     })
     .await
     .map_err(|e| Error::Config(format!("query task panicked: {e}")))??;
-
     Ok(Json(response).into_response())
+}
+
+/// The time range and every `match[]` of a metadata request.
+fn meta(pairs: &crate::params::Pairs) -> Result<(u64, u64, Vec<String>), ApiError> {
+    let params = MetaParams {
+        start: pairs.first("start"),
+        end: pairs.first("end"),
+        matches: None,
+    };
+    let (start, end) = prometheus::meta_range(&params, telemetryd_store::now_nanos())?;
+    Ok((start, end, pairs.all(&["match[]", "match"])))
 }

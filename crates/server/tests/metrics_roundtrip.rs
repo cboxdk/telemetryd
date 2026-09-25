@@ -438,16 +438,19 @@ async fn an_unsupported_promql_function_is_named_with_a_400() {
         .await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(response["error"]["code"], "unsupported_feature");
+    // Prometheus's envelope: `error` is the message, telemetryd's details ride beside it.
+    assert_eq!(response["status"], "error");
+    assert_eq!(response["errorType"], "bad_data");
+    assert_eq!(response["code"], "unsupported_feature");
     assert!(
-        response["error"]["message"]
+        response["error"]
             .as_str()
             .unwrap()
             .contains("predict_linear"),
         "{response}"
     );
     assert!(
-        response["error"]["docs"]
+        response["docs"]
             .as_str()
             .unwrap()
             .ends_with("COMPATIBILITY.md")
@@ -477,7 +480,7 @@ async fn an_absurd_step_is_refused_with_a_usable_message() {
         .await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    let message = response["error"]["message"].as_str().unwrap();
+    let message = response["error"].as_str().unwrap();
     assert!(message.contains("points per series"), "{message}");
     assert!(message.contains("step"), "{message}");
 }
