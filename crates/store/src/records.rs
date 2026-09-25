@@ -1254,10 +1254,19 @@ impl<S: RecordSchema> RecordStore<S> {
                 names.extend(segment.manifest.labels.keys().cloned());
             }
         }
-        for chunk in Self::buffered_in(&mut lock(&self.writer)) {
+        // Taken in its own statement. In the loop header the lock guard is a temporary
+        // of the `for` expression and lives until the loop ends, so every append waited
+        // for this walk of the buffer.
+        let buffered = Self::buffered_in(&mut lock(&self.writer));
+        // Buffered records of one stream share its labels, so each set is looked at once.
+        let mut visited = std::collections::HashSet::new();
+        for chunk in &buffered {
             for record in &chunk.records {
                 let ts = S::timestamp(record);
-                if ts >= start_nanos && ts <= end_nanos {
+                if ts >= start_nanos
+                    && ts <= end_nanos
+                    && visited.insert(S::index_labels(record).storage_id())
+                {
                     names.extend(S::index_labels(record).names().map(str::to_owned));
                 }
             }
@@ -1314,11 +1323,18 @@ impl<S: RecordSchema> RecordStore<S> {
             }
         }
 
-        for chunk in Self::buffered_in(&mut lock(&self.writer)) {
+        // Taken in its own statement. In the loop header the lock guard is a temporary
+        // of the `for` expression and lives until the loop ends, so every append waited
+        // for this walk of the buffer.
+        let buffered = Self::buffered_in(&mut lock(&self.writer));
+        // Buffered records of one stream share its labels, so each set is looked at once.
+        let mut visited = std::collections::HashSet::new();
+        for chunk in &buffered {
             for record in &chunk.records {
                 let ts = S::timestamp(record);
                 if ts >= start_nanos
                     && ts <= end_nanos
+                    && visited.insert(S::index_labels(record).storage_id())
                     && let Some(value) = S::index_labels(record).get(name)
                 {
                     values.insert(value.to_owned());
@@ -1374,11 +1390,18 @@ impl<S: RecordSchema> RecordStore<S> {
             );
         }
 
-        for chunk in Self::buffered_in(&mut lock(&self.writer)) {
+        // Taken in its own statement. In the loop header the lock guard is a temporary
+        // of the `for` expression and lives until the loop ends, so every append waited
+        // for this walk of the buffer.
+        let buffered = Self::buffered_in(&mut lock(&self.writer));
+        // Buffered records of one stream share its labels, so each set is looked at once.
+        let mut visited = std::collections::HashSet::new();
+        for chunk in &buffered {
             for record in &chunk.records {
                 let ts = S::timestamp(record);
                 if ts >= start_nanos
                     && ts <= end_nanos
+                    && visited.insert(S::index_labels(record).storage_id())
                     && matches_all(matchers, S::index_labels(record))
                 {
                     seen.insert(S::index_labels(record).clone());
