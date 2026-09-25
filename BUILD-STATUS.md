@@ -187,6 +187,22 @@ rules`, Tempo's TraceQL source — and each case is a test:
 - A label set's fingerprint is keyed per process and cannot be forged from inside a
   label value, and no table turns a fingerprint into a stream id without checking.
 
+**Hardened against the network, the browser and the host.** A web page cannot act
+through its visitor's browser: a foreign `Origin` is refused, and while a loopback
+instance has an open surface so is a non-loopback `Host`, which closes DNS rebinding.
+A client trickling header bytes is cut off after 30 seconds and connections are capped
+below the descriptor limit. `SIGHUP` reloads the tokens, so a revoked one stops working
+at the next request. Live tails are capped at 64 and filter off the async workers; a
+stalled export is given up on after a minute. Secrets stay out of logs — upstream URLs
+are redacted, the Docker entrypoint no longer prints tokens, and a refused query is
+logged by fingerprint. A 5xx carries a reference, not internal detail. The `/debug`
+cookie holds a server-side session instead of the admin token. `nbf` is enforced, a
+client-less token cannot write through a strict relay, loopback is decided by parsing
+the URL, the relay does not follow redirects, and the installer fails closed. The data
+directory is closed to other accounts and the units carry `UMask=0077`,
+`StateDirectoryMode=0700`, `LimitNOFILE` and a fuller sandbox. CI passes inputs
+through the environment, scopes credentials per job and pins every action by commit.
+
 **Known gap:** the four per-segment structures are still all resident. Loading them on
 demand behind a cache bounded by the process's memory limit is the remaining fix; sharing
 reduced the dominant term but did not make it independent of how much is stored.

@@ -520,6 +520,9 @@ which is worth knowing before you conclude that data is missing:
 | `GET /api/search`, `/api/search/tags`, `…/tag/{name}/values` | reads the newest **100,000** spans in the window | silent — the most recent matches and tags, as Tempo gives |
 | any PromQL, LogQL or TraceQL query | **64** regular expressions, each compiling to at most **256 KiB** | `400`, naming the limit |
 | any ingest route | `limits.max_decoded_bytes` once decoded (default 128 MiB), and parsed structure proportional to the body | `413`, the whole request refused and nothing stored |
+| `GET /loki/api/v1/tail` | **64** live tails open at once | `429` before the upgrade |
+| `GET /api/v1/export` | a client that reads nothing for **60 s** | the stream ends and the slot is freed |
+| any connection | **30 s** to send a complete request head; at most half the process's open-file limit open at once | the connection is closed; past the ceiling new ones wait in the kernel's backlog |
 
 The Prometheus one is the behaviour to copy and the other two match what the upstream
 APIs do, which is why they were left alone rather than made to error: a client that
