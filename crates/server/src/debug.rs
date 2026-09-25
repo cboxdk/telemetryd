@@ -71,16 +71,32 @@ pub struct LoginForm {
 /// The admin token, falling back to the query token when no admin token is configured —
 /// identical to `/status` and `/metrics`, so an operator has one credential to think
 /// about rather than a rule per page.
+///
+/// With Cbox ID on, an access token it issued for the admin surface opens it too — the
+/// same token `/status` and `/metrics` take.
 fn accepts(state: &AppState, presented: &str) -> bool {
-    if !state.admin_tokens.is_empty() {
-        return state.admin_tokens.verify(presented);
-    }
-    state.query_tokens.verify(presented)
+    let static_ok = if state.admin_tokens.is_empty() {
+        state.query_tokens.verify(presented)
+    } else {
+        state.admin_tokens.verify(presented)
+    };
+    static_ok
+        || (state.oidc.is_enabled()
+            && state
+                .oidc
+                .authorize(presented, crate::auth::Surface::Admin)
+                .is_ok())
 }
 
 /// Whether anything guards this instance at all.
+///
+/// Cbox ID counts. This used to look only at the static tokens, so an instance secured
+/// with Cbox ID alone — a loopback bind behind a proxy, which is exactly what the single
+/// sign-on guide sets up — served this page, and every app's recent telemetry on it, to
+/// anyone, while `/status` beside it correctly answered 401. The shared guard already
+/// counted Cbox ID; this page had its own copy of the rule and it had drifted.
 fn guarded(state: &AppState) -> bool {
-    !state.admin_tokens.is_empty() || !state.query_tokens.is_empty()
+    !state.admin_tokens.is_empty() || !state.query_tokens.is_empty() || state.oidc.is_enabled()
 }
 
 /// The credential on this request: the header if a tool sent one, otherwise the cookie a

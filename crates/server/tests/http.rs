@@ -1610,3 +1610,38 @@ async fn a_refused_query_is_counted_by_reason() {
         "the refusal should be counted by surface and reason:\n{metrics}"
     );
 }
+
+/// `/debug` shows every app's recent telemetry, so it answers to the same rule as every
+/// other read surface: when anything guards the instance, it is guarded.
+///
+/// It had its own copy of that rule, which looked only at the static tokens. An instance
+/// secured with Cbox ID alone — a loopback bind behind a proxy, the setup the single
+/// sign-on guide walks through — served the page to anyone while `/metrics` beside it
+/// answered 401.
+#[tokio::test]
+async fn debug_is_guarded_when_only_cbox_id_guards_the_instance() {
+    let harness = Harness::new(|config| {
+        config.auth.oidc.issuer = "https://id.invalid".to_owned();
+        config.auth.oidc.audience = "telemetryd".to_owned();
+    });
+
+    let (status, _, _) = harness.get("/metrics").await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the shared guard counts Cbox ID"
+    );
+
+    for token in [None, Some("not-a-token")] {
+        let (status, _, body) = match token {
+            None => harness.get("/debug").await,
+            Some(token) => harness.get_with_token("/debug", token).await,
+        };
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "/debug with {token:?}");
+        assert!(
+            body.contains("action=\"/debug/login\""),
+            "/debug with {token:?} must show the sign-in form, got: {}",
+            &body[..body.len().min(200)]
+        );
+    }
+}
