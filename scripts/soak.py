@@ -366,6 +366,7 @@ def main() -> int:
         shutil.rmtree(data_dir, ignore_errors=True)
 
     check_disk_budget(binary)
+    check_killed_mid_ingest(binary)
     check_reload(binary)
     check_damaged_segment(binary)
     check_oidc(binary)
@@ -388,6 +389,86 @@ def main() -> int:
         return 1
     print("SOAK PASSED")
     return 0
+
+
+def check_killed_mid_ingest(binary: str) -> None:
+    """A process killed while writing keeps every record it acknowledged, once.
+
+    SIGKILL is what the kernel sends at the unit's MemoryMax, and what a crash amounts
+    to. Acknowledged records used to sit in telemetryd's own write buffer for up to the
+    sync interval, so a kill lost them though the machine never went down. Writers post
+    numbered lines until the process is killed under them; after a restart, every line
+    that got a 200 must be there, and no line twice.
+    """
+    print("\n=== killed mid-ingest ===")
+    data_dir = tempfile.mkdtemp(prefix="telemetryd-kill-")
+    # A sync interval far longer than the run, so nothing reaches the disk by a timer:
+    # only what was handed to the kernel before each answer survives the kill.
+    proc = start(binary, data_dir, env={"TELEMETRYD_STORAGE_WAL_SYNC_INTERVAL": "60s"})
+    acknowledged: list[int] = []
+    lock = threading.Lock()
+    stop_writing = threading.Event()
+
+    def writer(worker: int) -> None:
+        batch = 0
+        while not stop_writing.is_set():
+            ids = [worker * 1_000_000 + batch * 50 + i for i in range(50)]
+            payload = {"resourceLogs": [{"resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "killed"}}]},
+                "scopeLogs": [{"logRecords": [
+                    {"timeUnixNano": str(NOW + n * 1_000), "severityNumber": 9,
+                     "body": {"stringValue": f"line {n}"}} for n in ids]}]}]}
+            try:
+                status, _ = request("/v1/logs", payload)
+            except OSError:
+                return
+            if status == 200:
+                with lock:
+                    acknowledged.extend(ids)
+            batch += 1
+            time.sleep(0.01)
+
+    threads = [threading.Thread(target=writer, args=(w,)) for w in range(4)]
+    for thread in threads:
+        thread.start()
+    time.sleep(3)
+    proc.send_signal(signal.SIGKILL)
+    proc.wait(timeout=30)
+    stop_writing.set()
+    for thread in threads:
+        thread.join(timeout=70)
+
+    proc = start(binary, data_dir)
+    try:
+        # Paged forward in time: one answer holds at most 5,000 lines. Every line has a
+        # timestamp of its own, so the next page starts just after the last one seen.
+        found: dict[int, int] = {}
+        cursor = NOW - SECOND
+        while True:
+            status, body = query(
+                "/loki/api/v1/query_range", query='{service_name="killed"}',
+                start=cursor, end=NOW + 10_000_000 * SECOND, limit=5_000,
+                direction="forward",
+            )
+            values = [v for stream in (body.get("data", {}).get("result", [])
+                                       if isinstance(body, dict) else [])
+                      for v in stream.get("values", [])]
+            for _, line in values:
+                number = int(line.split()[1])
+                found[number] = found.get(number, 0) + 1
+            if len(values) < 5_000:
+                break
+            cursor = max(int(ts) for ts, _ in values) + 1
+        missing = [n for n in acknowledged if n not in found]
+        doubled = [n for n, count in found.items() if count > 1]
+        check("the writers were acknowledged before the kill, so this tested something",
+              len(acknowledged) > 1_000, f"{len(acknowledged)} acknowledged")
+        check("every acknowledged record survived the kill", not missing,
+              f"{len(missing)} of {len(acknowledged)} missing")
+        check("no record was stored twice", not doubled, f"{len(doubled)} doubled")
+    finally:
+        stop(proc)
+        shutil.rmtree(data_dir, ignore_errors=True)
 
 
 def check_disk_budget(binary: str) -> None:

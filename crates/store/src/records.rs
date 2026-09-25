@@ -571,9 +571,13 @@ impl<S: RecordSchema> RecordStore<S> {
                     S::SIGNAL
                 )));
             }
-            for ((record, payload), fingerprint) in records.iter().zip(&payloads).zip(&fingerprints)
-            {
+            for payload in &payloads {
                 writer.wal.append(payload)?;
+            }
+            // In the kernel's hands before they are queryable or acknowledged; see
+            // `Wal::hand_off`.
+            writer.wal.hand_off()?;
+            for (record, fingerprint) in records.iter().zip(&fingerprints) {
                 writer
                     .buffer
                     .push_fingerprinted(record.clone(), *fingerprint);

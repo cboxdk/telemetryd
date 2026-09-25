@@ -181,6 +181,26 @@ impl Wal {
         Ok(())
     }
 
+    /// Hand everything appended so far to the kernel, without waiting for the disk.
+    ///
+    /// Called before a batch is acknowledged. Frames used to sit in this process's own
+    /// write buffer until the next sync, a hundred milliseconds by default — so a crash
+    /// of the *process*, not the machine, lost records the client had been told were
+    /// stored. The unit's `MemoryMax` makes the kernel's OOM kill a designed recovery
+    /// path, and a panic or `SIGKILL` does the same. Once written here they are the
+    /// kernel's, and only losing the machine before the next sync can lose them — which
+    /// is the promise `wal_sync = "interval"` makes.
+    pub fn hand_off(&mut self) -> Result<()> {
+        if let Err(error) = self.writer.flush() {
+            self.roll_back();
+            return Err(Error::io(
+                format!("writing WAL segment {}", self.path().display()),
+                error,
+            ));
+        }
+        Ok(())
+    }
+
     /// Flush userspace buffers and fsync, regardless of policy. Called on shutdown and
     /// before sealing a segment.
     pub fn sync(&mut self) -> Result<()> {

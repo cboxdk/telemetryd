@@ -32,6 +32,11 @@ A record is written to the write-ahead log **before** the client is told it was
 accepted. The log is the durability boundary and nothing else — not a replication log,
 not a query source beyond crash recovery.
 
+Before the answer goes back, the batch is also handed to the kernel. So a crash of the
+*process* — a panic, `SIGKILL`, the kernel stopping it at the unit's `MemoryMax` — loses
+nothing that was acknowledged; before 0.64.1 it could lose the last 100 ms, which sat in
+telemetryd's own write buffer until the next sync.
+
 `wal_sync` defaults to `interval` at 100 ms. **On hard power loss you can lose up to
 100 ms of telemetry.** That is a deliberate default — per-write fsync caps ingest at the
 device's sync rate — and it is your call to change:
