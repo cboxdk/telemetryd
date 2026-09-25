@@ -658,6 +658,12 @@ impl Store {
         self.metrics.backfill_folds(limit)
     }
 
+    /// Forget shared label sets nothing holds any more — every segment holding them has
+    /// been deleted and nothing buffered names them. Returns how many went.
+    pub fn release_unused_label_sets(&self) -> usize {
+        crate::intern::prune()
+    }
+
     /// Give back the budget held by series nothing has written to lately.
     ///
     /// Returns how many slots came back, for the maintenance log.

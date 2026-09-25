@@ -153,6 +153,14 @@ impl Labels {
         Self(std::sync::Arc::clone(&self.0))
     }
 
+    /// Whether nothing else holds this set's map: no other `Labels` shares it.
+    ///
+    /// For a table that shares sets out, to tell which entries only it still holds.
+    #[must_use]
+    pub fn is_only_holder(&self) -> bool {
+        std::sync::Arc::strong_count(&self.0) == 1
+    }
+
     /// Whether two label sets are backed by the same allocation.
     ///
     /// Public because sharing is a memory *contract*, not an implementation detail: the

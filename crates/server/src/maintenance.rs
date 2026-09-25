@@ -83,7 +83,14 @@ impl Maintenance {
                 // ingest for as long as it takes. Off the async workers, like every other
                 // store call.
                 match crate::fatal::storage(
-                    tokio::task::spawn_blocking(move || store.reclaim_idle_series()).await,
+                    tokio::task::spawn_blocking(move || {
+                        let unused = store.release_unused_label_sets();
+                        if unused > 0 {
+                            tracing::debug!(unused, "forgot label sets nothing holds");
+                        }
+                        store.reclaim_idle_series()
+                    })
+                    .await,
                     "reclaiming idle series",
                 ) {
                     Ok(0) => {}

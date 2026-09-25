@@ -17,13 +17,14 @@
 //!
 //! # What this deliberately does not do
 //!
-//! It does not free an entry when the last segment holding it is deleted. Doing so needs
-//! weak references through `Labels`'s private interior, and the payoff is small: the table
-//! holds one entry per *distinct* label set, which is the same order as the series limit
-//! the store is already sized for. A capacity bound stops it growing without limit in the case
-//! that would matter — an instance churning through label sets faster than retention
-//! removes them — by simply declining to intern beyond a fixed capacity. Declining costs
-//! sharing, never correctness.
+//! It does not free an entry the moment the last segment holding it is deleted; that would
+//! need weak references through `Labels`'s private interior. Instead [`prune`] drops, now
+//! and then, every entry nothing but the table still holds. Without it the table only
+//! grew: an instance churning through label sets — a deploy id in the labels, a pod name —
+//! filled it with sets retention had long since deleted, and at capacity it quietly stopped
+//! sharing, which brought back the per-segment copies it exists to remove. A capacity bound
+//! still stops it growing without limit between prunes, by declining to intern past it.
+//! Declining costs sharing, never correctness.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -93,6 +94,20 @@ pub fn shared_pairs(pairs: &[(&str, &str)]) -> Labels {
     )
 }
 
+/// Drop every entry nothing but the table holds, and say how many went.
+///
+/// An entry is handed out only under the table's lock, which this holds, so one found
+/// held by nothing else cannot be claimed between the check and its removal.
+pub fn prune() -> usize {
+    let mut table = table()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let before = table.len();
+    table.retain(|_, labels| !labels.is_only_holder());
+    table.shrink_to_fit();
+    before - table.len()
+}
+
 /// How many distinct label sets are being shared. For `/status` and for tests.
 #[must_use]
 pub fn distinct() -> usize {
@@ -156,6 +171,22 @@ mod tests {
         let made = shared_pairs(&[("app", "checkout"), ("route", "/r/78")]);
         assert_eq!(made, labels(78));
         assert!(made.shares_storage_with(&shared(labels(78))));
+    }
+
+    /// A set nothing holds any more leaves the table; one still held stays shared.
+    #[test]
+    fn prune_drops_only_what_nothing_holds() {
+        let kept = shared(labels(901));
+        drop(shared(labels(902)));
+        prune();
+        assert!(
+            kept.shares_storage_with(&shared(labels(901))),
+            "still shared"
+        );
+        let again = shared(labels(902));
+        assert!(!again.shares_storage_with(&labels(902)));
+        // Re-entered fresh: it is the table's entry now, not a stale one.
+        assert!(again.shares_storage_with(&shared(labels(902))));
     }
 
     #[test]
