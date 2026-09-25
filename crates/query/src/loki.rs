@@ -315,15 +315,24 @@ fn parse_rfc3339(raw: &str) -> Result<u64> {
         return Err(invalid());
     }
 
-    // Strip the zone; we only accept UTC, which is all Loki clients send.
-    let time = rest
-        .trim_end_matches('Z')
-        .split(['+'])
-        .next()
-        .ok_or_else(invalid)?;
-    let time = match time.rfind('-') {
-        Some(index) if index > 0 => &time[..index],
-        _ => time,
+    // The zone: `Z`, or an offset from UTC. It used to be stripped and the time read as
+    // UTC whatever it said, so `10:00+02:00` — which is 08:00 UTC — asked for a window
+    // two hours late, and a client in Europe saw the wrong logs with nothing to say so.
+    let (time, zone_seconds) = if let Some(time) = rest.strip_suffix(['Z', 'z']) {
+        (time, 0)
+    } else if let Some(index) = rest.rfind(['+', '-']) {
+        let (time, zone) = rest.split_at(index);
+        let sign = if zone.starts_with('-') { -1 } else { 1 };
+        let (hours, minutes) = zone[1..].split_once(':').ok_or_else(invalid)?;
+        let hours: i64 = hours.parse().map_err(|_| invalid())?;
+        let minutes: i64 = minutes.parse().map_err(|_| invalid())?;
+        if hours > 23 || minutes > 59 {
+            return Err(invalid());
+        }
+        (time, sign * (hours * 3_600 + minutes * 60))
+    } else {
+        // No zone at all is not RFC3339, but it was accepted as UTC and still is.
+        (rest, 0)
     };
 
     let (hms, fraction) = time.split_once('.').unwrap_or((time, ""));
@@ -352,7 +361,7 @@ fn parse_rfc3339(raw: &str) -> Result<u64> {
     }
 
     let days = days_from_civil(year, month, day);
-    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second - zone_seconds;
     if seconds < 0 {
         return Err(Error::BadRequest(format!(
             "{raw:?} is before the unix epoch, which telemetryd does not store"
@@ -860,6 +869,23 @@ mod tests {
         );
         // Round-trips against the value the API itself hands back.
         assert_eq!(parse_time("1750000000000000000").unwrap(), NOW);
+    }
+
+    /// One instant in three zones. The offset used to be stripped and the local time read
+    /// as UTC, so each of these asked for a different window.
+    #[test]
+    fn an_rfc3339_offset_is_honoured() {
+        assert_eq!(parse_time("2025-06-15T17:06:40+02:00").unwrap(), NOW);
+        assert_eq!(
+            parse_time("2025-06-15T11:36:40.5-03:30").unwrap(),
+            NOW + 500_000_000
+        );
+        assert_eq!(parse_time("2025-06-15T15:06:40+00:00").unwrap(), NOW);
+        assert!(
+            parse_time("2025-06-15T15:06:40+2").is_err(),
+            "an offset needs its minutes"
+        );
+        assert!(parse_time("2025-06-15T15:06:40+24:00").is_err());
     }
 
     #[test]
