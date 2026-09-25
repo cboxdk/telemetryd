@@ -1016,26 +1016,6 @@ fn derive_concurrency(cost_bytes: u64, min: u32, max: u32) -> u32 {
     derived.clamp(min, max)
 }
 
-/// What this process is actually allowed to use, read once.
-///
-/// The cgroup limit first, because in a container the host's free memory is not the
-/// number that gets you killed — and the container is a first-class way to run this. The
-/// systemd unit sets `MemoryMax` for the same reason, so a service install lands here too.
-///
-/// # `MemTotal` is not ours, and assuming it was took down a server
-///
-/// The fallback used to return the host's total memory, and every derived limit was a
-/// fraction of that. On a dedicated box that is merely aggressive. On the box this was
-/// reported from — telemetryd sharing a 7.5 GiB VPS with MySQL, php-fpm, Redis, Typesense
-/// and the website those serve — it sized itself as though it owned the machine, derived
-/// 64 concurrent queries, and reached 6.65 GB resident. The load average hit 38 and
-/// nothing on the server answered, telemetryd included.
-///
-/// A single-node observability tool is *usually* a guest on a machine that has a job. It
-/// cannot tell a dedicated host from a shared one, so it assumes the answer that fails
-/// safe: a quarter of what is installed. An operator who has given telemetryd the whole
-/// box says so with `MemoryMax` in the unit, or by setting the limits outright — both of
-/// which are read exactly, and neither of which is guessed.
 /// Whether anything is actually stopping this process from taking the machine.
 ///
 /// `false` means no cgroup limit is in force, so every derived limit is a guess about a
@@ -1075,8 +1055,7 @@ fn cgroup_memory_limit() -> Option<u64> {
             .split_whitespace()
             .find_map(|word| word.parse::<u64>().ok())
             // cgroup v2 writes the literal `max` when unlimited, which parses to nothing.
-            // cgroup v1 spells it as a number near `u64::MAX` instead.
-            .filter(|limit| *limit > 0 && *limit < u64::MAX / 2)
+            .filter(|limit| *limit > 0)
     };
 
     let mut smallest: Option<u64> = None;
@@ -1103,7 +1082,27 @@ fn cgroup_memory_limit() -> Option<u64> {
 
     consider(read_limit("/sys/fs/cgroup/memory.max"));
     consider(read_limit("/sys/fs/cgroup/memory/memory.limit_in_bytes"));
-    smallest
+    binding(smallest, installed_memory_bytes())
+}
+
+/// A cgroup limit, if it binds: one at or above the memory installed limits nothing.
+///
+/// cgroup v1 spells "unlimited" as `0x7FFFFFFFFFFFF000` — `LONG_MAX` rounded down to a
+/// page — and the old test for it, "below half of `u64::MAX`", let exactly that value
+/// through. Every derived limit was then a fraction of eight exbibytes: the most
+/// concurrent queries, the largest series budget, the highest ceiling, and a startup
+/// that reported memory as capped. A limit larger than the machine is no limit, whatever
+/// number spells it, and the host's memory is what decides that.
+fn binding(limit: Option<u64>, installed: Option<u64>) -> Option<u64> {
+    limit.filter(|limit| installed.is_none_or(|installed| *limit < installed))
+}
+
+/// `MemTotal` from `/proc/meminfo`: `MemTotal:  16305892 kB`, in kibibytes.
+fn installed_memory_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = meminfo.lines().find(|line| line.starts_with("MemTotal:"))?;
+    let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    Some(kib.saturating_mul(1024))
 }
 
 /// This process's cgroup path, as `/system.slice/telemetryd.service`.
@@ -1135,6 +1134,26 @@ fn parse_cgroup_path(contents: &str) -> Option<String> {
     v1
 }
 
+/// What this process is actually allowed to use, read once.
+///
+/// The cgroup limit first, because in a container the host's free memory is not the
+/// number that gets you killed — and the container is a first-class way to run this. The
+/// systemd unit sets `MemoryMax` for the same reason, so a service install lands here too.
+///
+/// # `MemTotal` is not ours, and assuming it was took down a server
+///
+/// The fallback used to return the host's total memory, and every derived limit was a
+/// fraction of that. On a dedicated box that is merely aggressive. On the box this was
+/// reported from — telemetryd sharing a 7.5 GiB VPS with MySQL, php-fpm, Redis, Typesense
+/// and the website those serve — it sized itself as though it owned the machine, derived
+/// 64 concurrent queries, and reached 6.65 GB resident. The load average hit 38 and
+/// nothing on the server answered, telemetryd included.
+///
+/// A single-node observability tool is *usually* a guest on a machine that has a job. It
+/// cannot tell a dedicated host from a shared one, so it assumes the answer that fails
+/// safe: a quarter of what is installed. An operator who has given telemetryd the whole
+/// box says so with `MemoryMax` in the unit, or by setting the limits outright — both of
+/// which are read exactly, and neither of which is guessed.
 fn memory_limit_bytes() -> u64 {
     const ASSUMED: u64 = 2 * 1024 * 1024 * 1024;
     /// Share of a machine's installed memory to assume is ours when nothing says.
@@ -1145,18 +1164,9 @@ fn memory_limit_bytes() -> u64 {
         return limit;
     }
 
-    // `MemTotal:  16305892 kB` — the first number on that line, in kibibytes.
-    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo")
-        && let Some(line) = meminfo.lines().find(|line| line.starts_with("MemTotal:"))
-        && let Some(kib) = line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|v| v.parse::<u64>().ok())
-    {
-        return (kib * 1024 / UNCONTAINED_SHARE).max(256 * 1024 * 1024);
-    }
-
-    ASSUMED
+    installed_memory_bytes().map_or(ASSUMED, |installed| {
+        (installed / UNCONTAINED_SHARE).max(256 * 1024 * 1024)
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1234,7 +1244,7 @@ where
 
 #[cfg(test)]
 mod cgroup_tests {
-    use super::parse_cgroup_path;
+    use super::{binding, parse_cgroup_path};
 
     /// The shape on a systemd host, which is exactly where this was getting the wrong
     /// answer: the root cgroup has no `memory.max` file there, so every lookup missed.
@@ -1258,6 +1268,21 @@ mod cgroup_tests {
             parse_cgroup_path(contents).as_deref(),
             Some("/system.slice/telemetryd.service")
         );
+    }
+
+    /// cgroup v1's "unlimited" is a number, and it is not a limit; nor is any limit
+    /// larger than the machine.
+    #[test]
+    fn a_limit_above_installed_memory_does_not_bind() {
+        const GIB: u64 = 1 << 30;
+        let v1_unlimited = 0x7FFF_FFFF_FFFF_F000;
+        assert_eq!(binding(Some(v1_unlimited), Some(8 * GIB)), None);
+        assert_eq!(binding(Some(16 * GIB), Some(8 * GIB)), None);
+        assert_eq!(binding(Some(8 * GIB), Some(8 * GIB)), None);
+        assert_eq!(binding(Some(2 * GIB), Some(8 * GIB)), Some(2 * GIB));
+        // Without /proc/meminfo there is nothing to compare with; the limit stands.
+        assert_eq!(binding(Some(2 * GIB), None), Some(2 * GIB));
+        assert_eq!(binding(None, Some(8 * GIB)), None);
     }
 
     /// v2 wins where both appear, which is what a hybrid host looks like.
