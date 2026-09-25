@@ -414,9 +414,7 @@ impl Config {
 /// Loopback is exempt from the https rules: it is how the OIDC paths are tested, and
 /// a plaintext hop that never leaves the machine cannot be substituted in flight.
 fn is_loopback(url: &str) -> bool {
-    url.starts_with("http://127.0.0.1")
-        || url.starts_with("http://localhost")
-        || url.starts_with("http://[::1]")
+    crate::http::is_loopback_url(url)
 }
 
 /// The message an operator sees when they expose telemetryd without a token.

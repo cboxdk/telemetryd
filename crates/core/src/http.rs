@@ -225,3 +225,55 @@ mod redaction_tests {
         assert_eq!(redact_url("not a url"), "not a url");
     }
 }
+
+/// Whether a URL's host is this machine: `localhost`, or a loopback address.
+///
+/// Parsed with the `http` crate's URI parser and compared exactly. Both copies of this
+/// used to be written by hand: one matched a prefix, so `http://localhost.attacker.example`
+/// was loopback and could fetch signing keys or relay telemetry in clear; the other took
+/// the host from before the last `:`, so `http://localhost:4319@evil.example` was
+/// `localhost` and the CLI sent it this machine's admin token.
+#[must_use]
+pub fn is_loopback_url(url: &str) -> bool {
+    let Ok(uri) = url.trim().parse::<ureq::http::Uri>() else {
+        return false;
+    };
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+#[cfg(test)]
+mod loopback_tests {
+    use super::is_loopback_url;
+
+    #[test]
+    fn only_this_machine_is_loopback() {
+        for url in [
+            "http://127.0.0.1:4319",
+            "http://localhost:4319",
+            "https://localhost",
+            "http://LOCALHOST/x",
+            "http://[::1]:4319",
+            "http://127.0.0.2:4319/status?x=1",
+        ] {
+            assert!(is_loopback_url(url), "{url} should be loopback");
+        }
+        for url in [
+            "http://localhost.attacker.example",
+            "http://localhost:4319@evil.example",
+            "http://127.0.0.1@evil.example/",
+            "https://127.0.0.1.evil.example/status",
+            "http://10.0.0.5:4319",
+            "not a url",
+            "",
+        ] {
+            assert!(!is_loopback_url(url), "{url} must not be loopback");
+        }
+    }
+}

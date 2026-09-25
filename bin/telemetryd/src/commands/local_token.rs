@@ -24,24 +24,12 @@ pub enum Surface {
     Query,
 }
 
-/// Whether a URL points at this machine.
-///
-/// Parsed rather than pattern-matched on the whole string: `https://127.0.0.1.evil.com`
-/// contains `127.0.0.1` and is not loopback.
+/// Whether a URL points at this machine. See [`telemetryd_core::http::is_loopback_url`],
+/// which replaced a hand-written parser here that read `http://localhost:4319@evil.example`
+/// as `localhost` and sent this machine's token to `evil.example`.
 #[must_use]
 pub fn is_loopback(url: &str) -> bool {
-    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let host = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default()
-        .rsplit_once(':')
-        .map_or(
-            rest.split(['/', '?', '#']).next().unwrap_or_default(),
-            |(host, _)| host,
-        )
-        .trim_matches(['[', ']']);
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
+    telemetryd_core::http::is_loopback_url(url)
 }
 
 /// Read the token for `surface` out of this machine's configuration.
@@ -88,6 +76,7 @@ mod tests {
             "https://telemetry.example.com",
             "http://10.0.0.5:4319",
             "https://localhost.attacker.net",
+            "http://localhost:4319@evil.example",
         ] {
             assert!(!is_loopback(url), "{url} must not be treated as loopback");
         }
