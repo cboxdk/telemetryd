@@ -39,7 +39,14 @@ const MIN_BYTES: usize = 256;
 const MAX_BYTES: usize = 256 * 1024;
 
 const FILE: &str = "text.bloom";
-const MAGIC: &[u8; 4] = b"TDTG";
+/// Written since the file gained a checksum trailer — see `crate::sidecar`. A new
+/// magic, not only the trailer, because a binary from before reads its magic and
+/// nothing else: it would take the trailer for filter bits, shift every position, and
+/// skip segments that hold the data. On a new magic it sees no filter and reads the
+/// segment, which is only slower.
+const MAGIC: &[u8; 4] = b"TDT2";
+/// What files written before the trailer carry. Still read.
+const LEGACY_MAGIC: &[u8; 4] = b"TDTG";
 
 /// The shortest pattern that has a trigram. Shorter filters cannot prune.
 pub const MIN_PATTERN: usize = 3;
@@ -161,7 +168,7 @@ impl TrigramIndex {
     #[must_use]
     pub fn read(dir: &Path) -> Option<Self> {
         let raw = crate::sidecar::read(&dir.join(FILE))?;
-        if raw.len() < 8 || &raw[..4] != MAGIC {
+        if raw.len() < 8 || (&raw[..4] != MAGIC && &raw[..4] != LEGACY_MAGIC) {
             return None;
         }
         let hashes = u32::from_le_bytes(raw[4..8].try_into().ok()?);

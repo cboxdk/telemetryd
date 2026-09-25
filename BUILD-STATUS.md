@@ -203,6 +203,20 @@ directory is closed to other accounts and the units carry `UMask=0077`,
 `StateDirectoryMode=0700`, `LimitNOFILE` and a fuller sandbox. CI passes inputs
 through the environment, scopes credentials per job and pins every action by commit.
 
+**Durable under crashes, full disks and a moving clock.** Seals run one at a time, so
+one can no longer truncate the log through another's unpublished records, and a query
+mid-seal sees each record once. A seal that fails is contained: it cleans up its staging
+directory, pauses instead of retrying on every append, never fails the request whose
+records were already stored, and past twice a segment ingest is refused with a retryable
+`503` before memory runs out. A torn log write is rolled back, rotation moves the epoch
+only once the new file exists, and an emptied log directory does not reuse sealed epochs.
+Index files are fsynced, renamed into place and checksummed. A segment that cannot be
+opened just now fails the query instead of being written off, and one deleted under a
+reader is skipped. Metric segments count towards the disk budget, `relay.when_full =
+"reject"` rejects, relay cursors follow the seal sequence rather than the clock, and a
+torn log tail reaches `/status`. Measured by killing the release build with SIGKILL
+mid-ingest while it sealed: every acknowledged record came back, none twice.
+
 **Known gap:** the four per-segment structures are still all resident. Loading them on
 demand behind a cache bounded by the process's memory limit is the remaining fix; sharing
 reduced the dominant term but did not make it independent of how much is stored.

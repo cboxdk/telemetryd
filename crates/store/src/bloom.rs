@@ -22,7 +22,14 @@ const MIN_BYTES: usize = 64;
 const MAX_BYTES: usize = 1 << 20;
 
 const FILE: &str = "keys.bloom";
-const MAGIC: &[u8; 4] = b"TDBF";
+/// Written since the file gained a checksum trailer — see `crate::sidecar`. A new
+/// magic, not only the trailer, because a binary from before reads its magic and
+/// nothing else: it would take the trailer for filter bits, shift every position, and
+/// skip segments that hold the data. On a new magic it sees no filter and reads the
+/// segment, which is only slower.
+const MAGIC: &[u8; 4] = b"TDB2";
+/// What files written before the trailer carry. Still read.
+const LEGACY_MAGIC: &[u8; 4] = b"TDBF";
 
 #[derive(Debug, Clone)]
 pub struct Bloom {
@@ -84,7 +91,7 @@ impl Bloom {
     /// sidecar is damaged would turn a slow answer into no answer.
     pub fn read(dir: &Path) -> Option<Self> {
         let bytes = crate::sidecar::read(&dir.join(FILE))?;
-        if bytes.len() < 8 || &bytes[..4] != MAGIC {
+        if bytes.len() < 8 || (&bytes[..4] != MAGIC && &bytes[..4] != LEGACY_MAGIC) {
             return None;
         }
         let hashes = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
@@ -116,6 +123,23 @@ fn fnv1a(bytes: &[u8], seed: u64) -> u64 {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A filter written before the checksum trailer — old magic, no trailer — still
+    /// loads and still answers.
+    #[test]
+    fn a_filter_from_before_the_checksum_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut filter = Bloom::with_capacity(100);
+        filter.insert("4bf92f3577b34da6a3ce929d0e0e4736");
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(LEGACY_MAGIC);
+        legacy.extend_from_slice(&filter.hashes.to_le_bytes());
+        legacy.extend_from_slice(&filter.bits);
+        std::fs::write(dir.path().join(FILE), &legacy).unwrap();
+
+        let loaded = Bloom::read(dir.path()).unwrap();
+        assert!(loaded.may_contain("4bf92f3577b34da6a3ce929d0e0e4736"));
+    }
 
     #[test]
     fn every_inserted_key_tests_positive() {
