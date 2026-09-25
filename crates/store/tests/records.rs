@@ -714,10 +714,12 @@ fn a_failing_seal_is_contained() {
     }
     let refused = refused.expect("the buffer stops growing");
     assert!(refused.to_string().contains("sealing"), "{refused}");
+    assert!(store.refusing_writes(), "what `/ready` reports");
 
     // Once the disk takes writes again, a seal succeeds and ingest resumes.
     std::fs::set_permissions(&segments, std::fs::Permissions::from_mode(0o700)).unwrap();
     store.seal_now().unwrap().expect("a segment");
+    assert!(!store.refusing_writes());
     store.append(&batch(10_000)).unwrap();
 }
 

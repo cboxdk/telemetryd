@@ -1,9 +1,9 @@
 //! telemetryd's own metrics, in Prometheus text exposition format.
 //!
 //! Hand-rolled rather than pulling in a metrics facade: the surface is a few dozen
-//! counters and gauges, the exposition format is stable and simple, and the dependency
-//! budget is a product constraint here (one static binary, no surprises). If this ever
-//! needs histograms with exemplars, revisit.
+//! counters and gauges and one latency histogram, the exposition format is stable and
+//! simple, and the dependency budget is a product constraint here (one static binary, no
+//! surprises). If this ever needs exemplars, revisit.
 //!
 //! The counters declared here are half the "degrade loudly" contract from the brief —
 //! every rejection path increments one, so a limit being hit is observable rather than
@@ -20,6 +20,21 @@ type Series = (&'static str, Vec<(String, String)>);
 pub enum Kind {
     Counter,
     Gauge,
+    Histogram,
+}
+
+/// Upper bounds of the latency histogram, in seconds: from a cached label lookup to
+/// a query at the request timeout.
+const LATENCY_BUCKETS: [f64; 12] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
+/// Cumulative counts per bucket, as the exposition format wants them.
+#[derive(Debug, Default, Clone)]
+struct Histogram {
+    buckets: [u64; LATENCY_BUCKETS.len()],
+    count: u64,
+    sum: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -47,6 +62,37 @@ pub const DESCRIPTORS: &[Descriptor] = &[
         name: "telemetryd_http_requests_total",
         kind: Kind::Counter,
         help: "HTTP requests handled, by route, method and status class",
+    },
+    Descriptor {
+        name: "telemetryd_http_request_duration_seconds",
+        kind: Kind::Histogram,
+        help: "Time to answer a request, by route and method, until the response head is \
+               ready; a streamed body is not included",
+    },
+    Descriptor {
+        name: "telemetryd_ingest_in_flight",
+        kind: Kind::Gauge,
+        help: "Ingest requests holding a slot in the queue now",
+    },
+    Descriptor {
+        name: "telemetryd_ingest_queue_depth",
+        kind: Kind::Gauge,
+        help: "Ingest requests that may hold a slot at once (limits.ingest_queue_depth)",
+    },
+    Descriptor {
+        name: "telemetryd_ingest_memory_bytes",
+        kind: Kind::Gauge,
+        help: "Memory ingest requests in flight hold between them now",
+    },
+    Descriptor {
+        name: "telemetryd_ingest_memory_limit_bytes",
+        kind: Kind::Gauge,
+        help: "Memory ingest requests in flight may hold (limits.ingest_memory, resolved)",
+    },
+    Descriptor {
+        name: "process_resident_memory_bytes",
+        kind: Kind::Gauge,
+        help: "Resident memory of this process; Linux only",
     },
     Descriptor {
         name: "telemetryd_auth_failures_total",
@@ -284,6 +330,7 @@ pub const DESCRIPTORS: &[Descriptor] = &[
 #[derive(Debug, Default)]
 pub struct Metrics {
     counters: RwLock<BTreeMap<Series, u64>>,
+    histograms: RwLock<BTreeMap<Series, Histogram>>,
 }
 
 impl Metrics {
@@ -302,6 +349,23 @@ impl Metrics {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *counters.entry(key).or_insert(0) += by;
+    }
+
+    /// Record one observation, in seconds, in a histogram.
+    pub fn observe(&self, name: &'static str, labels: &[(&str, &str)], seconds: f64) {
+        let key = (name, normalise(labels));
+        let mut histograms = self
+            .histograms
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let histogram = histograms.entry(key).or_default();
+        for (bucket, bound) in histogram.buckets.iter_mut().zip(LATENCY_BUCKETS) {
+            if seconds <= bound {
+                *bucket += 1;
+            }
+        }
+        histogram.count += 1;
+        histogram.sum += seconds;
     }
 
     pub fn get(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
@@ -329,6 +393,10 @@ impl Metrics {
             .counters
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let histograms = self
+            .histograms
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let mut out = String::with_capacity(4096);
         for descriptor in DESCRIPTORS {
@@ -343,6 +411,12 @@ impl Metrics {
                     .filter(|sample| sample.name == descriptor.name)
                     .map(|sample| format_line(sample.name, &sample.labels, sample.value)),
             );
+            for ((name, labels), histogram) in histograms
+                .iter()
+                .filter(|((name, _), _)| *name == descriptor.name)
+            {
+                histogram_lines(name, labels, histogram, &mut lines);
+            }
 
             let _ = writeln!(out, "# HELP {} {}", descriptor.name, descriptor.help);
             let _ = writeln!(
@@ -352,6 +426,7 @@ impl Metrics {
                 match descriptor.kind {
                     Kind::Counter => "counter",
                     Kind::Gauge => "gauge",
+                    Kind::Histogram => "histogram",
                 }
             );
             for line in lines {
@@ -415,6 +490,40 @@ fn normalise(labels: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect();
     labels.sort();
     labels
+}
+
+/// A histogram's `_bucket`, `_sum` and `_count` lines.
+#[allow(clippy::cast_precision_loss)] // counts stay far below 2^53
+fn histogram_lines(
+    name: &str,
+    labels: &[(String, String)],
+    histogram: &Histogram,
+    lines: &mut Vec<String>,
+) {
+    let bucket = format!("{name}_bucket");
+    let with_le = |le: String| {
+        let mut labelled = labels.to_vec();
+        labelled.push(("le".to_owned(), le));
+        labelled
+    };
+    for (count, bound) in histogram.buckets.iter().zip(LATENCY_BUCKETS) {
+        lines.push(format_line(
+            &bucket,
+            &with_le(bound.to_string()),
+            *count as f64,
+        ));
+    }
+    lines.push(format_line(
+        &bucket,
+        &with_le("+Inf".to_owned()),
+        histogram.count as f64,
+    ));
+    lines.push(format_line(&format!("{name}_sum"), labels, histogram.sum));
+    lines.push(format_line(
+        &format!("{name}_count"),
+        labels,
+        histogram.count as f64,
+    ));
 }
 
 fn format_line(name: &str, labels: &[(String, String)], value: f64) -> String {
@@ -525,5 +634,34 @@ mod tests {
         ]);
         assert!(rendered.contains("telemetryd_disk_used_bytes{kind=\"wal\"} 4096"));
         assert!(rendered.contains("telemetryd_uptime_seconds 1.5"));
+    }
+
+    /// Buckets are cumulative and end in `+Inf`, with `_sum` and `_count` beside them —
+    /// what `histogram_quantile` needs to read the latency back.
+    #[test]
+    fn a_histogram_renders_as_prometheus_reads_one() {
+        let metrics = Metrics::new();
+        let labels = [("route", "/v1/logs"), ("method", "POST")];
+        for seconds in [0.003, 0.2, 0.2, 40.0] {
+            metrics.observe("telemetryd_http_request_duration_seconds", &labels, seconds);
+        }
+        let rendered = metrics.render(&[]);
+        let name = "telemetryd_http_request_duration_seconds";
+        assert!(rendered.contains(&format!("# TYPE {name} histogram")));
+        let bucket =
+            |le: &str| format!("{name}_bucket{{method=\"POST\",route=\"/v1/logs\",le=\"{le}\"}}");
+        assert!(
+            rendered.contains(&format!("{} 1\n", bucket("0.005"))),
+            "{rendered}"
+        );
+        assert!(rendered.contains(&format!("{} 3\n", bucket("0.25"))));
+        assert!(rendered.contains(&format!("{} 3\n", bucket("30"))));
+        assert!(rendered.contains(&format!("{} 4\n", bucket("+Inf"))));
+        assert!(rendered.contains(&format!(
+            "{name}_count{{method=\"POST\",route=\"/v1/logs\"}} 4"
+        )));
+        assert!(rendered.contains(&format!(
+            "{name}_sum{{method=\"POST\",route=\"/v1/logs\"}} 40.403"
+        )));
     }
 }

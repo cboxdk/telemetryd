@@ -658,6 +658,31 @@ impl Store {
         self.metrics.backfill_folds(limit)
     }
 
+    /// Why writes are being refused right now, if they are — what `/ready` answers with.
+    #[must_use]
+    pub fn not_accepting(&self) -> Option<String> {
+        if self.refusing.load(std::sync::atomic::Ordering::Relaxed) {
+            return Some(
+                "the disk budget is full of telemetry not yet forwarded upstream".to_owned(),
+            );
+        }
+        let failing: Vec<&str> = [
+            ("logs", self.logs.refusing_writes()),
+            ("traces", self.traces.refusing_writes()),
+            ("metrics", self.metrics.refusing_writes()),
+        ]
+        .into_iter()
+        .filter_map(|(signal, refusing)| refusing.then_some(signal))
+        .collect();
+        (!failing.is_empty()).then(|| {
+            format!(
+                "sealing is failing and {} writes are refused until it recovers; the server \
+                 log says why",
+                failing.join(", ")
+            )
+        })
+    }
+
     /// Forget shared label sets nothing holds any more — every segment holding them has
     /// been deleted and nothing buffered names them. Returns how many went.
     pub fn release_unused_label_sets(&self) -> usize {

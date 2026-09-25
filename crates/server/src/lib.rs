@@ -216,7 +216,13 @@ async fn record_request(State(state): State<AppState>, request: Request, next: N
         .map_or_else(|| "<unmatched>".to_owned(), |m| m.as_str().to_owned());
     let method = method_label(request.method());
 
+    let started = std::time::Instant::now();
     let response = next.run(request).await;
+    state.metrics.observe(
+        "telemetryd_http_request_duration_seconds",
+        &[("route", &route), ("method", method)],
+        started.elapsed().as_secs_f64(),
+    );
 
     state.metrics.incr(
         "telemetryd_http_requests_total",

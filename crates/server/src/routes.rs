@@ -28,10 +28,23 @@ pub async fn healthz() -> Response {
 /// Readiness, under the name Loki, Tempo and Kubernetes probes use.
 ///
 /// The server only starts listening once the store has opened and replayed its
-/// write-ahead log, so answering at all means ready. What deeper readiness would add —
-/// a failing seal, a full disk — is reported on `/status`.
-pub async fn ready() -> Response {
-    (StatusCode::OK, "ready\n").into_response()
+/// write-ahead log, so answering at all means it has started. It is not ready while it
+/// refuses writes — a seal failing with the buffer full, or a relay's backlog filling the
+/// disk budget — and says so with `503` and the reason, so a load balancer sends writes
+/// elsewhere instead of to an instance that will answer each of them `503`. It used to
+/// say `ready` regardless. Liveness stays with `/healthz`: an instance refusing writes is
+/// alive, and restarting it would lose its buffer.
+pub async fn ready(State(state): State<AppState>) -> Response {
+    let store = std::sync::Arc::clone(&state.store);
+    match tokio::task::spawn_blocking(move || store.not_accepting()).await {
+        Ok(None) => (StatusCode::OK, "ready\n").into_response(),
+        Ok(Some(reason)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("not ready: {reason}\n"),
+        )
+            .into_response(),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "not ready\n").into_response(),
+    }
 }
 
 /// Tempo's connection check. Grafana's Tempo datasource calls exactly this on "Save &
@@ -494,6 +507,14 @@ fn gauges(state: &AppState) -> Result<Vec<Sample>, Error> {
         state.tail_subscribers() as f64,
     ));
 
+    push_load_gauges(state, &mut samples);
+
+    Ok(samples)
+}
+
+/// What is in flight against each limit, and the process's own memory.
+#[allow(clippy::cast_precision_loss)] // counts and bytes far below 2^52
+fn push_load_gauges(state: &AppState, samples: &mut Vec<Sample>) {
     // Both halves of each pair, so an alert can be written as a ratio. In-flight alone
     // says nothing without the ceiling, and the ceiling may have been derived rather than
     // configured — which means nobody can read it off the config file.
@@ -517,6 +538,44 @@ fn gauges(state: &AppState) -> Result<Vec<Sample>, Error> {
         &[],
         state.export_concurrency() as f64,
     ));
+    let (ingest_in_flight, queue_depth) = state.ingest_in_flight();
+    samples.push(Sample::new(
+        "telemetryd_ingest_in_flight",
+        &[],
+        ingest_in_flight as f64,
+    ));
+    samples.push(Sample::new(
+        "telemetryd_ingest_queue_depth",
+        &[],
+        queue_depth as f64,
+    ));
+    samples.push(Sample::new(
+        "telemetryd_ingest_memory_bytes",
+        &[],
+        state.ingest_memory.in_use() as f64,
+    ));
+    samples.push(Sample::new(
+        "telemetryd_ingest_memory_limit_bytes",
+        &[],
+        state.ingest_memory.capacity() as f64,
+    ));
+    if let Some(resident) = resident_memory_bytes() {
+        samples.push(Sample::new(
+            "process_resident_memory_bytes",
+            &[],
+            resident as f64,
+        ));
+    }
+}
 
-    Ok(samples)
+/// This process's resident memory, from `VmRSS` in `/proc/self/status`.
+///
+/// The number an operator compares with `MemoryMax`, and the one that decides whether
+/// the kernel stops the process. Read in kibibytes from `status` rather than in pages
+/// from `statm`, because a page is not four kibibytes on every kernel this runs on.
+fn resident_memory_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib.saturating_mul(1024))
 }

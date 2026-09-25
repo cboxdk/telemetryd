@@ -384,6 +384,15 @@ impl AppState {
     }
 
     /// How many of each are running right now.
+    /// Ingest requests holding a slot, and how many may.
+    pub fn ingest_in_flight(&self) -> (usize, usize) {
+        (
+            self.queue_depth
+                .saturating_sub(self.ingest_permits.available_permits()),
+            self.queue_depth,
+        )
+    }
+
     pub fn queries_in_flight(&self) -> usize {
         self.query_concurrency
             .saturating_sub(self.query_permits.available_permits())

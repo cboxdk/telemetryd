@@ -232,6 +232,7 @@ async fn the_exported_metric_names_cannot_change_by_accident() {
     exported.dedup();
 
     let expected = [
+        "process_resident_memory_bytes",
         "telemetryd_app_bytes_estimate",
         "telemetryd_app_rows",
         "telemetryd_app_series",
@@ -241,9 +242,14 @@ async fn the_exported_metric_names_cannot_change_by_accident() {
         "telemetryd_disk_used_bytes",
         "telemetryd_export_concurrency_limit",
         "telemetryd_exports_in_flight",
+        "telemetryd_http_request_duration_seconds",
         "telemetryd_http_requests_total",
         "telemetryd_ingest_accepted_total",
         "telemetryd_ingest_bodies_truncated_total",
+        "telemetryd_ingest_in_flight",
+        "telemetryd_ingest_memory_bytes",
+        "telemetryd_ingest_memory_limit_bytes",
+        "telemetryd_ingest_queue_depth",
         "telemetryd_ingest_rejected_total",
         "telemetryd_ingest_timestamps_rescaled_total",
         "telemetryd_oidc_keys",

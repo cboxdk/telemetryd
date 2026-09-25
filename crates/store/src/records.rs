@@ -599,6 +599,13 @@ impl<S: RecordSchema> RecordStore<S> {
         Ok(())
     }
 
+    /// Whether appends are being refused: sealing is failing and the buffer has reached
+    /// the point where `append` answers `Unavailable` rather than hold more.
+    pub fn refusing_writes(&self) -> bool {
+        lock(&self.seal_failed_at).is_some()
+            && lock(&self.writer).buffer.bytes as u64 >= 2 * self.settings.max_segment_bytes
+    }
+
     /// Whether automatic seals are pausing after a failure.
     ///
     /// A failing seal was retried on every append past the threshold — each attempt
