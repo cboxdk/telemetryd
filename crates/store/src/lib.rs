@@ -258,19 +258,28 @@ impl Store {
     }
 
     /// Seal any buffer whose window has elapsed.
+    ///
+    /// Every signal is tried whatever happens to the others: a disk problem sealing logs
+    /// used to return before traces and metrics were looked at. The first error is
+    /// returned once all three have had their turn.
     pub fn maybe_seal(&self) -> Result<()> {
-        self.logs.maybe_seal()?;
-        self.traces.maybe_seal()?;
-        self.metrics.maybe_seal()?;
-        Ok(())
+        let results = [
+            self.logs.maybe_seal().map(|_| ()),
+            self.traces.maybe_seal().map(|_| ()),
+            self.metrics.maybe_seal().map(|_| ()),
+        ];
+        results.into_iter().collect()
     }
 
-    /// Seal everything, regardless of window. Used on shutdown and by tests.
+    /// Seal everything, regardless of window. Used on shutdown and by tests. Every
+    /// signal is tried, as in [`Self::maybe_seal`].
     pub fn seal_all(&self) -> Result<()> {
-        self.logs.seal_now()?;
-        self.traces.seal_now()?;
-        self.metrics.seal_now()?;
-        Ok(())
+        let results = [
+            self.logs.seal_now().map(|_| ()),
+            self.traces.seal_now().map(|_| ()),
+            self.metrics.seal_now().map(|_| ()),
+        ];
+        results.into_iter().collect()
     }
 
     /// Run one retention pass: expire by age, then enforce the disk budget.

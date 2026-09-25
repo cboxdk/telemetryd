@@ -671,3 +671,52 @@ fn everything_survives_a_restart_after_concurrent_load() {
     let reopened = harness.open();
     assert_eq!(all(&reopened).len(), 800);
 }
+
+/// A seal that fails — here the segments directory refuses the publish, as a full or
+/// read-only disk would — must not become the ingest request's failure, must not leave
+/// its staging directory behind, and must not let the buffer grow without bound.
+#[cfg(unix)]
+#[test]
+fn a_failing_seal_is_contained() {
+    use std::os::unix::fs::PermissionsExt;
+    let harness = Harness::new();
+    let store = harness.open_with(StoreSettings {
+        max_segment_bytes: 4 * 1024,
+        ..settings()
+    });
+    let segments = harness.root.join("segments");
+    std::fs::set_permissions(&segments, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    // Past the size threshold, the append triggers a seal, which fails. The records are
+    // stored and the append says so.
+    let batch = |from: u64| -> Vec<LogRecord> {
+        (from..from + 40)
+            .map(|i| record(i, "checkout", Severity::Info, &"x".repeat(100)))
+            .collect()
+    };
+    store.append(&batch(0)).unwrap();
+    assert!(store.seal_now().is_err(), "the publish is refused");
+    let staging: Vec<_> = std::fs::read_dir(harness.root.join("tmp"))
+        .unwrap()
+        .collect();
+    assert!(
+        staging.is_empty(),
+        "a failed seal leaves no staging directory: {staging:?}"
+    );
+
+    // While sealing fails the buffer may reach twice a segment, then ingest is refused.
+    let mut refused = None;
+    for round in 1..200 {
+        if let Err(error) = store.append(&batch(round * 40)) {
+            refused = Some(error);
+            break;
+        }
+    }
+    let refused = refused.expect("the buffer stops growing");
+    assert!(refused.to_string().contains("sealing"), "{refused}");
+
+    // Once the disk takes writes again, a seal succeeds and ingest resumes.
+    std::fs::set_permissions(&segments, std::fs::Permissions::from_mode(0o700)).unwrap();
+    store.seal_now().unwrap().expect("a segment");
+    store.append(&batch(10_000)).unwrap();
+}

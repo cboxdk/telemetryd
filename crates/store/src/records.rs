@@ -74,7 +74,19 @@ pub struct RecordStore<S: RecordSchema> {
     /// the failure a concurrency test exists to find. A record must become durable and
     /// queryable atomically.
     writer: Mutex<Writer<S>>,
+    /// Lock order: whoever holds both takes `catalogue` first, then `writer`. Publishing a
+    /// segment does, and so does every query that reads the buffer beside the segments —
+    /// which is what lets a seal hand records from one to the other without a query
+    /// seeing them twice or not at all.
     catalogue: RwLock<Vec<Arc<Segment>>>,
+    /// Held for a whole seal, so two cannot overlap. They could — the ticker and an
+    /// append crossing the size threshold — and the later one, finishing first,
+    /// truncated the log through its own epoch: the earlier seal's records, rotated out
+    /// and not yet published, went with it, lost to a crash in that window. Replay then
+    /// skipped them as well, since it resumes after the highest published epoch.
+    seal_lock: Mutex<()>,
+    /// When the last seal failed, while failures continue; cleared by a success.
+    seal_failed_at: Mutex<Option<Instant>>,
     seal_sequence: AtomicU64,
     stats: Stats,
 }
@@ -83,6 +95,13 @@ pub struct RecordStore<S: RecordSchema> {
 struct Writer<S: RecordSchema> {
     wal: Wal,
     buffer: Buffer<S>,
+    /// Records taken from the buffer by a seal that has not published its segment yet.
+    ///
+    /// They used to be in neither place for the length of the Parquet write, so a
+    /// query in that window missed them — or, taking the buffer before the drain and the
+    /// segments after the publish, counted them twice. Queries read this slot beside the
+    /// buffer; the seal empties it in the same step that publishes the segment.
+    sealing: Option<Arc<Chunk<S>>>,
 }
 
 impl<S: RecordSchema> std::fmt::Debug for RecordStore<S> {
@@ -208,43 +227,42 @@ impl<S: RecordSchema> Buffer<S> {
         self.records
     }
 
-    /// Take everything for sealing, as one contiguous run.
+    /// Take everything for sealing, as one contiguous chunk.
     ///
     /// Chunks whose only holder is the buffer are moved out; a chunk a query is still
     /// reading is copied instead, so sealing never waits on a reader and a reader never
-    /// sees records vanish mid-scan.
-    fn drain(&mut self) -> Vec<S::Record> {
+    /// sees records vanish mid-scan. The bounds come from the chunks', not a pass over
+    /// the records, since this runs under the lock appends need.
+    fn drain(&mut self) -> Chunk<S> {
         self.freeze();
         let chunks = std::mem::take(&mut self.chunks);
-        let mut out = Vec::with_capacity(self.records);
+        let mut records = Vec::with_capacity(self.records);
+        let (mut min_nanos, mut max_nanos) = (u64::MAX, u64::MIN);
         for chunk in chunks {
+            min_nanos = min_nanos.min(chunk.min_nanos);
+            max_nanos = max_nanos.max(chunk.max_nanos);
             match Arc::try_unwrap(chunk) {
-                Ok(chunk) => out.extend(chunk.records),
-                Err(shared) => out.extend(shared.records.iter().cloned()),
+                Ok(chunk) => records.extend(chunk.records),
+                Err(shared) => records.extend(shared.records.iter().cloned()),
             }
         }
         self.records = 0;
         self.bytes = 0;
-        out
+        Chunk {
+            records,
+            min_nanos,
+            max_nanos,
+        }
     }
 
-    /// Put records back at the front, preserving order, after a failed seal.
-    fn restore(&mut self, records: Vec<S::Record>) {
-        if records.is_empty() {
+    /// Put a drained chunk back at the front, preserving order, after a failed seal.
+    fn restore(&mut self, chunk: Arc<Chunk<S>>) {
+        if chunk.records.is_empty() {
             return;
         }
-        self.bytes += records.iter().map(S::size_estimate).sum::<usize>();
-        self.records += records.len();
-        let min_nanos = records.iter().map(S::timestamp).min().unwrap_or(0);
-        let max_nanos = records.iter().map(S::timestamp).max().unwrap_or(0);
-        self.chunks.insert(
-            0,
-            Arc::new(Chunk {
-                records,
-                min_nanos,
-                max_nanos,
-            }),
-        );
+        self.bytes += chunk.records.iter().map(S::size_estimate).sum::<usize>();
+        self.records += chunk.records.len();
+        self.chunks.insert(0, chunk);
     }
 }
 
@@ -463,7 +481,13 @@ impl<S: RecordSchema> RecordStore<S> {
             segments_dir,
             tmp_dir,
             settings,
-            writer: Mutex::new(Writer { wal, buffer }),
+            writer: Mutex::new(Writer {
+                wal,
+                buffer,
+                sealing: None,
+            }),
+            seal_lock: Mutex::new(()),
+            seal_failed_at: Mutex::new(None),
             catalogue: RwLock::new(segments.into_iter().map(Arc::new).collect()),
             seal_sequence: AtomicU64::new(seal_sequence),
             stats,
@@ -478,9 +502,24 @@ impl<S: RecordSchema> RecordStore<S> {
         if records.is_empty() {
             return Ok(());
         }
+        let failing = lock(&self.seal_failed_at).is_some();
 
         let should_seal = {
             let mut writer = lock(&self.writer);
+            // Sealing is what turns the buffer into disk, and while it fails the buffer
+            // only grows. Past twice a segment's worth, refuse — before writing, so
+            // nothing is half-accepted — with an error senders retry. Holding more
+            // would end with the process out of memory and the records with it.
+            if failing && writer.buffer.bytes as u64 >= 2 * self.settings.max_segment_bytes {
+                return Err(Error::io(
+                    format!(
+                        "buffering {} records, because sealing them into segments is \
+                         failing",
+                        S::SIGNAL
+                    ),
+                    std::io::Error::other("the buffer is full; see the log for why sealing fails"),
+                ));
+            }
             for record in records {
                 let payload = postcard::to_stdvec(record)
                     .map_err(|e| Error::Config(format!("encoding a {} record: {e}", S::SIGNAL)))?;
@@ -494,10 +533,24 @@ impl<S: RecordSchema> RecordStore<S> {
             .appended
             .fetch_add(records.len() as u64, Ordering::Relaxed);
 
-        if should_seal {
-            self.seal_now()?;
+        // The records are durable and queryable already, so a seal that fails here is
+        // not this request's failure: it is logged, retried by the ticker after a pause,
+        // and the client is told what is true — accepted. Returning it used to answer
+        // 5xx for records that were stored, and the sender's retry stored them twice.
+        if should_seal && !self.backing_off() {
+            let _ = self.seal_now();
         }
         Ok(())
+    }
+
+    /// Whether automatic seals are pausing after a failure.
+    ///
+    /// A failing seal was retried on every append past the threshold — each attempt
+    /// rotating the log and writing a staging directory — which on a full disk is a
+    /// failure per request. Forced seals (shutdown, `seal_now`) are not held back.
+    fn backing_off(&self) -> bool {
+        const PAUSE: std::time::Duration = std::time::Duration::from_secs(30);
+        lock(&self.seal_failed_at).is_some_and(|at| at.elapsed() < PAUSE)
     }
 
     /// Seal if the buffer has been open longer than the segment window.
@@ -508,9 +561,14 @@ impl<S: RecordSchema> RecordStore<S> {
         let due = {
             let writer = lock(&self.writer);
             !writer.buffer.is_empty()
-                && writer.buffer.opened_at.elapsed() >= self.settings.segment_duration
+                && (writer.buffer.opened_at.elapsed() >= self.settings.segment_duration
+                    || writer.buffer.bytes as u64 >= self.settings.max_segment_bytes)
         };
-        if due { self.seal_now() } else { Ok(None) }
+        if due && !self.backing_off() {
+            self.seal_now()
+        } else {
+            Ok(None)
+        }
     }
 
     /// Seal the current buffer into an immutable segment.
@@ -520,7 +578,8 @@ impl<S: RecordSchema> RecordStore<S> {
     /// is rotated before the buffer is taken, and only truncated after the segment is
     /// published, so a crash anywhere in between recovers rather than loses.
     pub fn seal_now(&self) -> Result<Option<Arc<Segment>>> {
-        let (records, wal_sequence) = {
+        let _one_at_a_time = lock(&self.seal_lock);
+        let (chunk, wal_sequence) = {
             let mut writer = lock(&self.writer);
             if writer.buffer.is_empty() {
                 return Ok(None);
@@ -528,14 +587,15 @@ impl<S: RecordSchema> RecordStore<S> {
             // Rotate and drain under the same lock that appends hold, so the boundary
             // between "in this segment" and "still in the log" is exact.
             let wal_sequence = writer.wal.rotate()?;
-            let records = writer.buffer.drain();
+            let chunk = Arc::new(writer.buffer.drain());
             writer.buffer.opened_at = Instant::now();
-            (records, wal_sequence)
+            writer.sealing = Some(Arc::clone(&chunk));
+            (chunk, wal_sequence)
         };
 
         let sequence = self.seal_sequence.fetch_add(1, Ordering::Relaxed) + 1;
         let segment = seal::<S>(
-            &records,
+            &chunk.records,
             SealOptions {
                 segments_dir: &self.segments_dir,
                 tmp_dir: &self.tmp_dir,
@@ -552,7 +612,10 @@ impl<S: RecordSchema> RecordStore<S> {
                 // Put the records back rather than dropping them on the floor. They
                 // are still in the WAL, so they would survive a restart either way,
                 // but a running process must not silently lose queryable data.
-                lock(&self.writer).buffer.restore(records);
+                *lock(&self.seal_failed_at) = Some(Instant::now());
+                let mut writer = lock(&self.writer);
+                writer.sealing = None;
+                writer.buffer.restore(chunk);
                 tracing::error!(
                     signal = %S::SIGNAL,
                     error = %error,
@@ -562,12 +625,21 @@ impl<S: RecordSchema> RecordStore<S> {
             }
         };
 
+        *lock(&self.seal_failed_at) = None;
         self.stats.sealed_segments.fetch_add(1, Ordering::Relaxed);
         self.stats
             .sealed_records
             .fetch_add(segment.manifest.rows, Ordering::Relaxed);
 
-        lock_write(&self.catalogue).push(Arc::clone(&segment));
+        // Publish and retire the sealing slot as one step. A query takes the catalogue
+        // before the writer, so it sees these records in the slot or in the segment,
+        // never both and never neither.
+        {
+            let mut catalogue = lock_write(&self.catalogue);
+            catalogue.push(Arc::clone(&segment));
+            lock(&self.writer).sealing = None;
+        }
+        drop(chunk);
 
         // Only now is the log redundant.
         if let Err(e) = lock(&self.writer).wal.remove_up_to(wal_sequence) {
@@ -580,6 +652,27 @@ impl<S: RecordSchema> RecordStore<S> {
         }
 
         Ok(Some(segment))
+    }
+
+    /// The segments and the buffered records, taken together.
+    ///
+    /// Together, under both locks in their order, because a seal moves records from the
+    /// one to the other: taken apart, a query could read the buffer before a drain and
+    /// the segments after the publish, and count a seal's records twice — or the other
+    /// way round and miss them.
+    fn view(&self) -> (Vec<Arc<Chunk<S>>>, Vec<Arc<Segment>>) {
+        let catalogue = lock_read(&self.catalogue);
+        let chunks = Self::buffered_in(&mut lock(&self.writer));
+        (chunks, catalogue.clone())
+    }
+
+    /// Everything unsealed: the buffer, and a seal's records until it publishes.
+    fn buffered_in(writer: &mut Writer<S>) -> Vec<Arc<Chunk<S>>> {
+        let mut chunks = writer.buffer.snapshot();
+        if let Some(sealing) = &writer.sealing {
+            chunks.push(Arc::clone(sealing));
+        }
+        chunks
     }
 
     /// Flush and fsync the write-ahead log without sealing.
@@ -624,7 +717,7 @@ impl<S: RecordSchema> RecordStore<S> {
     /// The newest and smallest part of the store, and the one part with no segment to
     /// carry a precomputed summary — so a caller folding a window has to walk it.
     pub(crate) fn buffered_between(&self, start_nanos: u64, end_nanos: u64) -> Vec<S::Record> {
-        let chunks = lock(&self.writer).buffer.snapshot();
+        let chunks = Self::buffered_in(&mut lock(&self.writer));
         let mut out = Vec::new();
         for chunk in &chunks {
             if !chunk.overlaps(start_nanos, end_nanos) {
@@ -698,6 +791,7 @@ impl<S: RecordSchema> RecordStore<S> {
         extra: &(dyn Fn(&S::Record) -> bool + Sync),
     ) -> Result<Vec<S::Record>> {
         let mut collector = TopK::new(request.limit, request.order);
+        let segments_seen;
 
         // The live buffer first: it holds the newest data, so filling the collector
         // from it maximises how many sealed segments the cutoff can then skip.
@@ -706,7 +800,8 @@ impl<S: RecordSchema> RecordStore<S> {
             // Snapshot, then release. Holding the lock across the scan is what made a
             // single reader cost 45% of ingest throughput: appends need the same lock,
             // so every query stalled every writer for a full buffer walk.
-            let mut buffered = lock(&self.writer).buffer.snapshot();
+            let (mut buffered, from_catalogue) = self.view();
+            segments_seen = from_catalogue;
 
             // Visit chunks from the end the caller asked for, so the collector's cutoff
             // tightens immediately and the rest can be skipped on their bounds alone.
@@ -736,7 +831,7 @@ impl<S: RecordSchema> RecordStore<S> {
 
         // Walk segments from the end the caller cares about, so the cutoff tightens as
         // fast as possible.
-        let mut segments = self.segments();
+        let mut segments = segments_seen;
         match request.order {
             Order::Descending => {
                 segments.sort_by_key(|s| std::cmp::Reverse(s.manifest.max_time_nanos));
@@ -1029,7 +1124,7 @@ impl<S: RecordSchema> RecordStore<S> {
                 names.extend(segment.manifest.labels.keys().cloned());
             }
         }
-        for chunk in lock(&self.writer).buffer.snapshot() {
+        for chunk in Self::buffered_in(&mut lock(&self.writer)) {
             for record in &chunk.records {
                 let ts = S::timestamp(record);
                 if ts >= start_nanos && ts <= end_nanos {
@@ -1089,7 +1184,7 @@ impl<S: RecordSchema> RecordStore<S> {
             }
         }
 
-        for chunk in lock(&self.writer).buffer.snapshot() {
+        for chunk in Self::buffered_in(&mut lock(&self.writer)) {
             for record in &chunk.records {
                 let ts = S::timestamp(record);
                 if ts >= start_nanos
@@ -1143,7 +1238,7 @@ impl<S: RecordSchema> RecordStore<S> {
             );
         }
 
-        for chunk in lock(&self.writer).buffer.snapshot() {
+        for chunk in Self::buffered_in(&mut lock(&self.writer)) {
             for record in &chunk.records {
                 let ts = S::timestamp(record);
                 if ts >= start_nanos
@@ -1163,7 +1258,7 @@ impl<S: RecordSchema> RecordStore<S> {
         let (buffered, buffered_records, buffered_bytes) = {
             let mut writer = lock(&self.writer);
             let counts = (writer.buffer.len() as u64, writer.buffer.bytes as u64);
-            (writer.buffer.snapshot(), counts.0, counts.1)
+            (Self::buffered_in(&mut writer), counts.0, counts.1)
         };
 
         let mut oldest = segments.iter().map(|s| s.manifest.min_time_nanos).min();
@@ -1212,4 +1307,86 @@ fn lock_read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
 fn lock_write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
     lock.write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::logs::LogSchema;
+    use telemetryd_core::{Labels, LogRecord, Severity};
+
+    fn record(i: u64) -> LogRecord {
+        let mut stream = Labels::new();
+        stream.insert("app", "checkout");
+        LogRecord {
+            timestamp_nanos: 1_750_000_000_000_000_000 + i,
+            stream,
+            severity: Severity::Info,
+            severity_text: "INFO".to_owned(),
+            body: format!("line {i}"),
+            attributes: Labels::new(),
+            trace_id: None,
+            span_id: None,
+        }
+    }
+
+    fn open(dir: &std::path::Path) -> RecordStore<LogSchema> {
+        RecordStore::<LogSchema>::open(
+            &dir.join("wal"),
+            dir.join("segments"),
+            dir.join("tmp"),
+            StoreSettings {
+                segment_duration: std::time::Duration::from_secs(3600),
+                max_segment_bytes: 1 << 30,
+                wal_sync: telemetryd_core::config::WalSync::Always,
+                wal_sync_interval: std::time::Duration::ZERO,
+                compression: telemetryd_core::config::Compression::Zstd,
+                query_parallelism: 1,
+            },
+        )
+        .unwrap()
+    }
+
+    fn count(store: &RecordStore<LogSchema>) -> usize {
+        store
+            .scan(Scan::range(0, u64::MAX), &[], &|_| true)
+            .unwrap()
+            .len()
+    }
+
+    /// A query in the middle of a seal — records out of the buffer, segment not yet
+    /// published — sees each record once. It used to see none of them for the length
+    /// of the Parquet write; the window is held open here by doing the drain half of a
+    /// seal by hand, since no timing could.
+    #[test]
+    fn a_query_during_a_seal_sees_every_record_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open(tmp.path());
+        store
+            .append(&(0..10).map(record).collect::<Vec<_>>())
+            .unwrap();
+
+        {
+            let mut writer = lock(&store.writer);
+            let chunk = Arc::new(writer.buffer.drain());
+            writer.sealing = Some(chunk);
+        }
+        store
+            .append(&(10..15).map(record).collect::<Vec<_>>())
+            .unwrap();
+        assert_eq!(
+            count(&store),
+            15,
+            "mid-seal, records in the slot are still found"
+        );
+
+        // Finishing the seal publishes them and empties the slot in one step: still
+        // fifteen, not twenty-five.
+        let chunk = lock(&store.writer).sealing.take().unwrap();
+        lock(&store.writer).buffer.restore(chunk);
+        store.seal_now().unwrap();
+        assert_eq!(count(&store), 15);
+        assert!(lock(&store.writer).sealing.is_none());
+    }
 }
