@@ -78,10 +78,33 @@ pub(super) const ENV_KEYS: &[(&str, &str)] = &[
         "TELEMETRYD_LIMITS_INGEST_QUEUE_DEPTH",
         "limits.ingest_queue_depth",
     ),
+    ("TELEMETRYD_LIMITS_INGEST_MEMORY", "limits.ingest_memory"),
+    (
+        "TELEMETRYD_LIMITS_MAX_QUERY_SAMPLES",
+        "limits.max_query_samples",
+    ),
+    (
+        "TELEMETRYD_LIMITS_SERIES_IDLE_AFTER",
+        "limits.series_idle_after",
+    ),
+    (
+        "TELEMETRYD_LIMITS_WHEN_SERIES_FULL",
+        "limits.when_series_full",
+    ),
+    (
+        "TELEMETRYD_LIMITS_QUERY_CONCURRENCY",
+        "limits.query_concurrency",
+    ),
+    (
+        "TELEMETRYD_LIMITS_EXPORT_CONCURRENCY",
+        "limits.export_concurrency",
+    ),
     (
         "TELEMETRYD_INGEST_TRUNCATE_OVERSIZED_BODIES",
         "ingest.truncate_oversized_bodies",
     ),
+    // A list: `["service_name", "k8s_namespace_name"]`, as in the file.
+    ("TELEMETRYD_INGEST_STREAM_LABELS", "ingest.stream_labels"),
     // Cbox ID / OIDC. Absent until now, which meant the one deployment shape that
     // most needs env-only configuration — a container — could not turn SSO on at all
     // without baking a file into the image.
@@ -131,6 +154,14 @@ pub fn env_var_path(var: &str) -> Option<&'static str> {
         .find(|(name, _)| *name == var)
         .map(|(_, path)| *path)
 }
+/// Variables `install.sh` reads. Not settings of the server, and not typos of one.
+const INSTALLER_VARS: [&str; 4] = [
+    "TELEMETRYD_VERSION",
+    "TELEMETRYD_INSTALL_DIR",
+    "TELEMETRYD_TARGET",
+    "TELEMETRYD_NO_VERIFY",
+];
+
 /// A `TELEMETRYD_*` variable that matches nothing is almost always a typo. Ignoring it
 /// silently means the operator believes a setting is applied when it is not.
 pub(super) fn unknown_env_var_warnings() -> Vec<String> {
@@ -138,13 +169,70 @@ pub(super) fn unknown_env_var_warnings() -> Vec<String> {
         .map(|(key, _)| key)
         .filter(|key| key.starts_with("TELEMETRYD_"))
         .filter(|key| !ENV_KEYS.iter().any(|(var, _)| var == key))
+        // install.sh's own settings, which a shell may well still have exported.
+        .filter(|key| !INSTALLER_VARS.contains(&key.as_str()))
         .map(|key| {
             format!(
                 "unrecognised environment variable {key} has no effect \
-                 (see docs/CONFIGURATION.md for the supported names)"
+                 (see docs/configuration/reference.md for the supported names)"
             )
         })
         .collect();
     warnings.sort();
     warnings
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// Every setting can be set from the environment, under the name the documented
+    /// rule gives it: `TELEMETRYD_` and the path, upper-cased, dots as underscores.
+    ///
+    /// The table is written by hand, and five `limits.*` keys were left out of it — so
+    /// `TELEMETRYD_LIMITS_QUERY_CONCURRENCY` did nothing but earn a warning, in a
+    /// container where the environment is the only configuration there is. This walks
+    /// the settings themselves, so a key added later cannot be missed.
+    #[test]
+    fn every_setting_has_its_environment_variable() {
+        fn leaves(prefix: &str, value: &serde_json::Value, out: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(map) if !map.is_empty() => {
+                    for (key, value) in map {
+                        let path = if prefix.is_empty() {
+                            key.clone()
+                        } else {
+                            format!("{prefix}.{key}")
+                        };
+                        leaves(&path, value, out);
+                    }
+                }
+                _ => out.push(prefix.to_owned()),
+            }
+        }
+        let mut paths = Vec::new();
+        leaves(
+            "",
+            &serde_json::to_value(crate::config::Config::default()).unwrap(),
+            &mut paths,
+        );
+        // Credentials bound to app names, a list of tables: a file is where those
+        // belong, and the environment spelling of one would be unreadable.
+        let file_only = ["relay.client"];
+        let missing: Vec<String> = paths
+            .iter()
+            .filter(|path| !file_only.contains(&path.as_str()))
+            .filter(|path| !ENV_KEYS.iter().any(|(_, mapped)| mapped == path))
+            .cloned()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "settings with no environment variable: {missing:?}"
+        );
+        for (var, path) in ENV_KEYS {
+            let expected = format!("TELEMETRYD_{}", path.to_uppercase().replace('.', "_"));
+            assert_eq!(*var, expected, "{path} is set by {var}");
+        }
+    }
 }

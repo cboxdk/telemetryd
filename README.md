@@ -36,7 +36,7 @@ laptop. It targets that case completely rather than scaling to a large fleet.
 
 **Single-node is a design choice, not a limitation we plan to remove.** It is what
 lets us delete sharding, consensus, object-store tiering and a query scheduler — and
-ship one 2.6 MB binary instead of a stack of services to operate. If you outgrow one
+ship one static binary — about 15 MB — instead of a stack of services to operate. If you outgrow one
 node, you have outgrown telemetryd, and we would rather say so than pretend
 otherwise.
 

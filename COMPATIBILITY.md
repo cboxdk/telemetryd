@@ -133,10 +133,14 @@ request must not be able to buy more memory than an uncompressed one.
 **It bounds the body, not the memory the body costs.** An empty container is cheap to
 encode and not free to represent: measured, 16 MiB of empty protobuf messages reached
 801 MB resident, and the same shape in JSON reached 111 MB, because two bytes on the wire
-become a struct in a vector. Any repeated field past 100,000 elements is now refused with
-a `400` naming the field and telling you to split the batch — far above a real batch, far
-below what it takes to hurt. Refused rather than truncated, so a shortened batch is never
-mistaken for a complete one.
+become a struct in a vector. So what a body may parse into is bounded too: a protobuf
+body may expand to 32 times its size while it is parsed (at least 4 MiB, at most
+256 MiB), and a JSON body may hold one object for every eight bytes (at least 10,000, at
+most 900,000). Real payloads sit far inside both — they expand about tenfold — and the
+floods that hurt sit far outside. Past either, the request is refused with a `400`
+telling you to split the batch. Refused rather than truncated, so a shortened batch is
+never mistaken for a complete one. What it decodes into is then bounded again, per
+request by `limits.max_decoded_bytes` and across requests by `limits.ingest_memory`.
 
 Accepted beyond the strict spec, because real producers send it:
 
@@ -298,7 +302,7 @@ default, `{service_name=~".+"}`, satisfies this.
 
 `GET /api/echo` answers `echo`, which is what Grafana's Tempo datasource checks on
 "Save & test". It sits behind the query token, so the check also proves the credential.
-`GET /ready` answers without a token, for probes.
+`GET /ready` answers without a token, for probes: `200 ready` while writes are accepted, `503` with the reason while they are refused — a failing seal with the buffer full, or a relay backlog filling the disk budget. `GET /healthz` is liveness and always answers `200`.
 
 | Endpoint | Used by | Notes |
 |---|---|---|
@@ -406,6 +410,12 @@ Names written before the upgrade keep their old spelling until retention removes
 a range that straddles it has both. Nothing needs to be done about that beyond waiting.
 
 ### PromQL subset
+
+Answers are held to Prometheus's own: `crates/query/tests/conformance/promql.json` is a
+promtool test file whose expectations Prometheus wrote, CI asks Prometheus for them again
+on every run, and telemetryd must give the same answer by each of its three read paths.
+Forty-four expressions across rates and increases with counter resets, aggregations,
+`topk`/`bottomk`, histogram quantiles, offsets, staleness, gaps and operator precedence.
 
 Driven by what `PromqlCompiler` actually generates:
 

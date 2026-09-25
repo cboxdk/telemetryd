@@ -52,12 +52,14 @@ Download the `.deb` for your architecture from the
 [releases page](https://github.com/cboxdk/telemetryd/releases) and install it:
 
 ```bash
-sudo dpkg -i telemetryd_0.20.9_amd64.deb
+sudo dpkg -i telemetryd_0.64.0_amd64.deb
 sudo systemctl enable --now telemetryd
 ```
 
 The package creates an unprivileged `telemetryd` user, a state directory at
-`/var/lib/telemetryd`, and a hardened systemd unit.
+`/var/lib/telemetryd`, a hardened systemd unit, and — on first install only —
+`/etc/telemetryd/telemetryd.toml` from the example beside it, readable by root and the
+service user. Upgrades leave that file alone; it is yours from then on.
 
 **There is no hosted apt repository**, deliberately. Running one means running signing
 infrastructure and keeping it available; for a project at this scale a signed release
@@ -147,7 +149,10 @@ cd telemetryd
 cargo build --release
 ```
 
-Needs Rust 1.89+ and nothing else — there are no C dependencies in the tree.
+Needs Rust 1.89 or newer and a C compiler: zstd and `ring`, the TLS library's
+cryptography, are built from C and assembly. Nothing is linked from the system — the
+release binaries are static — so there is no library to install on the machine that runs
+it.
 
 ## Verifying what you got
 
@@ -162,12 +167,6 @@ binary.
 Every release also publishes `SHA256SUMS` and `sbom.json`, a CycloneDX 1.5 manifest of
 everything linked into the binary.
 
-## Signing
-
-Not yet in place. Releases carry checksums, which protect against a corrupted download
-but not against a compromised release. Named here as a known gap rather than implied to
-be covered by an unsigned checksum file.
-\n
 ## Is there a newer one?
 
 ```bash

@@ -18,9 +18,16 @@ which is what makes a container configurable with no file at all — see
 
 The one exception is `[[relay.client]]`, a list of tables with no sensible flat
 spelling. Mount a config file for it; its values are credentials, so that is where they
-belong. The variable names are a table rather than a mechanical transformation, so a
-misspelled `TELEMETRYD_*` variable is a startup error instead of a setting that silently
-does nothing.
+belong. Lists take the file's spelling: `TELEMETRYD_INGEST_STREAM_LABELS='["service_name",
+"k8s_namespace_name"]'`.
+
+A `TELEMETRYD_*` variable that names no setting is almost always a typo, and a typo that
+did nothing in silence would leave you believing a setting was applied. It is named in a
+warning when the server starts and by `telemetryd validate`. A warning rather than an
+error, because `install.sh` reads variables of the same prefix
+(`TELEMETRYD_VERSION`, `TELEMETRYD_INSTALL_DIR`, `TELEMETRYD_TARGET`,
+`TELEMETRYD_NO_VERIFY`) that a shell may still have exported; those four are not warned
+about.
 
 Durations are humantime strings (`500ms`, `30s`, `7d`). Sizes are byte strings
 (`64MiB`, `10GiB`). Unknown keys are a startup error.
@@ -58,8 +65,8 @@ dangerous outcome, and it is the one case that cannot happen.
 listen           = "127.0.0.1:4319"  # one port: ingest + query + UI APIs
 insecure         = false             # allow non-loopback bind with a surface left unguarded
 max_body_bytes   = "16MiB"           # per ingest request, before *and* after decompression
-                                     # bounds the body; a repeated field is separately
-                                     # capped at 100,000 elements — see COMPATIBILITY.md
+                                     # bounds the body; what it parses into is bounded
+                                     # separately — see COMPATIBILITY.md
 request_timeout  = "30s"
 shutdown_grace   = "15s"             # drain in-flight requests, then flush WAL
 
@@ -146,6 +153,15 @@ max_request_bytes     = "4MiB"       # segments are split into requests this siz
 # [[relay.client]]
 # app   = "mobile-ios"
 # token = "file:/run/secrets/mobile-ios"
+
+[ingest]
+# Resource attributes that become stream labels, beside `app` and `level`. The
+# cardinality contract: anything not listed is still stored and filterable, it just
+# does not start a stream. Never list per-process or per-deploy values (host.id,
+# process.pid, container.id).
+stream_labels = ["service_name", "service_namespace", "service_version",
+                 "deployment_environment", "deployment_environment_name"]
+truncate_oversized_bodies = true     # cut an over-long body, marked and counted, rather than refuse the record
 
 [log]                                # telemetryd's own logging
 level  = "info"                      # trace | debug | info | warn | error

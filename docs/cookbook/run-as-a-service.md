@@ -90,7 +90,9 @@ nothing answered. telemetryd was not killed, because nothing had told the kernel
 allowed to be.
 
 `MemoryMax` is the wall: past it the kernel kills telemetryd, `Restart=on-failure` brings
-it back, and the machine is never the thing that dies.
+it back, and the machine is never the thing that dies. `MemorySwapMax=0` beside it keeps
+the wall where it is: with swap enabled the limit counts resident pages only, and a
+process at it pages out instead of being stopped.
 
 **There is deliberately no `MemoryHigh`.** It throttles rather than fails, and a process
 that genuinely needs more than the soft limit does not fail — it is held just underneath
@@ -196,10 +198,28 @@ curl -fsS http://127.0.0.1:4319/           # what this server is, and its routes
 this machine's own configuration. Against a remote URL it will ask, because sending a
 local credential to another host is not something a convenience should do quietly.
 
-`/healthz` is unauthenticated by design and is the right target for a supervisor probe.
+`/healthz` is unauthenticated by design and is the right target for a supervisor probe:
+it answers while the process is alive. `/ready` is the one for a load balancer — it
+answers `503` with the reason while writes are being refused, so traffic goes elsewhere
+rather than to an instance that would refuse it.
 `/` is open too and names the product, its version and its routes — no token, and
 nothing about what this instance holds. `/status` and `/metrics` require the admin
 token, falling back to the query token when no admin token is set.
+
+## What to alert on
+
+`/metrics` is Prometheus text; point a scrape at it with the admin token. The numbers
+that say this instance is in trouble before its users do:
+
+| Metric | Worth an alert when |
+|---|---|
+| `process_resident_memory_bytes` | it nears the unit's `MemoryMax` |
+| `telemetryd_ingest_memory_bytes` / `telemetryd_ingest_memory_limit_bytes` | the ratio stays high: senders are being told to wait |
+| `telemetryd_ingest_in_flight` / `telemetryd_ingest_queue_depth` | the same, for request count |
+| `telemetryd_ingest_rejected_total` | it rises; the `reason` label says why |
+| `telemetryd_http_request_duration_seconds` | `histogram_quantile(0.95, …)` for query routes climbs |
+| `telemetryd_storage_over_budget` | it is 1 |
+| `telemetryd_segments_unreadable_total` | it rises at all |
 
 ## Changing configuration afterwards
 
