@@ -258,3 +258,59 @@ fn a_segment_from_before_these_fields_existed_still_reads() {
         "a segment with no trigram index must not be pruned away"
     );
 }
+
+/// A segment that cannot be *opened* just now — out of descriptors, a permission slip,
+/// a device hiccup — is not a damaged one. The query fails with an error a client
+/// retries, and the segment is read again once it can be. It used to be written off as
+/// unreadable for the life of the process, and every later answer lacked its rows.
+#[cfg(unix)]
+#[test]
+fn a_segment_that_cannot_be_opened_is_retried_not_written_off() {
+    use std::os::unix::fs::PermissionsExt;
+    let harness = Harness::new();
+    let store = harness.open();
+    store
+        .append(&(0..10).map(record).collect::<Vec<_>>())
+        .unwrap();
+    let segment = store.seal_now().unwrap().unwrap();
+    let data = segment.dir.join("data.parquet");
+
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(
+        store
+            .scan(Scan::range(0, u64::MAX), &[], &|_| true)
+            .is_err()
+    );
+    assert!(!segment.is_unreadable(), "a failed open is not damage");
+
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        store
+            .scan(Scan::range(0, u64::MAX), &[], &|_| true)
+            .unwrap()
+            .len(),
+        10
+    );
+}
+
+/// A segment retention deletes while a query is on its way to it was meant to go; the
+/// query answers with what is left instead of failing.
+#[test]
+fn a_segment_deleted_under_a_query_is_skipped() {
+    let harness = Harness::new();
+    let store = harness.open();
+    store
+        .append(&(0..10).map(record).collect::<Vec<_>>())
+        .unwrap();
+    let gone = store.seal_now().unwrap().unwrap();
+    store
+        .append(&(10..20).map(record).collect::<Vec<_>>())
+        .unwrap();
+    store.seal_now().unwrap().unwrap();
+
+    std::fs::remove_dir_all(&gone.dir).unwrap();
+    let left = store
+        .scan(Scan::range(0, u64::MAX), &[], &|_| true)
+        .unwrap();
+    assert_eq!(left.len(), 10);
+}

@@ -840,7 +840,7 @@ impl<S: RecordSchema> RecordStore<S> {
         let workers = self.scan_workers(&request, segments.len());
         if workers <= 1 {
             for (ordinal, segment) in segments.iter().enumerate() {
-                self.scan_segment(segment, ordinal, &request, matchers, extra, &mut collector);
+                self.scan_segment(segment, ordinal, &request, matchers, extra, &mut collector)?;
                 Self::over_ceiling(&request, collector.len())?;
             }
             return Ok(collector.into_sorted());
@@ -869,6 +869,8 @@ impl<S: RecordSchema> RecordStore<S> {
         // of 200,001 — and was refused only after the memory was spent.
         let held = std::sync::atomic::AtomicUsize::new(0);
         let over = std::sync::atomic::AtomicBool::new(false);
+        // The first read that failed for a reason worth retrying; it ends every worker.
+        let failed: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
 
         std::thread::scope(|scope| {
             for _ in 0..workers {
@@ -894,7 +896,13 @@ impl<S: RecordSchema> RecordStore<S> {
                         }
 
                         let before = local.len();
-                        self.scan_segment(segment, index, &request, matchers, extra, &mut local);
+                        if let Err(error) =
+                            self.scan_segment(segment, index, &request, matchers, extra, &mut local)
+                        {
+                            lock(&failed).get_or_insert(error);
+                            over.store(true, Ordering::Relaxed);
+                            break;
+                        }
                         let grown = local.len().saturating_sub(before);
                         let now = held.fetch_add(grown, Ordering::Relaxed) + grown;
                         if request.abort_over != 0 && now > request.abort_over {
@@ -908,6 +916,9 @@ impl<S: RecordSchema> RecordStore<S> {
             }
         });
 
+        if let Some(error) = lock(&failed).take() {
+            return Err(error);
+        }
         if over.load(Ordering::Relaxed) {
             Self::over_ceiling(&request, held.load(Ordering::Relaxed))?;
         }
@@ -973,7 +984,7 @@ impl<S: RecordSchema> RecordStore<S> {
         matchers: &[LabelMatcher],
         extra: &(dyn Fn(&S::Record) -> bool + Sync),
         collector: &mut TopK<S::Record>,
-    ) {
+    ) -> Result<()> {
         // Buffer chunks occupy the low positions, so sealed segments continue above
         // them. Setting it here rather than in each driver is what makes the sequential
         // and parallel paths produce the same answer instead of two defensible ones.
@@ -1012,7 +1023,7 @@ impl<S: RecordSchema> RecordStore<S> {
 
         if prunable {
             self.stats.segments_pruned.fetch_add(1, Ordering::Relaxed);
-            return;
+            return Ok(());
         }
         self.stats.segments_scanned.fetch_add(1, Ordering::Relaxed);
 
@@ -1037,7 +1048,7 @@ impl<S: RecordSchema> RecordStore<S> {
             self.stats
                 .segments_unreadable
                 .fetch_add(1, Ordering::Relaxed);
-            return;
+            return Ok(());
         }
 
         let outcome = segment.scan_batches_where(Some(selection), |batch| {
@@ -1062,21 +1073,38 @@ impl<S: RecordSchema> RecordStore<S> {
             Ok(Flow::Continue)
         });
 
-        if let Err(error) = outcome {
-            if segment.mark_unreadable() {
-                tracing::error!(
-                    signal = %S::SIGNAL,
-                    segment = %manifest.id,
-                    rows = manifest.rows,
-                    %error,
-                    "segment is unreadable and will be skipped by every query from now \
-                     on; the data in it is lost. Delete the segment directory to stop \
-                     this being reported."
-                );
+        match outcome {
+            Ok(()) => Ok(()),
+            // Deleted by retention while this query was on its way to it: the data was
+            // meant to go, and the answer is what is left.
+            Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                Ok(())
             }
-            self.stats
-                .segments_unreadable
-                .fetch_add(1, Ordering::Relaxed);
+            // Could not open or read it just now — out of descriptors, a device
+            // hiccup. That says nothing about the file, so it is not written off: the
+            // query fails with an error the client retries. It used to be marked
+            // unreadable for the life of the process, and every later answer quietly
+            // lacked its rows.
+            Err(error @ Error::Io { .. }) => Err(error),
+            // The file itself is damaged. Skipped — one bad segment must not deny every
+            // healthy one in the range — said once, and counted.
+            Err(error) => {
+                if segment.mark_unreadable() {
+                    tracing::error!(
+                        signal = %S::SIGNAL,
+                        segment = %manifest.id,
+                        rows = manifest.rows,
+                        %error,
+                        "segment is unreadable and will be skipped by every query from now \
+                         on; the data in it is lost. Delete the segment directory to stop \
+                         this being reported."
+                    );
+                }
+                self.stats
+                    .segments_unreadable
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
         }
     }
 
