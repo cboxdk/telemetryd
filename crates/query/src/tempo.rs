@@ -32,6 +32,8 @@ pub struct SearchParams {
     pub limit: Option<String>,
     /// Accepted and ignored — Tempo's legacy tag syntax, superseded by `q`.
     pub tags: Option<String>,
+    /// `resource`, `span` or `intrinsic` on the v2 tag listing; absent means all.
+    pub scope: Option<String>,
     #[serde(rename = "minDuration")]
     pub min_duration: Option<String>,
     #[serde(rename = "maxDuration")]
@@ -214,6 +216,18 @@ pub struct SearchMetrics {
 pub struct TagsResponse {
     #[serde(rename = "tagNames")]
     pub tag_names: Vec<String>,
+}
+
+/// `GET /api/v2/search/tags`.
+#[derive(Debug, Serialize)]
+pub struct TagScopesResponse {
+    pub scopes: Vec<TagScope>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TagScope {
+    pub name: &'static str,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -491,20 +505,67 @@ pub fn tags(
     start_nanos: u64,
     end_nanos: u64,
 ) -> Result<TagsResponse> {
-    let mut names: BTreeSet<String> = store
-        .label_names(start_nanos, end_nanos)
-        .into_iter()
-        .collect();
-
-    for span in store.scan(newest(start_nanos, end_nanos), &[], &|_| true)? {
-        names.extend(span.attributes.names().map(str::to_owned));
+    let scoped = scoped_tags(store, start_nanos, end_nanos)?;
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for (_, tags) in scoped {
+        names.extend(tags);
     }
-    // Intrinsics are filterable, so they belong in the tag list a UI offers.
-    names.extend(["name", "status", "duration", "kind"].map(str::to_owned));
-
     Ok(TagsResponse {
         tag_names: names.into_iter().collect(),
     })
+}
+
+/// `GET /api/v2/search/tags` — the same names, grouped by TraceQL scope.
+///
+/// Grafana's Tempo datasource reads only `scopes` from this path, and because the call
+/// succeeds it never falls back to v1; answering with the v1 shape left its query builder
+/// and autocomplete empty. `scope` narrows the answer to one of `resource`, `span` or
+/// `intrinsic`, as Tempo's does.
+pub fn tags_v2(
+    store: &RecordStore<SpanSchema>,
+    start_nanos: u64,
+    end_nanos: u64,
+    scope: Option<&str>,
+) -> Result<TagScopesResponse> {
+    let wanted = scope
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "all");
+    let scopes = scoped_tags(store, start_nanos, end_nanos)?
+        .into_iter()
+        .filter(|(name, _)| wanted.is_none_or(|w| w.eq_ignore_ascii_case(name)))
+        .map(|(name, tags)| TagScope {
+            name,
+            tags: tags.into_iter().collect(),
+        })
+        .collect();
+    Ok(TagScopesResponse { scopes })
+}
+
+/// Tag names by scope: stream labels are the resource, span attributes are the span,
+/// and the intrinsics every span has.
+fn scoped_tags(
+    store: &RecordStore<SpanSchema>,
+    start_nanos: u64,
+    end_nanos: u64,
+) -> Result<Vec<(&'static str, BTreeSet<String>)>> {
+    let resource: BTreeSet<String> = store
+        .label_names(start_nanos, end_nanos)
+        .into_iter()
+        .collect();
+    let mut span: BTreeSet<String> = BTreeSet::new();
+    for record in store.scan(newest(start_nanos, end_nanos), &[], &|_| true)? {
+        span.extend(record.attributes.names().map(str::to_owned));
+    }
+    // Intrinsics are filterable, so they belong in the tag list a UI offers.
+    let intrinsic: BTreeSet<String> = ["name", "status", "duration", "kind"]
+        .map(str::to_owned)
+        .into_iter()
+        .collect();
+    Ok(vec![
+        ("resource", resource),
+        ("span", span),
+        ("intrinsic", intrinsic),
+    ])
 }
 
 /// `GET /api/v2/search/tag/{name}/values`
@@ -699,5 +760,164 @@ mod tests {
         // Nanoseconds as a string: the UI does intdiv() on it.
         assert!(json["traces"][0]["startTimeUnixNano"].is_string());
         assert!(json["traces"][0]["spanSets"].is_array());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Protobuf, for Grafana
+// ---------------------------------------------------------------------------
+
+/// Grafana's Tempo datasource asks for traces with `Accept: application/protobuf` and
+/// decodes the body with `proto.Unmarshal` whatever its content type — it tries
+/// `/api/v2/traces/{id}` first and falls back to `/api/traces/{id}` only on a 404. JSON
+/// therefore never worked there: the trace view failed on every trace.
+///
+/// `tempopb.Trace` is `repeated ResourceSpans resourceSpans = 1`, which is byte for
+/// byte OTLP's `TracesData`, so these are the OTLP field numbers the ingest decoder reads.
+impl TraceResponse {
+    /// `tempopb.Trace`, for `/api/traces/{id}`.
+    #[must_use]
+    pub fn to_protobuf(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for batch in &self.batches {
+            pb::message(&mut out, 1, &batch.to_protobuf());
+        }
+        out
+    }
+
+    /// `tempopb.TraceByIDResponse`, for `/api/v2/traces/{id}`: the trace under field 1.
+    #[must_use]
+    pub fn to_protobuf_v2(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        pb::message(&mut out, 1, &self.to_protobuf());
+        out
+    }
+}
+
+impl ResourceSpans {
+    fn to_protobuf(&self) -> Vec<u8> {
+        let mut resource = Vec::new();
+        for kv in &self.resource.attributes {
+            pb::message(&mut resource, 1, &kv.to_protobuf());
+        }
+        let mut out = Vec::new();
+        pb::message(&mut out, 1, &resource);
+        for scope in &self.scope_spans {
+            // The instrumentation scope, always present even when empty. Grafana reads
+            // `scope.Name` without checking for nil, so leaving an empty scope out — which
+            // proto3 would allow — panicked its trace transform on every trace. Found by
+            // running Grafana 12.2 against this, not by reading.
+            let mut encoded = Vec::new();
+            pb::message(&mut encoded, 1, &[]);
+            for span in &scope.spans {
+                pb::message(&mut encoded, 2, &span.to_protobuf());
+            }
+            pb::message(&mut out, 2, &encoded);
+        }
+        out
+    }
+}
+
+impl SpanJson {
+    fn to_protobuf(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        pb::bytes(&mut out, 1, &pb::hex(&self.trace_id));
+        pb::bytes(&mut out, 2, &pb::hex(&self.span_id));
+        pb::bytes(&mut out, 4, &pb::hex(&self.parent_span_id));
+        pb::string(&mut out, 5, &self.name);
+        pb::uint(&mut out, 6, u64::try_from(self.kind).unwrap_or(0));
+        pb::fixed64(&mut out, 7, self.start_time_unix_nano.parse().unwrap_or(0));
+        pb::fixed64(&mut out, 8, self.end_time_unix_nano.parse().unwrap_or(0));
+        for kv in &self.attributes {
+            pb::message(&mut out, 9, &kv.to_protobuf());
+        }
+        for event in &self.events {
+            let mut encoded = Vec::new();
+            pb::fixed64(&mut encoded, 1, event.time_unix_nano.parse().unwrap_or(0));
+            pb::string(&mut encoded, 2, &event.name);
+            for kv in &event.attributes {
+                pb::message(&mut encoded, 3, &kv.to_protobuf());
+            }
+            pb::message(&mut out, 11, &encoded);
+        }
+        let mut status = Vec::new();
+        pb::string(&mut status, 2, &self.status.message);
+        pb::uint(&mut status, 3, u64::try_from(self.status.code).unwrap_or(0));
+        pb::message(&mut out, 15, &status);
+        out
+    }
+}
+
+impl TempoKeyValue {
+    fn to_protobuf(&self) -> Vec<u8> {
+        let mut value = Vec::new();
+        pb::string(&mut value, 1, &self.value.string_value);
+        let mut out = Vec::new();
+        pb::string(&mut out, 1, &self.key);
+        pb::message(&mut out, 2, &value);
+        out
+    }
+}
+
+/// The few protobuf writers these messages need. Proto3 omits zero and empty scalars, and
+/// so do these; a nested message is always written, since its presence carries meaning.
+mod pb {
+    pub(super) fn varint(out: &mut Vec<u8>, mut value: u64) {
+        loop {
+            let byte = u8::try_from(value & 0x7f).unwrap_or(0);
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    fn tag(out: &mut Vec<u8>, field: u32, wire: u8) {
+        varint(out, (u64::from(field) << 3) | u64::from(wire));
+    }
+
+    pub(super) fn message(out: &mut Vec<u8>, field: u32, payload: &[u8]) {
+        tag(out, field, 2);
+        varint(out, payload.len() as u64);
+        out.extend_from_slice(payload);
+    }
+
+    pub(super) fn bytes(out: &mut Vec<u8>, field: u32, payload: &[u8]) {
+        if !payload.is_empty() {
+            message(out, field, payload);
+        }
+    }
+
+    pub(super) fn string(out: &mut Vec<u8>, field: u32, text: &str) {
+        bytes(out, field, text.as_bytes());
+    }
+
+    pub(super) fn uint(out: &mut Vec<u8>, field: u32, value: u64) {
+        if value != 0 {
+            tag(out, field, 0);
+            varint(out, value);
+        }
+    }
+
+    pub(super) fn fixed64(out: &mut Vec<u8>, field: u32, value: u64) {
+        if value != 0 {
+            tag(out, field, 1);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    /// Ids are hex on the JSON side and raw bytes on the wire. Anything that is not hex
+    /// becomes an absent id rather than a wrong one.
+    pub(super) fn hex(text: &str) -> Vec<u8> {
+        if !text.len().is_multiple_of(2) {
+            return Vec::new();
+        }
+        (0..text.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&text[at..at + 2], 16))
+            .collect::<Result<Vec<u8>, _>>()
+            .unwrap_or_default()
     }
 }
