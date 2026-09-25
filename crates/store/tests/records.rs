@@ -720,3 +720,44 @@ fn a_failing_seal_is_contained() {
     store.seal_now().unwrap().expect("a segment");
     store.append(&batch(10_000)).unwrap();
 }
+
+/// A log directory that comes up empty — cleared by hand, left out of a restore — must
+/// not number its new epochs from 1. Replay skips every epoch a sealed segment covers,
+/// so records written into them after such a restart vanished at the next one.
+#[test]
+fn an_emptied_log_directory_does_not_reuse_sealed_epochs() {
+    let harness = Harness::new();
+    {
+        let store = harness.open();
+        for round in 0..3u64 {
+            store
+                .append(
+                    &(round * 10..round * 10 + 10)
+                        .map(|i| record(i, "checkout", Severity::Info, "sealed"))
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            store.seal_now().unwrap();
+        }
+    }
+    for entry in std::fs::read_dir(harness.wal_dir()).unwrap() {
+        std::fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    {
+        let store = harness.open();
+        store
+            .append(
+                &(100..105)
+                    .map(|i| record(i, "checkout", Severity::Info, "after"))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        store.sync().unwrap();
+    }
+    let reopened = harness.open();
+    assert_eq!(
+        all(&reopened).len(),
+        35,
+        "the five written after the restart survive"
+    );
+}

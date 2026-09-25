@@ -452,11 +452,12 @@ impl<S: RecordSchema> RecordStore<S> {
             }
         })?;
 
-        let wal = Wal::open(
+        let wal = Wal::open_after(
             wal_dir,
             settings.wal_sync,
             settings.wal_sync_interval,
             settings.max_segment_bytes,
+            sealed_through,
         )?;
 
         if !buffer.is_empty() {

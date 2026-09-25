@@ -70,11 +70,32 @@ impl Wal {
         sync_interval: Duration,
         max_segment_bytes: u64,
     ) -> Result<Self> {
+        Self::open_after(dir, sync, sync_interval, max_segment_bytes, 0)
+    }
+
+    /// As [`Self::open`], never writing into an epoch at or below `sealed_through` —
+    /// the highest one a sealed segment already covers.
+    ///
+    /// Replay skips those epochs, since their records are in segments. A log directory
+    /// that came up empty — emptied by hand, restored from a backup without it —
+    /// started again at 1, so new records went into epochs replay would skip and a
+    /// crash lost them.
+    pub fn open_after(
+        dir: impl AsRef<Path>,
+        sync: WalSync,
+        sync_interval: Duration,
+        max_segment_bytes: u64,
+        sealed_through: u64,
+    ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)
             .map_err(|e| Error::io(format!("creating WAL directory {}", dir.display()), e))?;
 
-        let seq = segment_sequences(&dir)?.last().copied().unwrap_or(1);
+        let first_unsealed = sealed_through.saturating_add(1);
+        let seq = segment_sequences(&dir)?
+            .last()
+            .copied()
+            .map_or(first_unsealed, |newest| newest.max(first_unsealed));
         let (file, segment_bytes) = open_segment(&dir, seq)?;
 
         Ok(Self {
