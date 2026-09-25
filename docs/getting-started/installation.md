@@ -29,6 +29,13 @@ TELEMETRYD_VERSION=0.20.9 sh install.sh
 TELEMETRYD_INSTALL_DIR="$HOME/.local/bin" sh install.sh
 ```
 
+Verification fails closed. A release with no `SHA256SUMS`, a checksum file with no line
+for your platform, a machine with no `sha256sum` or `shasum`, or — with `cosign`
+installed — a release with no signature bundle each stop the install with the reason.
+`TELEMETRYD_NO_VERIFY=1` installs anyway and says it did; it is there for releases from
+before signing, not for everyday use. Before 0.62.0 each of these was a note, and the
+install went ahead.
+
 ## Homebrew
 
 ```bash

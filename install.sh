@@ -14,9 +14,22 @@ BIN="telemetryd"
 
 VERSION="${TELEMETRYD_VERSION:-latest}"
 INSTALL_DIR="${TELEMETRYD_INSTALL_DIR:-}"
+# Verification fails closed. Set to 1 to install what cannot be verified — a release
+# from before signing, a machine with no sha256 tool — knowing that it was not.
+NO_VERIFY="${TELEMETRYD_NO_VERIFY:-}"
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# Stop, unless the caller said to install unverified anyway.
+unverified() {
+    if [ "$NO_VERIFY" = "1" ]; then
+        say "warning: $1 — installing unverified because TELEMETRYD_NO_VERIFY=1"
+    else
+        die "$1 — refusing to install unverified.
+  Set TELEMETRYD_NO_VERIFY=1 to install it anyway."
+    fi
+}
 
 need() {
     command -v "$1" >/dev/null 2>&1 || die "this installer needs $1"
@@ -113,7 +126,7 @@ main() {
   The checksum file is not signed by the telemetryd release workflow."
                 say "signature verified"
             else
-                say "note: v$version predates release signing, falling back to checksums"
+                unverified "cosign is installed but v$version has no signature bundle"
             fi
         else
             # Naming a way to get one, because the previous message stopped at the
@@ -124,15 +137,20 @@ main() {
             say "      to check the publisher too: https://github.com/cboxdk/telemetryd/blob/main/docs/getting-started/installation.md#getting-a-verifier"
         fi
 
+        # Each gap used to be a note and an install anyway: no line for this archive,
+        # no tool to hash it, no checksum file at all. An installer that continues past
+        # what it could not check protects nothing, so each is a stop now.
         expected="$(grep " $name.tar.gz\$" "$tmp/SHA256SUMS" | awk '{print $1}' | head -n 1)"
-        if [ -n "$expected" ]; then
+        if [ -z "$expected" ]; then
+            unverified "SHA256SUMS for v$version has no line for $name.tar.gz"
+        else
             if command -v sha256sum >/dev/null 2>&1; then
                 actual="$(sha256sum "$tmp/$name.tar.gz" | awk '{print $1}')"
             elif command -v shasum >/dev/null 2>&1; then
                 actual="$(shasum -a 256 "$tmp/$name.tar.gz" | awk '{print $1}')"
             else
                 actual=""
-                say "warning: no sha256 tool found, skipping checksum verification"
+                unverified "no sha256sum or shasum on this machine to check the download"
             fi
             if [ -n "$actual" ]; then
                 [ "$actual" = "$expected" ] || die "checksum mismatch — refusing to install
@@ -142,7 +160,7 @@ main() {
             fi
         fi
     else
-        say "warning: no SHA256SUMS published for v$version, skipping verification"
+        unverified "no SHA256SUMS is published for v$version"
     fi
 
     tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
