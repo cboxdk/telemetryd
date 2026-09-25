@@ -10,16 +10,15 @@
 //!   ones could not possibly be in the newest hundred.
 //!
 //! These assert the properties rather than the timings. Wall-clock thresholds on a
-//! shared CI runner are how a suite earns a reputation for flaking, so what is checked
-//! is the *ratio* between doing the work alone and doing it under concurrent queries,
-//! with wide margins — a regression to the old behaviour is a factor of two, not a few
-//! percent.
+//! shared CI runner are how a suite earns a reputation for flaking — one here did — so
+//! what is checked is structural: an append completing while a query is held inside
+//! its scan, and how many records a limited query examines.
 
 #![allow(clippy::unwrap_used)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use telemetryd_core::config::{Compression, WalSync};
 use telemetryd_core::{LabelMatcher, Labels, LogRecord, Severity};
@@ -88,67 +87,66 @@ fn newest_hundred() -> Scan<'static> {
 
 /// An append must not wait for a query to finish scanning.
 ///
-/// Measured as the *worst* time a single append blocks, not as average throughput.
-/// Throughput conflates two different things — the reader competing for CPU, which is
-/// unavoidable and small, and the reader holding the append lock, which is the defect.
-/// A ratio test cannot tell them apart, and would have passed on the 45% regression
-/// this exists to catch.
+/// Checked by holding a query *inside* its scan — its record predicate parks until told
+/// to go on — and appending meanwhile. If the scan held the lock appends need, the
+/// append cannot finish until the query does, and the query does not go on until the
+/// append has finished or the wait gives up.
 ///
-/// So the reader sleeps between queries. It uses almost no CPU, and any append delay
-/// that remains is the lock.
+/// It used to be measured: the worst time one append blocked while a reader scanned,
+/// against 20 ms. That was right about the defect and wrong about CI, where a busy
+/// runner can stall any thread for 20 ms, so the gate failed now and then for nothing.
+/// Holding the scan open answers the same question with no clock in it.
 #[test]
 fn an_append_does_not_wait_for_a_query() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(store(tmp.path()));
+    store
+        .append(&(0..10_000).map(record).collect::<Vec<_>>())
+        .unwrap();
 
-    // A buffer big enough that scanning all of it is clearly measurable — which is
-    // exactly what the old implementation did on every query, while holding the lock.
-    let batch: Vec<LogRecord> = (0..300_000).map(record).collect();
-    store.append(&batch).unwrap();
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let queries = Arc::new(AtomicU64::new(0));
+    let (inside, in_scan) = std::sync::mpsc::channel::<()>();
+    let (appended, append_done) = std::sync::mpsc::channel::<()>();
+    let append_done = std::sync::Mutex::new(append_done);
+    let finished_while_scanning = Arc::new(AtomicBool::new(false));
     let reader = {
-        let (store, stop, queries) = (store.clone(), stop.clone(), queries.clone());
+        let (store, finished) = (Arc::clone(&store), Arc::clone(&finished_while_scanning));
         std::thread::spawn(move || {
-            let matchers = [LabelMatcher::equal("app", "checkout")];
-            while !stop.load(Ordering::Relaxed) {
-                store.scan(newest_hundred(), &matchers, &|_| true).unwrap();
-                queries.fetch_add(1, Ordering::Relaxed);
-                std::thread::sleep(Duration::from_millis(2));
-            }
+            let parked = AtomicBool::new(false);
+            let predicate = |_: &LogRecord| {
+                if !parked.swap(true, Ordering::Relaxed) {
+                    inside.send(()).unwrap();
+                    let waited = append_done
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10));
+                    finished.store(waited.is_ok(), Ordering::Relaxed);
+                }
+                true
+            };
+            store
+                .scan(Scan::range(0, u64::MAX), &[], &predicate)
+                .unwrap();
         })
     };
 
-    let mut worst = Duration::ZERO;
-    for i in 0..400u64 {
-        let started = Instant::now();
-        store.append(&[record(300_000 + i)]).unwrap();
-        worst = worst.max(started.elapsed());
-        std::thread::sleep(Duration::from_millis(1));
-    }
-
-    stop.store(true, Ordering::Relaxed);
+    in_scan.recv().unwrap();
+    store.append(&[record(10_000)]).unwrap();
+    // Only sent once the append is back. If it could not get the lock, the reader gave
+    // up waiting first, and the flag says so.
+    let _ = appended.send(());
     reader.join().unwrap();
     assert!(
-        queries.load(Ordering::Relaxed) > 10,
-        "the reader barely ran ({} queries), so this measured nothing",
-        queries.load(Ordering::Relaxed)
-    );
-
-    // Appending one record is microseconds of work. Scanning 300k buffered records is
-    // tens of milliseconds, and under the old buffer an append that landed during a
-    // scan waited for all of it. 20 ms is far above the real cost and far below that.
-    assert!(
-        worst < Duration::from_millis(20),
-        "an append blocked for {worst:?} while a query was running —          queries are holding the append lock again"
+        finished_while_scanning.load(Ordering::Relaxed),
+        "an append waited for a query to finish scanning — queries are holding the append \
+         lock again"
     );
 }
 
-/// A limited query must not get slower as the buffer fills.
+/// A limited query must not examine more of the buffer as the buffer fills.
 ///
-/// Without time bounds on the buffer chunks its cost was linear in everything buffered,
-/// so this compares a small buffer against one twenty times the size.
+/// Without time bounds on the buffer chunks its cost was linear in everything buffered.
+/// Counted as the records it looks at, rather than timed: a count cannot flake, and it
+/// is the thing the chunk bounds exist to keep small.
 #[test]
 fn a_limited_query_does_not_scale_with_the_buffer() {
     let tmp = tempfile::tempdir().unwrap();
@@ -157,30 +155,34 @@ fn a_limited_query_does_not_scale_with_the_buffer() {
 
     let batch: Vec<LogRecord> = (0..20_000).map(record).collect();
     store.append(&batch).unwrap();
-    let small = time_queries(&store, &matchers);
+    let small = examined(&store, &matchers);
 
     let batch: Vec<LogRecord> = (20_000..400_000).map(record).collect();
     store.append(&batch).unwrap();
-    let large = time_queries(&store, &matchers);
+    let large = examined(&store, &matchers);
 
-    // Twenty times the data. A linear scan would be ~20x slower; pruning should keep
-    // this near flat, so 5x is a generous ceiling that still catches the regression.
+    // Twenty times the data. A walk of everything examines twenty times as many; the
+    // newest hundred sit in the newest chunk or two whatever the size.
     assert!(
-        large < small * 5 + Duration::from_millis(5),
-        "query cost scales with buffer size: {small:?} at 20k records, {large:?} at 400k"
+        large <= small * 2,
+        "a limited query looked at {small} records of 20k and {large} of 400k"
+    );
+    assert!(
+        large < 20_000,
+        "{large} records examined for the newest hundred"
     );
 }
 
-fn time_queries(store: &RecordStore<LogSchema>, matchers: &[LabelMatcher]) -> Duration {
-    // Warm once so the first call's allocations are not attributed to the measurement.
-    store.scan(newest_hundred(), matchers, &|_| true).unwrap();
-
-    let started = Instant::now();
-    for _ in 0..20 {
-        let found = store.scan(newest_hundred(), matchers, &|_| true).unwrap();
-        assert_eq!(found.len(), 100);
-    }
-    started.elapsed() / 20
+fn examined(store: &RecordStore<LogSchema>, matchers: &[LabelMatcher]) -> u64 {
+    let seen = AtomicU64::new(0);
+    let found = store
+        .scan(newest_hundred(), matchers, &|_| {
+            seen.fetch_add(1, Ordering::Relaxed);
+            true
+        })
+        .unwrap();
+    assert_eq!(found.len(), 100);
+    seen.load(Ordering::Relaxed)
 }
 
 /// Whatever the buffer reports having is what a query can actually see.

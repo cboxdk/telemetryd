@@ -1,0 +1,712 @@
+{
+ "rule_files": [],
+ "evaluation_interval": "15s",
+ "tests": [
+  {
+   "interval": "15s",
+   "input_series": [
+    {
+     "series": "http_requests_total{job=\"api\",code=\"200\",instance=\"a\"}",
+     "values": "0+10x40"
+    },
+    {
+     "series": "http_requests_total{job=\"api\",code=\"500\",instance=\"a\"}",
+     "values": "0+1x40"
+    },
+    {
+     "series": "http_requests_total{job=\"api\",code=\"200\",instance=\"b\"}",
+     "values": "0+20x20 3+20x19"
+    },
+    {
+     "series": "http_requests_total{job=\"web\",code=\"200\",instance=\"c\"}",
+     "values": "5+5x40"
+    },
+    {
+     "series": "http_requests_total{job=\"web\",code=\"500\",instance=\"c\"}",
+     "values": "0 0 1 1 2 2 3 3 4 4 5x30"
+    },
+    {
+     "series": "queue_depth{job=\"api\",instance=\"a\"}",
+     "values": "1 5 3 8 2 9 4x34"
+    },
+    {
+     "series": "queue_depth{job=\"api\",instance=\"b\"}",
+     "values": "40-1x40"
+    },
+    {
+     "series": "queue_depth{job=\"web\",instance=\"c\"}",
+     "values": "-3+0.5x40"
+    },
+    {
+     "series": "latency_seconds_bucket{job=\"api\",le=\"0.1\"}",
+     "values": "0+2x40"
+    },
+    {
+     "series": "latency_seconds_bucket{job=\"api\",le=\"0.5\"}",
+     "values": "0+5x40"
+    },
+    {
+     "series": "latency_seconds_bucket{job=\"api\",le=\"1\"}",
+     "values": "0+7x40"
+    },
+    {
+     "series": "latency_seconds_bucket{job=\"api\",le=\"+Inf\"}",
+     "values": "0+8x40"
+    },
+    {
+     "series": "latency_seconds_bucket{job=\"web\",le=\"0.1\"}",
+     "values": "0+1x40"
+    },
+    {
+     "series": "latency_seconds_bucket{job=\"web\",le=\"0.5\"}",
+     "values": "0+1x40"
+    },
+    {
+     "series": "latency_seconds_bucket{job=\"web\",le=\"1\"}",
+     "values": "0+3x40"
+    },
+    {
+     "series": "latency_seconds_bucket{job=\"web\",le=\"+Inf\"}",
+     "values": "0+4x40"
+    },
+    {
+     "series": "up{job=\"api\",instance=\"a\"}",
+     "values": "1x40"
+    },
+    {
+     "series": "up{job=\"api\",instance=\"b\"}",
+     "values": "1x10 stale"
+    },
+    {
+     "series": "up{job=\"web\",instance=\"c\"}",
+     "values": "0x5 1x35"
+    },
+    {
+     "series": "sparse_total{job=\"batch\"}",
+     "values": "1 _ _ 4 _ 6x5 _ _ _ 20"
+    }
+   ],
+   "promql_expr_test": [
+    {
+     "expr": "rate(http_requests_total[1m])",
+     "eval_time": "5m",
+     "exp_samples": [
+      {
+       "labels": "{code=\"200\", instance=\"a\", job=\"api\"}",
+       "value": 0.6666666666666666
+      },
+      {
+       "labels": "{code=\"200\", instance=\"b\", job=\"api\"}",
+       "value": 1.3333333333333333
+      },
+      {
+       "labels": "{code=\"200\", instance=\"c\", job=\"web\"}",
+       "value": 0.3333333333333333
+      },
+      {
+       "labels": "{code=\"500\", instance=\"a\", job=\"api\"}",
+       "value": 0.06666666666666665
+      },
+      {
+       "labels": "{code=\"500\", instance=\"c\", job=\"web\"}",
+       "value": 0.0
+      }
+     ]
+    },
+    {
+     "expr": "rate(http_requests_total[5m])",
+     "eval_time": "5m",
+     "exp_samples": [
+      {
+       "labels": "{code=\"200\", instance=\"a\", job=\"api\"}",
+       "value": 0.6666666666666666
+      },
+      {
+       "labels": "{code=\"200\", instance=\"b\", job=\"api\"}",
+       "value": 1.3333333333333333
+      },
+      {
+       "labels": "{code=\"200\", instance=\"c\", job=\"web\"}",
+       "value": 0.3333333333333333
+      },
+      {
+       "labels": "{code=\"500\", instance=\"a\", job=\"api\"}",
+       "value": 0.06666666666666667
+      },
+      {
+       "labels": "{code=\"500\", instance=\"c\", job=\"web\"}",
+       "value": 0.016666666666666666
+      }
+     ]
+    },
+    {
+     "expr": "rate(http_requests_total[5m])",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{code=\"200\", instance=\"a\", job=\"api\"}",
+       "value": 0.6666666666666666
+      },
+      {
+       "labels": "{code=\"200\", instance=\"b\", job=\"api\"}",
+       "value": 1.2766666666666666
+      },
+      {
+       "labels": "{code=\"200\", instance=\"c\", job=\"web\"}",
+       "value": 0.3333333333333333
+      },
+      {
+       "labels": "{code=\"500\", instance=\"a\", job=\"api\"}",
+       "value": 0.06666666666666667
+      },
+      {
+       "labels": "{code=\"500\", instance=\"c\", job=\"web\"}",
+       "value": 0.0
+      }
+     ]
+    },
+    {
+     "expr": "increase(http_requests_total[5m])",
+     "eval_time": "6m",
+     "exp_samples": [
+      {
+       "labels": "{code=\"200\", instance=\"a\", job=\"api\"}",
+       "value": 200.0
+      },
+      {
+       "labels": "{code=\"200\", instance=\"b\", job=\"api\"}",
+       "value": 382.10526315789474
+      },
+      {
+       "labels": "{code=\"200\", instance=\"c\", job=\"web\"}",
+       "value": 100.0
+      },
+      {
+       "labels": "{code=\"500\", instance=\"a\", job=\"api\"}",
+       "value": 20.0
+      },
+      {
+       "labels": "{code=\"500\", instance=\"c\", job=\"web\"}",
+       "value": 3.1578947368421053
+      }
+     ]
+    },
+    {
+     "expr": "increase(http_requests_total[5m])",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{code=\"200\", instance=\"a\", job=\"api\"}",
+       "value": 200.0
+      },
+      {
+       "labels": "{code=\"200\", instance=\"b\", job=\"api\"}",
+       "value": 382.99999999999994
+      },
+      {
+       "labels": "{code=\"200\", instance=\"c\", job=\"web\"}",
+       "value": 100.0
+      },
+      {
+       "labels": "{code=\"500\", instance=\"a\", job=\"api\"}",
+       "value": 20.0
+      },
+      {
+       "labels": "{code=\"500\", instance=\"c\", job=\"web\"}",
+       "value": 0.0
+      }
+     ]
+    },
+    {
+     "expr": "increase(http_requests_total[10m])",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{code=\"200\", instance=\"a\", job=\"api\"}",
+       "value": 399.99999999999994
+      },
+      {
+       "labels": "{code=\"200\", instance=\"b\", job=\"api\"}",
+       "value": 782.5641025641025
+      },
+      {
+       "labels": "{code=\"200\", instance=\"c\", job=\"web\"}",
+       "value": 199.99999999999997
+      },
+      {
+       "labels": "{code=\"500\", instance=\"a\", job=\"api\"}",
+       "value": 40.0
+      },
+      {
+       "labels": "{code=\"500\", instance=\"c\", job=\"web\"}",
+       "value": 5.0
+      }
+     ]
+    },
+    {
+     "expr": "rate(http_requests_total{instance=\"b\"}[2m])",
+     "eval_time": "5m",
+     "exp_samples": [
+      {
+       "labels": "{code=\"200\", instance=\"b\", job=\"api\"}",
+       "value": 1.3333333333333333
+      }
+     ]
+    },
+    {
+     "expr": "rate(http_requests_total{instance=\"b\"}[2m])",
+     "eval_time": "5m15s",
+     "exp_samples": [
+      {
+       "labels": "{code=\"200\", instance=\"b\", job=\"api\"}",
+       "value": 1.1714285714285713
+      }
+     ]
+    },
+    {
+     "expr": "rate(http_requests_total{instance=\"b\"}[2m])",
+     "eval_time": "6m",
+     "exp_samples": [
+      {
+       "labels": "{code=\"200\", instance=\"b\", job=\"api\"}",
+       "value": 1.1714285714285713
+      }
+     ]
+    },
+    {
+     "expr": "sum(rate(http_requests_total[5m]))",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 2.3433333333333333
+      }
+     ]
+    },
+    {
+     "expr": "sum by (job) (rate(http_requests_total[5m]))",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{job=\"api\"}",
+       "value": 2.01
+      },
+      {
+       "labels": "{job=\"web\"}",
+       "value": 0.3333333333333333
+      }
+     ]
+    },
+    {
+     "expr": "sum without (instance) (rate(http_requests_total[5m]))",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{code=\"200\", job=\"api\"}",
+       "value": 1.9433333333333334
+      },
+      {
+       "labels": "{code=\"200\", job=\"web\"}",
+       "value": 0.3333333333333333
+      },
+      {
+       "labels": "{code=\"500\", job=\"api\"}",
+       "value": 0.06666666666666667
+      },
+      {
+       "labels": "{code=\"500\", job=\"web\"}",
+       "value": 0.0
+      }
+     ]
+    },
+    {
+     "expr": "sum by (code) (increase(http_requests_total[10m]))",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{code=\"200\"}",
+       "value": 1382.5641025641025
+      },
+      {
+       "labels": "{code=\"500\"}",
+       "value": 45.0
+      }
+     ]
+    },
+    {
+     "expr": "sum(rate(http_requests_total{code=\"500\"}[5m])) / sum(rate(http_requests_total[5m]))",
+     "eval_time": "8m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 0.028485757121439283
+      }
+     ]
+    },
+    {
+     "expr": "avg by (job) (queue_depth)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{job=\"api\"}",
+       "value": 19.0
+      },
+      {
+       "labels": "{job=\"web\"}",
+       "value": -1.0
+      }
+     ]
+    },
+    {
+     "expr": "avg by (job) (queue_depth)",
+     "eval_time": "9m",
+     "exp_samples": [
+      {
+       "labels": "{job=\"api\"}",
+       "value": 4.0
+      },
+      {
+       "labels": "{job=\"web\"}",
+       "value": 15.0
+      }
+     ]
+    },
+    {
+     "expr": "min by (job) (queue_depth)",
+     "eval_time": "9m",
+     "exp_samples": [
+      {
+       "labels": "{job=\"api\"}",
+       "value": 4.0
+      },
+      {
+       "labels": "{job=\"web\"}",
+       "value": 15.0
+      }
+     ]
+    },
+    {
+     "expr": "max(queue_depth)",
+     "eval_time": "1m15s",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 35.0
+      }
+     ]
+    },
+    {
+     "expr": "count by (job) (queue_depth)",
+     "eval_time": "9m",
+     "exp_samples": [
+      {
+       "labels": "{job=\"api\"}",
+       "value": 2.0
+      },
+      {
+       "labels": "{job=\"web\"}",
+       "value": 1.0
+      }
+     ]
+    },
+    {
+     "expr": "topk(2, queue_depth)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{__name__=\"queue_depth\", instance=\"a\", job=\"api\"}",
+       "value": 2.0
+      },
+      {
+       "labels": "{__name__=\"queue_depth\", instance=\"b\", job=\"api\"}",
+       "value": 36.0
+      }
+     ]
+    },
+    {
+     "expr": "bottomk(1, queue_depth)",
+     "eval_time": "9m15s",
+     "exp_samples": [
+      {
+       "labels": "{__name__=\"queue_depth\", instance=\"b\", job=\"api\"}",
+       "value": 3.0
+      }
+     ]
+    },
+    {
+     "expr": "queue_depth * 2 + 1",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{instance=\"a\", job=\"api\"}",
+       "value": 5.0
+      },
+      {
+       "labels": "{instance=\"b\", job=\"api\"}",
+       "value": 73.0
+      },
+      {
+       "labels": "{instance=\"c\", job=\"web\"}",
+       "value": -1.0
+      }
+     ]
+    },
+    {
+     "expr": "queue_depth offset 1m",
+     "eval_time": "2m",
+     "exp_samples": [
+      {
+       "labels": "{__name__=\"queue_depth\", instance=\"a\", job=\"api\"}",
+       "value": 2.0
+      },
+      {
+       "labels": "{__name__=\"queue_depth\", instance=\"b\", job=\"api\"}",
+       "value": 36.0
+      },
+      {
+       "labels": "{__name__=\"queue_depth\", instance=\"c\", job=\"web\"}",
+       "value": -1.0
+      }
+     ]
+    },
+    {
+     "expr": "abs(queue_depth{job=\"web\"})",
+     "eval_time": "30s",
+     "exp_samples": [
+      {
+       "labels": "{instance=\"c\", job=\"web\"}",
+       "value": 2.0
+      }
+     ]
+    },
+    {
+     "expr": "abs(queue_depth{job=\"web\"})",
+     "eval_time": "9m",
+     "exp_samples": [
+      {
+       "labels": "{instance=\"c\", job=\"web\"}",
+       "value": 15.0
+      }
+     ]
+    },
+    {
+     "expr": "clamp_min(queue_depth, 4)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{instance=\"a\", job=\"api\"}",
+       "value": 4.0
+      },
+      {
+       "labels": "{instance=\"b\", job=\"api\"}",
+       "value": 36.0
+      },
+      {
+       "labels": "{instance=\"c\", job=\"web\"}",
+       "value": 4.0
+      }
+     ]
+    },
+    {
+     "expr": "clamp_max(queue_depth, 4)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{instance=\"a\", job=\"api\"}",
+       "value": 2.0
+      },
+      {
+       "labels": "{instance=\"b\", job=\"api\"}",
+       "value": 4.0
+      },
+      {
+       "labels": "{instance=\"c\", job=\"web\"}",
+       "value": -1.0
+      }
+     ]
+    },
+    {
+     "expr": "histogram_quantile(0.9, sum by (le) (rate(latency_seconds_bucket[5m])))",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 1.0
+      }
+     ]
+    },
+    {
+     "expr": "histogram_quantile(0.5, sum by (job, le) (rate(latency_seconds_bucket[5m])))",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{job=\"api\"}",
+       "value": 0.3666666666666667
+      },
+      {
+       "labels": "{job=\"web\"}",
+       "value": 0.75
+      }
+     ]
+    },
+    {
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(latency_seconds_bucket{job=\"web\"}[5m])))",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 1.0
+      }
+     ]
+    },
+    {
+     "expr": "up",
+     "eval_time": "2m",
+     "exp_samples": [
+      {
+       "labels": "{__name__=\"up\", instance=\"a\", job=\"api\"}",
+       "value": 1.0
+      },
+      {
+       "labels": "{__name__=\"up\", instance=\"b\", job=\"api\"}",
+       "value": 1.0
+      },
+      {
+       "labels": "{__name__=\"up\", instance=\"c\", job=\"web\"}",
+       "value": 1.0
+      }
+     ]
+    },
+    {
+     "expr": "up",
+     "eval_time": "5m",
+     "exp_samples": [
+      {
+       "labels": "{__name__=\"up\", instance=\"a\", job=\"api\"}",
+       "value": 1.0
+      },
+      {
+       "labels": "{__name__=\"up\", instance=\"c\", job=\"web\"}",
+       "value": 1.0
+      }
+     ]
+    },
+    {
+     "expr": "sum(up)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 2.0
+      }
+     ]
+    },
+    {
+     "expr": "sum(up)",
+     "eval_time": "5m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 2.0
+      }
+     ]
+    },
+    {
+     "expr": "sparse_total",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{__name__=\"sparse_total\", job=\"batch\"}",
+       "value": 4.0
+      }
+     ]
+    },
+    {
+     "expr": "sparse_total",
+     "eval_time": "4m",
+     "exp_samples": [
+      {
+       "labels": "{__name__=\"sparse_total\", job=\"batch\"}",
+       "value": 20.0
+      }
+     ]
+    },
+    {
+     "expr": "sparse_total",
+     "eval_time": "9m",
+     "exp_samples": []
+    },
+    {
+     "expr": "increase(sparse_total[3m])",
+     "eval_time": "3m",
+     "exp_samples": [
+      {
+       "labels": "{job=\"batch\"}",
+       "value": 2.3333333333333335
+      }
+     ]
+    },
+    {
+     "expr": "rate(sparse_total[5m])",
+     "eval_time": "5m",
+     "exp_samples": [
+      {
+       "labels": "{job=\"batch\"}",
+       "value": 0.06095238095238095
+      }
+     ]
+    },
+    {
+     "expr": "1 + 2 * 3",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 7.0
+      }
+     ]
+    },
+    {
+     "expr": "2 ^ 3 ^ 2",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 512.0
+      }
+     ]
+    },
+    {
+     "expr": "-2 ^ 2",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": -4.0
+      }
+     ]
+    },
+    {
+     "expr": "vector(1) + vector(2)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 3.0
+      }
+     ]
+    },
+    {
+     "expr": "sum(rate(http_requests_total[5m] offset 2m))",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 2.340350877192982
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

@@ -711,6 +711,39 @@ fn histogram_point(reader: &mut Reader<'_>) -> Result<HistogramPoint> {
 mod tests {
     use super::*;
 
+    /// The protobuf fuzz target starts from these, so they had better be what they claim
+    /// to be: a logs, a traces and a metrics request an SDK could have sent. A seed that
+    /// fails to decode teaches the fuzzer nothing about the paths past the decoder.
+    #[test]
+    fn the_fuzz_seeds_are_real_requests() {
+        let seed = |n: usize| {
+            std::fs::read(format!(
+                "{}/../../fuzz/seeds/otlp_protobuf/seed-{n}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap()
+        };
+        let logs_request = logs(&seed(0)).unwrap();
+        assert_eq!(
+            logs_request.resource_logs[0].scope_logs[0]
+                .log_records
+                .len(),
+            2
+        );
+        let traces_request = traces(&seed(1)).unwrap();
+        assert_eq!(
+            traces_request.resource_spans[0].scope_spans[0].spans.len(),
+            1
+        );
+        let metrics_request = metrics(&seed(2)).unwrap();
+        assert_eq!(
+            metrics_request.resource_metrics[0].scope_metrics[0]
+                .metrics
+                .len(),
+            3
+        );
+    }
+
     #[test]
     fn hex_matches_the_json_spelling_of_an_id() {
         assert_eq!(

@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [logql, traceql, promql, otlp_logs, otlp_traces, otlp_metrics, remote_write, remote_read, body_decompression]
+        target: [logql, traceql, promql, otlp_logs, otlp_traces, otlp_metrics, otlp_protobuf, remote_write, remote_read, body_decompression]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # libFuzzer needs nightly, which is why this is a separate workflow rather than a
