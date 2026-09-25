@@ -1003,6 +1003,14 @@ impl Snapshot {
                 }
                 Ok(Value::Vector(vector))
             }
+            Function::Vector => match self.eval(&args[0], at_nanos)? {
+                Value::Scalar(value) => Ok(Value::Vector(InstantVector {
+                    samples: vec![(Labels::new(), value)],
+                })),
+                Value::Vector(_) => Err(Error::BadRequest(
+                    "`vector` needs a scalar argument".to_owned(),
+                )),
+            },
         }
     }
 

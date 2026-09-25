@@ -39,6 +39,89 @@ pub struct QueryRangeRequest {
     pub end_nanos: u64,
     pub limit: usize,
     pub direction: Direction,
+    /// Answer in Loki's categorised shape. Set from the
+    /// `X-Loki-Response-Encoding-Flags: categorize-labels` request header, which
+    /// Grafana always sends; see [`Entry::Categorized`].
+    pub categorize: bool,
+}
+
+/// Raw parameters of `GET /loki/api/v1/query`.
+#[derive(Debug, Default, Deserialize)]
+pub struct InstantParams {
+    pub query: Option<String>,
+    /// When to evaluate, in any form `start`/`end` accept. Defaults to now.
+    pub time: Option<String>,
+    pub limit: Option<String>,
+    pub direction: Option<String>,
+}
+
+/// How far an instant *log* query looks back from `time`, as Loki's default does.
+pub const INSTANT_LOOKBACK_NANOS: u64 = 3_600_000_000_000;
+
+impl InstantParams {
+    /// The instant as nanoseconds, now when absent.
+    ///
+    /// # Errors
+    /// A `400` when `time` is present and unparseable.
+    pub fn at_nanos(&self, now_nanos: u64) -> Result<u64> {
+        self.time
+            .as_deref()
+            .filter(|raw| !raw.trim().is_empty())
+            .map_or(Ok(now_nanos), parse_time)
+    }
+
+    /// Whether this is an expression over literals alone — no stream selector at all.
+    ///
+    /// Grafana's Loki health check is `vector(1)+vector(1)`. Everything with a selector
+    /// is a log or metric query and goes through LogQL.
+    #[must_use]
+    pub fn is_literal(&self) -> bool {
+        self.query
+            .as_deref()
+            .is_some_and(|q| !q.trim().is_empty() && !q.contains('{'))
+    }
+
+    /// The log query as a range ending at `time`, for the query-range path.
+    #[must_use]
+    pub fn as_range(&self, at_nanos: u64) -> QueryRangeParams {
+        QueryRangeParams {
+            query: self.query.clone(),
+            start: Some(at_nanos.saturating_sub(INSTANT_LOOKBACK_NANOS).to_string()),
+            end: Some(at_nanos.to_string()),
+            limit: self.limit.clone(),
+            direction: self.direction.clone(),
+            ..QueryRangeParams::default()
+        }
+    }
+}
+
+/// Evaluate a literal-only expression the way Loki's instant query answers it.
+///
+/// LogQL's metric grammar over literals is PromQL's, so the PromQL evaluator answers it
+/// on an empty store.
+///
+/// # Errors
+/// A `400` when the expression does not parse or does not evaluate.
+pub fn instant_literal(query: &str, at_nanos: u64) -> Result<serde_json::Value> {
+    use crate::prometheus::{format_value, to_seconds};
+    use crate::promeval::{Snapshot, Value};
+
+    let expr = crate::promql::parse(query)?;
+    let at = to_seconds(at_nanos);
+    let data = match Snapshot::from_samples(Vec::new()).eval(&expr, at_nanos)? {
+        Value::Scalar(value) => serde_json::json!({
+            "resultType": "scalar",
+            "result": [at, format_value(value)],
+        }),
+        Value::Vector(vector) => serde_json::json!({
+            "resultType": "vector",
+            "result": vector.samples.iter().map(|(labels, value)| serde_json::json!({
+                "metric": labels.iter().collect::<BTreeMap<_, _>>(),
+                "value": [at, format_value(*value)],
+            })).collect::<Vec<_>>(),
+        }),
+    };
+    Ok(serde_json::json!({ "status": "success", "data": data }))
 }
 
 /// Raw query-string parameters, before validation.
@@ -115,6 +198,7 @@ impl QueryRangeRequest {
             end_nanos,
             limit,
             direction,
+            categorize: false,
         })
     }
 }
@@ -319,6 +403,10 @@ impl<T> LokiResponse<T> {
 pub struct StreamsData {
     #[serde(rename = "resultType")]
     pub result_type: &'static str,
+    /// Present when the caller asked for categorised labels. Declared before `result`
+    /// on purpose: a streaming reader has to know the shape before it meets the entries.
+    #[serde(rename = "encodingFlags", skip_serializing_if = "Option::is_none")]
+    pub encoding_flags: Option<Vec<&'static str>>,
     pub result: Vec<StreamResult>,
     pub stats: Stats,
 }
@@ -342,6 +430,26 @@ pub struct StreamResult {
 pub enum Entry {
     Plain([String; 2]),
     WithMetadata(String, String, BTreeMap<String, String>),
+    /// Loki's categorised shape: `[ts, line, {"structuredMetadata": {…}, "parsed": {…}}]`.
+    ///
+    /// Grafana's Loki datasource always asks for it, and its reader for the flat shape
+    /// takes exactly two elements — so any line carrying attributes failed to parse and
+    /// Explore showed nothing. The flat shape stays the default because
+    /// `laravel-telemetry-ui` reads the third element as a flat map.
+    Categorized(String, String, Categorized),
+}
+
+/// The third element of a categorised entry. Each half is omitted when empty, and the
+/// element itself when both are, as Loki does.
+#[derive(Debug, Serialize)]
+pub struct Categorized {
+    #[serde(
+        rename = "structuredMetadata",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub structured_metadata: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub parsed: BTreeMap<String, String>,
 }
 
 impl Entry {
@@ -354,9 +462,30 @@ impl Entry {
         }
     }
 
+    /// A categorised entry: attributes as structured metadata, parser output as parsed.
+    pub fn categorized(
+        timestamp_nanos: u64,
+        line: String,
+        structured_metadata: BTreeMap<String, String>,
+        parsed: BTreeMap<String, String>,
+    ) -> Self {
+        if structured_metadata.is_empty() && parsed.is_empty() {
+            Self::Plain([timestamp_nanos.to_string(), line])
+        } else {
+            Self::Categorized(
+                timestamp_nanos.to_string(),
+                line,
+                Categorized {
+                    structured_metadata,
+                    parsed,
+                },
+            )
+        }
+    }
+
     pub fn timestamp(&self) -> &str {
         match self {
-            Self::Plain([ts, _]) | Self::WithMetadata(ts, _, _) => ts,
+            Self::Plain([ts, _]) | Self::WithMetadata(ts, _, _) | Self::Categorized(ts, _, _) => ts,
         }
     }
 
@@ -364,7 +493,9 @@ impl Entry {
     /// does not have to match on the variant to learn which tuple slot holds what.
     pub fn line(&self) -> &str {
         match self {
-            Self::Plain([_, line]) | Self::WithMetadata(_, line, _) => line,
+            Self::Plain([_, line])
+            | Self::WithMetadata(_, line, _)
+            | Self::Categorized(_, line, _) => line,
         }
     }
 }
@@ -441,10 +572,16 @@ pub fn query_range(
     let records = store.scan(scan, &request.query.matchers, &filter)?;
 
     let returned = records.len() as u64;
-    let result = group_into_streams(records, request.direction, &request.query);
+    let result = group_into_streams(
+        records,
+        request.direction,
+        &request.query,
+        request.categorize,
+    );
 
     Ok(LokiResponse::success(StreamsData {
         result_type: "streams",
+        encoding_flags: request.categorize.then(|| vec!["categorize-labels"]),
         result,
         stats: Stats {
             summary: StatsSummary {
@@ -508,6 +645,7 @@ fn group_into_streams(
     records: Vec<LogRecord>,
     direction: Direction,
     query: &LogQuery,
+    categorize: bool,
 ) -> Vec<StreamResult> {
     // Only when the query has one; otherwise every record pays a second pass over its
     // body to learn that nothing parses it.
@@ -545,7 +683,9 @@ fn group_into_streams(
         }
 
         // Fields a `| json` or `| logfmt` stage pulled out of the body. Without these a
-        // filter selected on a value the caller could never see.
+        // filter selected on a value the caller could never see. Kept apart from the
+        // attributes so the categorised shape can put each where Loki does.
+        let mut extracted: BTreeMap<String, String> = BTreeMap::new();
         if parses {
             for (name, value) in query.extracted(&record.body).iter() {
                 // A parsed field colliding with a stream label is renamed rather than
@@ -558,13 +698,21 @@ fn group_into_streams(
                 } else {
                     name.to_owned()
                 };
-                metadata.entry(key).or_insert_with(|| value.to_owned());
+                if !metadata.contains_key(&key) {
+                    extracted.entry(key).or_insert_with(|| value.to_owned());
+                }
             }
         }
+        let entry = if categorize {
+            Entry::categorized(record.timestamp_nanos, record.body, metadata, extracted)
+        } else {
+            metadata.extend(extracted);
+            Entry::new(record.timestamp_nanos, record.body, metadata)
+        };
         grouped
             .entry(record.stream.clone())
             .or_default()
-            .push(Entry::new(record.timestamp_nanos, record.body, metadata));
+            .push(entry);
     }
 
     grouped
@@ -590,26 +738,57 @@ fn group_into_streams(
 }
 
 /// `/loki/api/v1/labels`
+///
+/// With `query`, only labels of streams that selector matches, as Loki does. It was
+/// ignored, so Grafana's label browser offered values that returned nothing when picked.
 pub fn label_names(
     store: &RecordStore<LogSchema>,
-    start_nanos: u64,
-    end_nanos: u64,
-) -> LokiResponse<Vec<String>> {
-    LokiResponse::success(store.label_names(start_nanos, end_nanos))
-}
-
-/// `/loki/api/v1/label/{name}/values`
-pub fn label_values(
-    store: &RecordStore<LogSchema>,
-    name: &str,
+    selectors: &[String],
     start_nanos: u64,
     end_nanos: u64,
 ) -> Result<LokiResponse<Vec<String>>> {
-    Ok(LokiResponse::success(store.label_values(
-        name,
-        start_nanos,
-        end_nanos,
-    )?))
+    if selectors.is_empty() {
+        return Ok(LokiResponse::success(
+            store.label_names(start_nanos, end_nanos),
+        ));
+    }
+    let streams = matching_streams(store, selectors, start_nanos, end_nanos)?;
+    Ok(LokiResponse::success(crate::meta::names_of(&streams)))
+}
+
+/// `/loki/api/v1/label/{name}/values`, scoped by `query` like the names.
+pub fn label_values(
+    store: &RecordStore<LogSchema>,
+    name: &str,
+    selectors: &[String],
+    start_nanos: u64,
+    end_nanos: u64,
+) -> Result<LokiResponse<Vec<String>>> {
+    if selectors.is_empty() {
+        return Ok(LokiResponse::success(store.label_values(
+            name,
+            start_nanos,
+            end_nanos,
+        )?));
+    }
+    let streams = matching_streams(store, selectors, start_nanos, end_nanos)?;
+    Ok(LokiResponse::success(crate::meta::values_of(
+        &streams, name,
+    )))
+}
+
+fn matching_streams(
+    store: &RecordStore<LogSchema>,
+    selectors: &[String],
+    start_nanos: u64,
+    end_nanos: u64,
+) -> Result<std::collections::BTreeSet<Labels>> {
+    let mut seen = std::collections::BTreeSet::new();
+    for selector in selectors {
+        let query = logql::parse(selector)?;
+        seen.extend(store.streams(start_nanos, end_nanos, &query.matchers)?);
+    }
+    Ok(seen)
 }
 
 /// `/loki/api/v1/series`

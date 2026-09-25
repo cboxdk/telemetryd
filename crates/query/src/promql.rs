@@ -65,6 +65,9 @@ pub enum Function {
     ClampMin,
     ClampMax,
     Abs,
+    /// `vector(s)`: a scalar as a one-element vector with no labels. Grafana's Loki
+    /// health check is `vector(1)+vector(1)`.
+    Vector,
 }
 
 impl Function {
@@ -76,6 +79,7 @@ impl Function {
             "clamp_min" => Self::ClampMin,
             "clamp_max" => Self::ClampMax,
             "abs" => Self::Abs,
+            "vector" => Self::Vector,
             _ => return None,
         })
     }
@@ -88,6 +92,7 @@ impl Function {
             Self::ClampMin => "clamp_min",
             Self::ClampMax => "clamp_max",
             Self::Abs => "abs",
+            Self::Vector => "vector",
         }
     }
 
@@ -98,7 +103,7 @@ impl Function {
 
     fn arity(self) -> usize {
         match self {
-            Self::Rate | Self::Increase | Self::Abs => 1,
+            Self::Rate | Self::Increase | Self::Abs | Self::Vector => 1,
             Self::HistogramQuantile | Self::ClampMin | Self::ClampMax => 2,
         }
     }

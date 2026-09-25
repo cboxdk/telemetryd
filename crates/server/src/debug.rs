@@ -452,6 +452,7 @@ fn logs(
                     end_nanos: end,
                     limit: LINES,
                     direction: telemetryd_query::loki::Direction::Backward,
+                    categorize: false,
                 },
             )?;
             let mut rows = Vec::new();
