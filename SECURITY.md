@@ -52,6 +52,14 @@ Setting an issuer guards **every** surface, including any whose static token is
 deliberately empty — an empty token means "unguarded" only while nothing else guards
 that surface.
 
+**A web page cannot act through its visitor's browser.** telemetryd serves no CORS, and
+a request carrying an `Origin` that is not this server's own — every cross-site POST and
+WebSocket upgrade a browser sends — is refused with `403`. While any surface answers
+without a token on a loopback listener, a `Host` that is not a loopback name is refused
+too, which closes DNS rebinding. Before 0.62.0 any website a developer visited could
+stream a default instance's live tail and write records into it. Servers, SDKs,
+Grafana's backend and laravel-telemetry-ui send no `Origin` and are unaffected.
+
 **Constant-time comparison.** Presented and configured tokens are SHA-256'd and
 compared with `subtle::ConstantTimeEq`. Hashing first makes the comparison
 length-independent, so token length does not leak through timing.

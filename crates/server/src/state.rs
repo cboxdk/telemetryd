@@ -127,6 +127,21 @@ impl AppState {
         )
     }
 
+    /// Whether some surface answers without any credential — the default instance.
+    ///
+    /// The same rule the guard applies: admin falls back to the query tokens, relay
+    /// clients guard ingest, and Cbox ID guards everything.
+    #[must_use]
+    pub fn any_surface_open(&self) -> bool {
+        if self.oidc.is_enabled() {
+            return false;
+        }
+        let credentials = self.credentials();
+        (credentials.ingest.is_empty() && credentials.relay_clients.is_empty())
+            || credentials.query.is_empty()
+            || credentials.admin.is_empty()
+    }
+
     /// Put new credentials in force, returning which changed. Takes effect for the
     /// next request; one already admitted finishes under the old.
     pub fn replace_credentials(&self, fresh: Credentials) -> Vec<&'static str> {

@@ -2294,3 +2294,81 @@ async fn a_revoked_token_stops_working_once_the_credentials_are_replaced() {
         .replace_credentials(telemetryd_server::state::Credentials::resolve(&rotated).unwrap());
     assert!(again.is_empty());
 }
+
+/// A page on another site can make a visitor's browser send requests that need no
+/// preflight — a `text/plain` POST, a WebSocket upgrade — and against the default
+/// loopback instance with no tokens that let any website write records and stream the
+/// live tail. The browser says where the page came from, and that is refused.
+#[tokio::test]
+async fn a_web_page_on_another_site_is_refused() {
+    let harness = Harness::new(|_| {});
+    let post = |origin: Option<&str>| {
+        let mut request = Request::post("/v1/logs")
+            .header(header::HOST, "127.0.0.1:4319")
+            .header(header::CONTENT_TYPE, "text/plain");
+        if let Some(origin) = origin {
+            request = request.header(header::ORIGIN, origin);
+        }
+        request.body(Body::from(r#"{"resourceLogs":[]}"#)).unwrap()
+    };
+    let (status, _, body) = harness
+        .request(post(Some("https://attacker.example")))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("serves no CORS"), "{body}");
+
+    // A client that is not a browser sends no Origin, and a page telemetryd served
+    // itself names its own host: both proceed.
+    let (status, _, _) = harness.request(post(None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = harness.request(post(Some("http://127.0.0.1:4319"))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The live tail's upgrade carries the page's origin too.
+    let (status, _, _) = harness
+        .request(
+            Request::get("/loki/api/v1/tail?query=%7Bapp%3D~%22.%2B%22%7D")
+                .header(header::HOST, "127.0.0.1:4319")
+                .header(header::ORIGIN, "https://attacker.example")
+                .header(header::CONNECTION, "upgrade")
+                .header(header::UPGRADE, "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// DNS rebinding makes a page same-origin — `attacker.example` resolving to 127.0.0.1
+/// — so the name is what gives it away. Refused while a surface is open, and left to
+/// the tokens once every surface has one.
+#[tokio::test]
+async fn a_rebound_name_is_refused_while_the_instance_is_open() {
+    let open = Harness::new(|_| {});
+    let rebound = || {
+        Request::get("/loki/api/v1/labels")
+            .header(header::HOST, "attacker.example:4319")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (status, _, body) = open.request(rebound()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, _, _) = open
+        .request(
+            Request::get("/loki/api/v1/labels")
+                .header(header::HOST, "localhost:4319")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let guarded = Harness::new(|config| {
+        config.auth.ingest_token = serde_json::from_str(r#""i""#).unwrap();
+        config.auth.query_token = serde_json::from_str(r#""q""#).unwrap();
+    });
+    let (status, _, _) = guarded.request(rebound()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the token decides now");
+}

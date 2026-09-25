@@ -28,6 +28,11 @@ token when unset. Each accepts a list so a token can be rotated without a reject
 window, and each is reloaded on `SIGHUP`, so a leaked token is revoked by removing it
 and reloading.
 
+**A web page cannot act through its visitor's browser.** No CORS is served; a request
+whose `Origin` is another site is refused, and while a loopback instance has an open
+surface so is a `Host` that is not a loopback name — DNS rebinding. Clients that are not
+browsers send no `Origin`.
+
 **Constant-time comparison.** Tokens are SHA-256'd and compared with
 `subtle::ConstantTimeEq`, so token length does not leak through timing.
 

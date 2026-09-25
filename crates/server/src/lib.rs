@@ -5,6 +5,7 @@
 //!.
 
 pub mod auth;
+pub mod browser;
 pub mod debug;
 pub mod error;
 pub mod export;
@@ -147,17 +148,7 @@ pub fn router(state: AppState) -> Router {
             auth::require_query_token,
         ));
 
-    let ingest = Router::new()
-        // OTLP/HTTP JSON is the first-class ingest path; laravel-telemetry sends JSON,
-        // so protobuf is never on the client's critical path.
-        .route("/v1/logs", axum::routing::post(ingest::otlp_logs))
-        .route("/v1/traces", axum::routing::post(ingest::otlp_traces))
-        .route("/v1/metrics", axum::routing::post(ingest::otlp_metrics))
-        .route("/api/v1/write", axum::routing::post(ingest::remote_write))
-        .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            auth::require_ingest_token,
-        ));
+    let ingest = ingest_routes(&state);
 
     Router::new()
         .merge(public)
@@ -167,6 +158,12 @@ pub fn router(state: AppState) -> Router {
         .merge(export)
         .merge(ingest)
         .fallback(error::unimplemented)
+        // Before anything is read or authenticated, and inside `record_request` so a
+        // refusal is counted like any other answer.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            browser::guard,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             record_request,
@@ -190,6 +187,21 @@ pub fn router(state: AppState) -> Router {
         // unsynced window along with it.
         .layer(CatchPanicLayer::new())
         .with_state(state)
+}
+
+/// The write endpoints, behind the ingest token.
+fn ingest_routes(state: &AppState) -> Router<AppState> {
+    Router::new()
+        // OTLP/HTTP JSON is the first-class ingest path; laravel-telemetry sends JSON,
+        // so protobuf is never on the client's critical path.
+        .route("/v1/logs", axum::routing::post(ingest::otlp_logs))
+        .route("/v1/traces", axum::routing::post(ingest::otlp_traces))
+        .route("/v1/metrics", axum::routing::post(ingest::otlp_metrics))
+        .route("/api/v1/write", axum::routing::post(ingest::remote_write))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_ingest_token,
+        ))
 }
 
 /// Count every request by *matched route*, never by raw path.
