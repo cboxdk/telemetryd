@@ -323,6 +323,16 @@ Driven by what `PromqlCompiler` actually generates:
 `/api/v1/alerts`, exemplars, native histograms, and vector-to-vector matching beyond
 the `or` form above (`on`/`ignoring`/`group_left`).
 
+*Limits:* an expression may nest at most 128 levels deep, counting parentheses, unary
+minus, function and aggregation arguments, and each link in a chain of binary operators.
+Deeper queries are refused with a `400` naming the limit. Prometheus has no such limit;
+here, parsing and evaluation recurse on a fixed-size stack, and a two-kilobyte query of
+nested parentheses used to exhaust it and end the process.
+
+*Range queries* are evaluated at `start`, `start + step`, … up to the last step that
+does not pass `end`, exactly as Prometheus does. Earlier versions added one more point
+at an `end` that did not fall on a step.
+
 #### `rate` and `increase` do not extrapolate
 
 The one place a supported function answers differently from Prometheus, and it is

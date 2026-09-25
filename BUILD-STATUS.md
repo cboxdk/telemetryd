@@ -82,6 +82,23 @@ The whole change is additive — 482 inserted lines, none deleted — so a store
 summaries behaves exactly as it did before, and existing segments are folded by a
 background task rather than by a rewrite at startup.
 
+**A folded answer respects every selector.** The fold reads with only the label
+matchers every selector in the query shares, so `x{code="500"}` and `x` arrive
+together. It used to add every sample to every rate call, which made an error ratio
+over two hours read as exactly 1; each series is now matched against each call's own
+selector before it is folded. Per-segment summaries are also joined only when a stream's
+runs come in time order: late data in an overlapping segment was read as a counter
+reset, doubling a three-hour `increase`. Both are covered by
+`crates/query/tests/chart_folding.rs`, which fails on the old code.
+
+**A request cannot end the process.** Three query parameters could: a nested PromQL
+expression overflowed the stack, `step=1e300` hit a panicking conversion, and a step
+near `u64::MAX` wrapped the step loop into allocating until memory ran out. Each is a
+`400` now. The release build also unwinds instead of aborting, so a panic in a handler
+is a `500` for that request rather than an outage; work that changes what is stored
+still stops the process on a panic, on purpose, so the write-ahead log restores a
+consistent store on restart.
+
 **One query has a ceiling.** A PromQL read that holds its window keeps every sample of
 every matching series resident at once, and neither `limit` nor the series cap bounded it
 — measured at roughly 850 MB for a single query against weeks of high-cardinality metrics,
