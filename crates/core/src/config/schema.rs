@@ -944,7 +944,7 @@ pub fn manifest_memory(config: &Config) -> (u64, u64) {
 /// copied, so the per-sample residue is the numbers and the vector bookkeeping around
 /// them. Rounded well up, because under-estimating here is what the ceiling exists to
 /// prevent.
-const QUERY_SAMPLE_BYTES: u64 = 96;
+pub const QUERY_SAMPLE_BYTES: u64 = 96;
 
 /// Share of the memory limit one query may hold in loaded samples.
 ///

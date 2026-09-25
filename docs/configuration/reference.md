@@ -262,9 +262,13 @@ lookback, and no fold carries it. Such an expression is read the ordinary way ho
 its span, because folding it would drop that operand and return a confident wrong number
 instead of an error.
 
-`limits.max_query_samples` bounds both paths. The ordinary read is measured in samples
-held; the folded read is measured in accumulators held, one per series per point per call.
-Neither shape can be used to get around the other's limit.
+`limits.max_query_samples` bounds both paths, converted rather than compared directly.
+The ordinary read holds samples, budgeted at 96 bytes each because the evaluator holds
+one three times over before the first step is computed. The folded read holds one
+accumulator per series per point per call, held once and a fifth of that size. The limit
+is stated in samples and each shape is charged for what it actually costs, so neither can
+be used to get around the other's bound and a chart is not refused for memory it does not
+use.
 
 ## What happens when every read slot is busy
 
@@ -378,7 +382,7 @@ Security:
   ingest       token required
   query        token required
   admin        token required
-  identity     open on / and /status: telemetryd 0.55.1, storage format 1,
+  identity     open on / and /status: telemetryd 0.55.2, storage format 1,
                three signals. Never the deployment. Not a setting.
 ```
 

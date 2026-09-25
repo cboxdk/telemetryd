@@ -584,16 +584,24 @@ impl Snapshot {
                     // Folding does not hold the samples, but it does hold a cell per
                     // call, series and point, and a query asking for a thousand points
                     // across ten thousand series would trade one way of exhausting memory
-                    // for another. The same allowance covers both shapes, so raising the
-                    // limit raises it for whichever the query turns out to be.
+                    // for another. So the same allowance covers both shapes — converted,
+                    // because they are not the same size. `limits.max_query_samples` is
+                    // counted in samples, and a sample is budgeted at 96 bytes because the
+                    // evaluator holds it three times over; a fold cell is held once and is
+                    // a fifth of that. Charging a cell as if it were a sample refused a
+                    // chart that needed a tenth of the memory the limit allows, and did it
+                    // at the boundary, so the same panel failed and succeeded by turns.
+                    let cells_allowed = max_samples
+                        .saturating_mul(telemetryd_core::config::QUERY_SAMPLE_BYTES)
+                        / (std::mem::size_of::<Fold>() as u64).max(1);
                     let held = (calls.len() as u64)
                         .saturating_mul(labels.len() as u64)
                         .saturating_mul(points.len() as u64);
-                    if max_samples != 0 && held > max_samples {
+                    if max_samples != 0 && held > cells_allowed {
                         return Err(Error::BadRequest(format!(
-                            "this query would hold more than {max_samples} values at once: \
-                             {} series across {} points. Narrow the time range, add label \
-                             matchers, ask for fewer points, or raise \
+                            "this query would hold more than {cells_allowed} values at \
+                             once: {} series across {} points. Narrow the time range, add \
+                             label matchers, ask for fewer points, or raise \
                              limits.max_query_samples",
                             labels.len(),
                             points.len()

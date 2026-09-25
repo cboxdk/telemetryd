@@ -74,10 +74,13 @@ fn a_chart_over_a_wide_span_agrees_with_the_ordinary_read() {
     let step = (last - first) / 249;
     let points: Vec<u64> = (0..250).map(|i| first + i * step).collect();
 
-    // An allowance the ordinary read cannot meet and the fold can: 1,440 samples lie in
-    // the span, while the fold holds one call by two series by 250 points. Passing it is
-    // what proves the answer below came from the folded path and not from the other one.
-    let allowance = 1_000;
+    // An allowance the ordinary read cannot meet and the fold can. 1,440 samples lie in
+    // the span, so the ordinary read is refused. The fold holds one call by two series by
+    // 250 points — 500 cells, more than the allowance counted in items, and well under it
+    // counted in memory, which is what the allowance is actually about. Answering here
+    // proves both that the folded path was taken and that a cell is charged for what it
+    // costs rather than for what a sample costs.
+    let allowance = 300;
     let folded = Snapshot::load_at(store.metrics(), &expr, &points, allowance).unwrap();
 
     let mut walked = Snapshot::from_samples(rows);
