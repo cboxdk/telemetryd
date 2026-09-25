@@ -132,6 +132,18 @@ impl Store {
             settings,
         )?;
 
+        // Every torn tail replay cut off, per signal. Nothing put them here before, so
+        // /status and telemetryd_wal_truncations_total said none after a crash that had
+        // cost records.
+        let truncations = [
+            logs.wal_truncation(),
+            traces.wal_truncation(),
+            metrics.wal_truncation(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
         Ok(Self {
             data_dir,
             logs,
@@ -148,7 +160,7 @@ impl Store {
                 retention: config.retention.clone(),
             }),
             reaper: Mutex::new(ReaperReport::default()),
-            wal_truncations: RwLock::new(Vec::new()),
+            wal_truncations: RwLock::new(truncations),
             refusing: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -637,10 +649,6 @@ impl Store {
         lock_read(&self.policy).disk_budget
     }
 
-    pub fn record_wal_truncation(&self, truncation: Truncation) {
-        lock_write(&self.wal_truncations).push(truncation);
-    }
-
     /// A point-in-time view for `/status`.
     pub fn snapshot(&self) -> Result<StoreStatus> {
         let usage = self.data_dir.usage()?;
@@ -812,6 +820,49 @@ mod tests {
             .run_retention_protecting(retention::Undelivered::default())
             .unwrap();
         store.append_logs(&[record(now_nanos(), "again")]).unwrap();
+    }
+
+    /// A torn write-ahead log tail cut off at startup is reported in /status. It was
+    /// repaired, logged and forgotten, so /status said nothing had happened after a
+    /// crash that cost records.
+    #[test]
+    fn a_torn_log_tail_is_reported_after_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config(&tmp.path().join("data"));
+        {
+            let store = Store::open(&config).unwrap();
+            store
+                .append_logs(
+                    &(0..5)
+                        .map(|i| record(now_nanos() + i, "kept"))
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            store.sync_all().unwrap();
+        }
+        let wal = tmp.path().join("data/wal/logs");
+        let newest = std::fs::read_dir(&wal)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .max()
+            .unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&newest)
+            .unwrap();
+        std::io::Write::write_all(&mut file, &[0xff; 11]).unwrap();
+        drop(file);
+
+        let reopened = Store::open(&config).unwrap();
+        let status = reopened.snapshot().unwrap();
+        assert_eq!(
+            status.wal_truncations.len(),
+            1,
+            "{:?}",
+            status.wal_truncations
+        );
+        assert_eq!(reopened.logs().status().recovered_records, 5);
     }
 
     #[test]

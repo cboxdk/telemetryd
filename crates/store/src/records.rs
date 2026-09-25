@@ -89,6 +89,8 @@ pub struct RecordStore<S: RecordSchema> {
     seal_failed_at: Mutex<Option<Instant>>,
     seal_sequence: AtomicU64,
     stats: Stats,
+    /// The torn tail replay found and cut off at startup, if it found one.
+    wal_truncation: Option<crate::wal::Truncation>,
 }
 
 /// The write side: log and buffer, kept consistent with each other.
@@ -465,7 +467,6 @@ impl<S: RecordSchema> RecordStore<S> {
             );
         }
         let recovered = buffer.len() as u64;
-        let _ = replayed;
 
         let seal_sequence = segments
             .iter()
@@ -491,6 +492,7 @@ impl<S: RecordSchema> RecordStore<S> {
             catalogue: RwLock::new(segments.into_iter().map(Arc::new).collect()),
             seal_sequence: AtomicU64::new(seal_sequence),
             stats,
+            wal_truncation: replayed.truncated,
         })
     }
 
@@ -671,6 +673,13 @@ impl<S: RecordSchema> RecordStore<S> {
             chunks.push(Arc::clone(sealing));
         }
         chunks
+    }
+
+    /// The torn tail replay cut off when this store opened, if there was one. Held for
+    /// the process's life so `/status` keeps saying so; it was logged and forgotten.
+    #[must_use]
+    pub fn wal_truncation(&self) -> Option<crate::wal::Truncation> {
+        self.wal_truncation.clone()
     }
 
     /// Flush and fsync the write-ahead log without sealing.
