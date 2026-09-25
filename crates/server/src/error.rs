@@ -51,11 +51,27 @@ impl IntoResponse for ApiError {
             | Error::RelayDelivery(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
+        let mut body = self.0.to_body();
         if status.is_server_error() {
-            tracing::error!(error = %self.0, code = self.0.code(), "request failed");
+            // The detail goes to the log and not to the caller: an I/O error names paths
+            // inside the data directory, and a panic message names code. The caller gets
+            // what to do and a reference that finds the detail.
+            let reference = reference();
+            tracing::error!(reference, error = %self.0, code = self.0.code(), "request failed");
+            body.error.message = if matches!(self.0, Error::Io { .. }) {
+                format!(
+                    "telemetryd could not read or write its storage just now; retry \
+                     shortly. Reference {reference} in the server log has the detail."
+                )
+            } else {
+                format!(
+                    "telemetryd could not complete this request. Reference {reference} in \
+                     the server log has the detail."
+                )
+            };
         }
 
-        let mut response = (status, Json(self.0.to_body())).into_response();
+        let mut response = (status, Json(body)).into_response();
 
         match &self.0 {
             Error::Unauthorized => {
@@ -82,6 +98,17 @@ impl IntoResponse for ApiError {
 
         response
     }
+}
+
+/// A short id tying a response to its log line. Unique enough to find one error in a
+/// day's log; it identifies nothing else.
+fn reference() -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+    #[allow(clippy::cast_possible_truncation)]
+    let clock = telemetryd_store::now_nanos() as u32;
+    format!("{:08x}", clock.rotate_left(13) ^ sequence)
 }
 
 /// The Prometheus API's own error envelope, on the Prometheus API.
@@ -179,6 +206,7 @@ pub async fn unimplemented(uri: axum::http::Uri) -> Response {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -193,5 +221,29 @@ mod tests {
         let response = ApiError(error).into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(response.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    /// A 5xx tells the caller what to do and where the detail is, not the detail: an I/O
+    /// error names paths inside the data directory and a panic names code.
+    #[tokio::test]
+    async fn a_server_error_keeps_its_detail_in_the_log() {
+        for error in [
+            Error::io(
+                "writing /var/lib/telemetryd/wal/logs/00000001.wal",
+                std::io::Error::other("no space left on device"),
+            ),
+            Error::Config("query task panicked: index out of bounds at promeval.rs:812".into()),
+        ] {
+            let response = ApiError(error).into_response();
+            assert!(response.status().is_server_error());
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert!(body.contains("Reference"), "{body}");
+            for secret in ["/var/lib", "wal", "promeval", "panicked"] {
+                assert!(!body.contains(secret), "{secret} leaked: {body}");
+            }
+        }
     }
 }

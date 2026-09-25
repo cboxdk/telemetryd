@@ -169,15 +169,31 @@ pub async fn export(
     // half stays on this side of the response and encoding — which cannot fail — is what
     // streams.
     let (sender, receiver) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(2);
+    let runtime = tokio::runtime::Handle::current();
 
     tokio::task::spawn_blocking(move || {
         // Moved in so it lives exactly as long as the records do.
         let _permit = permit;
         let emit = |line: String| {
-            // `blocking_send` is the backpressure: a slow reader parks this thread
-            // rather than letting encoded batches pile up in the channel. An error
-            // means the client hung up, and there is nobody left to send to.
-            sender.blocking_send(Ok(line + "\n")).is_ok()
+            // Waiting to send is the backpressure: a slow reader parks this thread
+            // rather than letting encoded batches pile up in the channel. But not for
+            // ever. A client that stops reading used to hold this thread and its export
+            // slot until it disconnected, so a handful of them shut every other export
+            // out. One that takes nothing for `EXPORT_IDLE` is given up on; an error
+            // means it hung up, and there is nobody left to send to.
+            let sent = runtime.block_on(tokio::time::timeout(
+                EXPORT_IDLE,
+                sender.send(Ok(line + "\n")),
+            ));
+            if let Ok(sent) = sent {
+                sent.is_ok()
+            } else {
+                tracing::warn!(
+                    idle_seconds = EXPORT_IDLE.as_secs(),
+                    "an export client stopped reading; giving up on it"
+                );
+                false
+            }
         };
         match scanned {
             Scanned::Logs(records) => {
@@ -217,6 +233,9 @@ pub async fn export(
     )
         .into_response())
 }
+
+/// How long an export waits for its client to take the next batch before giving up.
+const EXPORT_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The scan result, kept in one type so the streaming half has a single value to match
 /// on rather than three parallel `Option`s.
