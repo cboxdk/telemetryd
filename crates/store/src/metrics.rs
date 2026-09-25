@@ -124,43 +124,7 @@ impl crate::RecordStore<MetricSchema> {
             return Ok(None);
         }
 
-        let mut needs_rows = 0usize;
-        let mut summarised = 0usize;
-        for segment in &segments {
-            let m = &segment.manifest;
-            if m.min_time_nanos > end_nanos || m.max_time_nanos <= start_nanos {
-                continue;
-            }
-            if m.min_time_nanos > start_nanos
-                && m.max_time_nanos <= end_nanos
-                && segment.has_folds()
-            {
-                summarised += 1;
-            } else {
-                needs_rows += 1;
-            }
-        }
-
-        // Nothing in this window is answerable from a summary, which is what a window
-        // narrower than a segment looks like: a chart's fifteen minutes sits inside one
-        // segment rather than containing any. Taking the shortcut anyway would read those
-        // segments *whole* to answer a quarter of an hour, once per point — measured at a
-        // thirty-second timeout on a panel the ordinary sliced scan answers in under two.
-        if summarised == 0 {
-            return Ok(None);
-        }
-        // Each segment the window does not contain whole is read *whole*, because a
-        // time-range scan would also touch the neighbours already taken from summaries.
-        // The caller says how many such reads it can afford: one evaluation point can
-        // carry a handful, two hundred and fifty can carry none, and a window narrower
-        // than a segment contains nothing and so is answered entirely by reading — which
-        // is the ordinary scan's job, done better.
-        if needs_rows > whole_reads_allowed {
-            // Decline. The caller then takes the ordinary pruned scan it has always taken,
-            // untouched, so a store whose segments are not summarised yet is never slower
-            // than one that never had summaries at all. Replacing that scan with a second
-            // fold-shaped implementation was tried and measured: thirty seconds against
-            // five. Summaries are a shortcut over the existing path, not a rewrite of it.
+        if !shortcut_pays(&segments, start_nanos, end_nanos, whole_reads_allowed) {
             return Ok(None);
         }
 
@@ -196,6 +160,9 @@ impl crate::RecordStore<MetricSchema> {
                     };
                     let key = note(&mut by_series, &mut order, labels);
                     if let Some(entry) = by_series.get_mut(&key) {
+                        if !entry.precedes(fold.first_nanos) {
+                            return Ok(None);
+                        }
                         entry.merge_later(fold);
                     }
                 }
@@ -206,24 +173,28 @@ impl crate::RecordStore<MetricSchema> {
             // *segment* rather than a time range matters — a range scan would also touch
             // its neighbours, which the loop has already taken from their summaries.
             let rows = segment.read::<MetricSchema>()?;
-            fold_rows(
+            if !fold_rows(
                 rows.into_iter(),
                 start_nanos,
                 end_nanos,
                 matchers,
                 &mut by_series,
                 &mut order,
-            );
+            ) {
+                return Ok(None);
+            }
         }
 
-        fold_rows(
+        if !fold_rows(
             self.buffered_between(start_nanos, end_nanos).into_iter(),
             start_nanos,
             end_nanos,
             matchers,
             &mut by_series,
             &mut order,
-        );
+        ) {
+            return Ok(None);
+        }
 
         let mut out: Vec<(Labels, StreamFold)> = order
             .into_iter()
@@ -234,12 +205,56 @@ impl crate::RecordStore<MetricSchema> {
     }
 }
 
+/// Whether answering a window from summaries costs less than reading it.
+///
+/// Decided from manifests alone — time bounds and whether a summary exists — so asking
+/// is cheap even when the answer is no.
+fn shortcut_pays(
+    segments: &[std::sync::Arc<crate::segment::Segment>],
+    start_nanos: u64,
+    end_nanos: u64,
+    whole_reads_allowed: usize,
+) -> bool {
+    let mut needs_rows = 0usize;
+    let mut summarised = 0usize;
+    for segment in segments {
+        let m = &segment.manifest;
+        if m.min_time_nanos > end_nanos || m.max_time_nanos <= start_nanos {
+            continue;
+        }
+        if m.min_time_nanos > start_nanos && m.max_time_nanos <= end_nanos && segment.has_folds() {
+            summarised += 1;
+        } else {
+            needs_rows += 1;
+        }
+    }
+
+    // Nothing in this window is answerable from a summary, which is what a window
+    // narrower than a segment looks like: a chart's fifteen minutes sits inside one
+    // segment rather than containing any. Taking the shortcut anyway would read those
+    // segments *whole* to answer a quarter of an hour, once per point — measured at a
+    // thirty-second timeout on a panel the ordinary sliced scan answers in under two.
+    //
+    // And each segment the window does not contain whole is read *whole*, because a
+    // time-range scan would also touch the neighbours already taken from summaries. The
+    // caller says how many such reads it can afford: one evaluation point can carry a
+    // handful, two hundred and fifty can carry none. Declining sends the caller to the
+    // ordinary pruned scan, untouched, so a store whose segments are not summarised yet is
+    // never slower than one that never had summaries at all.
+    summarised > 0 && needs_rows <= whole_reads_allowed
+}
+
 /// Fold a run of raw samples into `by_series`, in time order per stream.
 ///
 /// Order is the whole point: a fold applies the counter-reset rule by comparing each
 /// sample with the previous one, so feeding it rows in storage order would invent resets
 /// that never happened and inflate the result. Sorting here rather than at every call
 /// site is what keeps that from being something each caller has to remember.
+///
+/// Returns `false` when a stream's rows start before what is already folded for it —
+/// late data in a segment that overlaps an earlier one. The fold cannot be corrected
+/// after the fact, so the caller abandons the shortcut.
+#[must_use]
 fn fold_rows(
     records: impl Iterator<Item = MetricSample>,
     start_nanos: u64,
@@ -247,7 +262,7 @@ fn fold_rows(
     matchers: &[telemetryd_core::LabelMatcher],
     by_series: &mut std::collections::HashMap<Labels, crate::folds::StreamFold>,
     order: &mut Vec<Labels>,
-) {
+) -> bool {
     let mut rows: Vec<(Labels, u64, f64)> = Vec::new();
     for record in records {
         if record.timestamp_nanos <= start_nanos
@@ -265,9 +280,13 @@ fn fold_rows(
     rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
     for (key, at, value) in rows {
         if let Some(entry) = by_series.get_mut(&key) {
+            if !entry.precedes(at) {
+                return false;
+            }
             entry.add(at, value);
         }
     }
+    true
 }
 
 impl RecordSchema for MetricSchema {

@@ -429,7 +429,6 @@ impl Snapshot {
         expr: &Expr,
         calls: &[(&Selector, Duration, bool)],
         points: &[u64],
-        pushdown: &[telemetryd_core::LabelMatcher],
     ) -> Result<Option<Self>> {
         // What the shortcut may spend on segments the window does not contain whole. One
         // point can afford a handful; a chart asking for two hundred and fifty pays for
@@ -451,7 +450,13 @@ impl Snapshot {
             for (point, at_nanos) in points.iter().enumerate() {
                 let at = at_nanos.saturating_sub(offset_nanos);
                 let floor = at.saturating_sub(range_nanos);
-                let Some(folded) = store.fold_window(floor, at, pushdown, whole_reads)? else {
+                // The selector's own matchers, not the pushdown shared by every selector:
+                // the pushdown is only what all of them have in common, so `x{code="500"}`
+                // divided by `x` would otherwise fold every code into both sides and read
+                // as exactly 1. The selector's matchers include the pushdown, so this only
+                // ever prunes more.
+                let Some(folded) = store.fold_window(floor, at, &selector.matchers, whole_reads)?
+                else {
                     return Ok(None);
                 };
                 for (series, summary) in folded {
@@ -558,6 +563,10 @@ impl Snapshot {
         let mut labels: Vec<Labels> = Vec::new();
         // One accumulator per (call, series, point), grown as series are discovered.
         let mut folds: Vec<Vec<Vec<Fold>>> = vec![Vec::new(); calls.len()];
+        // Which calls each series belongs to. The read uses only the matchers every
+        // selector shares, so one series can be wanted by `x{code="500"}` and not by the
+        // `x` beside it, or the other way round. Decided once per series, not per sample.
+        let mut wanted: Vec<Vec<bool>> = Vec::new();
 
         // Bisection below needs the points in order. A range query builds them that way;
         // checking rather than trusting costs one pass and keeps any other caller correct.
@@ -578,6 +587,14 @@ impl Snapshot {
                     let index = labels.len();
                     identities.insert(id, index);
                     labels.push(sample.series.clone());
+                    wanted.push(
+                        calls
+                            .iter()
+                            .map(|(selector, _, _)| {
+                                telemetryd_core::matches_all(&selector.matchers, &sample.series)
+                            })
+                            .collect(),
+                    );
                     for per_series in &mut folds {
                         per_series.push(vec![Fold::default(); points.len()]);
                     }
@@ -611,6 +628,9 @@ impl Snapshot {
                 };
                 let at_nanos = sample.timestamp_nanos;
                 for (call, (selector, range, _)) in calls.iter().enumerate() {
+                    if !wanted[index][call] {
+                        continue;
+                    }
                     let offset = duration_nanos(selector.offset.unwrap_or(Duration::ZERO));
                     let range_nanos = duration_nanos(*range);
                     // A sample at `s` belongs to the points `p` where
@@ -694,7 +714,7 @@ impl Snapshot {
         // enough segments lack one that reading them whole would cost more than the scan
         // below — which is the same scan the store has always used, left untouched so the
         // shortcut can only ever add speed, never take it away.
-        if let Some(snapshot) = Self::fold_from_summaries(store, expr, &calls, points, pushdown)? {
+        if let Some(snapshot) = Self::fold_from_summaries(store, expr, &calls, points)? {
             return Ok(snapshot);
         }
 
@@ -1470,9 +1490,12 @@ fn histogram_quantile(quantile: f64, vector: &InstantVector) -> InstantVector {
         let bound = if le == "+Inf" {
             f64::INFINITY
         } else {
+            // A NaN bound has no place in the ordering, and `parse` accepts several
+            // spellings of it. It is dropped here rather than sorted, where it used to
+            // break the comparison and abort the process.
             match le.parse::<f64>() {
-                Ok(value) => value,
-                Err(_) => continue,
+                Ok(value) if !value.is_nan() => value,
+                _ => continue,
             }
         };
         histograms
@@ -1484,7 +1507,7 @@ fn histogram_quantile(quantile: f64, vector: &InstantVector) -> InstantVector {
     let mut samples: Vec<(Labels, f64)> = histograms
         .into_iter()
         .filter_map(|(labels, mut buckets)| {
-            buckets.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
             let total = buckets.last()?.1;
             if total <= 0.0 {
                 return None;
@@ -2297,6 +2320,57 @@ mod tests {
         let snapshot = Snapshot::from_samples(vec![sample("gauge", "checkout", T0, -5.0)]);
         let vector = eval(&snapshot, "clamp_min(gauge, 0)", T0);
         assert_eq!(value_for(&vector, "checkout"), Some(0.0));
+    }
+
+    /// `le="NaN"` parses as a float, and a NaN bound has no place in the ordering: it
+    /// made the bucket sort's comparison inconsistent, which the standard sort detects on
+    /// a histogram this size and answers with a panic. A NaN bound is dropped instead, so
+    /// the quantile is the one the real buckets give.
+    #[test]
+    fn a_nan_bucket_bound_is_dropped_rather_than_sorted() {
+        let bucket = |le: String, count: f64| {
+            let mut series = Labels::new();
+            series.insert(METRIC_NAME_LABEL, "lat_bucket");
+            series.insert("le", le);
+            MetricSample {
+                timestamp_nanos: T0,
+                series,
+                value: count,
+                kind: MetricKind::Histogram,
+            }
+        };
+        let mut clean = Vec::new();
+        for i in 1..=30u32 {
+            clean.push(bucket(
+                format!("{}", f64::from(i) / 10.0),
+                f64::from(i) * 10.0,
+            ));
+        }
+        clean.push(bucket("+Inf".to_owned(), 300.0));
+        let mut dirty = clean.clone();
+        for (i, spelling) in ["NaN", "nan", "-NaN", "+nan", "NAN"].iter().enumerate() {
+            for copy in 0..2u32 {
+                let count = f64::from(u32::try_from(i).unwrap() * 37 + copy * 11);
+                dirty.push(bucket(
+                    format!("{spelling}{}", " ".repeat(copy as usize))
+                        .trim()
+                        .to_owned(),
+                    count,
+                ));
+            }
+        }
+
+        let expected = eval(
+            &Snapshot::from_samples(clean),
+            "histogram_quantile(0.9, lat_bucket)",
+            T0,
+        );
+        let got = eval(
+            &Snapshot::from_samples(dirty),
+            "histogram_quantile(0.9, lat_bucket)",
+            T0,
+        );
+        assert_eq!(got.samples, expected.samples);
     }
 
     #[test]

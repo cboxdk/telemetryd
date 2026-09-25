@@ -155,3 +155,138 @@ fn a_bare_selector_is_read_the_ordinary_way_however_wide_the_span() {
     assert_eq!(a.len(), 2, "got {a:?}");
     assert_eq!(a, b, "the store and the samples disagree");
 }
+
+/// Two counters under one name, told apart only by a label.
+fn by_code() -> Vec<MetricSample> {
+    let mut out = Vec::new();
+    for tick in 1..=720u64 {
+        for (code, per_tick) in [("500", 1.0), ("200", 10.0)] {
+            let mut series = Labels::new();
+            series.insert("__name__", "reqs");
+            series.insert("code", code);
+            #[allow(clippy::cast_precision_loss)]
+            let value = tick as f64 * per_tick;
+            out.push(MetricSample {
+                series,
+                timestamp_nanos: tick * 30 * SECOND,
+                value,
+                kind: MetricKind::Counter,
+            });
+        }
+    }
+    out
+}
+
+fn compare(store: &Store, rows: Vec<MetricSample>, query: &str, points: &[u64]) -> usize {
+    let expr = promql::parse(query).unwrap();
+    let loaded = Snapshot::load_at(store.metrics(), &expr, points, 0).unwrap();
+    let mut walked = Snapshot::from_samples(rows);
+    walked.prepare(&expr, points);
+    let mut compared = 0;
+    for at in points {
+        let (Value::Vector(a), Value::Vector(b)) = (
+            loaded.eval(&expr, *at).unwrap(),
+            walked.eval(&expr, *at).unwrap(),
+        ) else {
+            panic!("{query} evaluates to a vector");
+        };
+        let (mut a, mut b) = (a.samples, b.samples);
+        a.sort_by(|x, y| x.0.cmp(&y.0));
+        b.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(a.len(), b.len(), "{query} at {at}: {a:?} vs {b:?}");
+        for (one, two) in a.iter().zip(b.iter()) {
+            assert_eq!(one.0, two.0, "{query} labels at {at}");
+            assert!(
+                (one.1 - two.1).abs() <= 1e-9 * one.1.abs().max(two.1.abs()).max(1.0),
+                "{query} at {at}: store {} vs rows {}",
+                one.1,
+                two.1
+            );
+            compared += 1;
+        }
+    }
+    compared
+}
+
+/// Selectors that share a name and differ by a label have to stay apart when folded.
+///
+/// The read uses only the matchers every selector shares, so both sides of an error
+/// ratio arrive together. Folding used to add every sample to every call, which made
+/// `errors / all` read as exactly 1 on any chart over two hours and on any window wider
+/// than that — the standard error-rate panel, confidently wrong.
+#[test]
+fn an_error_ratio_is_folded_per_selector() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&config(dir.path())).unwrap();
+    let rows = by_code();
+    for sample in &rows {
+        store
+            .metrics()
+            .append(std::slice::from_ref(sample))
+            .unwrap();
+    }
+    store.metrics().seal_now().ok();
+
+    let first = 30 * SECOND;
+    let last = 720 * 30 * SECOND;
+    let step = (last - first) / 249;
+    let chart: Vec<u64> = (0..250).map(|i| first + i * step).collect();
+
+    // A chart: 250 points across six hours, so the sliced fold answers it.
+    let ratio = r#"sum(rate(reqs{code="500"}[15m])) / sum(rate(reqs[15m]))"#;
+    assert!(compare(&store, rows.clone(), ratio, &chart) > 200);
+
+    // One point over a three-hour window, so the per-segment summaries answer it.
+    let wide = r#"sum(rate(reqs{code="500"}[3h])) / sum(rate(reqs[3h]))"#;
+    assert_eq!(compare(&store, rows.clone(), wide, &[last]), 1);
+
+    // And the number itself, not only agreement: one error in every eleven requests.
+    let expr = promql::parse(wide).unwrap();
+    let loaded = Snapshot::load_at(store.metrics(), &expr, &[last], 0).unwrap();
+    let Value::Vector(vector) = loaded.eval(&expr, last).unwrap() else {
+        panic!("a ratio evaluates to a vector");
+    };
+    let value = vector.samples[0].1;
+    assert!((value - 1.0 / 11.0).abs() < 1e-9, "ratio {value}");
+}
+
+/// Late data lands in a newer segment whose time range overlaps an older one.
+///
+/// Joining per-segment summaries in segment order then reads the step back to the older
+/// value as a counter reset, and the total comes out more than twice too large. The
+/// store has to notice the overlap and let the query read the rows, which it sorts.
+#[test]
+fn late_data_is_not_read_as_a_counter_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&config(dir.path())).unwrap();
+
+    let point = |minute: u64| {
+        let mut series = Labels::new();
+        series.insert("__name__", "late_total");
+        #[allow(clippy::cast_precision_loss)]
+        let value = minute as f64 * 3.0;
+        MetricSample {
+            series,
+            timestamp_nanos: minute * 60 * SECOND,
+            value,
+            kind: MetricKind::Counter,
+        }
+    };
+
+    // Minutes 1–60 and 121–180 arrive on time; 61–120 were buffered by an agent during
+    // an outage and arrive last, into a segment of their own.
+    let mut rows = Vec::new();
+    for minute in (1..=60u64).chain(121..=180) {
+        rows.push(point(minute));
+        store.metrics().append(&[point(minute)]).unwrap();
+    }
+    store.metrics().seal_now().ok();
+    for minute in 61..=120u64 {
+        rows.push(point(minute));
+        store.metrics().append(&[point(minute)]).unwrap();
+    }
+    store.metrics().seal_now().ok();
+
+    let end = 180 * 60 * SECOND;
+    assert_eq!(compare(&store, rows, "increase(late_total[3h])", &[end]), 1);
+}

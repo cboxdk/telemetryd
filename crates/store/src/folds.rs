@@ -98,6 +98,20 @@ impl StreamFold {
     ///
     /// The step across the join is counted here, because it is the only place both sides
     /// are known — the same reset rule as within a segment.
+    /// Whether a run whose first sample is at `first_nanos` can be joined after this one.
+    ///
+    /// Joining adds the step from this run's last value to the next run's first, which is
+    /// only the counter's increase when the next run really comes later. Late data breaks
+    /// that: an agent replaying after an outage lands samples in a newer segment whose
+    /// time range overlaps an older one, and joining in segment order reads the step back
+    /// to the older value as a counter reset — measured at 440.9 against a true 180. A
+    /// caller that finds a run out of order has to fall back to reading the rows, which
+    /// sorts them first.
+    #[must_use]
+    pub fn precedes(&self, first_nanos: u64) -> bool {
+        self.seen == 0 || first_nanos >= self.last_nanos
+    }
+
     pub fn merge_later(&mut self, later: &Self) {
         if later.seen == 0 {
             return;
