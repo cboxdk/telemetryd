@@ -29,7 +29,7 @@ pub async fn instant(
     let max_samples = state.config.limits.resolved_max_query_samples();
 
     let expression = params.query.clone().unwrap_or_default();
-    let response = tokio::task::spawn_blocking(move || {
+    let response = crate::auth::spawn_read(move || {
         prometheus::instant(store.metrics(), &params, now, max_samples)
     })
     .await
@@ -49,7 +49,7 @@ pub async fn range(
     let max_samples = state.config.limits.resolved_max_query_samples();
 
     let expression = params.query.clone().unwrap_or_default();
-    let response = tokio::task::spawn_blocking(move || {
+    let response = crate::auth::spawn_read(move || {
         prometheus::range(store.metrics(), &params, now, max_samples)
     })
     .await
@@ -68,7 +68,7 @@ pub async fn labels(
 
     let store = std::sync::Arc::clone(&state.store);
     let response =
-        tokio::task::spawn_blocking(move || prometheus::label_names(store.metrics(), start, end))
+        crate::auth::spawn_read(move || prometheus::label_names(store.metrics(), start, end))
             .await
             .map_err(|e| Error::Config(format!("query task panicked: {e}")))?;
 
@@ -84,7 +84,7 @@ pub async fn label_values(
     let (start, end) = prometheus::meta_range(&params, telemetryd_store::now_nanos())?;
 
     let store = std::sync::Arc::clone(&state.store);
-    let response = tokio::task::spawn_blocking(move || {
+    let response = crate::auth::spawn_read(move || {
         prometheus::label_values(store.metrics(), &name, start, end)
     })
     .await
@@ -116,7 +116,7 @@ pub async fn series(
     let (start, end) = prometheus::meta_range(&params, telemetryd_store::now_nanos())?;
 
     let store = std::sync::Arc::clone(&state.store);
-    let response = tokio::task::spawn_blocking(move || {
+    let response = crate::auth::spawn_read(move || {
         prometheus::series(store.metrics(), &selectors, start, end)
     })
     .await

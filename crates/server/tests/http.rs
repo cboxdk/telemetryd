@@ -1645,3 +1645,89 @@ async fn debug_is_guarded_when_only_cbox_id_guards_the_instance() {
         );
     }
 }
+
+/// A resource attribute is copied into every record it describes, so a small request
+/// can decode to far more than it is. Measured before the budget existed: 73 KB of JSON,
+/// a few hundred bytes gzipped, held 138 MB until the next seal. The request is refused
+/// whole once it outgrows `limits.max_decoded_bytes`, and nothing of it is stored.
+#[tokio::test]
+async fn a_request_that_expands_past_its_budget_is_refused_whole() {
+    let harness = Harness::new(|config| {
+        config.limits.max_decoded_bytes = bytesize::ByteSize::mib(4);
+    });
+    let post = |body: String| {
+        Request::post("/v1/logs")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let batch = |shared: &str, records: usize| {
+        format!(
+            r#"{{"resourceLogs":[{{"resource":{{"attributes":[{{"key":"service.name","value":{{"stringValue":"amp"}}}},{{"key":"blob","value":{{"stringValue":"{shared}"}}}}]}},"scopeLogs":[{{"logRecords":[{}]}}]}}]}}"#,
+            vec![r#"{"body":{"stringValue":"x"}}"#; records].join(",")
+        )
+    };
+
+    // 64 KiB shared by 200 records: about 70 KB on the wire, over 12 MB decoded.
+    let (status, _, body) = harness
+        .request(post(batch(&"a".repeat(64 * 1024), 200)))
+        .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert!(
+        body.contains("max_decoded_bytes"),
+        "the refusal names the limit: {body}"
+    );
+
+    // Nothing of it was stored.
+    let (_, _, labels) = harness
+        .get_with_token("/loki/api/v1/label/service_name/values", "")
+        .await;
+    assert!(
+        !labels.contains("amp"),
+        "a refused request left records behind: {labels}"
+    );
+
+    // An ordinary batch is untouched by the budget — and shows up under the very query
+    // that found nothing above, so that check was not vacuous.
+    let (status, _, body) = harness.request(post(batch("small", 200))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, _, labels) = harness
+        .get_with_token("/loki/api/v1/label/service_name/values", "")
+        .await;
+    assert!(
+        labels.contains("amp"),
+        "the accepted batch is queryable: {labels}"
+    );
+}
+
+/// A made-up HTTP method must not mint a series in our own metrics.
+///
+/// Routes were normalised to stop exactly this; methods were recorded verbatim. Two
+/// hundred unauthenticated requests with invented methods, each answered 401, left two
+/// hundred series behind.
+#[tokio::test]
+async fn invented_methods_do_not_grow_our_own_metrics() {
+    let harness = Harness::new(with_query_token);
+    for i in 0..50 {
+        let method = axum::http::Method::from_bytes(format!("M{i:05}").as_bytes()).unwrap();
+        let (status, _, _) = harness
+            .request(
+                Request::builder()
+                    .method(method)
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_ne!(status, StatusCode::OK);
+    }
+    let (_, _, exposition) = harness.get_with_token("/metrics", "query-secret").await;
+    assert!(
+        !exposition.contains("M00049"),
+        "an invented method became a label"
+    );
+    assert!(
+        exposition.contains("method=\"other\""),
+        "they are counted, as `other`"
+    );
+}

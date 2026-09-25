@@ -17,7 +17,7 @@ pub async fn search(
     let request = SearchRequest::from_params(&params, telemetryd_store::now_nanos())?;
 
     let store = std::sync::Arc::clone(&state.store);
-    let response = tokio::task::spawn_blocking(move || tempo::search(store.traces(), &request))
+    let response = crate::auth::spawn_read(move || tempo::search(store.traces(), &request))
         .await
         .map_err(|e| Error::Config(format!("search task panicked: {e}")))??;
 
@@ -30,7 +30,7 @@ pub async fn trace(
     Path(trace_id): Path<String>,
 ) -> Result<Response, ApiError> {
     let store = std::sync::Arc::clone(&state.store);
-    let response = tokio::task::spawn_blocking(move || tempo::trace(store.traces(), &trace_id))
+    let response = crate::auth::spawn_read(move || tempo::trace(store.traces(), &trace_id))
         .await
         .map_err(|e| Error::Config(format!("trace task panicked: {e}")))??;
 
@@ -51,7 +51,7 @@ pub async fn tags(
     let request = SearchRequest::from_params(&params, telemetryd_store::now_nanos())?;
 
     let store = std::sync::Arc::clone(&state.store);
-    let response = tokio::task::spawn_blocking(move || {
+    let response = crate::auth::spawn_read(move || {
         tempo::tags(store.traces(), request.start_nanos, request.end_nanos)
     })
     .await
@@ -70,7 +70,7 @@ pub async fn tag_values(
 
     let store = std::sync::Arc::clone(&state.store);
     let response =
-        tokio::task::spawn_blocking(move || tempo::tag_values(store.traces(), &name, &request))
+        crate::auth::spawn_read(move || tempo::tag_values(store.traces(), &name, &request))
             .await
             .map_err(|e| Error::Config(format!("tag values task panicked: {e}")))??;
 

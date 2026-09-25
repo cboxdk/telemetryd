@@ -146,9 +146,38 @@ pub async fn limit_query_concurrency(
             .metrics
             .incr("telemetryd_query_queued_total", &[("surface", "query")]);
     }
-    let response = next.run(request).await;
+    // Held by the response *and* by the blocking read it starts. A timeout or a client
+    // that hangs up drops the response future, and used to release the slot with it —
+    // while the scan it had started kept running on a blocking thread. The concurrency
+    // limit then bounded requests, not work: measured at 27 s of CPU after the 408, with
+    // `queries_in_flight` reading zero. Reads started through `spawn_read` keep a share
+    // of the permit until they finish.
+    let permit = std::sync::Arc::new(permit);
+    let response = QUERY_PERMIT
+        .scope(std::sync::Arc::clone(&permit), next.run(request))
+        .await;
     drop(permit);
     Ok(response)
+}
+
+tokio::task_local! {
+    static QUERY_PERMIT: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>;
+}
+
+/// `spawn_blocking` for a read, holding the request's query slot until the read is done.
+///
+/// Use this, not `spawn_blocking`, for anything a read route runs: the slot has to outlive
+/// the request when the request is abandoned, or the limit stops meaning anything.
+pub fn spawn_read<F, R>(work: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let held = QUERY_PERMIT.try_with(std::sync::Arc::clone).ok();
+    tokio::task::spawn_blocking(move || {
+        let _held = held;
+        work()
+    })
 }
 
 pub async fn require_query_token(
@@ -329,5 +358,36 @@ mod tests {
         assert_eq!(bearer("abc123"), None);
         assert_eq!(bearer("Bearer "), None);
         assert_eq!(bearer(""), None);
+    }
+
+    /// A request that times out, or whose client hangs up, drops its response future; the
+    /// read it started does not stop. The slot has to stay taken until the read finishes,
+    /// or the concurrency limit bounds requests while the work piles up behind it.
+    #[tokio::test]
+    async fn a_read_keeps_its_slot_after_the_request_is_abandoned() {
+        use std::sync::Arc;
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::new(Arc::clone(&slots).try_acquire_owned().unwrap());
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+
+        let read = QUERY_PERMIT.sync_scope(Arc::clone(&permit), || {
+            spawn_read(move || {
+                let _ = wait.recv();
+            })
+        });
+        drop(permit); // the request is gone
+
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "the slot went back while the read ran"
+        );
+        release.send(()).unwrap();
+        read.await.unwrap();
+        assert_eq!(
+            slots.available_permits(),
+            1,
+            "and comes back once it is done"
+        );
     }
 }

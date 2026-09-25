@@ -27,7 +27,7 @@ pub async fn query_range(
 
     // Reading segments is blocking file I/O; keep it off the async runtime.
     let store = std::sync::Arc::clone(&state.store);
-    let response = tokio::task::spawn_blocking(move || loki::query_range(store.logs(), &request))
+    let response = crate::auth::spawn_read(move || loki::query_range(store.logs(), &request))
         .await
         .map_err(|e| Error::Config(format!("query task panicked: {e}")))?
         .inspect_err(|error| state.refused_query("logql", &expression, error))?;
@@ -48,7 +48,7 @@ pub async fn labels(
     )?;
 
     let store = std::sync::Arc::clone(&state.store);
-    let response = tokio::task::spawn_blocking(move || loki::label_names(store.logs(), start, end))
+    let response = crate::auth::spawn_read(move || loki::label_names(store.logs(), start, end))
         .await
         .map_err(|e| Error::Config(format!("query task panicked: {e}")))?;
 
@@ -70,7 +70,7 @@ pub async fn label_values(
 
     let store = std::sync::Arc::clone(&state.store);
     let response =
-        tokio::task::spawn_blocking(move || loki::label_values(store.logs(), &name, start, end))
+        crate::auth::spawn_read(move || loki::label_values(store.logs(), &name, start, end))
             .await
             .map_err(|e| Error::Config(format!("query task panicked: {e}")))??;
 
@@ -105,7 +105,7 @@ pub async fn series(
 
     let store = std::sync::Arc::clone(&state.store);
     let response =
-        tokio::task::spawn_blocking(move || loki::series(store.logs(), &selectors, start, end))
+        crate::auth::spawn_read(move || loki::series(store.logs(), &selectors, start, end))
             .await
             .map_err(|e| Error::Config(format!("query task panicked: {e}")))??;
 

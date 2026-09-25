@@ -185,7 +185,7 @@ async fn record_request(State(state): State<AppState>, request: Request, next: N
         .extensions()
         .get::<MatchedPath>()
         .map_or_else(|| "<unmatched>".to_owned(), |m| m.as_str().to_owned());
-    let method = request.method().clone();
+    let method = method_label(request.method());
 
     let response = next.run(request).await;
 
@@ -193,11 +193,31 @@ async fn record_request(State(state): State<AppState>, request: Request, next: N
         "telemetryd_http_requests_total",
         &[
             ("route", &route),
-            ("method", method.as_str()),
+            ("method", method),
             ("status", response.status().as_str()),
         ],
     );
     response
+}
+
+/// The method as a label, from a closed set.
+///
+/// The route was already normalised for exactly this reason, and the method was not: HTTP
+/// allows any token as a method, so two hundred unauthenticated requests with made-up
+/// methods — each answered 401 — left two hundred series in `/metrics`, one of them four
+/// kilobytes long. Anything outside the standard methods is counted as `other`.
+fn method_label(method: &axum::http::Method) -> &'static str {
+    use axum::http::Method;
+    match *method {
+        Method::GET => "GET",
+        Method::HEAD => "HEAD",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::DELETE => "DELETE",
+        Method::OPTIONS => "OPTIONS",
+        Method::PATCH => "PATCH",
+        _ => "other",
+    }
 }
 
 /// Bind the listener and serve until shutdown is signalled.

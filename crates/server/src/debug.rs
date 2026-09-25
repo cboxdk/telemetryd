@@ -360,11 +360,18 @@ pub async fn debug(
     // On a blocking thread for the same reason every other read is: scanning opens
     // Parquet files, and a runtime worker is the wrong place for that.
     let max_samples = state.config.limits.resolved_max_query_samples();
-    let outcome = tokio::task::spawn_blocking(move || {
-        collect(&store, signal, &owned, start, now, max_samples)
-    })
-    .await
-    .map_err(|e| telemetryd_core::Error::Config(format!("debug query panicked: {e}")))?;
+    // A read like any other, so it takes a query slot like any other. This page was not
+    // behind the limiter, and a week of spans could be scanned here however busy the
+    // instance was. The slot is held until the read finishes, not just the request.
+    let outcome = match state.query_slot(state.query_wait()).await {
+        Some(permit) => tokio::task::spawn_blocking(move || {
+            let _held = permit;
+            collect(&store, signal, &owned, start, now, max_samples)
+        })
+        .await
+        .map_err(|e| telemetryd_core::Error::Config(format!("debug query panicked: {e}")))?,
+        None => Err(telemetryd_core::Error::Overloaded),
+    };
 
     let (rows, suggestions, error) = match outcome {
         Ok((rows, suggestions)) => (rows, suggestions, None),
