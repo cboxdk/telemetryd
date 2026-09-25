@@ -76,6 +76,8 @@ pub struct RelayStatus {
     pub failures: u64,
     /// Records lost because one alone exceeded a request. Should always be zero.
     pub records_dropped: u64,
+    /// Records upstream accepted the request for but refused in `partialSuccess`.
+    pub records_refused: u64,
     /// The request size upstream has been observed to accept, once it has refused one.
     pub learned_request_ceiling: Option<usize>,
     /// How far each signal has been delivered. Absent means nothing has yet.
@@ -89,6 +91,11 @@ pub struct RelayStats {
     pub failures: AtomicU64,
     /// Records dropped because one alone exceeded a request. Always data loss.
     pub records_dropped: AtomicU64,
+    /// Records upstream answered 2xx for but refused in `partialSuccess` — a series
+    /// limit, an overlong label. Not retried, because the OTLP spec says a partial
+    /// success must not be; so they are lost at the destination, and counted here
+    /// because otherwise nothing on this side would know.
+    pub records_refused: AtomicU64,
 }
 
 pub struct Relay {
@@ -215,6 +222,7 @@ impl Relay {
             records_delivered: self.stats.records_delivered.load(Ordering::Relaxed),
             failures: self.stats.failures.load(Ordering::Relaxed),
             records_dropped: self.stats.records_dropped.load(Ordering::Relaxed),
+            records_refused: self.stats.records_refused.load(Ordering::Relaxed),
             learned_request_ceiling: match self.learned_ceiling.load(Ordering::Relaxed) {
                 usize::MAX => None,
                 ceiling => Some(ceiling),
@@ -398,7 +406,12 @@ impl Relay {
             }
 
             match self.post(path, &encoded) {
-                Ok(()) => sent += batch.len() as u64,
+                Ok(refused) => {
+                    sent += (batch.len() as u64).saturating_sub(refused);
+                    self.stats
+                        .records_refused
+                        .fetch_add(refused, Ordering::Relaxed);
+                }
                 Err(error) if is_too_large(&error) && batch.len() > 1 => {
                     self.learn_ceiling(encoded.len());
                     // The receiver's limit is tighter than ours. Halve and retry
@@ -441,7 +454,9 @@ impl Relay {
         self.learned_ceiling.fetch_min(ceiling, Ordering::Relaxed);
     }
 
-    fn post(&self, path: &str, encoded: &str) -> Result<()> {
+    /// Send one request, returning how many records upstream refused in its
+    /// `partialSuccess` — zero when it took them all.
+    fn post(&self, path: &str, encoded: &str) -> Result<u64> {
         let url = format!("{}{path}", self.config.upstream.trim_end_matches('/'));
         let token = self.config.token.resolve()?;
 
@@ -463,7 +478,19 @@ impl Relay {
 
         let status = response.status().as_u16();
         if (200..300).contains(&status) {
-            return Ok(());
+            // A 2xx can still refuse records. Any 2xx used to count as delivered in full,
+            // so records an upstream series limit turned away were reported as sent.
+            let body = response.body_mut().read_to_string().unwrap_or_default();
+            let (refused, message) = partially_refused(&body);
+            if refused > 0 {
+                tracing::warn!(
+                    url,
+                    refused,
+                    message,
+                    "upstream accepted the request but refused some records"
+                );
+            }
+            return Ok(refused);
         }
 
         // The body is where an upstream says *why* — an unsupported field, a limit,
@@ -480,6 +507,31 @@ impl Relay {
             "{url} answered {status}: {detail}"
         )))
     }
+}
+
+/// How many records an OTLP response's `partialSuccess` refused, and why.
+///
+/// The count is an int64, which OTLP/JSON writes as a string, and a receiver may write
+/// it as a number; either is read.
+pub fn partially_refused(body: &str) -> (u64, String) {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
+        return (0, String::new());
+    };
+    let partial = &json["partialSuccess"];
+    let refused = ["rejectedLogRecords", "rejectedSpans", "rejectedDataPoints"]
+        .iter()
+        .find_map(|key| {
+            let value = &partial[*key];
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+        })
+        .unwrap_or(0);
+    let message = partial["errorMessage"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    (refused, message)
 }
 
 /// Whether upstream refused because the request was too big.
@@ -588,5 +640,22 @@ mod tests {
             })
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// A 2xx can still refuse records, and every 2xx used to count as delivered in full.
+    #[test]
+    fn partial_refusals_are_read_from_a_success() {
+        assert_eq!(
+            partially_refused(
+                r#"{"partialSuccess":{"rejectedLogRecords":"3","errorMessage":"series limit"}}"#
+            ),
+            (3, "series limit".to_owned())
+        );
+        assert_eq!(
+            partially_refused(r#"{"partialSuccess":{"rejectedSpans":2}}"#).0,
+            2
+        );
+        assert_eq!(partially_refused("{}").0, 0);
+        assert_eq!(partially_refused("").0, 0);
     }
 }

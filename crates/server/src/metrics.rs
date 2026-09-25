@@ -159,6 +159,11 @@ pub const DESCRIPTORS: &[Descriptor] = &[
         help: "Records accepted upstream since start",
     },
     Descriptor {
+        name: "telemetryd_relay_records_refused_total",
+        kind: Kind::Counter,
+        help: "Records upstream answered 2xx for but refused in partialSuccess. Not retried, as the OTLP spec requires, so lost at the destination",
+    },
+    Descriptor {
         name: "telemetryd_relay_failures_total",
         kind: Kind::Counter,
         help: "Failed delivery attempts since start. Retried from the cursor, not lost",

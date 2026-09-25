@@ -309,6 +309,10 @@ fn push_auth_and_cardinality_gauges(state: &AppState, samples: &mut Vec<Sample>)
                 relay.stats.records_delivered.load(Ordering::Relaxed),
             ),
             (
+                "telemetryd_relay_records_refused_total",
+                relay.stats.records_refused.load(Ordering::Relaxed),
+            ),
+            (
                 "telemetryd_relay_failures_total",
                 relay.stats.failures.load(Ordering::Relaxed),
             ),

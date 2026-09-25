@@ -296,6 +296,7 @@ impl Reporter {
                     "records": self.records,
                     "requests": self.requests,
                     "high_water_nanos": self.high_water.map(|n| n.to_string()),
+                    "refused": REFUSED.load(std::sync::atomic::Ordering::Relaxed),
                     "error": error,
                 })
             ),
@@ -317,6 +318,11 @@ impl Reporter {
                     .map(|e| format!(" — stopped: {e}"))
                     .unwrap_or_default()
             ),
+        }
+        if let Some(note) = refusal_note()
+            && !matches!(self.mode, Progress::Json)
+        {
+            eprintln!("  {note}");
         }
     }
 }
@@ -356,9 +362,10 @@ fn window(
     token: Option<&str>,
     start_nanos: u128,
     end_nanos: u128,
-) -> anyhow::Result<Option<(Value, u64, u64)>> {
+    limit: u64,
+) -> anyhow::Result<Option<Window>> {
     let url = format!(
-        "{base}/loki/api/v1/query_range?query={}&start={start_nanos}&end={end_nanos}&limit={WINDOW_LIMIT}&direction=backward",
+        "{base}/loki/api/v1/query_range?query={}&start={start_nanos}&end={end_nanos}&limit={limit}&direction=backward",
         super::query::urlencode(query)
     );
     let response = get(&url, token)?;
@@ -373,6 +380,9 @@ fn window(
     let mut resources = Vec::new();
     let mut count = 0u64;
     let mut oldest = u64::MAX;
+    // How many of this page's records share the oldest timestamp — what the next page
+    // would skip if the page cut through them.
+    let mut at_oldest = 0u64;
 
     for stream in &streams {
         let labels = stream.get("stream").and_then(Value::as_object);
@@ -403,7 +413,14 @@ fn window(
             let timestamp = pair.first().and_then(Value::as_str).unwrap_or("0");
             let text = pair.get(1).and_then(Value::as_str).unwrap_or("");
             if let Ok(nanos) = timestamp.parse::<u64>() {
-                oldest = oldest.min(nanos);
+                match nanos.cmp(&oldest) {
+                    std::cmp::Ordering::Less => {
+                        oldest = nanos;
+                        at_oldest = 1;
+                    }
+                    std::cmp::Ordering::Equal => at_oldest += 1,
+                    std::cmp::Ordering::Greater => {}
+                }
             }
 
             let mut record = serde_json::Map::new();
@@ -448,11 +465,20 @@ fn window(
     if count == 0 {
         return Ok(None);
     }
-    Ok(Some((
-        serde_json::json!({"resourceLogs": resources}),
+    Ok(Some(Window {
+        batch: serde_json::json!({"resourceLogs": resources}),
         count,
         oldest,
-    )))
+        at_oldest,
+    }))
+}
+
+/// One page of a walk.
+struct Window {
+    batch: Value,
+    count: u64,
+    oldest: u64,
+    at_oldest: u64,
 }
 
 /// The `severityNumber` a level maps back to.
@@ -508,11 +534,40 @@ fn walk(
     let mut cursor = end;
 
     loop {
-        let Some((batch, count, oldest)) = window(base, query, token, start, cursor)? else {
+        let Some(page) = window(base, query, token, start, cursor, WINDOW_LIMIT as u64)? else {
             break;
         };
-        emit(&batch)?;
-        reporter.advance(count, Some(oldest));
+        emit(&page.batch)?;
+        reporter.advance(page.count, Some(page.oldest));
+        let oldest = page.oldest;
+
+        // The next page starts one nanosecond older, which skips whatever this page left
+        // behind at `oldest`. That is nothing unless the page was full and cut through a
+        // timestamp many records share — a batch sent without timestamps is stamped with
+        // one arrival time for all of it. Checked rather than assumed: a migration that
+        // reports success for records it never sent is the failure this refuses.
+        //
+        // The probe asks for one more than the page held there: getting it back is the
+        // proof. A page that is one timestamp from end to end cannot be probed that way —
+        // query endpoints cap a page at the same size, Loki's included — and paging past
+        // it would skip whatever lies beyond the cap, so that stops too.
+        if page.count >= WINDOW_LIMIT as u64 {
+            let whole = page.at_oldest >= WINDOW_LIMIT as u64;
+            let at = u128::from(oldest);
+            let probe = page.at_oldest + 1;
+            if whole
+                || window(base, query, token, at, at, probe)?
+                    .is_some_and(|at| at.count > page.at_oldest)
+            {
+                anyhow::bail!(
+                    "at least {} records share the timestamp {oldest}, more than paging can \
+                     step past without skipping some. When the source is a telemetryd, \
+                     export through its own endpoint instead (leave out --query), whose \
+                     pages hold 200,000 records",
+                    if whole { page.at_oldest } else { probe }
+                );
+            }
+        }
 
         // Strictly older next time, or a window whose entries all share a timestamp
         // would repeat forever.
@@ -753,6 +808,24 @@ pub fn export(args: &ExportArgs) -> anyhow::Result<()> {
     }
 }
 
+/// Records the destination answered 2xx for but refused, across the whole run.
+static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Why, as the destination put it the first time.
+static FIRST_REFUSAL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The line the summary ends with when the destination refused anything.
+fn refusal_note() -> Option<String> {
+    let refused = REFUSED.load(std::sync::atomic::Ordering::Relaxed);
+    (refused > 0).then(|| {
+        format!(
+            "{refused} of them were refused by the destination: {}",
+            FIRST_REFUSAL
+                .get()
+                .map_or("no reason given", String::as_str)
+        )
+    })
+}
+
 fn post(url: &str, token: Option<&str>, body: &str) -> anyhow::Result<()> {
     let mut request = ureq::post(url)
         .config()
@@ -768,6 +841,16 @@ fn post(url: &str, token: Option<&str>, body: &str) -> anyhow::Result<()> {
         .with_context(|| format!("could not reach {url}"))?;
     let status = response.status().as_u16();
     if (200..300).contains(&status) {
+        // A 2xx can still refuse records in `partialSuccess` — a series limit at the
+        // destination, an overlong label. Every 2xx used to count as delivered in full,
+        // so a migration could report success for records that never arrived. Not
+        // retried: OTLP says a partial success must not be.
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        let (refused, message) = telemetryd_server::relay::partially_refused(&body);
+        if refused > 0 {
+            REFUSED.fetch_add(refused, std::sync::atomic::Ordering::Relaxed);
+            let _ = FIRST_REFUSAL.set(message);
+        }
         return Ok(());
     }
     let detail: String = response

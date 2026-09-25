@@ -259,6 +259,7 @@ async fn the_exported_metric_names_cannot_change_by_accident() {
         "telemetryd_relay_identity_overridden_total",
         "telemetryd_relay_pending_segments",
         "telemetryd_relay_records_delivered_total",
+        "telemetryd_relay_records_refused_total",
         "telemetryd_relay_segments_delivered_total",
         "telemetryd_retention_deleted_total",
         "telemetryd_segment_rows",
