@@ -6,12 +6,14 @@ description: "Copy the directory. Why that is safe while telemetryd is running, 
 
 # Back up and restore
 
-**Copy the data directory. That is the whole procedure**, and it is safe to do while
-telemetryd is running.
+**Copy the data directory, write-ahead log first. That is the whole procedure**, and it
+is safe to do while telemetryd is running.
 
 ```bash
-# Back up
-tar -czf telemetryd-$(date +%F).tar.gz -C /var/lib telemetryd
+# Back up — as root, since the directory is closed to other accounts. The order of
+# the paths is the point: wal/ before segments/.
+sudo tar -czf telemetryd-$(date +%F).tar.gz -C /var/lib \
+  telemetryd/VERSION telemetryd/wal telemetryd/segments
 
 # Restore
 systemctl stop telemetryd
@@ -42,6 +44,16 @@ later. It never becomes a corrupt segment.
 CRC. A copy taken mid-append catches a torn final record, which is exactly what a power
 cut leaves behind, and the recovery path repairs it on open — the same code, exercised
 the same way.
+
+**The log is copied before the segments, and that order is what makes it complete.**
+A seal publishes a segment and only then deletes the log epoch it came from. Copying
+`wal/` first, every record is in one of the two copies: still in the log when it was
+copied, or already in a segment by the time `segments/` was. Copied the other way round,
+a seal landing between the two could publish after `segments/` was copied and delete its
+log before `wal/` was — and the backup held that segment in neither. A single `tar` of the
+whole directory copies in whatever order the directory lists, so the paths are named.
+Anything in both copies is read once: replay skips log epochs a segment already covers.
+Earlier versions of this page said a plain `tar` of the directory was enough.
 
 **The lock is held by a process, not by a file.** `LOCK` is copied along with
 everything else and does not stop the restored copy from starting, because the lock is
