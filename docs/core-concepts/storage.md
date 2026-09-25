@@ -34,7 +34,7 @@ not a query source beyond crash recovery.
 
 Before the answer goes back, the batch is also handed to the kernel. So a crash of the
 *process* — a panic, `SIGKILL`, the kernel stopping it at the unit's `MemoryMax` — loses
-nothing that was acknowledged; before 0.64.1 it could lose the last 100 ms, which sat in
+nothing that was acknowledged; before 0.65.0 it could lose the last 100 ms, which sat in
 telemetryd's own write buffer until the next sync.
 
 `wal_sync` defaults to `interval` at 100 ms. **On hard power loss you can lose up to

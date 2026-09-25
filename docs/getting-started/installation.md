@@ -52,7 +52,7 @@ Download the `.deb` for your architecture from the
 [releases page](https://github.com/cboxdk/telemetryd/releases) and install it:
 
 ```bash
-sudo dpkg -i telemetryd_0.64.0_amd64.deb
+sudo dpkg -i telemetryd_0.65.0_amd64.deb
 sudo systemctl enable --now telemetryd
 ```
 
