@@ -7,6 +7,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Read-only: nothing here publishes, and a job that runs third-party build tooling has
+# no business holding a token that can write to the repository.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -47,10 +52,10 @@ jobs:
         run: cargo fmt --all --check
 
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace --all-features
+        run: cargo test --locked --workspace --all-features
 
       # `-D warnings` here, not just on clippy. Without it this step has never failed
       # anything: a broken intra-doc link sat in `out.rs` through several releases while
@@ -97,6 +102,20 @@ jobs:
 
       - name: SBOM is not stale
         run: python3 scripts/generate-sbom.py --check
+
+      # A target left out of the nightly matrix is a parser nobody fuzzes, and nothing
+      # says so: `otlp_protobuf` — the encoding every stock SDK sends — sat unrun that way.
+      - name: every fuzz target is fuzzed nightly and has seeds
+        run: |
+          MISSING=""
+          while read -r TARGET; do
+            grep -Eq "target: \[.*\b${TARGET}\b" .github/workflows/fuzz.yml || MISSING="$MISSING $TARGET(matrix)"
+            [ -n "$(ls "fuzz/seeds/$TARGET" 2>/dev/null)" ] || MISSING="$MISSING $TARGET(seeds)"
+          done < <(grep -A1 '^\[\[bin\]\]' fuzz/Cargo.toml | sed -n 's/^name = "\(.*\)"/\1/p')
+          if [ -n "$MISSING" ]; then
+            echo "::error::fuzz targets not covered:$MISSING"
+            exit 1
+          fi
 
       # Structure, frontmatter and dangling links. A moved doc that leaves a dead link
       # is the most common way documentation rots.
@@ -216,12 +235,23 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # The PromQL conformance suite's expectations are Prometheus's own answers. The Rust
+  # side holds telemetryd to them in `check`; this asks Prometheus again, so the file
+  # cannot say something Prometheus would not.
+  promql-conformance:
+    name: PromQL answers match Prometheus
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Prometheus agrees with every expectation
+        run: python3 scripts/promql-conformance.py --check
+
   # A single required check, so branch protection does not need updating every time
   # the matrix changes.
   ci:
     name: ci
     if: always()
-    needs: [check, deny, msrv, supply-chain, build]
+    needs: [check, deny, msrv, supply-chain, build, promql-conformance]
     runs-on: ubuntu-latest
     steps:
       # Parsed with jq rather than grep. The grep version worked, but only because

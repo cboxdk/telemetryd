@@ -19,8 +19,59 @@ env:
   RUST_VERSION: "1.97.1"
 
 jobs:
+  # Nothing is built for a tag until two things hold. A tag used to publish whatever it
+  # pointed at, and 0.47.0 and 0.51.0 shipped from commits CI had failed.
+  verify:
+    name: the tag is a green commit of that version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # Through the environment: the tag is text whoever pushes or dispatches chooses.
+      - name: the tag names the version Cargo.toml declares
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          DECLARED=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "${TAG#v}" != "$DECLARED" ]; then
+            echo "::error::the tag is $TAG but Cargo.toml declares $DECLARED"
+            exit 1
+          fi
+
+      # CI runs on every push to main and on the tag itself; either run passing for this
+      # commit is enough. Waited for rather than assumed, because a tag is usually pushed
+      # moments after the commit and its run is still going.
+      - name: CI passed on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHA=$(git rev-parse HEAD)
+          for _ in $(seq 1 90); do
+            RUNS=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$SHA" \
+              --json status,conclusion --jq '[.[] | "\(.status)/\(.conclusion)"] | join(" ")')
+            case " $RUNS " in
+              *" completed/success "*) echo "CI passed on $SHA"; exit 0 ;;
+            esac
+            # Every run finished, and none of them passed.
+            # shellcheck disable=SC2086 # one word per run, on purpose
+            if [ -n "$RUNS" ] && ! printf '%s\n' $RUNS | grep -qv '^completed/'; then
+              echo "::error::CI did not pass on $SHA: $RUNS"
+              exit 1
+            fi
+            echo "waiting for CI on $SHA (${RUNS:-no run yet})"
+            sleep 20
+          done
+          echo "::error::CI did not finish on $SHA within half an hour"
+          exit 1
+
   build:
     name: ${{ matrix.target }}
+    needs: verify
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -60,9 +111,9 @@ jobs:
       - name: build
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --profile dist --target ${{ matrix.target }} --bin telemetryd
+            cross build --locked --profile dist --target ${{ matrix.target }} --bin telemetryd
           else
-            cargo build --profile dist --target ${{ matrix.target }} --bin telemetryd
+            cargo build --locked --profile dist --target ${{ matrix.target }} --bin telemetryd
           fi
 
       # "One static binary, no runtime deps, no glibc surprises" is a promise on the
@@ -157,6 +208,14 @@ jobs:
           fi
           mkdir -p /var/lib/telemetryd
           chown telemetryd:telemetryd /var/lib/telemetryd
+          # The unit reads /etc/telemetryd/telemetryd.toml, and a package that did not
+          # provide it left `systemctl enable --now` restarting a service that could not
+          # start. Created from the example once, and never touched again: after that it
+          # is the operator's file. Tokens go in it, so only root and the service read it.
+          if [ ! -e /etc/telemetryd/telemetryd.toml ]; then
+              install -m 0640 -o root -g telemetryd \
+                  /etc/telemetryd/telemetryd.toml.example /etc/telemetryd/telemetryd.toml
+          fi
           if [ -d /run/systemd/system ]; then
               systemctl daemon-reload || true
           fi

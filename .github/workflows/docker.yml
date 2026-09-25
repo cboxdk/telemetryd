@@ -36,7 +36,6 @@ jobs:
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Through the environment, never `${{ }}` inside the script: the tag is text
       # whoever dispatches the workflow or pushes a tag chooses, and interpolated into
       # `run:` it was shell for this job to execute. Then held to the shape of a
@@ -59,6 +58,20 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          # A pre-release — `v1.2.0-rc.1` — is published under its own version and
+          # never as `latest`: someone pulling `latest` asked for the current release,
+          # and an rc tag used to hand them the candidate instead.
+          case "$TAG" in
+            *-*) echo "latest=" >> "$GITHUB_OUTPUT" ;;
+            *) echo "latest=ghcr.io/${GITHUB_REPOSITORY}:latest" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      # The tag's own Dockerfile and scripts, not whatever main holds by the time this
+      # runs: a `workflow_run` checks out the default branch unless told otherwise, so
+      # an image could be built for one release by the next one's recipe.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
 
       # Fails loudly on a checksum mismatch, so a tampered or half-uploaded asset
       # cannot become an image.
@@ -84,7 +97,7 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.version }}
-            ghcr.io/${{ github.repository }}:latest
+            ${{ steps.tag.outputs.latest }}
           labels: |
             org.opencontainers.image.title=telemetryd
             org.opencontainers.image.version=${{ steps.tag.outputs.version }}

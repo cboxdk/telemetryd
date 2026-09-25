@@ -32,6 +32,10 @@ RestartSec=5s
 # series budget from it, so raising it here raises those too — this is the one number to
 # change if you have given telemetryd a machine of its own.
 MemoryMax=25%
+# And no swap to fall into on the way. With swap enabled the limit counts only resident
+# pages, so a process at the wall pages out instead of being stopped — the same state
+# MemoryHigh produced, reached by another road: running, and doing nothing.
+MemorySwapMax=0
 
 User=telemetryd
 Group=telemetryd

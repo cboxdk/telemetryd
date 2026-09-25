@@ -77,12 +77,11 @@ fn unit_path() -> anyhow::Result<PathBuf> {
 }
 
 fn install(user: &str) -> anyhow::Result<()> {
-    let unit = unit_for_this_platform(user)?;
+    let exe = executable_for_the_service()?;
+    let unit = unit_for_executable(&exe.display().to_string(), user)?;
     let path = unit_path()?;
     #[cfg(not(target_os = "macos"))]
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(concern) = writable_by_others(&exe)
-    {
+    if let Some(concern) = writable_by_others(&exe) {
         crate::out::outln!(
             "warning: the unit will run {} as a service, and {concern}. Whoever can \
              replace that file can run code as the service. Install the binary \
@@ -462,14 +461,67 @@ fn unit_for_this_platform(user: &str) -> anyhow::Result<String> {
         |_| "/usr/local/bin/telemetryd".to_owned(),
         |p| p.display().to_string(),
     );
+    unit_for_executable(&exe, user)
+}
 
+fn unit_for_executable(exe: &str, user: &str) -> anyhow::Result<String> {
     Ok(if cfg!(target_os = "macos") {
-        launchd_plist(&exe)
+        launchd_plist(exe)
     } else if cfg!(target_os = "linux") {
-        systemd_unit(&exe, user)
+        systemd_unit(exe, user)
     } else {
         bail!("no service unit template for this platform");
     })
+}
+
+/// Where a binary the service could not see is copied to.
+const SERVICE_BINARY: &str = "/usr/local/bin/telemetryd";
+
+/// The binary the unit will run: this one, unless the service could not see it.
+///
+/// The unit sets `ProtectHome=true`, which hides `/home`, `/root` and `/run/user` from
+/// the service. `install.sh` puts the binary in `~/.local/bin` when that is writable, so
+/// `sudo telemetryd service install` straight afterwards wrote an `ExecStart` the service
+/// could not open, and it failed with `203/EXEC`. A binary in one of those places is
+/// copied to `/usr/local/bin` first, and the unit runs the copy.
+fn executable_for_the_service() -> anyhow::Result<std::path::PathBuf> {
+    let exe = std::env::current_exe().context("finding this executable")?;
+    if !cfg!(target_os = "linux") || !hidden_by_protect_home(&exe) {
+        return Ok(exe);
+    }
+    let target = std::path::Path::new(SERVICE_BINARY);
+    let staged = target.with_extension("partial");
+    let copy = || -> std::io::Result<()> {
+        std::fs::create_dir_all(target.parent().unwrap_or(std::path::Path::new("/")))?;
+        std::fs::copy(&exe, &staged)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+        }
+        std::fs::rename(&staged, target)
+    };
+    copy().with_context(|| {
+        format!(
+            "{} is in a home directory, which the service's ProtectHome hides from it, and \
+             copying it to {SERVICE_BINARY} failed. Copy it there yourself and run \
+             `sudo {SERVICE_BINARY} service install`",
+            exe.display()
+        )
+    })?;
+    crate::out::outln!(
+        "copied {} to {SERVICE_BINARY}: the service cannot see into home directories. \
+         The unit runs the copy, so upgrade that one from now on.",
+        exe.display()
+    );
+    Ok(target.to_path_buf())
+}
+
+/// Whether `ProtectHome=true` hides this path from the service.
+fn hidden_by_protect_home(path: &std::path::Path) -> bool {
+    ["/home", "/root", "/run/user"]
+        .iter()
+        .any(|hidden| path.starts_with(hidden))
 }
 
 /// Where the `.deb` installs the binary, and therefore the `ExecStart` in the unit
@@ -525,6 +577,10 @@ RestartSec=5s
 # series budget from it, so raising it here raises those too — this is the one number to
 # change if you have given telemetryd a machine of its own.
 MemoryMax=25%
+# And no swap to fall into on the way. With swap enabled the limit counts only resident
+# pages, so a process at the wall pages out instead of being stopped — the same state
+# MemoryHigh produced, reached by another road: running, and doing nothing.
+MemorySwapMax=0
 
 User={user}
 Group={user}
@@ -701,6 +757,31 @@ fn manual_steps() -> &'static str {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// Home directories are what `ProtectHome` hides; the rest of the filesystem is not.
+    #[test]
+    fn home_directories_are_the_paths_the_service_cannot_see() {
+        for hidden in [
+            "/home/forge/.local/bin/telemetryd",
+            "/root/.local/bin/telemetryd",
+            "/run/user/1000/telemetryd",
+        ] {
+            assert!(
+                hidden_by_protect_home(std::path::Path::new(hidden)),
+                "{hidden}"
+            );
+        }
+        for visible in [
+            "/usr/local/bin/telemetryd",
+            "/usr/bin/telemetryd",
+            "/homestead/telemetryd",
+        ] {
+            assert!(
+                !hidden_by_protect_home(std::path::Path::new(visible)),
+                "{visible}"
+            );
+        }
+    }
 
     /// The data directory is read out of the unit rather than hardcoded, so a change to
     /// one cannot leave the other chowning a path nothing uses.
