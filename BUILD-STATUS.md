@@ -118,6 +118,13 @@ is counted as `other` instead of becoming a series in `/metrics`; and a read kee
 query slot until it finishes, so a timed-out request no longer frees its slot while its
 scan runs on.
 
+**Every exposed surface needs its own guard.** On a non-loopback address telemetryd
+used to start as long as *any* token was set, while a surface with no token of its own
+answered anyone — so an ingest token alone left every read and export public. It now
+refuses to start unless ingest, query and admin are each guarded by a token or by Cbox
+ID, names the surfaces that are open and prints tokens for them; the Docker entrypoint
+generates tokens for whichever surfaces were not given one.
+
 **One query has a ceiling.** A PromQL read that holds its window keeps every sample of
 every matching series resident at once, and neither `limit` nor the series cap bounded it
 — measured at roughly 850 MB for a single query against weeks of high-cardinality metrics,
