@@ -149,8 +149,69 @@ Accepted beyond the strict spec, because real producers send it:
   `telemetryd_ingest_timestamps_rescaled_total`, so the producer bug stays visible
   rather than being papered over.
 
+- `"NaN"`, `"Infinity"` and `"-Infinity"` as JSON doubles, which is how proto3 JSON spells
+  the values JSON numbers cannot hold. A gauge that is momentarily undefined is stored as
+  NaN rather than failing the batch it arrived in.
+
 Rejections are per record, not per request. A batch with one oversized body stores the
 rest and reports the refusal through OTLP's own `partialSuccess` field.
+
+### What the answer tells a sender
+
+Every status is chosen for what the sender does next, because that is the only thing a
+status code controls.
+
+| Situation | OTLP | `remote_write` |
+|---|---|---|
+| everything stored | `200` | `204` |
+| some records refused | `200`, count and reason in `partialSuccess` | `204`; refusals counted in `telemetryd_ingest_rejected_total` |
+| every sample refused | `200`, all counted in `partialSuccess` | `400` naming why |
+| ingest queue full | `429` + `Retry-After: 1` | `503` + `Retry-After: 1` |
+| disk or volume error | `503` + `Retry-After: 5` | `503` + `Retry-After: 5` |
+| request timed out | `503` | `503` |
+| Remote-Write 2.0 | — | `415` |
+
+The OTLP exporters retry `429`, `502`, `503` and `504` and drop the batch on anything else,
+so a transient failure is never a `500` or a `408`. Prometheus retries every `5xx` but a
+`429` only when `retry_on_http_429` is set, which it is not by default — hence `503` there
+for the same full queue. A partial success is not retried by either, as the OTLP
+specification requires.
+
+**The response uses the request's encoding.** A protobuf export is answered with an
+`Export*ServiceResponse` protobuf, `partial_success` included; a JSON export with JSON.
+
+**Remote-Write 2.0 is refused with `415`**, recognised by its `Content-Type`
+(`io.prometheus.write.v2.Request`) or `X-Prometheus-Remote-Write-Version: 2.x`. Its
+message puts series in different protobuf fields, so reading it as 1.0 stored nothing and
+answered `204`. The 2.0 specification asks a receiver that cannot read it for `415`, which
+is the sender's cue to fall back to 1.0.
+
+### Metric types
+
+| OTLP metric | Stored |
+|---|---|
+| gauge | yes |
+| sum, cumulative | yes, as a counter |
+| sum, non-monotonic | yes, as a gauge |
+| histogram, cumulative | yes, as classic `_bucket` / `_sum` / `_count` series |
+| sum or histogram, **delta** | **refused** per point, reason `delta_temporality` |
+| summary, exponential histogram | **refused** per point, reason `unsupported_metric_type` |
+
+Delta temporality is refused rather than stored because stored as if cumulative it reads
+as a counter reset at every point: `increase` over deltas of 5, 3 and 4 came out 120
+instead of 12. The refusal names the fix — set
+`OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=cumulative` on the exporter, which the
+official SDKs support. Summaries and exponential histograms used to vanish with a `200`;
+now each point is counted in `partialSuccess` so the sender can see what was not kept.
+
+### Traces
+
+Spans keep their events and their **links** — the references a span makes to spans in
+other traces, such as the request that enqueued a job or the batch a consumer fanned in.
+Links carry their trace id, span id, `tracestate` and attributes, and come back from every
+trace endpoint in both JSON and protobuf, and out of `/api/v1/export`. A link whose ids do
+not parse points at nothing and is left out, without costing the span. Spans stored
+before 0.60.0 read back without links, as they were sent to an older version.
 
 ---
 

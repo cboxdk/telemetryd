@@ -156,6 +156,12 @@ ever rise, so they cannot tell you the shipper has stopped; a backlog that keeps
 is the only thing that says so. A few pending segments is normal — that is the seal
 interval. A number that climbs for an hour is not.
 
+**`telemetryd_relay_records_refused_total` counts what upstream turned away.** A `2xx`
+can still refuse records in `partialSuccess` — upstream's series limit, an overlong
+label. The OTLP specification forbids retrying those, so they are lost at the
+destination; this counter, and a warning naming upstream's reason, are how this side
+knows. It should stay at zero.
+
 `failures` counts delivery attempts that were retried, not records lost. Some is normal
 on a flaky link; a rate that matches your tick interval means every attempt is failing.
 

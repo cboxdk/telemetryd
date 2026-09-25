@@ -154,6 +154,16 @@ eight points, and the cap is gone. An expression is only folded when every sampl
 comes from a `rate` or `increase` — a bare selector wants the newest sample in a lookback,
 which no fold carries, so folding it would drop the operand and answer confidently wrong.
 
+**A sender learns what happened to its data.** Every refusal reaches the sender in a form
+it acts on: a transient failure is a status it retries (`503` with `Retry-After`, never
+`500` or `408`, which OTLP exporters drop), `remote_write` gets `503` where OTLP gets `429`
+because stock Prometheus drops a `429`, and a batch nothing survived is a `400` rather
+than a `204`. Delta-temporality metrics, summaries and exponential histograms are refused
+per point in `partialSuccess` — they used to be stored wrong or dropped with a `200`.
+Remote-Write 2.0 is a `415`, not a `204` over nothing stored. A protobuf export gets a
+protobuf answer. Span links are stored and served. The table is in
+[COMPATIBILITY.md](COMPATIBILITY.md#what-the-answer-tells-a-sender).
+
 **Known gap:** the four per-segment structures are still all resident. Loading them on
 demand behind a cache bounded by the process's memory limit is the remaining fix; sharing
 reduced the dominant term but did not make it independent of how much is stored.
@@ -161,7 +171,9 @@ reduced the dominant term but did not make it independent of how much is stored.
 **Storage.** Write-ahead log with crash recovery, immutable Parquet segments, per-segment
 stream dictionary, Bloom filters for exact-key lookup, trigram indexes for substring
 search, retention by age and by a global
-disk budget. One engine serves all three signals.
+disk budget. One engine serves all three signals. A segment is aged by its newest record
+or by when it was written, whichever is earlier, so one record from a clock set to 2099
+cannot keep its segment — and every honest record in it — past retention.
 
 **Damage is survivable.** A truncated, zero-length, garbled or deleted segment file
 costs that segment and nothing else: the query answers from what is left, the segment
@@ -234,7 +246,11 @@ migrating out, and pulling an incident window onto a laptop. All three signals r
 running pair rather than in prose. Against telemetryd, export reads records directly
 through `/api/v1/export`, so nothing passes through a query language; against a foreign backend it
 uses the read APIs, which cover logs and traces — metrics cannot be pulled that way,
-because a range query returns resampled points rather than stored samples.
+because a range query returns resampled points rather than stored samples. Records the
+destination answers `2xx` for but refuses in `partialSuccess` are counted and named in
+the summary, in relay mode too (`telemetryd_relay_records_refused_total`), rather than
+reported as delivered. A Loki-API walk that meets more records on one timestamp than a
+page can hold stops with an error instead of paging past the ones it could not see.
 
 **Getting to a running server.** `telemetryd init` writes a configuration with one
 generated token per surface, `0600` and referenced by path so the values stay out of the

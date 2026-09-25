@@ -28,6 +28,13 @@ Every rejection is counted with a reason. `body_too_large`, `too_many_labels`,
 `invalid_metric_name`, `missing_trace_id` each point somewhere specific. telemetryd
 never drops data quietly, so a zero here genuinely means nothing was refused.
 
+Two reasons are about the *kind* of metric rather than its size. `delta_temporality`
+means the exporter sends deltas, which telemetryd does not store — set
+`OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=cumulative` on it. `unsupported_metric_type`
+is a summary or an exponential histogram; switch the instrument to an explicit-bucket
+histogram. `remote_write_v2` is a Prometheus configured for Remote-Write 2.0; set
+`protobuf_message: prometheus.WriteRequest` on its `remote_write` block.
+
 `series_limit` is the one that looks least like a problem and is the most confusing to
 run into. It refuses only **new** series, so everything already flowing keeps flowing and
 one signal simply stops appearing — usually logs, because metrics got there first and
