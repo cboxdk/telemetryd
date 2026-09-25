@@ -157,7 +157,11 @@ pub fn plan(
         plan.by_budget.push(candidate.clone());
     }
 
-    if used <= disk_budget {
+    // Blocked only if undelivered segments are what stands between the store and its
+    // budget. With none, the rest is the write-ahead log and staging — nothing retention
+    // can delete — and calling that "blocked by undelivered" set the flag on instances
+    // with no relay at all, which now refuses every write.
+    if used <= disk_budget || protected.is_empty() {
         return plan;
     }
 
@@ -254,6 +258,23 @@ mod tests {
         assert_eq!(judged_time(NOW - 30 * DAY, NOW), NOW - 30 * DAY);
         // A manifest with no creation time falls back to the events.
         assert_eq!(judged_time(year_2099, 0), year_2099);
+    }
+
+    /// Over budget with nothing undelivered is not "blocked by undelivered": what
+    /// remains is the log and staging, which no pass can delete, and the flag it set on
+    /// instances with no relay now refuses every write.
+    #[test]
+    fn nothing_undelivered_means_nothing_blocks() {
+        let plan = plan(
+            &[candidate("a", Signal::Logs, DAY, 100)],
+            NOW,
+            &BTreeMap::new(),
+            10,
+            1_000,
+            Undelivered::default(),
+        );
+        assert!(!plan.blocked_by_undelivered);
+        assert_eq!(plan.by_budget.len(), 1);
     }
 
     #[test]

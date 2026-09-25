@@ -129,7 +129,7 @@ when_full = "drop_oldest"   # the default
 | | |
 |---|---|
 | `drop_oldest` | keep accepting; lose the oldest unforwarded telemetry. Right for phones, which have nowhere to buffer what you refuse. |
-| `reject` | stop accepting with `429`; let clients that *can* buffer hold it. Right in front of something that must not lose records. |
+| `reject` | stop accepting with `503` and `Retry-After`; let clients that *can* buffer hold it. Right in front of something that must not lose records. Decided at each retention pass, so writes are taken again as soon as upstream drains enough to make room. |
 
 Both log an error when they fire, and `drop_oldest` counts what it lost separately from
 ordinary budget deletions — "we deleted expired data" and "we deleted data that never

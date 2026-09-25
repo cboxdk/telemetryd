@@ -71,6 +71,10 @@ pub struct Store {
     /// Kept for the process lifetime rather than only logged at startup — a crash
     /// that cost records should stay visible in `/status`.
     wal_truncations: RwLock<Vec<Truncation>>,
+    /// Set by a retention pass that found the disk budget full of telemetry a relay
+    /// has not forwarded yet, with `relay.when_full = "reject"`; cleared by the next pass
+    /// that finds room. While set, every append is refused.
+    refusing: std::sync::atomic::AtomicBool,
 }
 
 /// What one app holds in the store.
@@ -145,6 +149,7 @@ impl Store {
             }),
             reaper: Mutex::new(ReaperReport::default()),
             wal_truncations: RwLock::new(Vec::new()),
+            refusing: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -200,6 +205,18 @@ impl Store {
         labels: impl Fn(&T) -> &Labels,
         store: impl FnOnce(&[T]) -> Result<()>,
     ) -> Result<Admitted> {
+        // `relay.when_full = "reject"` promised this and nothing did it: the log said
+        // ingest was being refused while every write was accepted, and the next pass had
+        // to choose between the budget and the undelivered data it protects. Refused
+        // with 503 and Retry-After, so senders hold their telemetry until upstream
+        // drains.
+        if self.refusing.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(telemetryd_core::Error::Unavailable(
+                "the disk budget is full of telemetry not yet forwarded upstream, and \
+                 relay.when_full = \"reject\"; retry once upstream catches up"
+                    .to_owned(),
+            ));
+        }
         let mut kept: Option<Vec<T>> = None;
         let mut admitted = Admitted {
             stored: records.len(),
@@ -368,6 +385,10 @@ impl Store {
             }
         }
         report.blocked_by_undelivered = plan.blocked_by_undelivered;
+        self.refusing.store(
+            plan.blocked_by_undelivered,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         if report.dropped_undelivered > 0 {
             // Telemetry that never reached its destination and now never will. Louder
@@ -740,6 +761,57 @@ mod tests {
             trace_id: None,
             span_id: None,
         }
+    }
+
+    /// `relay.when_full = "reject"`: a budget full of segments upstream has not taken
+    /// refuses writes rather than deleting them, and stops refusing once there is room.
+    /// It used to log that ingest was refused and accept every write.
+    #[test]
+    fn a_budget_full_of_undelivered_data_refuses_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = config(&tmp.path().join("data"));
+        config.storage.disk_budget = ByteSize::b(1);
+        let store = Store::open(&config).unwrap();
+        store
+            .append_logs(
+                &(0..50)
+                    .map(|i| record(now_nanos() + i, "held"))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        store.seal_all().unwrap();
+
+        let undelivered: std::collections::BTreeSet<String> = store
+            .logs()
+            .segments()
+            .iter()
+            .map(|s| s.manifest.id.clone())
+            .collect();
+        let report = store
+            .run_retention_protecting(retention::Undelivered {
+                ids: Some(&undelivered),
+                drop_when_full: false,
+            })
+            .unwrap();
+        assert!(report.blocked_by_undelivered);
+        let refused = store
+            .append_logs(&[record(now_nanos(), "more")])
+            .unwrap_err();
+        assert!(
+            matches!(refused, telemetryd_core::Error::Unavailable(_)),
+            "{refused}"
+        );
+        assert_eq!(
+            store.logs().segments().len(),
+            undelivered.len(),
+            "nothing deleted"
+        );
+
+        // Delivered: the next pass may free room, and writes are taken again.
+        store
+            .run_retention_protecting(retention::Undelivered::default())
+            .unwrap();
+        store.append_logs(&[record(now_nanos(), "again")]).unwrap();
     }
 
     #[test]

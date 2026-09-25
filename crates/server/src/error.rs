@@ -36,7 +36,7 @@ impl IntoResponse for ApiError {
             // a slow volume — and a writer told 500 gives up: the OTLP exporters retry only
             // 429, 502, 503 and 504, so a 500 on ingest was a batch lost for good. 503
             // with `Retry-After` gets it sent again.
-            Error::Io { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Error::Io { .. } | Error::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
 
             // Everything else is ours to fix.
             Error::Config(_)
@@ -53,7 +53,8 @@ impl IntoResponse for ApiError {
         };
 
         let mut body = self.0.to_body();
-        if status.is_server_error() {
+        // `Unavailable` carries a reason written for the caller, and keeps it.
+        if status.is_server_error() && !matches!(self.0, Error::Unavailable(_)) {
             // The detail goes to the log and not to the caller: an I/O error names paths
             // inside the data directory, and a panic message names code. The caller gets
             // what to do and a reference that finds the detail.
@@ -93,6 +94,11 @@ impl IntoResponse for ApiError {
                 response
                     .headers_mut()
                     .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+            }
+            Error::Unavailable(_) => {
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
             }
             _ => {}
         }

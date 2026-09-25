@@ -511,14 +511,12 @@ impl<S: RecordSchema> RecordStore<S> {
             // nothing is half-accepted — with an error senders retry. Holding more
             // would end with the process out of memory and the records with it.
             if failing && writer.buffer.bytes as u64 >= 2 * self.settings.max_segment_bytes {
-                return Err(Error::io(
-                    format!(
-                        "buffering {} records, because sealing them into segments is \
-                         failing",
-                        S::SIGNAL
-                    ),
-                    std::io::Error::other("the buffer is full; see the log for why sealing fails"),
-                ));
+                return Err(Error::Unavailable(format!(
+                    "{} records are waiting to be sealed into segments and sealing is \
+                     failing, so no more are accepted until it recovers; the server log \
+                     says why",
+                    S::SIGNAL
+                )));
             }
             for record in records {
                 let payload = postcard::to_stdvec(record)

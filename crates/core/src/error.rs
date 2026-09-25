@@ -65,6 +65,12 @@ pub enum Error {
     #[error("{limit} exceeded: {detail}")]
     LimitExceeded { limit: &'static str, detail: String },
 
+    /// The instance cannot take this now, for a reason the caller may be told and that
+    /// passes on its own: a relay whose disk is full of unforwarded data, a store whose
+    /// seals are failing. Answered `503` with `Retry-After`, the message intact.
+    #[error("{0}")]
+    Unavailable(String),
+
     /// Every slot for this kind of request is taken — ingest, queries, exports or live
     /// tails. It said "ingest queue is full" whichever it was, which sent someone whose
     /// export was refused looking at their ingest.
@@ -136,6 +142,7 @@ impl Error {
             Self::Unsupported { .. } => "unsupported_feature",
             Self::LimitExceeded { .. } => "limit_exceeded",
             Self::Overloaded => "overloaded",
+            Self::Unavailable(_) => "unavailable",
             Self::StorageVersionMismatch { .. } => "storage_version_mismatch",
             Self::DataDirLocked { .. } => "data_dir_locked",
             Self::Io { .. } => "io_error",
