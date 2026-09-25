@@ -155,8 +155,25 @@ pub async fn tail(
         .ok_or_else(|| Error::BadRequest("the `query` parameter is required".to_owned()))?;
     let query = logql::parse(raw)?;
 
-    Ok(upgrade.on_upgrade(move |socket| run_tail(socket, state, query)))
+    // Claimed before upgrading, so a refusal is a `429` the client can read.
+    let Some(slot) = state.tail_slot() else {
+        state.metrics.incr(
+            "telemetryd_query_rejected_total",
+            &[("surface", "query"), ("reason", "tails")],
+        );
+        return Err(Error::Overloaded.into());
+    };
+
+    // The tail sends and never listens beyond a close, so a client has no business
+    // sending more than a control frame. The default let one message be 64 MiB.
+    Ok(upgrade
+        .max_message_size(4 * 1024)
+        .max_frame_size(4 * 1024)
+        .on_upgrade(move |socket| run_tail(socket, state, std::sync::Arc::new(query), slot)))
 }
+
+/// How many ingested records a tail filters in one go on the blocking pool.
+const TAIL_BATCH: usize = 256;
 
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct TailParams {
@@ -186,7 +203,12 @@ struct DroppedEntry {
     labels: std::collections::BTreeMap<String, String>,
 }
 
-async fn run_tail(mut socket: WebSocket, state: AppState, query: logql::LogQuery) {
+async fn run_tail(
+    mut socket: WebSocket,
+    state: AppState,
+    query: std::sync::Arc<logql::LogQuery>,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+) {
     let mut receiver = state.subscribe_tail();
     state.metrics.incr("telemetryd_tail_connections_total", &[]);
 
@@ -205,41 +227,59 @@ async fn run_tail(mut socket: WebSocket, state: AppState, query: logql::LogQuery
             delivery = receiver.recv() => {
                 match delivery {
                     Ok(record) => {
-                        if !matches_tail(&query, &record) {
-                            continue;
+                        // Whatever else has arrived joins it, and the batch is matched on
+                        // the blocking pool. Matching runs a LogQL pipeline per record per
+                        // tail; on the async workers it competed with every request.
+                        let mut batch = vec![record];
+                        let mut missed = 0;
+                        while batch.len() < TAIL_BATCH {
+                            match receiver.try_recv() {
+                                Ok(more) => batch.push(more),
+                                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                                    missed += n;
+                                }
+                                Err(_) => break,
+                            }
                         }
-                        let frame = TailResponse {
-                            streams: vec![TailStream {
-                                stream: record
-                                    .stream
-                                    .iter()
-                                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                                    .collect(),
-                                values: vec![[
-                                    record.timestamp_nanos.to_string(),
-                                    record.body.clone(),
-                                ]],
-                            }],
-                            dropped_entries: Vec::new(),
+                        let query = std::sync::Arc::clone(&query);
+                        let Ok(matched) = tokio::task::spawn_blocking(move || {
+                            batch
+                                .into_iter()
+                                .filter(|record| matches_tail(&query, record))
+                                .collect::<Vec<_>>()
+                        })
+                        .await
+                        else {
+                            break;
                         };
-                        let Ok(json) = serde_json::to_string(&frame) else { continue };
-                        if socket.send(Message::Text(json.into())).await.is_err() {
+                        let mut gone = false;
+                        for record in matched {
+                            let frame = TailResponse {
+                                streams: vec![TailStream {
+                                    stream: record
+                                        .stream
+                                        .iter()
+                                        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                                        .collect(),
+                                    values: vec![[
+                                        record.timestamp_nanos.to_string(),
+                                        record.body.clone(),
+                                    ]],
+                                }],
+                                dropped_entries: Vec::new(),
+                            };
+                            let Ok(json) = serde_json::to_string(&frame) else { continue };
+                            if socket.send(Message::Text(json.into())).await.is_err() {
+                                gone = true;
+                                break;
+                            }
+                        }
+                        if gone || (missed > 0 && !report_dropped(&mut socket, &state, missed).await) {
                             break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
-                        // A slow client fell behind the buffer. Tell it so, rather than
-                        // silently showing an incomplete tail that looks complete.
-                        state.metrics.add("telemetryd_tail_dropped_total", &[], missed);
-                        let frame = TailResponse {
-                            streams: Vec::new(),
-                            dropped_entries: vec![DroppedEntry {
-                                timestamp: telemetryd_store::now_nanos().to_string(),
-                                labels: std::collections::BTreeMap::new(),
-                            }],
-                        };
-                        let Ok(json) = serde_json::to_string(&frame) else { continue };
-                        if socket.send(Message::Text(json.into())).await.is_err() {
+                        if !report_dropped(&mut socket, &state, missed).await {
                             break;
                         }
                     }
@@ -250,6 +290,25 @@ async fn run_tail(mut socket: WebSocket, state: AppState, query: logql::LogQuery
     }
 
     state.metrics.incr("telemetryd_tail_disconnects_total", &[]);
+}
+
+/// Tell a client it fell behind the buffer and lost `missed` records, rather than
+/// showing it an incomplete tail that looks complete. `false` when it has gone.
+async fn report_dropped(socket: &mut WebSocket, state: &AppState, missed: u64) -> bool {
+    state
+        .metrics
+        .add("telemetryd_tail_dropped_total", &[], missed);
+    let frame = TailResponse {
+        streams: Vec::new(),
+        dropped_entries: vec![DroppedEntry {
+            timestamp: telemetryd_store::now_nanos().to_string(),
+            labels: std::collections::BTreeMap::new(),
+        }],
+    };
+    let Ok(json) = serde_json::to_string(&frame) else {
+        return true;
+    };
+    socket.send(Message::Text(json.into())).await.is_ok()
 }
 
 fn matches_tail(query: &logql::LogQuery, record: &LogRecord) -> bool {

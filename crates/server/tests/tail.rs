@@ -21,6 +21,7 @@ const NOW: u64 = 1_750_000_000_000_000_000;
 
 struct Server {
     addr: std::net::SocketAddr,
+    state: AppState,
     client: reqwest_lite::Client,
     _tmp: tempfile::TempDir,
     shutdown: tokio::sync::oneshot::Sender<()>,
@@ -67,13 +68,14 @@ impl Server {
         };
         let store = Arc::new(Store::open(&config).unwrap());
         let state = AppState::new(Arc::new(config), store).unwrap();
+        let served = state.clone();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (shutdown, rx) = tokio::sync::oneshot::channel();
 
         let handle = tokio::spawn(async move {
-            let _ = axum::serve(listener, router(state))
+            let _ = axum::serve(listener, router(served))
                 .with_graceful_shutdown(async {
                     let _ = rx.await;
                 })
@@ -82,6 +84,7 @@ impl Server {
 
         Self {
             addr,
+            state,
             client: reqwest_lite::Client,
             _tmp: tmp,
             shutdown,
@@ -294,5 +297,33 @@ async fn tail_connections_are_counted_and_released() {
     // the lifetime of the process.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    server.stop().await;
+}
+
+/// Every open tail runs its query against every ingested record, so they are a
+/// standing cost on the write path and are capped. At the cap a new one is refused
+/// before the upgrade, with a 429 the client can read.
+#[tokio::test]
+async fn tails_past_the_cap_are_refused() {
+    let server = Server::start().await;
+    let held: Vec<_> = (0..telemetryd_server::state::MAX_TAILS)
+        .map(|_| server.state.tail_slot().expect("a free slot"))
+        .collect();
+
+    let url = format!(
+        "ws://{}/loki/api/v1/tail?query=%7Bapp%3D%22checkout%22%7D",
+        server.addr
+    );
+    match tokio_tungstenite::connect_async(url.clone()).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), 429);
+        }
+        other => panic!("expected a 429, got {other:?}"),
+    }
+
+    // A slot freed is a tail allowed.
+    drop(held);
+    let (socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    drop(socket);
     server.stop().await;
 }

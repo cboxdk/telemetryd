@@ -19,6 +19,15 @@ use crate::metrics::Metrics;
 /// it dropped entries rather than being shown an incomplete tail that looks complete.
 const TAIL_BUFFER: usize = 1024;
 
+/// How many live tails may be open at once.
+///
+/// A tail holds its WebSocket for as long as the client likes and runs its query against
+/// every record ingested, so each one is a standing cost on the write path. They were
+/// unbounded and outside the query limiter: two thousand of them turned every ingested
+/// line into two thousand pipeline evaluations. Sixty-four is far above what a team
+/// watches at once.
+pub const MAX_TAILS: usize = 64;
+
 #[derive(Clone, Debug)]
 pub struct AppState {
     pub config: Arc<Config>,
@@ -59,6 +68,7 @@ pub struct AppState {
     in_flight: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
     queue_depth: usize,
     tail: broadcast::Sender<Arc<LogRecord>>,
+    tail_permits: Arc<Semaphore>,
 }
 
 /// Every static credential the server checks, resolved from one configuration.
@@ -250,6 +260,7 @@ impl AppState {
             in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             queue_depth,
             tail,
+            tail_permits: Arc::new(Semaphore::new(MAX_TAILS)),
         })
     }
 
@@ -375,6 +386,12 @@ impl AppState {
 
     pub fn subscribe_tail(&self) -> broadcast::Receiver<Arc<LogRecord>> {
         self.tail.subscribe()
+    }
+
+    /// A slot for one live tail, or `None` when [`MAX_TAILS`] are open. Held for the life
+    /// of the WebSocket.
+    pub fn tail_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.tail_permits).try_acquire_owned().ok()
     }
 
     pub fn tail_subscribers(&self) -> usize {
