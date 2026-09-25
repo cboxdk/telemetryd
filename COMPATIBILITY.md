@@ -219,6 +219,10 @@ default, `{service_name=~".+"}`, satisfies this.
 
 ## Tempo
 
+`GET /api/echo` answers `echo`, which is what Grafana's Tempo datasource checks on
+"Save & test". It sits behind the query token, so the check also proves the credential.
+`GET /ready` answers without a token, for probes.
+
 | Endpoint | Used by | Notes |
 |---|---|---|
 | `GET /api/search/tags` | `TempoSource::probe()`, tag discovery | Must return `tagNames` (or `scopes`) — the UI's backend-recognition check |
@@ -258,6 +262,10 @@ spelling, `.service.name` still reaches the `service_name` label.
 ---
 
 ## Prometheus
+
+`/api/v1/query` and `/api/v1/query_range` read their parameters from the URL and, on a
+POST, from an `application/x-www-form-urlencoded` body, as Prometheus does; where both
+carry a key the body wins. Grafana's Prometheus datasource sends POST by default.
 
 | Endpoint | Used by | Notes |
 |---|---|---|

@@ -51,6 +51,7 @@ pub fn router(state: AppState) -> Router {
     let public = Router::new()
         .route("/", get(index::index))
         .route("/healthz", get(routes::healthz))
+        .route("/ready", get(routes::ready))
         // The debug page authenticates itself rather than sitting behind the bearer-token
         // layer, so that a browser without a credential gets a form to type one into
         // instead of a `401` it cannot act on. It is meant to be opened against a real
@@ -92,6 +93,7 @@ pub fn router(state: AppState) -> Router {
         .route("/loki/api/v1/series", get(loki::series))
         .route("/loki/api/v1/tail", get(loki::tail))
         // Tempo-compatible read APIs (M2).
+        .route("/api/echo", get(routes::echo))
         .route("/api/traces/{trace_id}", get(tempo::trace))
         .route("/api/search", get(tempo::search))
         .route("/api/search/tags", get(tempo::tags))

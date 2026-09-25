@@ -1731,3 +1731,57 @@ async fn invented_methods_do_not_grow_our_own_metrics() {
         "they are counted, as `other`"
     );
 }
+
+/// Grafana's Prometheus datasource sends POST with the query in a form body, and its
+/// "Save & test" is exactly this. Reading only the URL answered 400 "the `query` parameter
+/// is required", so Grafana could not connect at all.
+#[tokio::test]
+async fn a_query_can_arrive_in_a_form_body() {
+    let harness = Harness::new(|_| {});
+    let post = |uri: &str, body: &str| {
+        Request::post(uri)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body.to_owned()))
+            .unwrap()
+    };
+
+    let (status, _, body) = harness.request(post("/api/v1/query", "query=1%2B1")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["data"]["result"][0]["value"][1], "2", "{body}");
+
+    // The body wins where both carry a key, as in the Go form parsing Prometheus uses.
+    let (_, _, body) = harness
+        .request(post("/api/v1/query?query=5", "query=7"))
+        .await;
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["data"]["result"][0]["value"][1], "7", "{body}");
+
+    let (status, _, body) = harness
+        .request(post(
+            "/api/v1/query_range",
+            "query=1&start=0&end=60&step=30",
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Grafana's Tempo datasource checks the connection with `GET /api/echo`, and probes
+/// look for `/ready`. Both were 404, so the datasource could not be added at all.
+#[tokio::test]
+async fn tempo_connection_check_and_readiness_answer() {
+    let harness = Harness::new(with_query_token);
+    let (status, _, body) = harness.get_with_token("/api/echo", "query-secret").await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "echo"));
+
+    // Behind the query token, so the check also proves Grafana's credential works.
+    let (status, _, _) = harness.get("/api/echo").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _, _) = harness.get("/ready").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "readiness needs no token, like /healthz"
+    );
+}

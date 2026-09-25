@@ -25,6 +25,23 @@ pub async fn healthz() -> Response {
     (StatusCode::OK, "ok\n").into_response()
 }
 
+/// Readiness, under the name Loki, Tempo and Kubernetes probes use.
+///
+/// The server only starts listening once the store has opened and replayed its
+/// write-ahead log, so answering at all means ready. What deeper readiness would add —
+/// a failing seal, a full disk — is reported on `/status`.
+pub async fn ready() -> Response {
+    (StatusCode::OK, "ready\n").into_response()
+}
+
+/// Tempo's connection check. Grafana's Tempo datasource calls exactly this on "Save &
+/// test" and treats anything but a 200 as a broken datasource; it was a 404, so the
+/// datasource could not be added. Behind the query token, so the check also proves the
+/// credential Grafana was given works.
+pub async fn echo() -> Response {
+    (StatusCode::OK, "echo").into_response()
+}
+
 #[derive(Debug, Serialize)]
 pub struct StatusResponse {
     pub version: &'static str,
