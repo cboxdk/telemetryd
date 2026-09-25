@@ -337,7 +337,7 @@ async fn the_select_projection_is_accepted() {
 #[tokio::test]
 async fn an_unsupported_traceql_feature_is_named_with_a_400() {
     let harness = Harness::new();
-    let query = urlencode("{ a = 1 } || { b = 2 }");
+    let query = urlencode("{ .a = 1 } || { .b = 2 }");
     let (status, response) = harness
         .get(&format!("/api/search?q={query}&{}", window()))
         .await;
@@ -655,7 +655,10 @@ async fn a_span_sent_twice_is_one_span() {
     let (_, response) = harness
         .get(&format!("/api/search?q={}&{}", urlencode("{}"), window()))
         .await;
-    assert_eq!(response["traces"][0]["spanSets"][0]["matched"], 2, "{response}");
+    assert_eq!(
+        response["traces"][0]["spanSets"][0]["matched"], 2,
+        "{response}"
+    );
 
     let (status, response) = harness.get(&format!("/api/traces/{TRACE}")).await;
     assert_eq!(status, StatusCode::OK);

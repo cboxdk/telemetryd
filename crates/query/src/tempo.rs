@@ -778,7 +778,7 @@ mod tests {
     #[test]
     fn an_unsupported_traceql_feature_propagates_as_unsupported() {
         let params = SearchParams {
-            q: Some("{ a = 1 } || { b = 2 }".to_owned()),
+            q: Some("{ .a = 1 } || { .b = 2 }".to_owned()),
             ..SearchParams::default()
         };
         let err = SearchRequest::from_params(&params, NOW).unwrap_err();

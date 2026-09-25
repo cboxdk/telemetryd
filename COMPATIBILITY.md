@@ -324,10 +324,22 @@ followed by `| select(...)`:
 { resource.service.name = "checkout" && status = error && duration > 100ms }
 ```
 
-Supported: one spanset; `&&`-joined conditions; the operators `=`, `!=`, `=~`, `>`,
-`<`, `>=`, `<=`; `resource.*`, `span.*`, unscoped `.attribute` and intrinsic fields
-(`name`, `status`, `duration`, `kind`); string, number, duration and `nil` literals;
-`| select(...)` is accepted and ignored (telemetryd always returns the matched spans).
+Supported: one spanset; `&&`-joined conditions; the operators `=`, `!=`, `=~`, `!~`,
+`>`, `<`, `>=`, `<=`; `resource.*`, `span.*`, unscoped `.attribute` and intrinsic fields
+(`name`, `status`, `statusMessage`, `duration`, `kind`, also spelled `span:name` and so
+on); string, number, duration and `nil` literals; `| select(...)` is accepted and ignored
+(telemetryd always returns the matched spans).
+
+Comparisons follow Tempo's rules. Regular expressions are anchored at both ends, so
+`name =~ "GET"` matches `GET` and not `GET /health`. An attribute a span lacks matches
+nothing but `= nil` — `span.http.method != "GET"` does not return spans that are not
+requests. A bare word that is not an intrinsic is refused rather than read as an
+attribute, so a typo is an error instead of an empty result.
+
+A search row describes the whole trace — its root span's name and service, its start
+and its duration — while its span set lists the spans that matched. `minDuration` and
+`maxDuration` bound the trace's duration, as in Tempo. A span stored twice, as an
+exporter's retry can leave it, is returned once. Before 0.61.0 each of these differed.
 
 An unscoped `.attribute` searches span attributes first, then resource labels — the
 narrower scope wins, as in TraceQL. The leading dot is significant: `name` is the

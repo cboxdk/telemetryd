@@ -52,6 +52,7 @@ pub enum Field {
 pub enum Intrinsic {
     Name,
     Status,
+    StatusMessage,
     Duration,
     Kind,
 }
@@ -61,6 +62,7 @@ pub enum CompareOp {
     Equal,
     NotEqual,
     Regex,
+    NotRegex,
     Greater,
     GreaterEqual,
     Less,
@@ -159,16 +161,19 @@ impl Parser<'_> {
         let op = self.parse_op()?;
         let value = self.parse_value(&field)?;
 
-        let regex = if op == CompareOp::Regex {
+        let regex = if matches!(op, CompareOp::Regex | CompareOp::NotRegex) {
             let Value::Str(pattern) = &value else {
                 return Err(Error::BadRequest(
-                    "`=~` needs a quoted pattern on the right-hand side".to_owned(),
+                    "`=~` and `!~` need a quoted pattern on the right-hand side".to_owned(),
                 ));
             };
+            // Anchored at both ends, as Tempo anchors them — it matches through
+            // Prometheus's `FastRegexMatcher`. Unanchored, `name =~ "GET"` also matched
+            // `GET /health` and `FORGET`.
             Some(
-                telemetryd_core::matcher::compile_regex(pattern).map_err(|e| {
-                    Error::BadRequest(format!("invalid regular expression {pattern:?}: {e}"))
-                })?,
+                telemetryd_core::matcher::compile_regex(&format!("^(?s:{pattern})$")).map_err(
+                    |e| Error::BadRequest(format!("invalid regular expression {pattern:?}: {e}")),
+                )?,
             )
         } else {
             None
@@ -200,19 +205,41 @@ impl Parser<'_> {
             // Span attributes keep the producer's spelling; `get_relaxed` accepts either.
             Some(("span", rest)) => Field::Span(rest.to_owned()),
             _ => match path.as_str() {
-                "name" => Field::Intrinsic(Intrinsic::Name),
-                "status" => Field::Intrinsic(Intrinsic::Status),
-                "duration" => Field::Intrinsic(Intrinsic::Duration),
-                "kind" => Field::Intrinsic(Intrinsic::Kind),
+                "name" | "span:name" => Field::Intrinsic(Intrinsic::Name),
+                "status" | "span:status" => Field::Intrinsic(Intrinsic::Status),
+                "statusMessage" | "span:statusMessage" => {
+                    Field::Intrinsic(Intrinsic::StatusMessage)
+                }
+                "duration" | "span:duration" => Field::Intrinsic(Intrinsic::Duration),
+                "kind" | "span:kind" => Field::Intrinsic(Intrinsic::Kind),
                 // `rootName` / `rootServiceName` are trace-level, not span-level, and
                 // reporting them as unknown attributes would silently match nothing.
-                "rootName" | "rootServiceName" | "traceDuration" => {
+                "rootName" | "rootServiceName" | "traceDuration" | "trace:rootName"
+                | "trace:rootService" | "trace:duration" => {
                     return Err(Error::unsupported_with_hint(
                         format!("TraceQL trace-level intrinsic `{path}`"),
                         "filter on the span-level equivalent (`name`, `resource.service.name`, `duration`)",
                     ));
                 }
-                other => Field::Unscoped(other.to_owned()),
+                scoped if scoped.contains(':') => {
+                    return Err(Error::unsupported_with_hint(
+                        format!("TraceQL intrinsic `{scoped}`"),
+                        "the supported intrinsics are name, status, statusMessage, duration and kind",
+                    ));
+                }
+                // A dotted path can only be an attribute, and is read as an unscoped one
+                // — lenient where Tempo wants the leading `.`, since nothing else could
+                // be meant.
+                dotted if dotted.contains('.') => Field::Unscoped(dotted.to_owned()),
+                // A bare word that is no intrinsic is not an attribute either: Tempo
+                // refuses it. It used to be read as one, so a typo such as `stauts = error`
+                // matched nothing and looked like an empty result.
+                other => {
+                    return Err(Error::BadRequest(format!(
+                        "`{other}` is not a TraceQL intrinsic; write an attribute as \
+                         `.{other}`, `span.{other}` or `resource.{other}`"
+                    )));
+                }
             },
         })
     }
@@ -222,16 +249,11 @@ impl Parser<'_> {
             Some(Token::Equal) => CompareOp::Equal,
             Some(Token::NotEqual) => CompareOp::NotEqual,
             Some(Token::RegexMatch) => CompareOp::Regex,
+            Some(Token::RegexNotMatch) => CompareOp::NotRegex,
             Some(Token::Greater) => CompareOp::Greater,
             Some(Token::GreaterEqual) => CompareOp::GreaterEqual,
             Some(Token::Less) => CompareOp::Less,
             Some(Token::LessEqual) => CompareOp::LessEqual,
-            Some(Token::RegexNotMatch) => {
-                return Err(Error::unsupported_with_hint(
-                    "TraceQL `!~`",
-                    "use `=~` with a negated pattern, or filter client-side",
-                ));
-            }
             _ => return Err(self.unexpected("a comparison operator")),
         };
         self.pos += 1;
@@ -371,6 +393,9 @@ impl Condition {
                 }
             }
             Field::Intrinsic(Intrinsic::Name) => self.compare_text(Some(span.name.as_str())),
+            Field::Intrinsic(Intrinsic::StatusMessage) => {
+                self.compare_text(Some(span.status_message.as_str()))
+            }
             Field::Resource(name) => self.compare_text(span.stream.get(name)),
             Field::Span(name) => self.compare_text(span.attributes.get_relaxed(name)),
             // Unscoped: span attributes take precedence, then resource labels — the
@@ -398,10 +423,12 @@ impl Condition {
             };
         }
 
+        // An absent attribute matches nothing but `= nil`, as in Tempo: it compares its
+        // nil with the value, finds the types differ, and answers false for every
+        // operator. `!=` used to match spans without the attribute at all, so
+        // `span.http.method != "GET"` returned every span that was not a request.
         let Some(actual) = actual else {
-            // An absent attribute matches only a negative comparison, mirroring the
-            // label-matcher rule that an absent label is the empty string.
-            return matches!(self.op, CompareOp::NotEqual);
+            return false;
         };
 
         match self.op {
@@ -423,6 +450,7 @@ impl Condition {
                 }
             }
             CompareOp::Regex => self.regex.as_ref().is_some_and(|r| r.is_match(actual)),
+            CompareOp::NotRegex => self.regex.as_ref().is_some_and(|r| !r.is_match(actual)),
             // Ordered comparison against a text field: parse and compare, which is how
             // `span.http.status_code > 499` works when the attribute is a string.
             _ => actual
@@ -450,7 +478,7 @@ impl Condition {
             CompareOp::GreaterEqual => actual >= expected,
             CompareOp::Less => actual < expected,
             CompareOp::LessEqual => actual <= expected,
-            CompareOp::Regex => false,
+            CompareOp::Regex | CompareOp::NotRegex => false,
         }
     }
 
@@ -562,10 +590,13 @@ mod tests {
                 .matches(&span())
         );
         assert!(
-            parse(r#"{ service_name = "checkout" }"#)
+            parse(r#"{ .service_name = "checkout" }"#)
                 .unwrap()
                 .matches(&span())
         );
+        // A bare word is an intrinsic or nothing: a typo is an error, not an empty result.
+        assert!(parse(r#"{ service_name = "checkout" }"#).is_err());
+        assert!(parse("{ stauts = error }").is_err());
     }
 
     /// The dotted form is what TraceQL actually specifies for an unscoped attribute,
@@ -690,13 +721,35 @@ mod tests {
     }
 
     #[test]
-    fn an_absent_attribute_matches_only_a_negative_comparison() {
+    /// As in Tempo, where an absent attribute is nil and nil compared with a value is
+    /// false whatever the operator. `!=` used to match every span lacking it.
+    fn an_absent_attribute_matches_nothing_but_nil() {
+        for query in [
+            r#"{ span.missing != "x" }"#,
+            r#"{ span.missing = "x" }"#,
+            r#"{ span.missing !~ "x" }"#,
+            "{ span.missing > 1 }",
+            "{ span.missing != nil }",
+        ] {
+            assert!(!parse(query).unwrap().matches(&span()), "{query}");
+        }
+        assert!(parse("{ span.missing = nil }").unwrap().matches(&span()));
+    }
+
+    /// Regexes are anchored at both ends, as Tempo's are, and `!~` negates one.
+    #[test]
+    fn regexes_are_anchored_and_can_be_negated() {
+        let name = |query: &str| parse(query).unwrap().matches(&span());
+        let whole = span().name;
+        assert!(name(&format!(r#"{{ name =~ "{whole}" }}"#)));
+        let head: String = whole.chars().take(3).collect();
         assert!(
-            parse(r#"{ span.missing != "x" }"#)
-                .unwrap()
-                .matches(&span())
+            !name(&format!(r#"{{ name =~ "{head}" }}"#)),
+            "unanchored would match"
         );
-        assert!(!parse(r#"{ span.missing = "x" }"#).unwrap().matches(&span()));
+        assert!(name(&format!(r#"{{ name =~ "{head}.*" }}"#)));
+        assert!(name(&format!(r#"{{ name !~ "{head}" }}"#)));
+        assert!(!name(&format!(r#"{{ name !~ "{head}.*" }}"#)));
     }
 
     #[test]
@@ -720,7 +773,7 @@ mod tests {
         let cases = [
             (r#"{ status = error } && { name = "x" }"#, "single spanset"),
             ("{ status = error } | count() > 2", "count"),
-            (r#"{ name !~ "x" }"#, "!~"),
+            (r#"{ event:name = "x" }"#, "event:name"),
             ("{ rootServiceName = \"x\" }", "rootServiceName"),
         ];
         for (query, needle) in cases {
