@@ -53,6 +53,31 @@ pub struct MetricJson {
     pub gauge: Option<NumberData>,
     pub sum: Option<SumData>,
     pub histogram: Option<HistogramData>,
+    /// Counted, not decoded: telemetryd does not store these, and says so per point.
+    #[serde(alias = "exponential_histogram")]
+    pub exponential_histogram: Option<UncountedPoints>,
+    pub summary: Option<UncountedPoints>,
+}
+
+/// The data points of a metric type telemetryd refuses, counted so the refusal can say
+/// how many.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UncountedPoints {
+    #[serde(alias = "data_points")]
+    pub data_points: Vec<serde::de::IgnoredAny>,
+}
+
+/// OTLP's `AggregationTemporality`: 1 is delta, 2 cumulative, 0 unspecified.
+pub const TEMPORALITY_DELTA: i32 = 1;
+
+fn temporality(raw: &crate::otlp::FlexEnum) -> Option<i32> {
+    raw.resolve(|name| match name {
+        "AGGREGATION_TEMPORALITY_DELTA" => Some(1),
+        "AGGREGATION_TEMPORALITY_CUMULATIVE" => Some(2),
+        "AGGREGATION_TEMPORALITY_UNSPECIFIED" => Some(0),
+        _ => None,
+    })
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -69,6 +94,8 @@ pub struct SumData {
     pub data_points: Vec<NumberPoint>,
     #[serde(alias = "is_monotonic")]
     pub is_monotonic: bool,
+    #[serde(alias = "aggregation_temporality")]
+    pub aggregation_temporality: crate::otlp::FlexEnum,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -78,6 +105,7 @@ pub struct NumberPoint {
     pub time_unix_nano: FlexU64,
     pub attributes: Vec<KeyValue>,
     #[serde(alias = "as_double")]
+    #[serde(deserialize_with = "crate::otlp::flex_f64")]
     pub as_double: Option<f64>,
     #[serde(alias = "as_int")]
     pub as_int: crate::otlp::FlexI64,
@@ -97,6 +125,8 @@ impl NumberPoint {
 pub struct HistogramData {
     #[serde(alias = "data_points")]
     pub data_points: Vec<HistogramPoint>,
+    #[serde(alias = "aggregation_temporality")]
+    pub aggregation_temporality: crate::otlp::FlexEnum,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -106,6 +136,7 @@ pub struct HistogramPoint {
     pub time_unix_nano: FlexU64,
     pub attributes: Vec<KeyValue>,
     pub count: FlexU64,
+    #[serde(deserialize_with = "crate::otlp::flex_f64")]
     pub sum: Option<f64>,
     #[serde(alias = "bucket_counts")]
     pub bucket_counts: Vec<FlexU64>,
@@ -270,6 +301,10 @@ fn convert_metric(
         }
     }
     if let Some(sum) = &metric.sum {
+        if temporality(&sum.aggregation_temporality) == Some(TEMPORALITY_DELTA) {
+            refuse_delta(&metric.name, sum.data_points.len(), decoded);
+            return;
+        }
         // Monotonic is the only thing that makes a sum a counter — and the only thing
         // that earns `_total`.
         let kind = if sum.is_monotonic {
@@ -283,12 +318,44 @@ fn convert_metric(
         }
     }
     if let Some(histogram) = &metric.histogram {
+        if temporality(&histogram.aggregation_temporality) == Some(TEMPORALITY_DELTA) {
+            refuse_delta(&metric.name, histogram.data_points.len(), decoded);
+            return;
+        }
         // `_count`, `_sum` and `_bucket` are the counter-ish suffixes here; `_total` is
         // not part of the histogram convention.
         let name = prometheus_metric_name(&metric.name, &metric.unit, false);
         for point in &histogram.data_points {
             push_histogram(&name, point, resource, app, ctx, decoded);
         }
+    }
+    for (kind, points) in [
+        ("exponential histogram", &metric.exponential_histogram),
+        ("summary", &metric.summary),
+    ] {
+        let Some(points) = points else { continue };
+        for _ in &points.data_points {
+            decoded.refuse(Rejection::new(
+                RejectReason::UnsupportedMetricType,
+                format!(
+                    "{kind} {:?} is not stored; export it as an explicit-bucket histogram",
+                    metric.name
+                ),
+            ));
+        }
+    }
+}
+
+/// Refuse every point of a delta-temporality metric, naming the fix.
+fn refuse_delta(name: &str, points: usize, decoded: &mut Decoded<MetricSample>) {
+    for _ in 0..points {
+        decoded.refuse(Rejection::new(
+            RejectReason::DeltaTemporality,
+            format!(
+                "{name:?} uses delta temporality, which is not stored; configure the \
+                 exporter for cumulative (OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=cumulative)"
+            ),
+        ));
     }
 }
 
@@ -720,5 +787,62 @@ mod tests {
         assert_eq!(format_bound(0.1), "0.1");
         assert_eq!(format_bound(1.0), "1");
         assert_eq!(format_bound(f64::INFINITY), "+Inf");
+    }
+
+    /// Delta sums were stored as if cumulative — each point read as a counter reset,
+    /// `increase` of 5, 3, 4 came out 120 instead of 12 — and summaries and exponential
+    /// histograms vanished with a 200. Each is now refused per point, visibly.
+    #[test]
+    fn what_cannot_be_stored_is_refused_where_the_sender_sees_it() {
+        let limits = LimitsConfig::default();
+        let ingest = IngestConfig::default();
+        let ctx = MetricContext {
+            limits: &limits,
+            ingest: &ingest,
+            now_nanos: 1_750_000_000_000_000_000,
+        };
+        let point = r#"{"timeUnixNano":"1750000000000000000","asDouble":5}"#;
+        let json = format!(
+            r#"{{"resourceMetrics":[{{"scopeMetrics":[{{"metrics":[
+              {{"name":"delta_n","sum":{{"aggregationTemporality":1,"isMonotonic":true,"dataPoints":[{point},{point}]}}}},
+              {{"name":"delta_s","sum":{{"aggregationTemporality":"AGGREGATION_TEMPORALITY_DELTA","isMonotonic":true,"dataPoints":[{point}]}}}},
+              {{"name":"cumulative","sum":{{"aggregationTemporality":2,"isMonotonic":true,"dataPoints":[{point}]}}}},
+              {{"name":"quantiles","summary":{{"dataPoints":[{{}},{{}}]}}}},
+              {{"name":"expo","exponentialHistogram":{{"dataPoints":[{{}}]}}}}
+            ]}}]}}]}}"#
+        );
+        let decoded = decode(json.as_bytes(), ctx).unwrap();
+        assert_eq!(
+            decoded.records.len(),
+            1,
+            "only the cumulative sum is stored"
+        );
+        let count = |reason: RejectReason| {
+            decoded
+                .rejections
+                .iter()
+                .filter(|r| r.reason == reason)
+                .count()
+        };
+        assert_eq!(count(RejectReason::DeltaTemporality), 3);
+        assert_eq!(count(RejectReason::UnsupportedMetricType), 3);
+    }
+
+    /// OTLP/JSON spells the doubles JSON cannot hold as strings. Read as plain numbers
+    /// they failed the whole batch — every point in it, for one undefined gauge.
+    #[test]
+    fn nan_and_infinity_arrive_as_strings_and_are_kept() {
+        let decoded = decode_str(
+            r#"{"resourceMetrics":[{"scopeMetrics":[{"metrics":[{"name":"g","gauge":{"dataPoints":[
+              {"timeUnixNano":"1750000000000000000","asDouble":"NaN"},
+              {"timeUnixNano":"1750000000000000001","asDouble":"Infinity"},
+              {"timeUnixNano":"1750000000000000002","asDouble":"-Infinity"},
+              {"timeUnixNano":"1750000000000000003","asDouble":2.5}
+            ]}}]}]}]}"#,
+        );
+        let values: Vec<f64> = decoded.records.iter().map(|s| s.value).collect();
+        assert_eq!(values.len(), 4, "{:?}", decoded.rejections);
+        assert!(values[0].is_nan());
+        assert_eq!(&values[1..], &[f64::INFINITY, f64::NEG_INFINITY, 2.5]);
     }
 }

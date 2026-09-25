@@ -46,7 +46,7 @@ use crate::otlp::{
 };
 use crate::otlp_metrics::{
     HistogramData, HistogramPoint, MetricJson, MetricsData, NumberData, NumberPoint,
-    ResourceMetrics, ScopeMetrics, SumData,
+    ResourceMetrics, ScopeMetrics, SumData, UncountedPoints,
 };
 use crate::protobuf::{Reader, WireType};
 use crate::traces::{ResourceSpans, ScopeSpans, SpanEventJson, SpanJson, StatusJson, TracesData};
@@ -549,9 +549,15 @@ fn metric(reader: &mut Reader<'_>) -> Result<MetricJson> {
             }
             (9, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
-                out.histogram = Some(HistogramData {
-                    data_points: histogram_points(&mut nested)?,
-                });
+                out.histogram = Some(histogram(&mut nested)?);
+            }
+            (10, WireType::LengthDelimited) => {
+                let mut nested = reader.message()?;
+                out.exponential_histogram = Some(uncounted(&mut nested)?);
+            }
+            (11, WireType::LengthDelimited) => {
+                let mut nested = reader.message()?;
+                out.summary = Some(uncounted(&mut nested)?);
             }
             _ => reader.skip(wire)?,
         }
@@ -583,6 +589,11 @@ fn sum(reader: &mut Reader<'_>) -> Result<SumData> {
                 charge::<NumberPoint>("data points")?;
                 out.data_points.push(number_point(&mut nested)?);
             }
+            #[allow(clippy::cast_possible_truncation)]
+            (2, WireType::Varint) => {
+                out.aggregation_temporality =
+                    crate::otlp::FlexEnum::Number(reader.varint()? as i32);
+            }
             (3, WireType::Varint) => out.is_monotonic = reader.varint()? != 0,
             _ => reader.skip(wire)?,
         }
@@ -609,19 +620,37 @@ fn number_point(reader: &mut Reader<'_>) -> Result<NumberPoint> {
     Ok(out)
 }
 
-fn histogram_points(reader: &mut Reader<'_>) -> Result<Vec<HistogramPoint>> {
-    let mut points = Vec::new();
+/// A `Histogram`: its points, and the temporality that decides whether they can be stored.
+fn histogram(reader: &mut Reader<'_>) -> Result<HistogramData> {
+    let mut out = HistogramData::default();
     while let Some((field, wire)) = reader.next_field()? {
         match (field, wire) {
             (1, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
                 charge::<HistogramPoint>("data points")?;
-                points.push(histogram_point(&mut nested)?);
+                out.data_points.push(histogram_point(&mut nested)?);
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            (2, WireType::Varint) => {
+                out.aggregation_temporality =
+                    crate::otlp::FlexEnum::Number(reader.varint()? as i32);
             }
             _ => reader.skip(wire)?,
         }
     }
-    Ok(points)
+    Ok(out)
+}
+
+/// A summary or exponential histogram: its points counted, not decoded.
+fn uncounted(reader: &mut Reader<'_>) -> Result<UncountedPoints> {
+    let mut out = UncountedPoints::default();
+    while let Some((field, wire)) = reader.next_field()? {
+        reader.skip(wire)?;
+        if field == 1 {
+            out.data_points.push(serde::de::IgnoredAny);
+        }
+    }
+    Ok(out)
 }
 
 fn histogram_point(reader: &mut Reader<'_>) -> Result<HistogramPoint> {
@@ -972,5 +1001,50 @@ mod equivalence {
         point.extend((-5i64).to_le_bytes());
         let decoded = number_point(&mut Reader::new(&point)).unwrap();
         assert_eq!(decoded.as_int.get(), Some(-5));
+    }
+
+    /// Temporality is field 2 of `Sum` and `Histogram`, and was skipped, so a delta sum
+    /// over protobuf was stored as cumulative. It is read now, and the conversion
+    /// refuses the points; summaries (field 11) are counted and refused the same way.
+    #[test]
+    fn temporality_and_summaries_are_read_off_the_wire() {
+        fn field(tag: u8, payload: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag, u8::try_from(payload.len()).unwrap()];
+            out.extend_from_slice(payload);
+            out
+        }
+        let mut point = vec![0x21]; // as_double, field 4, fixed64
+        point.extend(5.0f64.to_le_bytes());
+        let mut sum = field(0x0a, &point);
+        sum.extend([0x10, 0x01, 0x18, 0x01]); // temporality = DELTA, is_monotonic
+        let mut delta = field(0x0a, b"d");
+        delta.extend(field(0x3a, &sum));
+        let mut summary = field(0x0a, b"s");
+        summary.extend(field(0x5a, &field(0x0a, &[])));
+        let mut metrics = field(0x12, &delta);
+        metrics.extend(field(0x12, &summary));
+        let body = field(0x0a, &field(0x12, &metrics));
+
+        let data = super::metrics(&body).unwrap();
+        let limits = telemetryd_core::config::LimitsConfig::default();
+        let ingest = telemetryd_core::config::IngestConfig::default();
+        let decoded = crate::otlp_metrics::convert_data(
+            &data,
+            crate::otlp_metrics::MetricContext {
+                limits: &limits,
+                ingest: &ingest,
+                now_nanos: 1,
+            },
+        );
+        assert!(decoded.records.is_empty(), "stored {:?}", decoded.records);
+        let reasons: Vec<_> = decoded.rejections.iter().map(|r| r.reason).collect();
+        assert!(
+            reasons.contains(&crate::RejectReason::DeltaTemporality),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons.contains(&crate::RejectReason::UnsupportedMetricType),
+            "{reasons:?}"
+        );
     }
 }

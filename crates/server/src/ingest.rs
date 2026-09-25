@@ -43,6 +43,70 @@ pub struct PartialSuccess {
     pub error_message: String,
 }
 
+impl OtlpResponse {
+    /// The same answer as an `Export*ServiceResponse` protobuf.
+    ///
+    /// The three signals' responses share a shape — `partial_success` at field 1, and in
+    /// it the rejected count at field 1 and the message at field 2 — so one encoder
+    /// serves all of them.
+    fn to_protobuf(&self) -> Vec<u8> {
+        fn varint(out: &mut Vec<u8>, mut value: u64) {
+            loop {
+                let byte = u8::try_from(value & 0x7f).unwrap_or(0);
+                value >>= 7;
+                if value == 0 {
+                    out.push(byte);
+                    return;
+                }
+                out.push(byte | 0x80);
+            }
+        }
+        let Some(partial) = &self.partial_success else {
+            return Vec::new();
+        };
+        let rejected: u64 = [
+            &partial.rejected_log_records,
+            &partial.rejected_spans,
+            &partial.rejected_data_points,
+        ]
+        .iter()
+        .find_map(|count| count.as_deref())
+        .and_then(|count| count.parse().ok())
+        .unwrap_or(0);
+        let mut inner = Vec::new();
+        if rejected > 0 {
+            inner.push(0x08);
+            varint(&mut inner, rejected);
+        }
+        if !partial.error_message.is_empty() {
+            inner.push(0x12);
+            varint(&mut inner, partial.error_message.len() as u64);
+            inner.extend_from_slice(partial.error_message.as_bytes());
+        }
+        let mut out = vec![0x0a];
+        varint(&mut out, inner.len() as u64);
+        out.extend(inner);
+        out
+    }
+}
+
+/// Answer an OTLP export in the encoding it arrived in.
+///
+/// The OTLP/HTTP specification says the response MUST use the request's content type.
+/// Protobuf requests were answered in JSON; the Collector and the Go SDK happen to
+/// tolerate that, and a stricter client would read the partial success as garbage.
+fn answer(wire: Wire, response: &OtlpResponse) -> Response {
+    match wire {
+        Wire::Json => (StatusCode::OK, Json(response)).into_response(),
+        Wire::Protobuf => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/x-protobuf")],
+            response.to_protobuf(),
+        )
+            .into_response(),
+    }
+}
+
 /// Overwrite what a client claimed to be with what its credential says it is.
 ///
 /// The security boundary of relay mode. `app` arrives in the payload, which
@@ -225,7 +289,7 @@ pub async fn otlp_logs(
         }),
     };
 
-    Ok((StatusCode::OK, Json(response)).into_response())
+    Ok(answer(encoding, &response))
 }
 
 /// `POST /v1/traces`
@@ -324,7 +388,7 @@ pub async fn otlp_traces(
         }),
     };
 
-    Ok((StatusCode::OK, Json(response)).into_response())
+    Ok(answer(encoding, &response))
 }
 
 /// `POST /v1/metrics`
@@ -379,7 +443,10 @@ pub async fn otlp_metrics(
         identity.as_ref(),
         decoded.records.iter_mut().map(|sample| &mut sample.series),
     );
-    store_samples(&state, decoded).await
+    Ok(answer(
+        encoding,
+        &store_samples(&state, decoded).await?.response,
+    ))
 }
 
 /// `POST /api/v1/write` — Prometheus remote_write.
@@ -390,6 +457,18 @@ pub async fn remote_write(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let identity = identity.map(|axum::Extension(identity)| identity);
+    if is_remote_write_v2(&headers) {
+        reject(&state, "metrics", "remote_write_v2");
+        return Ok((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(serde_json::json!({ "error": {
+                "code": "unsupported_media_type",
+                "message": "Remote-Write 2.0 is not supported; send Remote-Write 1.0 \
+                            (protobuf_message: prometheus.WriteRequest)",
+            }})),
+        )
+            .into_response());
+    }
     // Bound concurrent ingest. A rejected request is a signal the producer can act on
     // — back off, batch harder — where an accepted one that queues behind a hundred
     // others is the unbounded buffering `limits.ingest_queue_depth` exists to prevent.
@@ -398,7 +477,12 @@ pub async fn remote_write(
             "telemetryd_ingest_rejected_total",
             &[("signal", "metrics"), ("reason", "queue_full")],
         );
-        return Err(telemetryd_core::Error::Overloaded.into());
+        // 503 where OTLP gets 429. Prometheus retries a 429 only when
+        // `retry_on_http_429` is set, and otherwise drops the samples as if they were
+        // malformed; every 5xx is retried. The same `Retry-After` rides along.
+        let mut busy = ApiError::from(telemetryd_core::Error::Overloaded).into_response();
+        *busy.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+        return Ok(busy);
     };
 
     // Prometheus sends `Content-Encoding: snappy`, and that snappy is the payload's
@@ -440,20 +524,45 @@ pub async fn remote_write(
         decoded.records.iter_mut().map(|sample| &mut sample.series),
     );
 
-    // remote_write has no partial-success envelope; Prometheus expects 204 on success
-    // and treats anything else as a failure worth retrying.
-    let response = store_samples(&state, decoded).await?;
-    if response.status().is_success() {
-        return Ok(StatusCode::NO_CONTENT.into_response());
+    // remote_write has no partial-success envelope. A batch where some samples were
+    // stored is a 204 — the refusals are counted in our metrics, and a 4xx would make
+    // the sender drop the samples that were fine. A batch where *none* was stored is a
+    // 400: it used to be a 204 too, so Prometheus's own failure counter stayed at zero
+    // while every sample was being turned away.
+    let stored = store_samples(&state, decoded).await?;
+    if stored.accepted == 0 && stored.rejected > 0 {
+        return Err(Error::BadRequest(format!(
+            "none of the {} samples were stored: {}",
+            stored.rejected,
+            stored.summary.unwrap_or_default()
+        ))
+        .into());
     }
-    Ok(response)
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Whether this is a Remote-Write 2.0 request, which telemetryd does not decode.
+///
+/// Its message uses different protobuf fields, so decoding it as 1.0 skips every series
+/// and answers 204 having stored nothing. The 2.0 specification asks a receiver that
+/// cannot read it to answer 415, so a sender can fall back to 1.0.
+fn is_remote_write_v2(headers: &HeaderMap) -> bool {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let version = headers
+        .get("x-prometheus-remote-write-version")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    content_type.contains("io.prometheus.write.v2") || version.trim().starts_with('2')
 }
 
 /// Shared tail of both metric ingest paths.
 async fn store_samples(
     state: &AppState,
     mut decoded: telemetryd_ingest::Decoded<telemetryd_core::MetricSample>,
-) -> Result<Response, ApiError> {
+) -> Result<StoredSamples, ApiError> {
     if decoded.rescaled_timestamps > 0 {
         state.metrics.add(
             "telemetryd_ingest_timestamps_rescaled_total",
@@ -462,6 +571,7 @@ async fn store_samples(
         );
     }
 
+    let mut stored = 0;
     if !decoded.records.is_empty() {
         let store = std::sync::Arc::clone(&state.store);
         let records = decoded.records.clone();
@@ -470,6 +580,7 @@ async fn store_samples(
             tokio::task::spawn_blocking(move || store.append_samples(&records)).await,
             "appending metric samples",
         )??;
+        stored = admitted.stored;
         decoded.note_series_rejections(admitted.rejected, admitted.reason);
 
         // Counted here, after the store has spoken, rather than before it.
@@ -492,8 +603,9 @@ async fn store_samples(
         );
     }
 
+    let summary = decoded.rejection_summary();
     let response = OtlpResponse {
-        partial_success: decoded.rejection_summary().map(|message| PartialSuccess {
+        partial_success: summary.clone().map(|message| PartialSuccess {
             rejected_log_records: None,
             rejected_spans: None,
             rejected_data_points: Some(decoded.rejected().to_string()),
@@ -501,7 +613,23 @@ async fn store_samples(
         }),
     };
 
-    Ok((StatusCode::OK, Json(response)).into_response())
+    Ok(StoredSamples {
+        response,
+        accepted: stored,
+        rejected: decoded.rejected(),
+        summary,
+    })
+}
+
+/// What storing a batch of samples came to: the OTLP answer, and the counts the
+/// remote_write answer is decided from.
+struct StoredSamples {
+    response: OtlpResponse,
+    /// What the store kept — not what survived decoding, which still includes samples
+    /// the series limit then refused.
+    accepted: usize,
+    rejected: usize,
+    summary: Option<String>,
 }
 
 /// Undo `Content-Encoding` before the body reaches a decoder.

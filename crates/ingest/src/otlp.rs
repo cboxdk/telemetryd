@@ -94,6 +94,32 @@ impl<'de> Deserialize<'de> for FlexSignedText {
     }
 }
 
+/// A `double` as OTLP/JSON writes it: a number, or one of the strings `"NaN"`,
+/// `"Infinity"` and `"-Infinity"` that JSON has no literal for.
+///
+/// Read as a plain `f64`, the strings failed the whole batch with 400 — every record in
+/// it, for one gauge that happened to be undefined. Anything unreadable is absent, the
+/// promise the other flexible fields make.
+pub fn flex_f64<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<f64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Number(f64),
+        Text(String),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Raw>::deserialize(de)? {
+        Some(Raw::Number(value)) => Some(value),
+        Some(Raw::Text(text)) => match text.trim() {
+            "NaN" => Some(f64::NAN),
+            "Infinity" | "+Infinity" => Some(f64::INFINITY),
+            "-Infinity" => Some(f64::NEG_INFINITY),
+            other => other.parse().ok(),
+        },
+        Some(Raw::Other(_)) | None => None,
+    })
+}
+
 /// An enum field that may arrive as a number or as its proto name.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(untagged)]
@@ -149,6 +175,7 @@ pub struct AnyValue {
     #[serde(alias = "int_value")]
     pub int_value: FlexI64,
     #[serde(alias = "double_value")]
+    #[serde(deserialize_with = "flex_f64")]
     pub double_value: Option<f64>,
     #[serde(alias = "array_value")]
     pub array_value: Option<ArrayValue>,

@@ -52,6 +52,13 @@ pub enum RejectReason {
     /// Unlike the others this is decided by the *store*, after decoding, because the
     /// series is not known until then.
     SeriesLimit,
+    /// A delta-temporality sum or histogram. Stored as if cumulative it would read as a
+    /// counter resetting at every point, and `rate` would be wrong by the width of the
+    /// window, so it is refused where the sender can see it.
+    DeltaTemporality,
+    /// A summary or exponential histogram, which telemetryd does not store. It used to be
+    /// dropped with a 200 and nothing in `partialSuccess`.
+    UnsupportedMetricType,
 }
 
 impl RejectReason {
@@ -68,6 +75,8 @@ impl RejectReason {
             Self::InvalidMetricName => "invalid_metric_name",
             Self::InvalidTimestamp => "invalid_timestamp",
             Self::SeriesLimit => "series_limit",
+            Self::DeltaTemporality => "delta_temporality",
+            Self::UnsupportedMetricType => "unsupported_metric_type",
         }
     }
 }

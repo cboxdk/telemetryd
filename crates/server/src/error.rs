@@ -31,6 +31,12 @@ impl IntoResponse for ApiError {
             Error::LimitExceeded { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Error::Overloaded => StatusCode::TOO_MANY_REQUESTS,
 
+            // An I/O failure is transient more often than not — a full disk being cleared,
+            // a slow volume — and a writer told 500 gives up: the OTLP exporters retry only
+            // 429, 502, 503 and 504, so a 500 on ingest was a batch lost for good. 503
+            // with `Retry-After` gets it sent again.
+            Error::Io { .. } => StatusCode::SERVICE_UNAVAILABLE,
+
             // Everything else is ours to fix.
             Error::Config(_)
             | Error::ConfigUnreadable { .. }
@@ -39,7 +45,6 @@ impl IntoResponse for ApiError {
             | Error::SecretEmpty
             | Error::StorageVersionMismatch { .. }
             | Error::DataDirLocked { .. }
-            | Error::Io { .. }
             | Error::WalCorrupt { .. }
             // Never reaches a client: relay delivery runs on the maintenance loop, not
             // in a request. Listed so adding a variant stays a compile error.
@@ -66,6 +71,11 @@ impl IntoResponse for ApiError {
                 response
                     .headers_mut()
                     .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            }
+            Error::Io { .. } => {
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
             }
             _ => {}
         }
@@ -166,4 +176,22 @@ pub async fn unimplemented(uri: axum::http::Uri) -> Response {
         }
     });
     (StatusCode::NOT_IMPLEMENTED, Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A writer told 500 gives up — the OTLP exporters retry only 429, 502, 503 and
+    /// 504 — so a transient disk error on ingest was a batch lost for good.
+    #[test]
+    fn an_io_failure_asks_the_client_to_retry() {
+        let error = Error::io(
+            "writing the write-ahead log",
+            std::io::Error::other("no space left on device"),
+        );
+        let response = ApiError(error).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+    }
 }

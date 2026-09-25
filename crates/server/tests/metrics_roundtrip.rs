@@ -605,3 +605,54 @@ async fn all_three_signals_coexist() {
         );
     }
 }
+
+/// Remote-Write 2.0 uses different protobuf fields; decoded as 1.0 every series was
+/// skipped and the answer was 204 with nothing stored. The 2.0 spec asks for 415.
+#[tokio::test]
+async fn remote_write_v2_is_refused_as_unsupported_media() {
+    let harness = Harness::new();
+    let payload = remote_write_payload(
+        &[("__name__", "up")],
+        &[(1.0, i64::try_from(NOW_SECONDS * 1000).unwrap())],
+    );
+    let (status, body) = harness
+        .send(
+            Request::post("/api/v1/write")
+                .header(
+                    "content-type",
+                    "application/x-protobuf;proto=io.prometheus.write.v2.Request",
+                )
+                .header("content-encoding", "snappy")
+                .header("x-prometheus-remote-write-version", "2.0.0")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
+}
+
+/// A batch where nothing was stored used to answer 204 too, so Prometheus's own
+/// failure counter stayed at zero while every sample was refused. It is a 400 now; a
+/// batch where some samples were stored stays a 204.
+#[tokio::test]
+async fn remote_write_that_stores_nothing_says_so() {
+    let harness = Harness::new();
+    // `__name__` with a character Prometheus does not allow: refused, not renamed.
+    let refused = remote_write_payload(
+        &[("__name__", "not-a-metric")],
+        &[(1.0, i64::try_from(NOW_SECONDS * 1000).unwrap())],
+    );
+    assert_eq!(
+        harness.post_remote_write(refused).await,
+        StatusCode::BAD_REQUEST
+    );
+
+    let fine = remote_write_payload(
+        &[("__name__", "up")],
+        &[(1.0, i64::try_from(NOW_SECONDS * 1000).unwrap())],
+    );
+    assert_eq!(
+        harness.post_remote_write(fine).await,
+        StatusCode::NO_CONTENT
+    );
+}

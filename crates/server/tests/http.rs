@@ -1392,6 +1392,20 @@ async fn a_full_ingest_queue_is_refused_with_retry_after() {
         "a rejected producer needs to be told when to come back, got {headers:?}"
     );
 
+    // remote_write gets 503 for the same thing: stock Prometheus drops a batch
+    // answered 429 unless `retry_on_http_429` is set, and retries every 5xx.
+    let (status, headers, _) = harness
+        .request(
+            Request::post("/api/v1/write")
+                .header(header::CONTENT_TYPE, "application/x-protobuf")
+                .header(header::CONTENT_ENCODING, "snappy")
+                .body(Body::from(Vec::<u8>::new()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(headers.iter().any(|(name, _)| name == "retry-after"));
+
     // And once the slot frees, ingest resumes rather than staying wedged.
     drop(held);
     let (status, _, _) = harness.request(request()).await;
@@ -2149,4 +2163,79 @@ async fn label_endpoints_are_scoped_by_their_selectors() {
         .await;
     let json: Value = serde_json::from_str(&loki).unwrap();
     assert_eq!(json["data"].as_array().unwrap().len(), 2, "{loki}");
+}
+
+/// OTLP/HTTP answers in the request's own content type. Protobuf requests were answered
+/// in JSON, which the Collector tolerates and a stricter client reads as garbage.
+#[tokio::test]
+async fn a_protobuf_export_is_answered_in_protobuf() {
+    fn field(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let mut len = payload.len();
+        loop {
+            let byte = u8::try_from(len & 0x7f).unwrap();
+            len >>= 7;
+            if len == 0 {
+                out.push(byte);
+                break;
+            }
+            out.push(byte | 0x80);
+        }
+        out.extend_from_slice(payload);
+        out
+    }
+    let batch = |service: &str| {
+        let mut value = field(0x0a, service.as_bytes());
+        value = field(0x12, &value);
+        let mut key_value = field(0x0a, b"service.name");
+        key_value.extend(value);
+        let resource = field(0x0a, &field(0x0a, &key_value));
+        let scope = field(0x12, &field(0x12, &[]));
+        let mut resource_logs = resource;
+        resource_logs.extend(scope);
+        field(0x0a, &resource_logs)
+    };
+    let harness = Harness::new(|_| {});
+    let post = |body: Vec<u8>| {
+        Request::post("/v1/logs")
+            .header(header::CONTENT_TYPE, "application/x-protobuf")
+            .body(Body::from(body))
+            .unwrap()
+    };
+
+    let response = harness
+        .router
+        .clone()
+        .oneshot(post(batch(&"s".repeat(5_000))))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "application/x-protobuf"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    // partial_success { rejected_log_records = 1, error_message = "…" }
+    assert_eq!(body[0], 0x0a, "partial_success at field 1: {body:?}");
+    assert_eq!(&body[2..4], &[0x08, 0x01], "one rejected record: {body:?}");
+    assert!(
+        String::from_utf8_lossy(&body).contains("max_label_value_bytes"),
+        "{body:?}"
+    );
+
+    let response = harness
+        .router
+        .clone()
+        .oneshot(post(batch("shop")))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "application/x-protobuf"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        body.is_empty(),
+        "nothing refused is an empty response message: {body:?}"
+    );
 }

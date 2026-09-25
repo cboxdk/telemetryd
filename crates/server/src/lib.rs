@@ -172,8 +172,10 @@ pub fn router(state: AppState) -> Router {
             record_request,
         ))
         .layer(TraceLayer::new_for_http())
+        // 503, not 408: an OTLP exporter retries 429, 502, 503 and 504 and drops the
+        // batch on anything else, so a timed-out ingest answered 408 was a batch lost.
         .layer(TimeoutLayer::with_status_code(
-            axum::http::StatusCode::REQUEST_TIMEOUT,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
             request_timeout,
         ))
         // Outside the timeout, so a 408 on the Prometheus API gets the envelope too.
