@@ -447,6 +447,17 @@ overstated every period total for a new or departed series, up to sixty-fold in 
 cases above. A dashboard's `increase` over a day now reads what Prometheus's reads,
 fractions of a request included.
 
+#### The metric name is kept where Prometheus keeps it
+
+A selector's result carries `__name__`; arithmetic, unary minus, `abs`, `clamp_*`, `rate`,
+`increase` and `sum without (…)` drop it, `topk`, `bottomk`, `or` and `by (__name__)` keep
+it, and vector matching ignores it — so `errors_total / requests_total` matches across the
+two names. When dropping it leaves two elements with one label set, as
+`rate({__name__=~"http_.*"}[5m])` can, the query is refused with Prometheus's own
+"vector cannot contain metrics with the same labelset". Checked against Prometheus
+3.15.0. Before 0.61.0 every result lost the name, and such a query merged unrelated
+metrics into one series.
+
 #### Staleness markers end a series
 
 When a target disappears Prometheus writes a staleness marker — a NaN with one particular

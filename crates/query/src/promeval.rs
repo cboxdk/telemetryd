@@ -80,6 +80,13 @@ pub struct Snapshot {
     series: Vec<Series>,
     /// `series[i].labels` without `__name__`, ready to be handed to a result.
     stripped: Vec<Labels>,
+    /// `storage_id` of `series[i].labels` to `i`, so an operation that drops the metric
+    /// name can hand out the prepared `stripped[i]` instead of copying the map per step.
+    named: HashMap<usize, usize>,
+    /// Whether two loaded series differ only in their name, so that dropping it could
+    /// leave a vector with one label set twice. Decided once at load; when it is false,
+    /// no step has to look.
+    names_collide: bool,
     /// For each distinct selector in the expression, the series it matches.
     resolved: Vec<(Vec<telemetryd_core::LabelMatcher>, Vec<usize>)>,
     /// Range-vector calls evaluated for every step in one pass per series.
@@ -568,11 +575,13 @@ impl Snapshot {
                 samples: Vec::new(),
             })
             .collect();
-        let stripped: Vec<Labels> = labels.iter().map(strip_name).collect();
-        let grouped = Self::group_index(expr, &stripped);
+        let (stripped, named, names_collide) = Self::derive(&series);
+        let grouped = Self::group_index(expr, &series, &stripped);
         Ok(Some(Self {
             series,
             stripped,
+            named,
+            names_collide,
             resolved: Vec::new(),
             grouped,
             prepared,
@@ -594,7 +603,11 @@ impl Snapshot {
     }
 
     /// Where each series lands under every grouping the expression uses.
-    fn group_index(expr: &Expr, stripped: &[Labels]) -> Vec<GroupIndex> {
+    ///
+    /// Indexed under both of a series' label sets: the named one a bare selector hands
+    /// out, and the stripped one a function or arithmetic hands out. Each is grouped by
+    /// its own labels — `by (__name__)` sees a name only where there is one.
+    fn group_index(expr: &Expr, series: &[Series], stripped: &[Labels]) -> Vec<GroupIndex> {
         let mut grouped: Vec<GroupIndex> = Vec::new();
         for grouping in expr.groupings() {
             if grouped.iter().any(|index| index.grouping == grouping) {
@@ -602,7 +615,7 @@ impl Snapshot {
             }
             let mut of_series = HashMap::new();
             let mut keys: Vec<Labels> = Vec::new();
-            for labels in stripped {
+            for labels in series.iter().map(|s| &s.labels).chain(stripped) {
                 let key = group_key(labels, &grouping);
                 let position = keys
                     .iter()
@@ -620,6 +633,68 @@ impl Snapshot {
             });
         }
         grouped
+    }
+
+    /// Everything derived from the series alone: their names stripped, and the map back.
+    fn derive(series: &[Series]) -> (Vec<Labels>, HashMap<usize, usize>, bool) {
+        let stripped: Vec<Labels> = series.iter().map(|s| strip_name(&s.labels)).collect();
+        let named = series
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.labels.storage_id(), i))
+            .collect();
+        let distinct: std::collections::HashSet<&Labels> = stripped.iter().collect();
+        let collide = distinct.len() < stripped.len();
+        (stripped, named, collide)
+    }
+
+    /// The vector with `__name__` dropped, as Prometheus drops it once arithmetic or a
+    /// function has touched a value — the result is no longer that metric.
+    fn drop_names(&self, mut vector: InstantVector) -> InstantVector {
+        for (labels, _) in &mut vector.samples {
+            if labels.get(telemetryd_core::METRIC_NAME_LABEL).is_none() {
+                continue;
+            }
+            *labels = match self.named.get(&labels.storage_id()) {
+                Some(&index) => self.stripped[index].clone(),
+                None => strip_name(labels),
+            };
+        }
+        vector
+    }
+
+    /// Refuse a vector holding two elements with one label set, as Prometheus does.
+    ///
+    /// It happens when dropping the metric name makes two series identical —
+    /// `rate({__name__=~"http_.*"}[5m])` over two metrics with the same labels. Handed on,
+    /// the two became one series with two values at every timestamp, which a chart draws as
+    /// a sawtooth between unrelated metrics.
+    fn distinct(&self, vector: InstantVector) -> Result<InstantVector> {
+        if self.names_collide && vector.samples.len() > 1 {
+            let mut seen = std::collections::HashSet::with_capacity(vector.samples.len());
+            for (labels, _) in &vector.samples {
+                if !seen.insert(labels) {
+                    let spelled: Vec<String> = labels
+                        .iter()
+                        .map(|(name, value)| format!("{name}={value:?}"))
+                        .collect();
+                    return Err(Error::BadRequest(format!(
+                        "vector cannot contain metrics with the same labelset: more than one \
+                         series became {{{}}} once the metric name was dropped. Aggregate \
+                         them, for example `sum by (…)`, or select one metric",
+                        spelled.join(", ")
+                    )));
+                }
+            }
+        }
+        Ok(vector)
+    }
+
+    fn unnamed(&self, value: Value) -> Value {
+        match value {
+            Value::Vector(vector) => Value::Vector(self.drop_names(vector)),
+            scalar @ Value::Scalar(_) => scalar,
+        }
     }
 
     /// Read the span a slice at a time, folding each sample into every point it serves.
@@ -828,12 +903,14 @@ impl Snapshot {
                 samples: Vec::new(),
             })
             .collect();
-        let stripped: Vec<Labels> = labels.iter().map(strip_name).collect();
-        let grouped = Self::group_index(expr, &stripped);
+        let (stripped, named, names_collide) = Self::derive(&series);
+        let grouped = Self::group_index(expr, &series, &stripped);
 
         Ok(Self {
             series,
             stripped,
+            named,
+            names_collide,
             resolved: Vec::new(),
             grouped,
             prepared,
@@ -921,7 +998,7 @@ impl Snapshot {
 
         // Resolve every selector against the loaded series once. A query has a handful
         // of selectors; the loop inside `eval` has hundreds of steps.
-        let stripped: Vec<Labels> = series.iter().map(|s| strip_name(&s.labels)).collect();
+        let (stripped, named, names_collide) = Self::derive(&series);
         let mut resolved: Vec<(Vec<telemetryd_core::LabelMatcher>, Vec<usize>)> = Vec::new();
         for selector in expr.selectors() {
             if resolved.iter().any(|(m, _)| *m == selector.matchers) {
@@ -936,11 +1013,13 @@ impl Snapshot {
             resolved.push((selector.matchers.clone(), members));
         }
 
-        let grouped = Self::group_index(expr, &stripped);
+        let grouped = Self::group_index(expr, &series, &stripped);
 
         Ok(Self {
             series,
             stripped,
+            named,
+            names_collide,
             resolved,
             grouped,
             prepared: Vec::new(),
@@ -952,12 +1031,14 @@ impl Snapshot {
     /// Build directly from samples, for testing and for the in-memory path.
     pub fn from_samples(samples: Vec<MetricSample>) -> Self {
         let series = group_samples(samples);
-        let stripped = series.iter().map(|s| strip_name(&s.labels)).collect();
+        let (stripped, named, names_collide) = Self::derive(&series);
         // No expression to resolve against here, so selectors and groupings fall back to
         // being worked out per call. This path evaluates a handful of steps at most.
         Self {
             series,
             stripped,
+            named,
+            names_collide,
             resolved: Vec::new(),
             grouped: Vec::new(),
             prepared: Vec::new(),
@@ -976,14 +1057,18 @@ impl Snapshot {
             Expr::Selector(selector) => Ok(Value::Vector(self.instant(selector, at_nanos))),
             Expr::Negate(inner) => Ok(match self.eval(inner, at_nanos)? {
                 Value::Scalar(value) => Value::Scalar(-value),
-                Value::Vector(mut vector) => {
+                Value::Vector(vector) => {
+                    let mut vector = self.drop_names(vector);
                     for (_, value) in &mut vector.samples {
                         *value = -*value;
                     }
-                    Value::Vector(vector)
+                    Value::Vector(self.distinct(vector)?)
                 }
             }),
-            Expr::Call { function, args } => self.eval_call(*function, args, at_nanos),
+            Expr::Call { function, args } => match self.eval_call(*function, args, at_nanos)? {
+                Value::Vector(vector) => Ok(Value::Vector(self.distinct(vector)?)),
+                scalar @ Value::Scalar(_) => Ok(scalar),
+            },
             Expr::Aggregation {
                 op,
                 grouping,
@@ -1013,9 +1098,18 @@ impl Snapshot {
                 Ok(Value::Vector(self.aggregate(*op, grouping, &vector)))
             }
             Expr::Binary { op, left, right } => {
-                let left = self.eval(left, at_nanos)?;
-                let right = self.eval(right, at_nanos)?;
-                Ok(binary(*op, left, right))
+                let mut left = self.eval(left, at_nanos)?;
+                let mut right = self.eval(right, at_nanos)?;
+                // Arithmetic makes a new value; `or` only chooses between existing ones,
+                // so it keeps their names.
+                if *op != BinaryOp::Or {
+                    left = self.unnamed(left);
+                    right = self.unnamed(right);
+                }
+                match binary(*op, left, right) {
+                    Value::Vector(vector) => Ok(Value::Vector(self.distinct(vector)?)),
+                    scalar @ Value::Scalar(_) => Ok(scalar),
+                }
             }
         }
     }
@@ -1066,7 +1160,7 @@ impl Snapshot {
                         )));
                     }
                 };
-                let mut vector = self.eval(&args[0], at_nanos)?.into_vector();
+                let mut vector = self.drop_names(self.eval(&args[0], at_nanos)?.into_vector());
                 for (_, value) in &mut vector.samples {
                     *value = if function == Function::ClampMin {
                         value.max(bound)
@@ -1077,7 +1171,7 @@ impl Snapshot {
                 Ok(Value::Vector(vector))
             }
             Function::Abs => {
-                let mut vector = self.eval(&args[0], at_nanos)?.into_vector();
+                let mut vector = self.drop_names(self.eval(&args[0], at_nanos)?.into_vector());
                 for (_, value) in &mut vector.samples {
                     *value = value.abs();
                 }
@@ -1114,8 +1208,10 @@ impl Snapshot {
             // A series whose newest sample is a staleness marker has ended, and is absent
             // rather than NaN — which is what lets `sum(up)` go on adding up the targets
             // that remain instead of reading NaN for the lookback after one leaves.
+            // Named: a selector's result is still that metric. Whatever consumes it
+            // and changes the value drops the name then — see `drop_names`.
             if ts > floor && !telemetryd_core::is_stale_marker(value) {
-                samples.push((self.stripped[index].clone(), value));
+                samples.push((series.labels.clone(), value));
             }
         }
         InstantVector { samples }
@@ -1291,7 +1387,7 @@ fn group_hash(labels: &Labels, grouping: &Grouping) -> u64 {
         }
         Grouping::Without(names) => {
             for (name, value) in labels.iter() {
-                if !names.iter().any(|excluded| excluded == name) {
+                if !excluded_by(names, name) {
                     (name, value).hash(&mut hasher);
                 }
             }
@@ -1308,13 +1404,13 @@ fn group_matches(labels: &Labels, key: &Labels, grouping: &Grouping) -> bool {
         Grouping::Without(names) => {
             let kept = |set: &Labels| {
                 set.iter()
-                    .filter(|(name, _)| !names.iter().any(|excluded| excluded == name))
+                    .filter(|(name, _)| !excluded_by(names, name))
                     .count()
             };
             kept(labels) == key.len()
                 && labels
                     .iter()
-                    .filter(|(name, _)| !names.iter().any(|excluded| excluded == name))
+                    .filter(|(name, _)| !excluded_by(names, name))
                     .all(|(name, value)| key.get(name) == Some(value))
         }
     }
@@ -1330,10 +1426,16 @@ fn group_key(labels: &Labels, grouping: &Grouping) -> Labels {
             .collect(),
         Grouping::Without(names) => labels
             .iter()
-            .filter(|(name, _)| !names.iter().any(|excluded| excluded == name))
+            .filter(|(name, _)| !excluded_by(names, name))
             .map(|(name, value)| (name.to_owned(), value.to_owned()))
             .collect(),
     }
+}
+
+/// Whether `without (names)` leaves a label out. The metric name always is: the sum of
+/// several series is not any one metric.
+fn excluded_by(names: &[String], name: &str) -> bool {
+    name == telemetryd_core::METRIC_NAME_LABEL || names.iter().any(|excluded| excluded == name)
 }
 
 /// `topk` and `bottomk`: keep the k best elements of each group, labels intact.
@@ -1483,6 +1585,14 @@ fn aggregate(op: AggregateOp, grouping: &Grouping, vector: &InstantVector) -> In
     InstantVector { samples }
 }
 
+/// Two label sets are the same series for matching when they differ at most in name.
+fn same_series(a: &Labels, b: &Labels) -> bool {
+    let name = telemetryd_core::METRIC_NAME_LABEL;
+    a.iter()
+        .filter(|(key, _)| *key != name)
+        .eq(b.iter().filter(|(key, _)| *key != name))
+}
+
 fn binary(op: BinaryOp, left: Value, right: Value) -> Value {
     match (op, left, right) {
         // Vector union: the left side wins, the right fills gaps. This is what makes
@@ -1491,8 +1601,12 @@ fn binary(op: BinaryOp, left: Value, right: Value) -> Value {
             let left = left.into_vector();
             let right = right.into_vector();
             let mut samples = left.samples;
+            // Matched as Prometheus matches: on every label but the name.
             for (labels, value) in right.samples {
-                if !samples.iter().any(|(existing, _)| *existing == labels) {
+                if !samples
+                    .iter()
+                    .any(|(existing, _)| same_series(existing, &labels))
+                {
                     samples.push((labels, value));
                 }
             }
@@ -2613,13 +2727,66 @@ mod tests {
         assert_eq!(p50.samples[0].0.get("app"), Some("checkout"));
     }
 
+    /// Where `__name__` survives, against Prometheus 3.15.0's answers from `promtool test
+    /// rules` over the same series. A bare selector used to lose it, so
+    /// `{__name__=~"foo_.*"}` returned two series with one label set — merged downstream
+    /// into a single series with two values at every timestamp.
     #[test]
-    fn the_metric_name_is_dropped_from_results() {
-        // Once a function or aggregation has run, the value is no longer that metric.
-        let snapshot = Snapshot::from_samples(vec![sample("up", "checkout", T0, 1.0)]);
-        let vector = eval(&snapshot, "up", T0);
-        assert!(vector.samples[0].0.get("__name__").is_none());
-        assert_eq!(vector.samples[0].0.get("app"), Some("checkout"));
+    fn the_metric_name_survives_where_prometheus_keeps_it() {
+        let series = |name: &str, instance: Option<&str>, ts: u64, value: f64| {
+            let mut s = sample(name, "x", ts, value);
+            if let Some(instance) = instance {
+                s.series.insert("instance", instance);
+            }
+            s
+        };
+        let mut samples = Vec::new();
+        for i in 0..=20u32 {
+            let ts = T0 + u64::from(i) * 15 * SECOND;
+            samples.push(series("up", Some("1"), ts, 1.0));
+            samples.push(series("up", Some("2"), ts, 3.0));
+            samples.push(series("foo_a", None, ts, f64::from(i) * 10.0));
+            samples.push(series("foo_b", None, ts, f64::from(i) * 20.0));
+        }
+        let snapshot = Snapshot::from_samples(samples);
+        let at = T0 + 300 * SECOND;
+        let names = |query: &str| -> Vec<Option<String>> {
+            eval(&snapshot, query, at)
+                .samples
+                .iter()
+                .map(|(labels, _)| labels.get("__name__").map(str::to_owned))
+                .collect()
+        };
+        let up = Some("up".to_owned());
+
+        assert_eq!(names("up"), [up.clone(), up.clone()]);
+        assert_eq!(names("up * 2"), [None, None]);
+        assert_eq!(names("-up"), [None, None]);
+        assert_eq!(names("abs(up)"), [None, None]);
+        assert_eq!(names("clamp_min(up, 0)"), [None, None]);
+        assert_eq!(names("sum without (instance) (up)"), [None]);
+        assert_eq!(names("sum by (__name__) (up)"), std::slice::from_ref(&up));
+        assert_eq!(names("topk(1, up)"), [up]);
+        assert_eq!(
+            names(r#"{__name__=~"foo_.*"}"#),
+            [Some("foo_a".to_owned()), Some("foo_b".to_owned())]
+        );
+
+        // Arithmetic matches across names, and `or` keeps the left side's.
+        let ratio = eval(&snapshot, "foo_b / foo_a", at);
+        assert_eq!(ratio.samples.len(), 1);
+        assert!((ratio.samples[0].1 - 2.0).abs() < 1e-12);
+        assert_eq!(names("foo_a or foo_b"), [Some("foo_a".to_owned())]);
+
+        // Two metrics that become one label set once the name drops are refused, as
+        // Prometheus refuses them, rather than merged.
+        let error = snapshot
+            .eval(
+                &crate::promql::parse(r#"rate({__name__=~"foo_.*"}[5m])"#).unwrap(),
+                at,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("same labelset"), "{error}");
     }
 
     #[test]
