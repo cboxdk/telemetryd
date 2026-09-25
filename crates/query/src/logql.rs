@@ -439,12 +439,11 @@ impl LogQuery {
     ///
     /// Returns an empty set when the query has no parser stage, so a caller can merge it
     /// unconditionally.
-    pub fn extracted(&self, line: &str) -> Labels {
+    pub fn extracted(&self, line: &str, stream: &Labels) -> Labels {
         let mut labels = Labels::new();
         for stage in &self.stages {
             match stage {
-                Stage::Json => merge_json(&mut labels, line),
-                Stage::Logfmt => merge_logfmt(&mut labels, line),
+                Stage::Json | Stage::Logfmt => absorb(&mut labels, &stage.parse(line), stream),
                 Stage::Line(_) | Stage::Label(_) => {}
             }
         }
@@ -458,7 +457,10 @@ impl LogQuery {
             .any(|stage| matches!(stage, Stage::Json | Stage::Logfmt))
     }
 
-    pub fn evaluate(&self, line: &str, base: &Labels) -> bool {
+    /// Whether a line passes every stage. `base` is what a label filter sees before any
+    /// parser runs — the stream labels and the record's attributes; `stream` is the
+    /// stream labels alone, which decide whether a parsed field is renamed.
+    pub fn evaluate(&self, line: &str, base: &Labels, stream: &Labels) -> bool {
         let mut extracted: Option<Labels> = None;
 
         for stage in &self.stages {
@@ -468,13 +470,9 @@ impl LogQuery {
                         return false;
                     }
                 }
-                Stage::Json => {
+                Stage::Json | Stage::Logfmt => {
                     let labels = extracted.get_or_insert_with(|| base.clone());
-                    merge_json(labels, line);
-                }
-                Stage::Logfmt => {
-                    let labels = extracted.get_or_insert_with(|| base.clone());
-                    merge_logfmt(labels, line);
+                    absorb(labels, &stage.parse(line), stream);
                 }
                 Stage::Label(predicate) => {
                     let labels = extracted.as_ref().unwrap_or(base);
@@ -495,16 +493,56 @@ impl LogQuery {
     }
 }
 
+impl Stage {
+    /// The fields a parser stage pulls out of a line. Empty for the other stages.
+    fn parse(&self, line: &str) -> Labels {
+        let mut labels = Labels::new();
+        match self {
+            Self::Json => merge_json(&mut labels, line),
+            Self::Logfmt => merge_logfmt(&mut labels, line),
+            Self::Line(_) | Self::Label(_) => {}
+        }
+        labels
+    }
+}
+
+/// Fold parsed fields into a label set the way Loki does.
+///
+/// A field whose name a stream label already has is kept as `<name>_extracted`, and the
+/// stream label stands. It used to overwrite it for filtering while the response said
+/// `_extracted` — so `| json | app="x"` selected on the line's `app` and returned records
+/// whose shown `app` was something else. Any other field — including one an attribute
+/// already has — takes the name: a parsed label outranks structured metadata in Loki.
+fn absorb(labels: &mut Labels, parsed: &Labels, stream: &Labels) {
+    for (name, value) in parsed.iter() {
+        if stream.get(name).is_some() {
+            labels.insert(format!("{name}_extracted"), value);
+        } else {
+            labels.insert(name, value);
+        }
+    }
+}
+
 /// Merge a JSON object's fields into the label set, flattening nested paths with `_`
 /// as Loki does.
+///
+/// A line that is not a JSON object contributes no fields and `__error__` =
+/// `JSONParserErr`, as in Loki. It is not a query failure — log streams are rarely
+/// homogeneous — but the label is how `| json | __error__=""` drops such lines, the
+/// filter Grafana's query builder adds, and how `| __error__!=""` finds them. It was
+/// never set, so the one kept plain-text lines and the other found nothing.
 fn merge_json(labels: &mut Labels, line: &str) {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-        // A line that is not JSON simply contributes no fields; it is not an error.
-        // Log streams are rarely homogeneous, and failing the query because one line
-        // out of a million is plain text would make `| json` unusable.
-        return;
-    };
-    flatten_json(labels, "", &value);
+    match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(value @ serde_json::Value::Object(_)) => flatten_json(labels, "", &value),
+        Ok(_) => {
+            labels.insert("__error__", "JSONParserErr");
+            labels.insert("__error_details__", "the line is not a JSON object");
+        }
+        Err(error) => {
+            labels.insert("__error__", "JSONParserErr");
+            labels.insert("__error_details__", error.to_string());
+        }
+    }
 }
 
 fn flatten_json(labels: &mut Labels, prefix: &str, value: &serde_json::Value) {
@@ -661,14 +699,17 @@ mod tests {
         assert_eq!(query.stages.len(), 4);
 
         let base = labels(&[("app", "x")]);
-        assert!(query.evaluate("payment declined for order 9912", &base));
+        assert!(query.evaluate("payment declined for order 9912", &base, &base));
         assert!(
-            !query.evaluate("payment declined test", &base),
+            !query.evaluate("payment declined test", &base, &base),
             "!= should reject"
         );
-        assert!(!query.evaluate("order created", &base), "|= should reject");
         assert!(
-            !query.evaluate("payment declined retry", &base),
+            !query.evaluate("order created", &base, &base),
+            "|= should reject"
+        );
+        assert!(
+            !query.evaluate("payment declined retry", &base, &base),
             "!~ should reject"
         );
     }
@@ -677,7 +718,7 @@ mod tests {
     fn line_filter_regexes_are_not_anchored() {
         // Unlike label matchers: |~ "err" means the line *contains* a match.
         let query = parse(r#"{app="x"} |~ "err""#).unwrap();
-        assert!(query.evaluate("an error occurred", &labels(&[])));
+        assert!(query.evaluate("an error occurred", &labels(&[]), &labels(&[])));
     }
 
     #[test]
@@ -694,17 +735,17 @@ mod tests {
         let query = parse(r#"{app="x"} | json | user_id="42""#).unwrap();
         let base = labels(&[("app", "x")]);
 
-        assert!(query.evaluate(r#"{"user":{"id":"42"},"msg":"hi"}"#, &base));
-        assert!(!query.evaluate(r#"{"user":{"id":"43"}}"#, &base));
+        assert!(query.evaluate(r#"{"user":{"id":"42"},"msg":"hi"}"#, &base, &base));
+        assert!(!query.evaluate(r#"{"user":{"id":"43"}}"#, &base, &base));
     }
 
     #[test]
     fn json_numbers_and_booleans_become_label_values() {
         let query = parse(r#"{app="x"} | json | status="200""#).unwrap();
-        assert!(query.evaluate(r#"{"status":200}"#, &labels(&[])));
+        assert!(query.evaluate(r#"{"status":200}"#, &labels(&[]), &labels(&[])));
 
         let flag = parse(r#"{app="x"} | json | ok="true""#).unwrap();
-        assert!(flag.evaluate(r#"{"ok":true}"#, &labels(&[])));
+        assert!(flag.evaluate(r#"{"ok":true}"#, &labels(&[]), &labels(&[])));
     }
 
     #[test]
@@ -712,18 +753,26 @@ mod tests {
         // Log streams are rarely homogeneous; one plain-text line must not break the
         // query for the other million.
         let query = parse(r#"{app="x"} | json | level="error""#).unwrap();
-        assert!(!query.evaluate("this is not json", &labels(&[])));
+        assert!(!query.evaluate("this is not json", &labels(&[]), &labels(&[])));
         // …and a line that does parse still matches.
-        assert!(query.evaluate(r#"{"level":"error"}"#, &labels(&[])));
+        assert!(query.evaluate(r#"{"level":"error"}"#, &labels(&[]), &labels(&[])));
     }
 
     #[test]
     fn logfmt_parser_handles_quoted_and_bare_values() {
         let query = parse(r#"{app="x"} | logfmt | method="GET""#).unwrap();
-        assert!(query.evaluate("method=GET path=/api status=200", &labels(&[])));
+        assert!(query.evaluate(
+            "method=GET path=/api status=200",
+            &labels(&[]),
+            &labels(&[])
+        ));
 
         let quoted = parse(r#"{app="x"} | logfmt | msg="hello world""#).unwrap();
-        assert!(quoted.evaluate(r#"level=info msg="hello world""#, &labels(&[])));
+        assert!(quoted.evaluate(
+            r#"level=info msg="hello world""#,
+            &labels(&[]),
+            &labels(&[])
+        ));
     }
 
     #[test]
@@ -732,17 +781,17 @@ mod tests {
         // `| json` to reach their attributes would be theatre.
         let query = parse(r#"{app="x"} | order_id="9912""#).unwrap();
         let base = labels(&[("app", "x"), ("order_id", "9912")]);
-        assert!(query.evaluate("anything", &base));
+        assert!(query.evaluate("anything", &base, &base));
 
         let miss = parse(r#"{app="x"} | order_id="1""#).unwrap();
-        assert!(!miss.evaluate("anything", &base));
+        assert!(!miss.evaluate("anything", &base, &base));
     }
 
     #[test]
     fn label_filters_accept_regex_operators() {
         let query = parse(r#"{app="x"} | route=~"/api/.*""#).unwrap();
-        assert!(query.evaluate("x", &labels(&[("route", "/api/orders")])));
-        assert!(!query.evaluate("x", &labels(&[("route", "/health")])));
+        assert!(query.evaluate("x", &labels(&[("route", "/api/orders")]), &Labels::new()));
+        assert!(!query.evaluate("x", &labels(&[("route", "/health")]), &Labels::new()));
     }
 
     // -- the subset boundary ----------------------------------------------
@@ -829,13 +878,17 @@ mod tests {
     #[test]
     fn logfmt_flattening_sanitises_field_names() {
         let query = parse(r#"{app="x"} | logfmt | http_status="200""#).unwrap();
-        assert!(query.evaluate("http.status=200", &labels(&[])));
+        assert!(query.evaluate("http.status=200", &labels(&[]), &labels(&[])));
     }
 
     #[test]
     fn json_flattening_sanitises_and_joins_nested_names() {
         let query = parse(r#"{app="x"} | json | http_status_code="500""#).unwrap();
-        assert!(query.evaluate(r#"{"http":{"status.code":500}}"#, &labels(&[])));
+        assert!(query.evaluate(
+            r#"{"http":{"status.code":500}}"#,
+            &labels(&[]),
+            &labels(&[])
+        ));
     }
 }
 
@@ -870,18 +923,30 @@ mod compatibility_tests {
     fn label_filters_combine_with_and() {
         let query = parse(r#"{app="x"} | status="500" and method="GET""#).unwrap();
 
-        assert!(query.evaluate("l", &labels(&[("status", "500"), ("method", "GET")])));
-        assert!(!query.evaluate("l", &labels(&[("status", "500"), ("method", "POST")])));
-        assert!(!query.evaluate("l", &labels(&[("status", "200"), ("method", "GET")])));
+        assert!(query.evaluate(
+            "l",
+            &labels(&[("status", "500"), ("method", "GET")]),
+            &Labels::new()
+        ));
+        assert!(!query.evaluate(
+            "l",
+            &labels(&[("status", "500"), ("method", "POST")]),
+            &Labels::new()
+        ));
+        assert!(!query.evaluate(
+            "l",
+            &labels(&[("status", "200"), ("method", "GET")]),
+            &Labels::new()
+        ));
     }
 
     #[test]
     fn label_filters_combine_with_or() {
         let query = parse(r#"{app="x"} | status="500" or status="503""#).unwrap();
 
-        assert!(query.evaluate("l", &labels(&[("status", "500")])));
-        assert!(query.evaluate("l", &labels(&[("status", "503")])));
-        assert!(!query.evaluate("l", &labels(&[("status", "200")])));
+        assert!(query.evaluate("l", &labels(&[("status", "500")]), &Labels::new()));
+        assert!(query.evaluate("l", &labels(&[("status", "503")]), &Labels::new()));
+        assert!(!query.evaluate("l", &labels(&[("status", "200")]), &Labels::new()));
     }
 
     #[test]
@@ -889,10 +954,10 @@ mod compatibility_tests {
         // `a or b and c` is `a or (b and c)`, as in LogQL.
         let query = parse(r#"{app="x"} | a="1" or b="2" and c="3""#).unwrap();
 
-        assert!(query.evaluate("l", &labels(&[("a", "1")])));
-        assert!(query.evaluate("l", &labels(&[("b", "2"), ("c", "3")])));
+        assert!(query.evaluate("l", &labels(&[("a", "1")]), &Labels::new()));
+        assert!(query.evaluate("l", &labels(&[("b", "2"), ("c", "3")]), &Labels::new()));
         assert!(
-            !query.evaluate("l", &labels(&[("b", "2")])),
+            !query.evaluate("l", &labels(&[("b", "2")]), &Labels::new()),
             "b alone must not satisfy `b and c`"
         );
     }
@@ -901,15 +966,26 @@ mod compatibility_tests {
     fn a_long_or_chain_parses() {
         let query = parse(r#"{app="x"} | s="1" or s="2" or s="3" or s="4""#).unwrap();
         for value in ["1", "2", "3", "4"] {
-            assert!(query.evaluate("l", &labels(&[("s", value)])), "{value}");
+            assert!(
+                query.evaluate("l", &labels(&[("s", value)]), &Labels::new()),
+                "{value}"
+            );
         }
-        assert!(!query.evaluate("l", &labels(&[("s", "5")])));
+        assert!(!query.evaluate("l", &labels(&[("s", "5")]), &Labels::new()));
     }
 
     #[test]
     fn mixed_operators_in_a_filter_chain_work() {
         let query = parse(r#"{app="x"} | route=~"/api/.*" and status!="200""#).unwrap();
-        assert!(query.evaluate("l", &labels(&[("route", "/api/orders"), ("status", "500")])));
-        assert!(!query.evaluate("l", &labels(&[("route", "/api/orders"), ("status", "200")])));
+        assert!(query.evaluate(
+            "l",
+            &labels(&[("route", "/api/orders"), ("status", "500")]),
+            &Labels::new()
+        ));
+        assert!(!query.evaluate(
+            "l",
+            &labels(&[("route", "/api/orders"), ("status", "200")]),
+            &Labels::new()
+        ));
     }
 }

@@ -264,7 +264,7 @@ fn matches_tail(query: &logql::LogQuery, record: &LogRecord) -> bool {
             base.insert(sanitized, value);
         }
     }
-    query.evaluate(&record.body, &base)
+    query.evaluate(&record.body, &base, &record.stream)
 }
 
 #[cfg(test)]

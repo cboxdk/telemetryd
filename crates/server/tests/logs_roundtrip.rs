@@ -654,13 +654,29 @@ async fn a_parser_stage_returns_the_fields_it_extracted() {
         }))
         .await;
 
-    let path = format!(
-        "/loki/api/v1/query_range?query={}&start={}&end={}&direction=forward",
-        urlencode(r#"{app="checkout"} | json | level="error""#),
-        NOW,
-        NOW + MS
-    );
-    let (status, response) = harness.get(&path).await;
+    let path = |query: &str| {
+        format!(
+            "/loki/api/v1/query_range?query={}&start={}&end={}&direction=forward",
+            urlencode(query),
+            NOW,
+            NOW + MS
+        )
+    };
+
+    // `level` is the stream label, as in Loki, so filtering it on the body's value finds
+    // nothing. It used to overwrite the stream label for the filter while the response
+    // showed `level_extracted` — selecting on one value and showing another.
+    let (status, response) = harness
+        .get(&path(r#"{app="checkout"} | json | level="error""#))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["data"]["result"], json!([]), "{response}");
+
+    let (status, response) = harness
+        .get(&path(
+            r#"{app="checkout"} | json | level_extracted="error""#,
+        ))
+        .await;
     assert_eq!(status, StatusCode::OK, "{response}");
 
     let entry = &response["data"]["result"][0];
@@ -1167,4 +1183,53 @@ async fn the_probe_the_ui_uses_to_recognise_a_log_backend_succeeds() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(response["status"], "success");
     assert!(response["data"].is_array());
+}
+
+/// A line `| json` cannot parse carries `__error__`, as in Loki. `| __error__=""` is the
+/// filter Grafana's query builder adds to drop such lines, and `| __error__!=""` finds
+/// them; with the label never set, the one kept plain text and the other found nothing.
+#[tokio::test]
+async fn a_line_that_is_not_json_carries_the_parser_error() {
+    let harness = Harness::new();
+    harness
+        .post_logs(&json!({
+            "resourceLogs": [{
+                "resource": {"attributes": [
+                    {"key": "service.name", "value": {"stringValue": "checkout"}}
+                ]},
+                "scopeLogs": [{"logRecords": [
+                    {"timeUnixNano": NOW.to_string(), "body": {"stringValue": r#"{"ok":true}"#}},
+                    {"timeUnixNano": (NOW + 1).to_string(), "body": {"stringValue": "plain text"}}
+                ]}]
+            }]
+        }))
+        .await;
+    let harness = &harness;
+    let lines = |query: &str| {
+        let path = format!(
+            "/loki/api/v1/query_range?query={}&start={}&end={}&direction=forward",
+            urlencode(query),
+            NOW,
+            NOW + MS
+        );
+        async move {
+            let (status, response) = harness.get(&path).await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+            response["data"]["result"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|stream| stream["values"].as_array().unwrap().clone())
+                .collect::<Vec<Value>>()
+        }
+    };
+
+    let clean = lines(r#"{app="checkout"} | json | __error__="""#).await;
+    assert_eq!(clean.len(), 1);
+    assert_eq!(clean[0][1], r#"{"ok":true}"#);
+
+    let failed = lines(r#"{app="checkout"} | json | __error__!="""#).await;
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0][1], "plain text");
+    assert_eq!(failed[0][2]["__error__"], "JSONParserErr");
 }

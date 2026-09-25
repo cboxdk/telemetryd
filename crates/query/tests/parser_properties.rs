@@ -85,7 +85,7 @@ proptest! {
         line in ".*",
     ) {
         if let Ok(query) = logql::parse(&input) {
-            let _ = query.evaluate(&line, &Labels::new());
+            let _ = query.evaluate(&line, &Labels::new(), &Labels::new());
         }
     }
 }
@@ -149,14 +149,14 @@ proptest! {
     ) {
         let query = logql::parse(&format!(r#"{{app="x"}} |= "{needle}""#)).unwrap();
         prop_assert_eq!(
-            query.evaluate(&line, &Labels::new()),
+            query.evaluate(&line, &Labels::new(), &Labels::new()),
             line.contains(&needle),
             "|= must mean exactly `contains` for {:?} / {:?}", line, needle
         );
 
         let negated = logql::parse(&format!(r#"{{app="x"}} != "{needle}""#)).unwrap();
         prop_assert_eq!(
-            negated.evaluate(&line, &Labels::new()),
+            negated.evaluate(&line, &Labels::new(), &Labels::new()),
             !line.contains(&needle)
         );
     }
@@ -173,8 +173,8 @@ proptest! {
         let reversed = logql::parse(&format!(r#"{{app="x"}} |= "{b}" |= "{a}""#)).unwrap();
 
         prop_assert_eq!(
-            forward.evaluate(&line, &Labels::new()),
-            reversed.evaluate(&line, &Labels::new())
+            forward.evaluate(&line, &Labels::new(), &Labels::new()),
+            reversed.evaluate(&line, &Labels::new(), &Labels::new())
         );
     }
 
@@ -183,14 +183,14 @@ proptest! {
     #[test]
     fn a_bare_json_stage_accepts_every_line(line in ".*") {
         let query = logql::parse(r#"{app="x"} | json"#).unwrap();
-        prop_assert!(query.evaluate(&line, &Labels::new()));
+        prop_assert!(query.evaluate(&line, &Labels::new(), &Labels::new()));
     }
 
     /// Same for logfmt: it extracts, it does not filter.
     #[test]
     fn a_bare_logfmt_stage_accepts_every_line(line in ".*") {
         let query = logql::parse(r#"{app="x"} | logfmt"#).unwrap();
-        prop_assert!(query.evaluate(&line, &Labels::new()));
+        prop_assert!(query.evaluate(&line, &Labels::new(), &Labels::new()));
     }
 
     /// Whatever `| json` extracts, a matching label filter must then accept.
@@ -209,7 +209,7 @@ proptest! {
         let query = logql::parse(&format!(r#"{{app="x"}} | json | {key}="{value}""#)).unwrap();
 
         prop_assert!(
-            query.evaluate(&line, &Labels::new()),
+            query.evaluate(&line, &Labels::new(), &Labels::new()),
             "extracted {}={} from {} but the filter rejected it", key, value, line
         );
     }
@@ -270,7 +270,7 @@ fn inputs_that_previously_looked_dangerous_are_handled_cleanly() {
         match logql::parse(input) {
             Ok(query) => {
                 // If it parsed, it must also evaluate without panicking.
-                let _ = query.evaluate("some line", &Labels::new());
+                let _ = query.evaluate("some line", &Labels::new(), &Labels::new());
             }
             Err(error) => assert!(
                 matches!(error, Error::BadRequest(_) | Error::Unsupported { .. }),
@@ -290,7 +290,7 @@ fn deeply_nested_input_does_not_blow_the_stack() {
         "1".to_owned() + &"}".repeat(2000)
     );
     let query = logql::parse(r#"{app="x"} | json | a="1""#).unwrap();
-    let _ = query.evaluate(&deep, &Labels::new());
+    let _ = query.evaluate(&deep, &Labels::new(), &Labels::new());
 }
 
 #[test]

@@ -551,7 +551,7 @@ pub fn query_range(
                 base.insert(sanitized, value);
             }
         }
-        request.query.evaluate(&record.body, &base)
+        request.query.evaluate(&record.body, &base, &record.stream)
     };
 
     // The limit and the direction go all the way down to storage. Collecting every
@@ -696,20 +696,15 @@ fn group_into_streams(
         // attributes so the categorised shape can put each where Loki does.
         let mut extracted: BTreeMap<String, String> = BTreeMap::new();
         if parses {
-            for (name, value) in query.extracted(&record.body).iter() {
-                // A parsed field colliding with a stream label is renamed rather than
-                // dropped or allowed to overwrite: `level` is both telemetryd's
-                // severity and, on a JSON line, the application's own idea of level, and
-                // they routinely disagree. Loki spells the survivor `_extracted`, so a
-                // reader of either system finds the same key.
-                let key = if record.stream.get(name).is_some() {
-                    format!("{name}_extracted")
-                } else {
-                    name.to_owned()
-                };
-                if !metadata.contains_key(&key) {
-                    extracted.entry(key).or_insert_with(|| value.to_owned());
-                }
+            // Renamed where they collide with a stream label, exactly as the filter saw
+            // them — see `logql::absorb`. `level` is both telemetryd's severity and, on
+            // a JSON line, the application's own idea of level, and they routinely
+            // disagree; Loki spells the parsed one `level_extracted`.
+            for (name, value) in query.extracted(&record.body, &record.stream).iter() {
+                // A parsed label outranks structured metadata of the same name, as in
+                // Loki: the value a filter selected on is the value shown.
+                metadata.remove(name);
+                extracted.insert(name.to_owned(), value.to_owned());
             }
         }
         let entry = if categorize {

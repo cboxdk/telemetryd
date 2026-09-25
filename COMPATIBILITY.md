@@ -269,7 +269,14 @@ Supported:
 - stream selectors with `=`, `!=`, `=~`, `!~`
 - line filters `|=`, `!=`, `|~`, `!~` (regexes here are **unanchored**, unlike label
   matchers, which are fully anchored)
-- the `json` and `logfmt` parsers
+- the `json` and `logfmt` parsers, with Loki's collision rule: a parsed field whose name
+  a stream label already has becomes `<name>_extracted` for filters and response alike,
+  so `| json | level="error"` reads the stream's `level` and `| json |
+  level_extracted="error"` the line's. A parsed field outranks an attribute of the same
+  name. A line `| json` cannot parse carries `__error__="JSONParserErr"` and
+  `__error_details__`, so `| __error__=""` drops it — the filter Grafana's builder adds —
+  and `| __error__!=""` finds it. Before 0.61.0 the filter read the parsed field while the
+  response showed `_extracted`, and `__error__` was never set.
 - label filters, including `and` / `or` chains — `| status="500" or status="503"` is
   what the UI's compiler emits, so a single bare matcher would not have been enough
 
