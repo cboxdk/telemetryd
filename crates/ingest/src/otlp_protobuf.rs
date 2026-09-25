@@ -166,7 +166,12 @@ fn any_value(reader: &mut Reader<'_>, depth: u32) -> Result<AnyValue> {
                 value.string_value = Some(reader.string()?.to_owned());
             }
             (2, WireType::Varint) => value.bool_value = Some(reader.varint()? != 0),
-            (3, WireType::Varint) => value.int_value = FlexU64::Number(reader.varint()?),
+            // `int64` on the wire is a varint of the two's-complement bits, so the cast is
+            // the decoding, not a truncation: -1 arrives as ten bytes of 0xff…
+            #[allow(clippy::cast_possible_wrap)]
+            (3, WireType::Varint) => {
+                value.int_value = crate::otlp::FlexI64::Number(reader.varint()? as i64);
+            }
             (4, WireType::Fixed64) => value.double_value = Some(reader.double()?),
             (5, WireType::LengthDelimited) => {
                 let mut nested = reader.message()?;
@@ -591,9 +596,12 @@ fn number_point(reader: &mut Reader<'_>) -> Result<NumberPoint> {
         match (field, wire) {
             (3, WireType::Fixed64) => out.time_unix_nano = FlexU64::Number(reader.fixed64()?),
             (4, WireType::Fixed64) => out.as_double = Some(reader.double()?),
-            // `as_int` is `sfixed64`: eight raw bytes, not a varint. Read as fixed64 and
-            // let the shared conversion decide what the number means.
-            (6, WireType::Fixed64) => out.as_int = FlexU64::Number(reader.fixed64()?),
+            // `as_int` is `sfixed64`: eight raw bytes of a signed integer. Read as fixed64
+            // and reinterpreted, since the bits are the same and only the sign differs.
+            #[allow(clippy::cast_possible_wrap)]
+            (6, WireType::Fixed64) => {
+                out.as_int = crate::otlp::FlexI64::Number(reader.fixed64()? as i64);
+            }
             (7, WireType::LengthDelimited) => push_attribute(reader, &mut out.attributes)?,
             _ => reader.skip(wire)?,
         }
@@ -946,5 +954,23 @@ mod equivalence {
         );
         assert_eq!(decoded.records.len(), 1);
         assert_eq!(decoded.records[0].body, "hello");
+    }
+
+    /// `int64` is a varint of the two's-complement bits and `sfixed64` is eight signed
+    /// bytes; both were read unsigned, so `-1` became 18446744073709551615.
+    #[test]
+    fn a_negative_integer_decodes_as_negative() {
+        // AnyValue { int_value = -1 }: field 3, varint, ten bytes.
+        let mut any = vec![0x18];
+        any.extend([0xff; 9]);
+        any.push(0x01);
+        let value = any_value(&mut Reader::new(&any), 0).unwrap();
+        assert_eq!(value.to_text().as_deref(), Some("-1"));
+
+        // NumberDataPoint { as_int = -5 }: field 6, fixed64.
+        let mut point = vec![0x31];
+        point.extend((-5i64).to_le_bytes());
+        let decoded = number_point(&mut Reader::new(&point)).unwrap();
+        assert_eq!(decoded.as_int.get(), Some(-5));
     }
 }

@@ -80,7 +80,7 @@ pub struct NumberPoint {
     #[serde(alias = "as_double")]
     pub as_double: Option<f64>,
     #[serde(alias = "as_int")]
-    pub as_int: FlexU64,
+    pub as_int: crate::otlp::FlexI64,
 }
 
 impl NumberPoint {

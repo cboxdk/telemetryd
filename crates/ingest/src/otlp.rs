@@ -54,6 +54,46 @@ impl<'de> Deserialize<'de> for FlexText {
     }
 }
 
+/// An `int64` that may arrive as a JSON string or a JSON number.
+///
+/// Attribute and gauge integers are signed in OTLP. They were read as `u64`, and every
+/// negative value went wrong in a different way: a JSON number `-1` failed the whole
+/// batch with 400, the string `"-1"` — the spelling the spec asks for, and the one
+/// laravel-telemetry sends — silently dropped the attribute, and over protobuf `-1`
+/// was stored as 18446744073709551615.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(untagged)]
+pub enum FlexI64 {
+    #[default]
+    Absent,
+    Number(i64),
+    Text(FlexSignedText),
+    /// Anything else — a float, an out-of-range number — reads as absent rather than
+    /// failing the batch, the same promise the unsigned form makes.
+    Other(serde::de::IgnoredAny),
+}
+
+impl FlexI64 {
+    pub fn get(self) -> Option<i64> {
+        match self {
+            Self::Number(n) => Some(n),
+            Self::Text(t) => t.0,
+            Self::Absent | Self::Other(_) => None,
+        }
+    }
+}
+
+/// A decimal string parsed as `i64`, `None` when it is not one.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FlexSignedText(pub Option<i64>);
+
+impl<'de> Deserialize<'de> for FlexSignedText {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(de)?;
+        Ok(Self(raw.trim().parse::<i64>().ok()))
+    }
+}
+
 /// An enum field that may arrive as a number or as its proto name.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(untagged)]
@@ -107,7 +147,7 @@ pub struct AnyValue {
     #[serde(alias = "bool_value")]
     pub bool_value: Option<bool>,
     #[serde(alias = "int_value")]
-    pub int_value: FlexU64,
+    pub int_value: FlexI64,
     #[serde(alias = "double_value")]
     pub double_value: Option<f64>,
     #[serde(alias = "array_value")]
@@ -405,5 +445,23 @@ mod tests {
             normalize_id("4BF92F3577B34DA6A3CE929D0E0E4736").unwrap(),
             "4bf92f3577b34da6a3ce929d0e0e4736"
         );
+    }
+
+    /// OTLP integers are signed, and each spelling of a negative one used to fail
+    /// differently: a JSON number failed the batch, a JSON string dropped the attribute.
+    #[test]
+    fn a_negative_integer_survives_every_json_spelling() {
+        for json in [
+            r#"{"intValue":-1}"#,
+            r#"{"intValue":"-1"}"#,
+            r#"{"int_value":"-42"}"#,
+        ] {
+            let value: AnyValue = serde_json::from_str(json).unwrap();
+            let expected = if json.contains("42") { "-42" } else { "-1" };
+            assert_eq!(value.to_text().as_deref(), Some(expected), "{json}");
+        }
+        // Still lenient about what is not an integer at all.
+        let float: AnyValue = serde_json::from_str(r#"{"intValue":1.5}"#).unwrap();
+        assert_eq!(float.to_text(), None);
     }
 }
