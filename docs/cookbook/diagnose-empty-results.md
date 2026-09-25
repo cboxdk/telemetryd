@@ -68,8 +68,11 @@ sudo journalctl -u telemetryd | grep "refused a query"
 curl -s localhost:4319/metrics | grep telemetryd_query_rejected_total
 ```
 
-The log line carries the expression and the reason; the counter is labelled by surface
-(`promql`, `logql`) and reason. Before this, a refusal existed only in the client's
+The log line carries the reason and a fingerprint of the expression; the expression
+itself is logged at `debug` under the same fingerprint, since a query can hold what
+someone searched for. To see it, set `log.level = "debug"` and `systemctl reload
+telemetryd` — no restart. The counter is labelled by surface (`promql`, `logql`) and
+reason. Before this, a refusal existed only in the client's
 response — an operator looking at their own instance could not tell which query had failed
 or that any had.
 

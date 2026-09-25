@@ -123,7 +123,8 @@ used to start as long as *any* token was set, while a surface with no token of i
 answered anyone — so an ingest token alone left every read and export public. It now
 refuses to start unless ingest, query and admin are each guarded by a token or by Cbox
 ID, names the surfaces that are open and prints tokens for them; the Docker entrypoint
-generates tokens for whichever surfaces were not given one.
+generates tokens for whichever surfaces were not given one, and says where they are
+rather than printing them into the container log.
 
 **Grafana connects to all three datasources.** Checked against a real Grafana 12.2
 container: "Save & test" passes for Prometheus, Loki and Tempo; Explore shows log lines

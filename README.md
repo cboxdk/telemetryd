@@ -94,7 +94,8 @@ docker run -d -p 4319:4319 -v telemetryd-data:/var/lib/telemetryd \
 ```
 
 A container binds `0.0.0.0`, which telemetryd refuses to do unauthenticated, so the
-image generates tokens on first start and prints them once — `docker logs` has them.
+image generates tokens on first start and keeps them in the data volume —
+`docker exec <container> cat /var/lib/telemetryd/generated-tokens.env` shows them.
 Every setting is an environment variable, so nothing needs a file. See
 [Docker](docs/getting-started/docker.md).
 

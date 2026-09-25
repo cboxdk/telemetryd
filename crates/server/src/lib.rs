@@ -333,7 +333,7 @@ pub async fn serve_state(state: AppState) -> Result<()> {
 
     if let Some(relay) = &state.relay {
         tracing::info!(
-            upstream = %config.relay.upstream,
+            upstream = %telemetryd_core::http::redact_url(&config.relay.upstream),
             trust_client_identity = config.relay.trust_client_identity,
             "relay mode: forwarding sealed segments upstream"
         );

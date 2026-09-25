@@ -460,21 +460,26 @@ impl Relay {
         let url = format!("{}{path}", self.config.upstream.trim_end_matches('/'));
         let token = self.config.token.resolve()?;
 
+        let shown = telemetryd_core::http::redact_url(&url);
+        // No redirects: one to `http://` would send the batch in cleartext, and one to
+        // another host would send it somewhere nobody configured. A 3xx is a delivery
+        // failure that names where upstream pointed.
         let mut request = ureq::post(&url)
             .config()
             .tls_config(telemetryd_core::http::tls())
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_global(Some(TOTAL_TIMEOUT))
             .http_status_as_error(false)
+            .max_redirects(0)
             .build()
             .header("content-type", "application/json");
         if !token.is_empty() {
             request = request.header("authorization", &format!("Bearer {token}"));
         }
 
-        let mut response = request
-            .send(encoded)
-            .map_err(|e| telemetryd_core::Error::RelayDelivery(format!("posting to {url}: {e}")))?;
+        let mut response = request.send(encoded).map_err(|e| {
+            telemetryd_core::Error::RelayDelivery(format!("posting to {shown}: {e}"))
+        })?;
 
         let status = response.status().as_u16();
         if (200..300).contains(&status) {
@@ -484,13 +489,26 @@ impl Relay {
             let (refused, message) = partially_refused(&body);
             if refused > 0 {
                 tracing::warn!(
-                    url,
+                    url = %shown,
                     refused,
                     message,
                     "upstream accepted the request but refused some records"
                 );
             }
             return Ok(refused);
+        }
+
+        if (300..400).contains(&status) {
+            let location = response
+                .headers()
+                .get("location")
+                .and_then(|value| value.to_str().ok())
+                .map_or_else(|| "nowhere".to_owned(), telemetryd_core::http::redact_url);
+            return Err(telemetryd_core::Error::RelayDelivery(format!(
+                "{shown} answered {status}, redirecting to {location}. telemetryd does not \
+                 follow redirects with telemetry; set relay.upstream to the address that \
+                 accepts it"
+            )));
         }
 
         // The body is where an upstream says *why* — an unsupported field, a limit,
@@ -504,7 +522,7 @@ impl Relay {
             .take(400)
             .collect::<String>();
         Err(telemetryd_core::Error::RelayDelivery(format!(
-            "{url} answered {status}: {detail}"
+            "{shown} answered {status}: {detail}"
         )))
     }
 }
@@ -576,6 +594,54 @@ mod tests {
             },
             dir,
         )
+    }
+
+    /// A redirect is a failed delivery that says where upstream pointed, never a
+    /// second POST: one to `http://` would send the batch in cleartext, one elsewhere to
+    /// somewhere nobody configured. The credentials in the upstream URL stay out of the
+    /// message.
+    #[test]
+    fn a_redirect_is_reported_and_not_followed() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = std::thread::spawn(move || {
+            let mut requests = 0;
+            listener.set_nonblocking(false).unwrap();
+            for stream in listener.incoming().take(1) {
+                let mut stream = stream.unwrap();
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer);
+                requests += 1;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: http://elsewhere.example/v1/logs\r\n\
+                          Content-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+            }
+            requests
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Relay::new(
+            RelayConfig {
+                upstream: format!("http://user:secret@127.0.0.1:{port}"),
+                ..RelayConfig::default()
+            },
+            dir.path(),
+        );
+        let error = relay.post("/v1/logs", "{}").unwrap_err().to_string();
+        assert!(
+            error.contains("redirecting to http://elsewhere.example"),
+            "{error}"
+        );
+        assert!(!error.contains("secret"), "{error}");
+        assert_eq!(
+            served.join().unwrap(),
+            1,
+            "one request, the redirect not followed"
+        );
     }
 
     #[test]

@@ -187,3 +187,41 @@ mod tests {
         }
     }
 }
+
+/// `url` without the credentials some carry in their userinfo, for logs and messages.
+///
+/// A relay upstream may be written `https://user:secret@host/`, and it was logged that
+/// way at startup and in every delivery error.
+#[must_use]
+pub fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{scheme}://[redacted]@{}", &rest[at + 1..]),
+        None => url.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::redact_url;
+
+    #[test]
+    fn userinfo_is_removed_and_nothing_else() {
+        assert_eq!(
+            redact_url("https://user:secret@upstream.example/v1/logs"),
+            "https://[redacted]@upstream.example/v1/logs"
+        );
+        assert_eq!(
+            redact_url("https://upstream.example/a@b"),
+            "https://upstream.example/a@b"
+        );
+        assert_eq!(
+            redact_url("https://upstream.example"),
+            "https://upstream.example"
+        );
+        assert_eq!(redact_url("not a url"), "not a url");
+    }
+}

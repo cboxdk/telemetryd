@@ -64,13 +64,17 @@ EOF
         {
             echo
             echo "  ────────────────────────────────────────────────────────────────────────"
-            echo "  Some surfaces had no token, so telemetryd generated them. They are"
-            echo "  printed once, stored in ${GENERATED} and reused on restart;"
-            echo "  delete that file to get new ones."
+            echo "  Some surfaces had no token, so telemetryd generated them and stored"
+            echo "  them in ${GENERATED}, readable only inside the container and reused"
+            echo "  on restart; delete that file to get new ones. They are not printed:"
+            echo "  container logs are read by more people, for longer, than a token"
+            echo "  should be. To read them:"
             echo
-            [ -z "$GIVEN_INGEST" ] && echo "    ingest (write telemetry)   ${TELEMETRYD_AUTH_INGEST_TOKEN}"
-            [ -z "$GIVEN_QUERY" ] && echo "    query  (read telemetry)    ${TELEMETRYD_AUTH_QUERY_TOKEN}"
-            [ -z "$GIVEN_ADMIN" ] && echo "    admin  (/status, /metrics) ${TELEMETRYD_AUTH_ADMIN_TOKEN}"
+            echo "    docker exec <container> cat ${GENERATED}"
+            echo
+            [ -z "$GIVEN_INGEST" ] && echo "    generated: ingest (write telemetry)"
+            [ -z "$GIVEN_QUERY" ] && echo "    generated: query  (read telemetry)"
+            [ -z "$GIVEN_ADMIN" ] && echo "    generated: admin  (/status, /metrics)"
             echo
             echo "  Set TELEMETRYD_AUTH_*_TOKEN yourself for anything that is not a laptop."
             echo "  ────────────────────────────────────────────────────────────────────────"

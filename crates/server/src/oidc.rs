@@ -322,11 +322,14 @@ fn fetch(url: &str) -> Result<String, String> {
     const TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
     const MAX_JWKS_BYTES: u64 = 512 * 1024;
 
+    // A key set fetched over HTTPS may be redirected, but never down to plain HTTP,
+    // where anyone on the path could hand over keys of their own.
     let mut response = ureq::get(url)
         .config()
         .tls_config(telemetryd_core::http::tls())
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_global(Some(TOTAL_TIMEOUT))
+        .https_only(url.starts_with("https://"))
         .build()
         .call()
         .map_err(|e| unreachable_keys(url, &e.to_string()))?;

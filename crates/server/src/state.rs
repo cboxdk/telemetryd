@@ -314,18 +314,32 @@ impl AppState {
     /// named in the response and logged. The read side had the response and nothing else.
     ///
     /// `WARN`, because a refusal means someone is looking at a broken panel right now. The
-    /// expression is included because the reason is meaningless without it, and truncated
+    /// expression itself is logged at `DEBUG` beside a fingerprint the `WARN` line carries
+    /// too: a query can hold what someone searched for, a leaked token included, and a
+    /// warning log is read more widely than the instance. `log.level` reloads on `SIGHUP`,
+    /// so seeing the expression costs a reload, not a restart. Truncated either way,
     /// because a query is caller-controlled input.
     pub fn refused_query(&self, surface: &'static str, query: &str, error: &Error) {
+        use std::hash::{Hash, Hasher};
         const MAX_LOGGED: usize = 400;
         let reason = error.code();
-        let shown: String = query.chars().take(MAX_LOGGED).collect();
+        // Fixed keys, so the same query has the same fingerprint across restarts.
+        let mut hasher = std::hash::DefaultHasher::new();
+        query.hash(&mut hasher);
+        let fingerprint = format!("{:08x}", hasher.finish() >> 32);
         tracing::warn!(
             surface,
             reason,
+            query_fingerprint = %fingerprint,
+            query_chars = query.chars().count(),
+            "refused a query: {error}"
+        );
+        let shown: String = query.chars().take(MAX_LOGGED).collect();
+        tracing::debug!(
+            query_fingerprint = %fingerprint,
             query = %shown,
             truncated = query.chars().count() > MAX_LOGGED,
-            "refused a query: {error}"
+            "the refused query"
         );
         self.metrics.incr(
             "telemetryd_query_rejected_total",

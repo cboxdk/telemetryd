@@ -827,10 +827,12 @@ fn refusal_note() -> Option<String> {
 }
 
 fn post(url: &str, token: Option<&str>, body: &str) -> anyhow::Result<()> {
+    // Not redirected: a destination that answers 3xx gets its records nowhere else.
     let mut request = ureq::post(url)
         .config()
         .tls_config(telemetryd_core::http::tls())
         .http_status_as_error(false)
+        .max_redirects(0)
         .build()
         .header("content-type", "application/json");
     if let Some(token) = token {

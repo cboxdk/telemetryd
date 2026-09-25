@@ -13,7 +13,7 @@ docker run -d -p 4319:4319 -v telemetryd-data:/var/lib/telemetryd \
 
 That is a working instance. No configuration file, no flags.
 
-## The first thing it prints is a set of tokens
+## It generates its own tokens
 
 telemetryd refuses to listen on an address reachable from outside the machine with no
 authentication configured, and a
@@ -21,25 +21,17 @@ container binds `0.0.0.0` by definition. The two obvious ways to make a zero-con
 image are both bad: fail to start, or default to `insecure` and serve everyone's
 telemetry to anyone who can reach the port.
 
-So on its **first** start the image generates three tokens, stores them next to the data
-and prints them once:
-
-```
-  ────────────────────────────────────────────────────────────────────────
-  No authentication was configured, so telemetryd generated its own.
-  ...
-    ingest (write telemetry)  8Kq2m-vX...
-    query  (read telemetry)   pR4nT9wz...
-    admin  (/status, /metrics) Lf7cH2ae...
-  ────────────────────────────────────────────────────────────────────────
-```
+So on its **first** start the image generates a token for each surface you did not set,
+and stores them next to the data, readable only inside the container. It does not print
+them: container logs are read by more people, and kept longer, than a token should be.
+The first lines of `docker logs` say which were generated and how to read them:
 
 ```bash
-docker logs <container> 2>&1 | head -20     # they are printed once, at first start
+docker exec <container> cat /var/lib/telemetryd/generated-tokens.env
 ```
 
-They live in `/var/lib/telemetryd/generated-tokens.env` and are reused on restart.
-Delete that file to get new ones.
+They are reused on restart. Delete that file to get new ones. Before 0.62.0 the values
+were printed to the container log.
 
 **Set your own for anything that is not a laptop.** Supplying any
 `TELEMETRYD_AUTH_*_TOKEN`, mounting a config file, or setting
