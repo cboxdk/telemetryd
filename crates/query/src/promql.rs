@@ -316,7 +316,6 @@ impl Parser<'_> {
                 Some(Token::Star) => BinaryOp::Mul,
                 Some(Token::Slash) => BinaryOp::Div,
                 Some(Token::Percent) => BinaryOp::Mod,
-                Some(Token::Caret) => BinaryOp::Pow,
                 _ => {
                     self.depth = base;
                     return Ok(left);
@@ -333,6 +332,8 @@ impl Parser<'_> {
         }
     }
 
+    /// Unary minus binds looser than `^` and tighter than `*`: `-2^2` is `-(2^2)`, -4,
+    /// as in PromQL and in arithmetic.
     fn parse_unary(&mut self) -> Result<Expr> {
         if self.peek() == Some(&Token::Minus) {
             self.pos += 1;
@@ -342,7 +343,27 @@ impl Parser<'_> {
             self.depth = base;
             return Ok(Expr::Negate(Box::new(inner)));
         }
-        self.parse_atom()
+        self.parse_power()
+    }
+
+    /// `^` binds tightest of the binary operators and to the right: `2 * 3^2` is 18 and
+    /// `2^3^2` is `2^(3^2)`, 512. It shared a level with `*` and associated left, which
+    /// made them 36 and 64. The exponent may carry its own sign, `2^-1`.
+    fn parse_power(&mut self) -> Result<Expr> {
+        let base = self.parse_atom()?;
+        if self.peek() != Some(&Token::Caret) {
+            return Ok(base);
+        }
+        self.pos += 1;
+        let depth = self.depth;
+        self.deeper()?;
+        let exponent = self.parse_unary()?;
+        self.depth = depth;
+        Ok(Expr::Binary {
+            op: BinaryOp::Pow,
+            left: Box::new(base),
+            right: Box::new(exponent),
+        })
     }
 
     fn parse_atom(&mut self) -> Result<Expr> {

@@ -2498,6 +2498,35 @@ mod tests {
         assert!((fold.finish(window, false).unwrap() - 85.0).abs() < 1e-9);
     }
 
+    /// Operator precedence and associativity, against Prometheus 3.15.0's answers from
+    /// `promtool test rules`. `^` shared a level with `*` and associated left, and unary
+    /// minus bound tighter than `^`: the first three were 36, 64 and 4.
+    #[test]
+    fn arithmetic_binds_as_promql_does() {
+        let snapshot = Snapshot::default();
+        for (query, expected) in [
+            ("2 * 3 ^ 2", 18.0),
+            ("2 ^ 3 ^ 2", 512.0),
+            ("-2 ^ 2", -4.0),
+            ("2 ^ -1", 0.5),
+            ("-2 * 3", -6.0),
+            ("10 - 2 - 3", 5.0),
+            ("2 ^ 3 * 2", 16.0),
+            ("8 / 2 / 2", 2.0),
+            ("-(2) ^ 2", -4.0),
+            ("2 ^ 3 % 5", 3.0),
+            ("- -2", 2.0),
+        ] {
+            let value = snapshot
+                .eval(&crate::promql::parse(query).unwrap(), T0)
+                .unwrap();
+            assert!(
+                matches!(value, Value::Scalar(got) if (got - expected).abs() < 1e-12),
+                "{query}: got {value:?}, Prometheus says {expected}"
+            );
+        }
+    }
+
     #[test]
     fn samples_sharing_one_timestamp_yield_no_rate() {
         // No elapsed time to divide by; inventing one would report an arbitrary rate.
