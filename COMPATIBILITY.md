@@ -400,6 +400,8 @@ Driven by what `PromqlCompiler` actually generates:
 - `histogram_quantile(0.95, sum by (le, …) (rate(sel[5m])))`
 - arithmetic against scalars: `expr * 60`
 - `vector(s)`, a scalar as a one-element vector — Grafana's Loki health check uses it
+- a query that is a scalar, `1+1`, answers `resultType: scalar` with a bare
+  `[time, "value"]` pair as an instant query, and one unlabelled series over a range
 - **`offset`**, **`or` between vectors**, and **`clamp_min`** — required by the
   compiler's counter-increase form:
   `clamp_min(sel - (sel offset 5m or sel * 0), 0)`. Our first plan listed all three as

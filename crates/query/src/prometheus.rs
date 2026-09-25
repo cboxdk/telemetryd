@@ -67,7 +67,27 @@ impl<T> PromResponse<T> {
 pub struct InstantData {
     #[serde(rename = "resultType")]
     pub result_type: &'static str,
-    pub result: Vec<InstantResult>,
+    pub result: InstantAnswer,
+}
+
+/// An instant query's `result`: a list of samples, or — for a scalar — one bare
+/// `[seconds, "value"]` pair, which is how Prometheus answers `1+1`.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum InstantAnswer {
+    Vector(Vec<InstantResult>),
+    Scalar((f64, String)),
+}
+
+impl InstantAnswer {
+    /// The samples of a vector answer; none for a scalar.
+    #[must_use]
+    pub fn samples(&self) -> &[InstantResult] {
+        match self {
+            Self::Vector(samples) => samples,
+            Self::Scalar(_) => &[],
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -242,9 +262,15 @@ pub fn instant(
     let snapshot = Snapshot::load(store, &expr, at, at, max_samples)?;
     let vector = match snapshot.eval(&expr, at)? {
         Value::Vector(vector) => vector,
-        Value::Scalar(value) => crate::promeval::InstantVector {
-            samples: vec![(Labels::new(), value)],
-        },
+        // `resultType: scalar` and a bare pair, as Prometheus answers. It was a
+        // one-element vector with no labels, which a client that switches on the type —
+        // Grafana, laravel-telemetry-ui — reads as a different kind of answer.
+        Value::Scalar(value) => {
+            return Ok(PromResponse::success(InstantData {
+                result_type: "scalar",
+                result: InstantAnswer::Scalar((to_seconds(at), format_value(value))),
+            }));
+        }
     };
 
     let result = vector
@@ -258,7 +284,7 @@ pub fn instant(
 
     Ok(PromResponse::success(InstantData {
         result_type: "vector",
-        result,
+        result: InstantAnswer::Vector(result),
     }))
 }
 
@@ -311,7 +337,16 @@ pub fn range(
     // 3.4 MB of JSON; production-sized inputs would have been gigabytes.
     let mut emitted: u64 = 0;
     for &at in &timestamps {
-        if let Value::Vector(vector) = snapshot.eval(&expr, at)? {
+        // A scalar is a series with no labels, one point per step, as Prometheus draws
+        // `vector(1)` and `1+1` over a range. Scalars used to be dropped, which left a
+        // constant threshold line off every chart that plotted one.
+        let vector = match snapshot.eval(&expr, at)? {
+            Value::Vector(vector) => vector,
+            Value::Scalar(value) => crate::promeval::InstantVector {
+                samples: vec![(Labels::new(), value)],
+            },
+        };
+        {
             emitted += vector.samples.len() as u64;
             if max_samples != 0 && emitted > max_samples {
                 return Err(Error::BadRequest(format!(
@@ -547,12 +582,12 @@ mod tests {
     fn the_instant_response_shape_matches_prometheus() {
         let response = PromResponse::success(InstantData {
             result_type: "vector",
-            result: vec![InstantResult {
+            result: InstantAnswer::Vector(vec![InstantResult {
                 metric: [("app".to_owned(), "checkout".to_owned())]
                     .into_iter()
                     .collect(),
                 value: (1_750_000_000.0, "42".to_owned()),
-            }],
+            }]),
         });
         let json = serde_json::to_value(&response).unwrap();
 
@@ -562,6 +597,16 @@ mod tests {
         // A number then a string, in that order.
         assert!(json["data"]["result"][0]["value"][0].is_number());
         assert_eq!(json["data"]["result"][0]["value"][1], "42");
+
+        // A scalar is a bare pair, not a list.
+        let scalar = PromResponse::success(InstantData {
+            result_type: "scalar",
+            result: InstantAnswer::Scalar((1_750_000_000.0, "2".to_owned())),
+        });
+        assert_eq!(
+            serde_json::to_value(&scalar).unwrap()["data"],
+            serde_json::json!({"resultType": "scalar", "result": [1_750_000_000.0, "2"]})
+        );
     }
 
     #[test]

@@ -564,10 +564,11 @@ fn metrics(
                     end,
                     max_samples,
                 )?;
-                let series = response.data.result.len();
+                let series = response.data.result.samples().len();
                 let value = response
                     .data
                     .result
+                    .samples()
                     .first()
                     .map_or_else(|| "—".to_owned(), |sample| sample.value.1.clone());
                 rows.push(Row {

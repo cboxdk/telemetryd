@@ -690,3 +690,44 @@ async fn a_target_that_left_is_absent_rather_than_nan() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(response["data"]["result"][0]["value"][1], "1", "{response}");
 }
+
+/// A scalar is answered as Prometheus answers it: `resultType: scalar` and a bare pair
+/// for an instant query, one unlabelled series for a range. It was a vector for the one
+/// and dropped from the other, so a constant threshold line never reached a chart.
+#[tokio::test]
+async fn a_scalar_is_answered_as_a_scalar() {
+    let harness = Harness::new();
+    let (status, response) = harness
+        .get(&format!("/api/v1/query?query=1%2B1&time={NOW_SECONDS}"))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["data"]["resultType"], "scalar", "{response}");
+    assert_eq!(response["data"]["result"][1], "2");
+
+    let (status, response) = harness
+        .get(&format!(
+            "/api/v1/query_range?query=vector(1)*0%2B2&start={}&end={NOW_SECONDS}&step=60",
+            NOW_SECONDS - 120
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        response["data"]["result"][0]["values"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+
+    let (status, response) = harness
+        .get(&format!(
+            "/api/v1/query_range?query=2&start={}&end={NOW_SECONDS}&step=60",
+            NOW_SECONDS - 120
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let result = response["data"]["result"].as_array().unwrap();
+    assert_eq!(result.len(), 1, "{response}");
+    assert_eq!(result[0]["metric"], serde_json::json!({}));
+    assert_eq!(result[0]["values"][2][1], "2");
+}

@@ -1770,14 +1770,16 @@ async fn a_query_can_arrive_in_a_form_body() {
     let (status, _, body) = harness.request(post("/api/v1/query", "query=1%2B1")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let json: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(json["data"]["result"][0]["value"][1], "2", "{body}");
+    // A scalar, answered as Prometheus answers one: a bare [time, "value"] pair.
+    assert_eq!(json["data"]["resultType"], "scalar", "{body}");
+    assert_eq!(json["data"]["result"][1], "2", "{body}");
 
     // The body wins where both carry a key, as in the Go form parsing Prometheus uses.
     let (_, _, body) = harness
         .request(post("/api/v1/query?query=5", "query=7"))
         .await;
     let json: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(json["data"]["result"][0]["value"][1], "7", "{body}");
+    assert_eq!(json["data"]["result"][1], "7", "{body}");
 
     let (status, _, body) = harness
         .request(post(
