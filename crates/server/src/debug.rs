@@ -75,10 +75,11 @@ pub struct LoginForm {
 /// With Cbox ID on, an access token it issued for the admin surface opens it too — the
 /// same token `/status` and `/metrics` take.
 fn accepts(state: &AppState, presented: &str) -> bool {
-    let static_ok = if state.admin_tokens.is_empty() {
-        state.query_tokens.verify(presented)
+    let credentials = state.credentials();
+    let static_ok = if credentials.admin.is_empty() {
+        credentials.query.verify(presented)
     } else {
-        state.admin_tokens.verify(presented)
+        credentials.admin.verify(presented)
     };
     static_ok
         || (state.oidc.is_enabled()
@@ -96,7 +97,8 @@ fn accepts(state: &AppState, presented: &str) -> bool {
 /// anyone, while `/status` beside it correctly answered 401. The shared guard already
 /// counted Cbox ID; this page had its own copy of the rule and it had drifted.
 fn guarded(state: &AppState) -> bool {
-    !state.admin_tokens.is_empty() || !state.query_tokens.is_empty() || state.oidc.is_enabled()
+    let credentials = state.credentials();
+    !credentials.admin.is_empty() || !credentials.query.is_empty() || state.oidc.is_enabled()
 }
 
 /// The credential on this request: the header if a tool sent one, otherwise the cookie a

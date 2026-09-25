@@ -2256,3 +2256,41 @@ async fn a_protobuf_export_is_answered_in_protobuf() {
         "nothing refused is an empty response message: {body:?}"
     );
 }
+
+/// A token removed from the configuration stops working at the next request once the
+/// credentials are replaced — what `SIGHUP` does. They used to be fixed for the life of
+/// the process, so a leaked token revoked with a reload went on working.
+#[tokio::test]
+async fn a_revoked_token_stops_working_once_the_credentials_are_replaced() {
+    let harness = Harness::new(|config| {
+        config.auth.query_token = serde_json::from_str(r#""leaked""#).unwrap();
+    });
+    let (status, _, _) = harness
+        .get_with_token("/loki/api/v1/labels", "leaked")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut rotated = (*harness.state.config).clone();
+    rotated.auth.query_token = serde_json::from_str(r#""rotated""#).unwrap();
+    let changed = harness
+        .state
+        .replace_credentials(telemetryd_server::state::Credentials::resolve(&rotated).unwrap());
+    // Named by setting, never by value. The admin token falls back to the query token,
+    // so it changed with it.
+    assert_eq!(changed, ["auth.query_token", "auth.admin_token"]);
+
+    let (status, _, _) = harness
+        .get_with_token("/loki/api/v1/labels", "leaked")
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _, _) = harness
+        .get_with_token("/loki/api/v1/labels", "rotated")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Replacing them with the same again changes nothing and says so.
+    let again = harness
+        .state
+        .replace_credentials(telemetryd_server::state::Credentials::resolve(&rotated).unwrap());
+    assert!(again.is_empty());
+}

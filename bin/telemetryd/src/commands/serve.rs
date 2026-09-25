@@ -42,16 +42,17 @@ pub fn run(config_file: Option<&std::path::Path>, overrides: &Overrides) -> anyh
         .context("building the tokio runtime")?;
 
     runtime.block_on(async {
-        // SIGHUP re-reads the file and applies retention, the disk budget and the log
-        // level. Anything else that changed is refused by name rather than ignored.
+        // SIGHUP re-reads the file and applies the tokens, retention, the disk budget and
+        // the log level. Anything else that changed is refused by name, not ignored.
+        let state = telemetryd_server::AppState::new(Arc::clone(&config), Arc::clone(&store))?;
         spawn_reload_listener(
             config_file.map(std::path::Path::to_path_buf),
             overrides.clone(),
             Arc::clone(&config),
-            Arc::clone(&store),
+            state.clone(),
             level,
         );
-        telemetryd_server::serve(config, Arc::clone(&store)).await
+        telemetryd_server::serve_state(state).await
     })?;
     Ok(())
 }
@@ -66,7 +67,7 @@ fn spawn_reload_listener(
     config_file: Option<std::path::PathBuf>,
     overrides: Overrides,
     config: Arc<Config>,
-    store: Arc<Store>,
+    state: telemetryd_server::AppState,
     level: crate::logging::LevelHandle,
 ) {
     tokio::spawn(async move {
@@ -78,14 +79,16 @@ fn spawn_reload_listener(
                 return;
             }
         };
-        tracing::debug!("send SIGHUP to reload retention, the disk budget and the log level");
+        tracing::debug!(
+            "send SIGHUP to reload tokens, retention, the disk budget and the log level"
+        );
 
         while hangup.recv().await.is_some() {
             let (config_file, overrides) = (config_file.clone(), overrides.clone());
-            let (config, store, level) = (Arc::clone(&config), Arc::clone(&store), level.clone());
+            let (config, state, level) = (Arc::clone(&config), state.clone(), level.clone());
             // The reload reads a file and walks no data, but it is still blocking I/O.
             let _ = tokio::task::spawn_blocking(move || {
-                crate::reload::apply(config_file.as_deref(), &overrides, &config, &store, &level);
+                crate::reload::apply(config_file.as_deref(), &overrides, &config, &state, &level);
             })
             .await;
         }
@@ -97,7 +100,7 @@ fn spawn_reload_listener(
     _config_file: Option<std::path::PathBuf>,
     _overrides: Overrides,
     _config: Arc<Config>,
-    _store: Arc<Store>,
+    _state: telemetryd_server::AppState,
     _level: crate::logging::LevelHandle,
 ) {
 }

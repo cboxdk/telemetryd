@@ -7,8 +7,11 @@
 //! fixed by shortening retention, and restarting the observability backend during an
 //! incident means losing the live tail of the incident.
 //!
-//! So reload is deliberately narrow rather than general. Three things change:
+//! So reload is deliberately narrow rather than general. Four things change:
 //!
+//! - the static credentials — `auth.ingest_token`, `auth.query_token`,
+//!   `auth.admin_token` and `[[relay.client]]` — because the moment you need to revoke
+//!   a leaked token is not a moment to restart the service
 //! - `retention.*` — the windows per signal
 //! - `storage.disk_budget` — the ceiling the reaper enforces
 //! - `log.level` — because turning up logging should not require restarting the
@@ -18,11 +21,10 @@
 //! file would be worse than no reload at all: the operator would believe a setting had
 //! taken effect when it had not, and would go looking for the problem somewhere else.
 
-use std::sync::Arc;
-
 use telemetryd_core::Config;
 use telemetryd_core::config::Overrides;
-use telemetryd_store::Store;
+use telemetryd_server::AppState;
+use telemetryd_server::state::Credentials;
 
 use crate::logging::LevelHandle;
 
@@ -74,6 +76,30 @@ fn immutable_differences(old: &Config, new: &Config) -> Vec<String> {
         old.server.max_body_bytes.to_string(),
         new.server.max_body_bytes.to_string(),
     );
+    // Cbox ID holds a key cache and a refresh task built for one issuer, and TLS a
+    // listener built for one certificate; both are rebuilt only by a restart. Relay
+    // forwarding holds its cursor and upstream for the life of the process. Compared by
+    // everything that identifies them, so a change is named rather than lost.
+    note(
+        "auth.oidc",
+        format!(
+            "{} {} {}",
+            old.auth.oidc.issuer, old.auth.oidc.audience, old.auth.oidc.jwks_url
+        ),
+        format!(
+            "{} {} {}",
+            new.auth.oidc.issuer, new.auth.oidc.audience, new.auth.oidc.jwks_url
+        ),
+    );
+    note(
+        "server.tls",
+        format!("{:?}", old.server.tls),
+        format!("{:?}", new.server.tls),
+    );
+    // Named without its values: an upstream URL can carry credentials in its userinfo.
+    if old.relay.upstream != new.relay.upstream {
+        differences.push("relay.upstream (changed)".to_owned());
+    }
 
     differences
 }
@@ -87,7 +113,7 @@ pub fn apply(
     config_file: Option<&std::path::Path>,
     overrides: &Overrides,
     current: &Config,
-    store: &Arc<Store>,
+    state: &AppState,
     level: &LevelHandle,
 ) {
     let loaded = match Config::load(config_file, overrides) {
@@ -97,7 +123,13 @@ pub fn apply(
             return;
         }
     };
-    if let Err(error) = loaded.config.validate() {
+    // Validated as the running process would be: the listen address cannot change
+    // without a restart, so the exposed-bind rule is judged against the one in use. A
+    // file that dropped the last token from a public listener is refused whole, rather
+    // than opening the surface until someone noticed.
+    let mut effective = loaded.config.clone();
+    effective.server.listen = current.server.listen;
+    if let Err(error) = effective.validate() {
         tracing::error!(%error, "reloaded configuration is invalid; keeping the running one");
         return;
     }
@@ -105,7 +137,21 @@ pub fn apply(
         tracing::warn!("{warning}");
     }
 
-    let mut changes = store.apply_retention_policy(&loaded.config);
+    let mut changes = state.store.apply_retention_policy(&loaded.config);
+
+    // Named, never valued: a token must not reach a log line even as a diff.
+    match Credentials::resolve(&loaded.config) {
+        Ok(fresh) => changes.extend(
+            state
+                .replace_credentials(fresh)
+                .into_iter()
+                .map(|name| format!("{name} replaced")),
+        ),
+        Err(error) => tracing::error!(
+            %error,
+            "the tokens could not be read; the ones in force stay in force"
+        ),
+    }
 
     if loaded.config.log.level != current.log.level {
         match level.set(&loaded.config.log.level) {
@@ -174,5 +220,24 @@ mod tests {
         let mut body = Config::default();
         body.server.max_body_bytes = bytesize::ByteSize::mib(123);
         assert!(!immutable_differences(&old, &body).is_empty());
+
+        let mut oidc = Config::default();
+        oidc.auth.oidc.issuer = "https://id.example".to_owned();
+        assert!(immutable_differences(&old, &oidc)[0].contains("auth.oidc"));
+
+        let mut tls = Config::default();
+        tls.server.tls.self_signed = "localhost".to_owned();
+        assert!(immutable_differences(&old, &tls)[0].contains("server.tls"));
+    }
+
+    /// An upstream URL may carry credentials in its userinfo, so a changed one is named
+    /// and its values are not.
+    #[test]
+    fn a_changed_upstream_is_named_without_its_credentials() {
+        let old = Config::default();
+        let mut new = Config::default();
+        new.relay.upstream = "https://user:secret@upstream.example".to_owned();
+        let differences = immutable_differences(&old, &new);
+        assert_eq!(differences, ["relay.upstream (changed)"]);
     }
 }

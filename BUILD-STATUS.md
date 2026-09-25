@@ -286,8 +286,10 @@ over SSH when the UI is the thing you cannot reach, and for getting data out as 
 lines. `telemetryd bench` measures what the machine can ingest and query, on a
 throwaway directory, so sizing is a measurement rather than a guess.
 `/healthz`, `/status`, `/metrics`. `telemetryd validate` prints every
-resolved value with its origin. `SIGHUP` reloads retention, the disk budget and the log
-level; anything else that changed in the file is refused by name rather than ignored. `telemetryd service install` writes a hardened unit.
+resolved value with its origin. `SIGHUP` reloads the static tokens and relay client
+credentials, retention, the disk budget and the log level; anything else that changed in
+the file is refused by name rather than ignored. Tokens were fixed for the life of the
+process before 0.62.0, so a leaked one revoked with a reload kept working. `telemetryd service install` writes a hardened unit.
 
 **Packaging.** Four cross-compiled targets, install script with checksum verification
 (and signature verification, once a signed release exists), Homebrew formula, `.deb`, deterministic CycloneDX SBOM with a

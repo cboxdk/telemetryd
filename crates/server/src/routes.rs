@@ -173,9 +173,9 @@ pub async fn status(State(state): State<AppState>) -> Result<Response, ApiError>
             insecure: config.server.insecure,
             tls: config.server.tls.posture(),
             auth: AuthStatus {
-                ingest: enabled(state.ingest_tokens.is_empty()),
-                query: enabled(state.query_tokens.is_empty()),
-                admin: enabled(state.admin_tokens.is_empty()),
+                ingest: enabled(state.credentials().ingest.is_empty()),
+                query: enabled(state.credentials().query.is_empty()),
+                admin: enabled(state.credentials().admin.is_empty()),
                 oidc: state.oidc.is_enabled().then(|| OidcStatus {
                     issuer: config.auth.oidc.issuer.clone(),
                     keys: state.oidc.key_count(),

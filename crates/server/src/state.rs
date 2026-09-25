@@ -24,16 +24,14 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub store: Arc<Store>,
     pub metrics: Arc<Metrics>,
-    /// Resolved at startup, not per request: a `file:` token indirection should be read
-    /// once, and a token that cannot be resolved must stop the process rather than
-    /// silently failing every request.
-    pub ingest_tokens: Arc<TokenSet>,
-    pub query_tokens: Arc<TokenSet>,
-    /// Guards `/status` and `/metrics`.
+    /// The static tokens and relay client credentials, swapped whole on `SIGHUP`.
     ///
-    /// Falls back to the query tokens when unset, which is what guarded them before
-    /// the role existed — so a deployment that never heard of it keeps working.
-    pub admin_tokens: Arc<TokenSet>,
+    /// Resolved at startup and on reload, not per request: a `file:` token indirection is
+    /// read then, and a token that cannot be resolved stops startup or fails the reload
+    /// rather than failing every request. Behind a lock because a reload replaces them:
+    /// they were fixed for the life of the process, so a leaked token removed from the
+    /// file and reloaded kept working until someone thought to restart.
+    credentials: Arc<std::sync::RwLock<Arc<Credentials>>>,
     pub started: Instant,
     pub started_at: OffsetDateTime,
     /// Bounds how many ingest requests are in flight at once.
@@ -54,8 +52,6 @@ pub struct AppState {
     export_concurrency: usize,
     /// Cbox ID token validation. Disabled unless an issuer is configured.
     pub oidc: Arc<crate::oidc::Oidc>,
-    /// Relay client credentials, each carrying the app it is allowed to be.
-    pub relay_clients: Arc<telemetryd_core::ClientTokens>,
     /// Forwarding upstream. `None` unless `relay.upstream` is set.
     pub relay: Option<Arc<crate::relay::Relay>>,
     /// Ingest requests in flight per client. Only ever holds clients with an active
@@ -65,7 +61,86 @@ pub struct AppState {
     tail: broadcast::Sender<Arc<LogRecord>>,
 }
 
+/// Every static credential the server checks, resolved from one configuration.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Credentials {
+    pub ingest: TokenSet,
+    pub query: TokenSet,
+    /// Guards `/status` and `/metrics`.
+    ///
+    /// Falls back to the query tokens when unset, which is what guarded them before
+    /// the role existed — so a deployment that never heard of it keeps working.
+    pub admin: TokenSet,
+    /// Relay client credentials, each carrying the app it is allowed to be.
+    pub relay_clients: telemetryd_core::ClientTokens,
+}
+
+impl Credentials {
+    /// Read every token the configuration names, following `file:` indirections.
+    pub fn resolve(config: &Config) -> Result<Self> {
+        let mut clients = Vec::with_capacity(config.relay.client.len());
+        for client in &config.relay.client {
+            clients.push((client.token.resolve_digest()?, client.app.clone()));
+        }
+        Ok(Self {
+            ingest: config.auth.ingest_token.resolve()?,
+            query: config.auth.query_token.resolve()?,
+            admin: if config.auth.admin_token.is_empty() {
+                config.auth.query_token.resolve()?
+            } else {
+                config.auth.admin_token.resolve()?
+            },
+            relay_clients: telemetryd_core::ClientTokens::new(clients),
+        })
+    }
+
+    /// Which credentials differ from `other`, by name and never by value.
+    #[must_use]
+    pub fn changed_from(&self, other: &Self) -> Vec<&'static str> {
+        let mut changed = Vec::new();
+        if self.ingest != other.ingest {
+            changed.push("auth.ingest_token");
+        }
+        if self.query != other.query {
+            changed.push("auth.query_token");
+        }
+        if self.admin != other.admin {
+            changed.push("auth.admin_token");
+        }
+        if self.relay_clients != other.relay_clients {
+            changed.push("relay.client");
+        }
+        changed
+    }
+}
+
 impl AppState {
+    /// The credentials in force now. A request holds the snapshot it started with, so a
+    /// reload never changes the rules halfway through one.
+    #[must_use]
+    pub fn credentials(&self) -> Arc<Credentials> {
+        Arc::clone(
+            &self
+                .credentials
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Put new credentials in force, returning which changed. Takes effect for the
+    /// next request; one already admitted finishes under the old.
+    pub fn replace_credentials(&self, fresh: Credentials) -> Vec<&'static str> {
+        let mut current = self
+            .credentials
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = fresh.changed_from(current.as_ref());
+        if !changed.is_empty() {
+            *current = Arc::new(fresh);
+        }
+        changed
+    }
+
     /// Claim a slot for one ingest request, or `None` when the queue is full.
     ///
     /// The permit is held for the whole handler, blocking work included, so this
@@ -133,11 +208,9 @@ impl AppState {
             usize::try_from(config.limits.resolved_export_concurrency()).unwrap_or(4);
         let oidc = Arc::new(crate::oidc::Oidc::new(config.auth.oidc.clone()));
 
-        let mut clients = Vec::with_capacity(config.relay.client.len());
-        for client in &config.relay.client {
-            clients.push((client.token.resolve_digest()?, client.app.clone()));
-        }
-        let relay_clients = Arc::new(telemetryd_core::ClientTokens::new(clients));
+        let credentials = Arc::new(std::sync::RwLock::new(Arc::new(Credentials::resolve(
+            &config,
+        )?)));
 
         let relay = config.relay.is_enabled().then(|| {
             Arc::new(crate::relay::Relay::new(
@@ -146,13 +219,7 @@ impl AppState {
             ))
         });
         Ok(Self {
-            ingest_tokens: Arc::new(config.auth.ingest_token.resolve()?),
-            query_tokens: Arc::new(config.auth.query_token.resolve()?),
-            admin_tokens: Arc::new(if config.auth.admin_token.is_empty() {
-                config.auth.query_token.resolve()?
-            } else {
-                config.auth.admin_token.resolve()?
-            }),
+            credentials,
             config,
             store,
             metrics: Arc::new(Metrics::new()),
@@ -164,7 +231,6 @@ impl AppState {
             query_concurrency,
             export_concurrency,
             oidc,
-            relay_clients,
             relay,
             in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             queue_depth,

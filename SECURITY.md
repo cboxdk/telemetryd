@@ -25,7 +25,8 @@ logs a warning on every start and is reported as `insecure: true` in `/status`.
 **Three independent bearer tokens.** `ingest_token` guards the write endpoints,
 `query_token` the read APIs, and `admin_token` `/status` and `/metrics`. Each accepts a
 list so a token can be rotated without a window where either the old or the new one is
-rejected.
+rejected, and each is reloaded on `SIGHUP`: a leaked token is revoked by removing it from
+the file and reloading, effective at the next request, without a restart.
 
 `/status` answers a caller with no admin token rather than refusing it, but only with
 what telemetryd *is* — product, version, storage format, signals — never with what this

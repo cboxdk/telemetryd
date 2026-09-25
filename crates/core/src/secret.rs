@@ -169,7 +169,7 @@ impl Secret {
 }
 
 /// Resolved, pre-hashed tokens ready for request-time comparison.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct TokenSet(Vec<[u8; 32]>);
 
 impl TokenSet {
@@ -202,7 +202,7 @@ impl TokenSet {
 /// the response time depend on a token's position in the list, and an attacker who can
 /// measure that learns how close a guess is — the same reason `TokenSet::verify`
 /// accumulates instead of returning early.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ClientTokens(Vec<([u8; 32], String)>);
 
 impl ClientTokens {

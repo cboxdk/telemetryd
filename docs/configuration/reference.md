@@ -33,14 +33,20 @@ what it became before you rely on it.
 
 ## Changing it on a running instance
 
-`retention.*`, `storage.disk_budget` and `log.level` apply on `SIGHUP` with no restart:
+The static tokens — `auth.ingest_token`, `auth.query_token`, `auth.admin_token` — and
+`[[relay.client]]`, `retention.*`, `storage.disk_budget` and `log.level` apply on `SIGHUP`
+with no restart:
 
 ```bash
 sudo systemctl reload telemetryd     # the generated unit maps this to SIGHUP
 journalctl -u telemetryd -n 5
 ```
 
-The log names each change as `old -> new`. Every other key that differs is **refused by
+The log names each change as `old -> new`, and a replaced token by its setting alone —
+never its value. A token removed from the file stops working at the next request, which is
+how a leaked one is revoked. A file that would leave an exposed listener without a guard is
+refused whole and the running configuration kept. `auth.oidc`, `server.tls` and
+`relay.upstream` need a restart. Every other key that differs is **refused by
 name**, so a reload that prints a refusal means the process is still running the old
 value and a restart is what applies it. Silence about a key you changed would be the
 dangerous outcome, and it is the one case that cannot happen.

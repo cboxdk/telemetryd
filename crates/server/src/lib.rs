@@ -238,7 +238,14 @@ fn method_label(method: &axum::http::Method) -> &'static str {
 
 /// Bind the listener and serve until shutdown is signalled.
 pub async fn serve(config: Arc<Config>, store: Arc<Store>) -> Result<()> {
-    let state = AppState::new(Arc::clone(&config), Arc::clone(&store))?;
+    serve_state(AppState::new(config, store)?).await
+}
+
+/// As [`serve`], with state the caller built — so it can keep a handle to it, which is
+/// how a `SIGHUP` reaches the credentials of the running server.
+pub async fn serve_state(state: AppState) -> Result<()> {
+    let config = Arc::clone(&state.config);
+    let store = Arc::clone(&state.store);
 
     // Two listener types, one serving path. `Bound` exists so everything after this —
     // the key fetch, the maintenance timers, the graceful drain — is identical whether

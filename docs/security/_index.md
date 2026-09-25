@@ -22,9 +22,11 @@ binds that actually expose people. One token is not enough: before 0.58.0 an ing
 token alone started the server with every read and export open to anyone. Overridable
 with `--insecure`, which warns on every start and shows in `/status`.
 
-**Two independent bearer tokens.** `ingest_token` guards writes, `query_token` guards
-reads plus `/status` and `/metrics`. Both accept a list so a token can be rotated
-without a rejection window.
+**Three independent bearer tokens.** `ingest_token` guards writes, `query_token` guards
+reads, and `admin_token` guards `/status` and `/metrics` — falling back to the query
+token when unset. Each accepts a list so a token can be rotated without a rejection
+window, and each is reloaded on `SIGHUP`, so a leaked token is revoked by removing it
+and reloading.
 
 **Constant-time comparison.** Tokens are SHA-256'd and compared with
 `subtle::ConstantTimeEq`, so token length does not leak through timing.

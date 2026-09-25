@@ -7,7 +7,7 @@
 use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use telemetryd_core::{Error, TokenSet};
+use telemetryd_core::Error;
 
 use crate::error::ApiError;
 use crate::oidc::Rejected;
@@ -49,14 +49,7 @@ pub async fn require_ingest_token(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    guard(
-        Surface::Ingest,
-        &state.ingest_tokens.clone(),
-        state,
-        request,
-        next,
-    )
-    .await
+    guard(Surface::Ingest, state, request, next).await
 }
 
 /// Guards the operational surface: `/status` and `/metrics`.
@@ -69,14 +62,7 @@ pub async fn require_admin_token(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    guard(
-        Surface::Admin,
-        &state.admin_tokens.clone(),
-        state,
-        request,
-        next,
-    )
-    .await
+    guard(Surface::Admin, state, request, next).await
 }
 
 /// Guards `/status`, which answers everyone — but not with the same document.
@@ -185,29 +171,27 @@ pub async fn require_query_token(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    guard(
-        Surface::Query,
-        &state.query_tokens.clone(),
-        state,
-        request,
-        next,
-    )
-    .await
+    guard(Surface::Query, state, request, next).await
 }
 
 async fn guard(
     surface: Surface,
-    tokens: &TokenSet,
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    let credentials = state.credentials();
+    let tokens = match surface {
+        Surface::Ingest => &credentials.ingest,
+        Surface::Query => &credentials.query,
+        Surface::Admin => &credentials.admin,
+    };
     // An unguarded surface stays unguarded only while *nothing* guards it. Turning on
     // Cbox ID must not leave a surface open just because its static token is unset.
     // Relay clients are *ingest* credentials, so they guard that surface and no
     // other. Counting them everywhere locked the read API behind a token no client
     // could present — the surface demanded one, and nothing could satisfy it.
-    let relay_guards_this = surface == Surface::Ingest && !state.relay_clients.is_empty();
+    let relay_guards_this = surface == Surface::Ingest && !credentials.relay_clients.is_empty();
     if tokens.is_empty() && !state.oidc.is_enabled() && !relay_guards_this {
         return Ok(next.run(request).await);
     }
@@ -222,7 +206,7 @@ async fn guard(
     // time: one lookup answers both "may you write" and "as whom".
     if surface == Surface::Ingest
         && let Some(token) = presented
-        && let Some(app) = state.relay_clients.identify(token)
+        && let Some(app) = credentials.relay_clients.identify(token)
     {
         let app = app.to_owned();
         let mut request = request;

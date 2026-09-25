@@ -211,8 +211,9 @@ kill -HUP $(pgrep -f 'telemetryd serve')   # macOS: launchd has no reload verb
 journalctl -u telemetryd -n 5        # what actually changed
 ```
 
-`SIGHUP` reloads retention, the disk budget and the log level in place — no restart,
-no drain, no WAL replay. Anything else that changed in the file is **refused by name**
+`SIGHUP` reloads the tokens, retention, the disk budget and the log level in place — no
+restart, no drain, no WAL replay. A token taken out of the file stops working at the next
+request, so revoking a leaked one is an edit and a reload. Anything else that changed in the file is **refused by name**
 rather than silently ignored, so a reload that prints a refusal means the process is
 still running the old value and needs a restart.
 
