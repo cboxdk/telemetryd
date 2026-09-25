@@ -38,7 +38,10 @@ that label.
 In relay mode the label is set from **whatever authenticated the request**, and what
 the payload claimed is discarded. A `[[relay.client]]` credential is stamped with its
 configured `app`. A Cbox ID token is stamped with its `client_id` claim, which the
-issuer reserves against being overwritten.
+issuer reserves against being overwritten. A token that carries no `client_id` has nothing
+to stamp, so it may not write through a relay: it is refused with `403` rather than
+trusted to name its own `app` — the same reason a bare `auth.ingest_token` is refused at
+startup in this mode.
 
 Each client gets its own credential, so one can be revoked without touching the others —
 which is the entire reason not to share one.

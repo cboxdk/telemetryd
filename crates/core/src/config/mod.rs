@@ -97,7 +97,7 @@ impl Config {
                 figment = figment.merge(Env::raw().only(&[var]).map(move |_| (*path).into()));
             }
         }
-        let warnings = unknown_env_var_warnings();
+        let mut warnings = unknown_env_var_warnings();
 
         let mut config: Config = figment
             .extract()
@@ -122,6 +122,20 @@ impl Config {
         }
 
         config.validate()?;
+
+        // Without an audience of its own the issuer stands in, and every instance that
+        // trusts the issuer shares it: a token minted for a staging telemetryd opens this
+        // one too. Warned rather than refused — it is how a single instance is usually
+        // set up — but said, because nothing else would say it.
+        if config.auth.oidc.is_enabled() && config.auth.oidc.audience.trim().is_empty() {
+            warnings.push(format!(
+                "auth.oidc.audience is not set, so any access token {} issues for audience \
+                 {:?} is accepted here — including one meant for another telemetryd that \
+                 trusts the same issuer. Give this instance an audience of its own.",
+                config.auth.oidc.issuer,
+                config.auth.oidc.expected_audience()
+            ));
+        }
 
         Ok(Loaded {
             config,

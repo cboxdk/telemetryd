@@ -174,6 +174,43 @@ pub async fn require_query_token(
     guard(Surface::Query, state, request, next).await
 }
 
+/// In strict relay mode every writer's `app` comes from its credential. An access
+/// token that names no application leaves nothing to stamp, and letting it through
+/// would trust the payload's own claim — the hole this mode exists to close, and the
+/// one a bare ingest token is refused at startup for. A token cannot be checked at
+/// startup, so it is refused here.
+fn refuse_unidentified_writer(
+    state: &AppState,
+    surface: Surface,
+    client_id: Option<&str>,
+) -> Result<(), ApiError> {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    if surface != Surface::Ingest
+        || !state.config.relay.is_enabled()
+        || state.config.relay.trust_client_identity
+        || client_id.is_some()
+    {
+        return Ok(());
+    }
+    SAID.call_once(|| {
+        tracing::warn!(
+            "refusing ingest with an access token that names no client: relay mode \
+             stamps each record's app from the credential, and this one carries no \
+             client_id to stamp"
+        );
+    });
+    state.metrics.incr(
+        "telemetryd_auth_failures_total",
+        &[("surface", surface.as_str())],
+    );
+    Err(Error::Forbidden(
+        "this access token names no client (client_id), and relay mode identifies every \
+         writer by its credential"
+            .to_owned(),
+    )
+    .into())
+}
+
 async fn guard(
     surface: Surface,
     State(state): State<AppState>,
@@ -242,6 +279,7 @@ async fn guard(
                         subject = %authorized.subject,
                         "authorized by Cbox ID"
                     );
+                    refuse_unidentified_writer(&state, surface, authorized.client_id.as_deref())?;
                     let mut request = request;
                     // `client_id` names the application the token was issued to, and
                     // the issuer reserves it against being overwritten. `sub` is a
@@ -331,6 +369,23 @@ fn bearer(header: &str) -> Option<&str> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// Strict relay mode identifies every writer by its credential. An access token
+    /// that names no client leaves nothing to stamp, so it may not write — while it may
+    /// still read, and a token that names its client writes as that client.
+    #[test]
+    fn a_token_without_a_client_cannot_write_through_a_strict_relay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = telemetryd_core::Config::default();
+        config.storage.data_dir = Some(tmp.path().join("data"));
+        config.relay.upstream = "http://127.0.0.1:4399".to_owned();
+        let store = std::sync::Arc::new(telemetryd_store::Store::open(&config).unwrap());
+        let state = AppState::new(std::sync::Arc::new(config), store).unwrap();
+
+        assert!(refuse_unidentified_writer(&state, Surface::Ingest, None).is_err());
+        assert!(refuse_unidentified_writer(&state, Surface::Ingest, Some("mobile")).is_ok());
+        assert!(refuse_unidentified_writer(&state, Surface::Query, None).is_ok());
+    }
 
     #[test]
     fn parses_bearer_headers_leniently_but_not_wrongly() {

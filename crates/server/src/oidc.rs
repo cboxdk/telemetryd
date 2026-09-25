@@ -203,6 +203,9 @@ impl Oidc {
         validation.set_issuer(&[self.config.issuer.trim_end_matches('/')]);
         validation.set_audience(&[self.config.expected_audience()]);
         validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+        // Off by default in the library, though this module has always said it was
+        // checked: a token not valid until tomorrow was accepted today.
+        validation.validate_nbf = true;
         validation.leeway = self.config.clock_skew.as_secs();
 
         let data = decode::<Claims>(token, &key.key, &validation)
@@ -671,6 +674,32 @@ mod tests {
             oidc.authorize(&issuer.token(&expired), Surface::Query),
             Err(Rejected::BadSignatureOrClaims(_))
         ));
+    }
+
+    /// `nbf` is checked, as this module always said: a token that is not valid until
+    /// tomorrow is refused today, and one valid since a minute ago is accepted.
+    #[test]
+    fn a_token_not_yet_valid_is_refused() {
+        let issuer = TestIssuer::new();
+        let oidc = loaded(config(), &issuer.jwks);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut tomorrow = claims("telemetry:read");
+        tomorrow["nbf"] = serde_json::json!(now + 86_400);
+        assert!(matches!(
+            oidc.authorize(&issuer.token(&tomorrow), Surface::Query),
+            Err(Rejected::BadSignatureOrClaims(_))
+        ));
+
+        let mut since = claims("telemetry:read");
+        since["nbf"] = serde_json::json!(now - 60);
+        assert!(
+            oidc.authorize(&issuer.token(&since), Surface::Query)
+                .is_ok()
+        );
     }
 
     #[test]

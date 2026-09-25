@@ -21,6 +21,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.0 {
             Error::Unauthorized => StatusCode::UNAUTHORIZED,
+            Error::Forbidden(_) => StatusCode::FORBIDDEN,
 
             // A query-language feature outside our subset is a problem with the
             // request, not the server — API clients surface a 400 body to the user,

@@ -99,7 +99,12 @@ audience = "https://telemetry.example.com"
 
 Without it, telemetryd accepts the issuer's own value — which is what Cbox ID puts in
 `aud` when no resource was requested. With it, a token minted for another service on
-the same issuer cannot be replayed here.
+the same issuer cannot be replayed here. Because every telemetryd trusting one issuer
+would share that default — a staging token opening production — telemetryd warns at
+startup while `audience` is unset.
+
+`exp`, `nbf`, `iss` and `aud` are all checked, within `clock_skew`. A token that is not
+valid yet is refused like one that has expired; before 0.62.0 `nbf` was not checked.
 
 ## Another provider than Cbox ID
 

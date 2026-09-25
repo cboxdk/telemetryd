@@ -45,6 +45,11 @@ pub enum Error {
     #[error("authentication required")]
     Unauthorized,
 
+    /// Authenticated, and still not allowed: the credential is valid but cannot be used
+    /// for this.
+    #[error("{0}")]
+    Forbidden(String),
+
     #[error("{0}")]
     BadRequest(String),
 
@@ -122,6 +127,7 @@ impl Error {
                 "secret_unavailable"
             }
             Self::Unauthorized => "unauthorized",
+            Self::Forbidden(_) => "forbidden",
             Self::BadRequest(_) => "bad_request",
             Self::NotFound(_) => "not_found",
             Self::Unsupported { .. } => "unsupported_feature",
