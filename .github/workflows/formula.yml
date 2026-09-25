@@ -57,7 +57,7 @@ jobs:
       # Check out the *tag*, not the default branch: `packaging/telemetryd.rb` is
       # versioned with the code it installs, and publishing the formula as it exists on
       # main would describe a build that tag never produced.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event.inputs.tag || github.event.release.tag_name || github.event.workflow_run.head_branch }}
 
@@ -71,7 +71,7 @@ jobs:
       - name: mint an installation token
         id: app-token
         if: env.HAS_APP_KEY == 'true'
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           # `client-id` rather than the deprecated `app-id`. It identifies the App and
           # is not a credential — anyone in the organisation can read it back from the

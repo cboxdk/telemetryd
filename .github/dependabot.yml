@@ -1,0 +1,10 @@
+# Actions are pinned to commit SHAs, so a tag moved by whoever controls an action's
+# repository cannot change what runs here. Pins go stale without something to bump
+# them; this proposes the bump as a pull request, where it is reviewed like any
+# other change to what CI executes.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
