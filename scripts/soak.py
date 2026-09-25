@@ -322,11 +322,21 @@ def main() -> int:
         check("PromQL instant query", status == 200 and len(series(body)) == 1,
               f"HTTP {status}, {len(series(body))} series")
 
-        status, body = query("/api/v1/query", query="rate(http_requests_total[5m])", time=at)
+        # A window the series covers end to end reads its true rate.
+        status, body = query("/api/v1/query", query="rate(http_requests_total[30s])", time=at)
         rate = float(series(body)[0]["value"][1]) if series(body) else -1.0
         check("PromQL rate() is the true rate",
               status == 200 and abs(rate - METRIC_STEP_PER_SECOND) < 0.5,
               f"{rate}/s (expected ~{METRIC_STEP_PER_SECOND}/s)")
+
+        # A series one minute old, over five: Prometheus spreads the ~590 it counted across
+        # the whole window rather than claiming it ran at 10/s for all five minutes —
+        # extrapolatedRate, which telemetryd follows since 0.61.0.
+        status, body = query("/api/v1/query", query="rate(http_requests_total[5m])", time=at)
+        rate = float(series(body)[0]["value"][1]) if series(body) else -1.0
+        check("PromQL rate() over a partly covered window is Prometheus's",
+              status == 200 and 1.8 < rate < 2.05,
+              f"{rate}/s (expected ~1.95/s)")
 
         status, body = request("/api/v1/labels")
         names = body.get("data", []) if isinstance(body, dict) else []
