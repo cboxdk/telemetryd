@@ -469,12 +469,15 @@ impl<S: RecordSchema> RecordStore<S> {
         }
         let recovered = buffer.len() as u64;
 
+        // Never lower than the highest ever used, even once retention has deleted every
+        // segment that carried it: a relay orders what to ship by this number, and one
+        // that went back to 1 would read every new segment as already delivered.
         let seal_sequence = segments
             .iter()
-            .filter_map(|s| s.manifest.id.rsplit_once('-'))
-            .filter_map(|(_, seq)| seq.parse::<u64>().ok())
+            .filter_map(|s| crate::segment::seal_sequence_of(&s.manifest.id))
             .max()
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(crate::segment::recorded_sequence(&segments_dir));
 
         let stats = Stats::default();
         stats.recovered.store(recovered, Ordering::Relaxed);
@@ -595,6 +598,9 @@ impl<S: RecordSchema> RecordStore<S> {
         };
 
         let sequence = self.seal_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Err(error) = crate::segment::record_sequence(&self.segments_dir, sequence) {
+            tracing::warn!(signal = %S::SIGNAL, %error, "could not record the seal sequence");
+        }
         let segment = seal::<S>(
             &chunk.records,
             SealOptions {

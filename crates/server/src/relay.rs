@@ -252,9 +252,21 @@ impl Relay {
             .collect()
     }
 
-    /// `(created_at, id, rows)` for everything after the cursor, oldest first.
+    /// `(created_at, id, rows)` for everything after the cursor, in seal order.
+    ///
+    /// Ordered by the seal sequence in each id, which only ever rises, rather than by
+    /// creation time. A clock stepped back made new segments sort before the cursor, so
+    /// they read as delivered, were never shipped, and retention was then free to
+    /// delete them. The cursor's own sequence comes from its id, so a cursor written
+    /// before this still means what it did.
     fn pending(&self, store: &Store, signal: Signal) -> Vec<(u64, String, u64)> {
         let after = self.position(signal);
+        let order = |created: u64, id: &str| {
+            (
+                telemetryd_store::segment::seal_sequence_of(id).unwrap_or(0),
+                created,
+            )
+        };
         let mut segments: Vec<(u64, String, u64)> = match signal {
             Signal::Logs => store.logs().segments(),
             Signal::Traces => store.traces().segments(),
@@ -270,11 +282,11 @@ impl Relay {
         })
         .filter(|(created, id, _)| {
             after.as_ref().is_none_or(|position| {
-                (*created, id.as_str()) > (position.created_at_nanos, position.id.as_str())
+                order(*created, id) > order(position.created_at_nanos, &position.id)
             })
         })
         .collect();
-        segments.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        segments.sort_by_key(|(created, id, _)| order(*created, id));
         segments
     }
 
@@ -642,6 +654,58 @@ mod tests {
             1,
             "one request, the redirect not followed"
         );
+    }
+
+    /// What to ship follows the seal sequence, not the clock. A segment created after
+    /// the clock stepped back — its creation time earlier than the cursor's — is still
+    /// pending; ordered by time it read as delivered and was never shipped.
+    #[test]
+    fn a_clock_stepped_back_does_not_hide_a_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = telemetryd_core::Config::default();
+        config.storage.data_dir = Some(dir.path().join("data"));
+        let store = telemetryd_store::Store::open(&config).unwrap();
+        for i in 0..3u64 {
+            let mut stream = telemetryd_core::Labels::new();
+            stream.insert("app", "checkout");
+            store
+                .append_logs(&[telemetryd_core::LogRecord {
+                    timestamp_nanos: 1_750_000_000_000_000_000 + i,
+                    stream,
+                    severity: telemetryd_core::Severity::Info,
+                    severity_text: "INFO".to_owned(),
+                    body: "x".to_owned(),
+                    attributes: telemetryd_core::Labels::new(),
+                    trace_id: None,
+                    span_id: None,
+                }])
+                .unwrap();
+            store.seal_all().unwrap();
+        }
+        let mut segments = store.logs().segments();
+        segments.sort_by_key(|s| telemetryd_store::segment::seal_sequence_of(&s.manifest.id));
+        let relay = open(dir.path());
+        relay
+            .advance(
+                Signal::Logs,
+                Position {
+                    created_at_nanos: segments[1].manifest.created_at_nanos,
+                    id: segments[1].manifest.id.clone(),
+                },
+            )
+            .unwrap();
+
+        // The newest segment, as if written after the clock went back a day.
+        let manifest = segments[2].dir.join("manifest.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        raw["created_at_nanos"] = serde_json::json!(1);
+        std::fs::write(&manifest, serde_json::to_vec(&raw).unwrap()).unwrap();
+        drop(store);
+        let store = telemetryd_store::Store::open(&config).unwrap();
+
+        let pending = relay.undelivered(&store, Signal::Logs);
+        assert_eq!(pending, vec![segments[2].manifest.id.clone()]);
     }
 
     #[test]

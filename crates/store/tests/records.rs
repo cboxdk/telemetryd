@@ -761,3 +761,32 @@ fn an_emptied_log_directory_does_not_reuse_sealed_epochs() {
         "the five written after the restart survive"
     );
 }
+
+/// The seal sequence never goes back, even after retention has deleted every segment
+/// that carried it. A relay orders what to ship by it, and numbering from 1 again read
+/// every new segment as delivered already.
+#[test]
+fn the_seal_sequence_survives_every_segment_being_deleted() {
+    let harness = Harness::new();
+    {
+        let store = harness.open();
+        for round in 0..3u64 {
+            store
+                .append(&[record(round, "checkout", Severity::Info, "x")])
+                .unwrap();
+            store.seal_now().unwrap();
+        }
+        for segment in store.segments() {
+            store.remove_segment(&segment.manifest.id).unwrap();
+        }
+    }
+    let store = harness.open();
+    store
+        .append(&[record(9, "checkout", Severity::Info, "x")])
+        .unwrap();
+    let next = store.seal_now().unwrap().unwrap();
+    assert_eq!(
+        telemetryd_store::segment::seal_sequence_of(&next.manifest.id),
+        Some(4)
+    );
+}

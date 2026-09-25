@@ -871,6 +871,32 @@ fn sync_dir(path: &Path) -> Result<()> {
 }
 
 /// Scan a signal's segment directory and load every readable segment, oldest first.
+/// The seal sequence a segment id ends with: `{min_time}-{sequence}`.
+///
+/// Monotonic per signal across restarts — see `RecordStore` — and so the order to
+/// ship segments in, where their creation time is only as monotonic as the clock.
+#[must_use]
+pub fn seal_sequence_of(id: &str) -> Option<u64> {
+    id.rsplit_once('-')?.1.parse().ok()
+}
+
+/// Where a signal keeps the highest seal sequence it has used.
+const SEQUENCE_FILE: &str = "SEQUENCE";
+
+/// The highest seal sequence ever used in `segments_dir`, as last recorded.
+#[must_use]
+pub(crate) fn recorded_sequence(segments_dir: &Path) -> u64 {
+    crate::sidecar::read(&segments_dir.join(SEQUENCE_FILE))
+        .and_then(|raw| Some(u64::from_le_bytes(raw.get(..8)?.try_into().ok()?)))
+        .unwrap_or(0)
+}
+
+/// Record `sequence` as the highest used, so a restart after every segment has been
+/// deleted does not number from 1 again.
+pub(crate) fn record_sequence(segments_dir: &Path, sequence: u64) -> Result<()> {
+    crate::sidecar::write(&segments_dir.join(SEQUENCE_FILE), &sequence.to_le_bytes())
+}
+
 pub fn scan(segments_dir: &Path) -> Result<Vec<Segment>> {
     let entries = match fs::read_dir(segments_dir) {
         Ok(entries) => entries,
