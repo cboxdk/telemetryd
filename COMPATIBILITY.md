@@ -552,10 +552,13 @@ that for a histogram.
 |---|---|---|---|
 | `http.server.request.duration` | `ms` | histogram | `http_server_request_duration_milliseconds_{count,sum,bucket}` |
 | `cache.operations` | `1` | monotonic sum | `cache_operations_total` |
+| `system.memory.utilization` | `1` | gauge | `system_memory_utilization_ratio` |
 | `worker.memory.rss` | `By` | gauge | `worker_memory_rss_bytes` |
 | `job.time` | `s` | monotonic sum | `job_time_seconds_total` |
 
-`1` is dimensionless and adds nothing. A unit already spelled in the name is not repeated,
+`1` is dimensionless: a gauge of it — or a non-monotonic sum, which Prometheus reads as a
+gauge — is a ratio and takes `_ratio`, as the OpenTelemetry translation names it; a counter
+or histogram of it is a count and takes nothing. A unit already spelled in the name is not repeated,
 so a producer that follows the convention itself does not get `_seconds_seconds`. An
 unrecognised unit is left off rather than appended verbatim, because a name nobody queries
 is the failure this exists to prevent.
