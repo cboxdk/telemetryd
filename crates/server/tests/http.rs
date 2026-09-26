@@ -1567,7 +1567,10 @@ async fn a_query_past_the_sample_ceiling_is_refused_with_a_reason() {
                 {"key": "service.name", "value": {"stringValue": "checkout"}}
             ]},
             "scopeMetrics": [{"metrics": [{
-                "name": "probe", "unit": "1", "gauge": {"dataPoints": points}
+                // Unitless, not dimensionless `1`: a gauge of `1` is a ratio
+                // and is stored as `probe_ratio`. This test is about the
+                // sample ceiling, not about naming.
+                "name": "probe", "unit": "", "gauge": {"dataPoints": points}
             }]}],
         }]
     })

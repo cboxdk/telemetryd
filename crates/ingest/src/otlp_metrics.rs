@@ -218,15 +218,23 @@ const UNITS: &[(&str, &str)] = &[
 /// - the unit becomes part of the name, spelled out — `ms` → `milliseconds`
 /// - a monotonic sum gets `_total`, which is what makes it a counter to a reader
 ///
-/// `1` is dimensionless and adds nothing; a unit already present in the name is not
+/// `1` is dimensionless: the OTLP translation calls a *gauge* of it a ratio and suffixes
+/// `_ratio`, while a counter or a histogram of it is a count and takes nothing. A unit
+/// already present in the name is not
 /// repeated, because producers that follow the convention themselves would otherwise get
 /// `_seconds_seconds`.
-fn prometheus_metric_name(otlp_name: &str, unit: &str, counter: bool) -> String {
+fn prometheus_metric_name(otlp_name: &str, unit: &str, counter: bool, gauge: bool) -> String {
     let mut name = prometheus_name(otlp_name);
 
     let unit = unit.trim();
-    if !unit.is_empty()
-        && unit != "1"
+
+    if unit == "1" {
+        // A dimensionless gauge is a ratio; a dimensionless counter or
+        // histogram is a count, and a count needs no unit in its name.
+        if gauge && !name.ends_with("_ratio") {
+            name.push_str("_ratio");
+        }
+    } else if !unit.is_empty()
         && let Some((_, word)) = UNITS.iter().find(|(ucum, _)| *ucum == unit)
         && !name.ends_with(word)
     {
@@ -294,8 +302,9 @@ fn convert_metric(
         return;
     }
     if let Some(gauge) = &metric.gauge {
-        // A gauge is never a counter, so it never takes `_total`.
-        let name = prometheus_metric_name(&metric.name, &metric.unit, false);
+        // A gauge is never a counter, so it never takes `_total` — and it is
+        // the one kind whose dimensionless unit means a ratio.
+        let name = prometheus_metric_name(&metric.name, &metric.unit, false, true);
         for point in &gauge.data_points {
             push_number(&name, MetricKind::Gauge, point, resource, app, ctx, decoded);
         }
@@ -312,7 +321,14 @@ fn convert_metric(
         } else {
             MetricKind::Gauge
         };
-        let name = prometheus_metric_name(&metric.name, &metric.unit, sum.is_monotonic);
+        // A non-monotonic sum is an up-down counter, which Prometheus reads
+        // as a gauge; a monotonic one is a counter.
+        let name = prometheus_metric_name(
+            &metric.name,
+            &metric.unit,
+            sum.is_monotonic,
+            !sum.is_monotonic,
+        );
         for point in &sum.data_points {
             push_number(&name, kind, point, resource, app, ctx, decoded);
         }
@@ -324,7 +340,7 @@ fn convert_metric(
         }
         // `_count`, `_sum` and `_bucket` are the counter-ish suffixes here; `_total` is
         // not part of the histogram convention.
-        let name = prometheus_metric_name(&metric.name, &metric.unit, false);
+        let name = prometheus_metric_name(&metric.name, &metric.unit, false, false);
         for point in &histogram.data_points {
             push_histogram(&name, point, resource, app, ctx, decoded);
         }
@@ -708,44 +724,68 @@ mod tests {
         // nothing. A name that is merely wrong produces `200` with an empty result, so a
         // dashboard shows `0` instead of an error and nothing anywhere says why.
         assert_eq!(
-            prometheus_metric_name("http.server.request.duration", "ms", false),
+            prometheus_metric_name("http.server.request.duration", "ms", false, false),
             "http_server_request_duration_milliseconds"
         );
         assert_eq!(
-            prometheus_metric_name("cache.operations", "1", true),
+            prometheus_metric_name("cache.operations", "1", true, false),
             "cache_operations_total",
-            "`1` is dimensionless and adds nothing to the name"
+            "a dimensionless counter is a count, not a ratio"
         );
         assert_eq!(
-            prometheus_metric_name("worker.memory", "By", false),
+            prometheus_metric_name("worker.memory", "By", false, false),
             "worker_memory_bytes"
         );
 
         // Order: a counter measured in seconds is `_seconds_total`, never
         // `_total_seconds`.
         assert_eq!(
-            prometheus_metric_name("job.time", "s", true),
+            prometheus_metric_name("job.time", "s", true, false),
             "job_time_seconds_total"
         );
 
         // A producer already following the convention must not be doubled up.
         assert_eq!(
-            prometheus_metric_name("queue_wait_seconds", "s", false),
+            prometheus_metric_name("queue_wait_seconds", "s", false, false),
             "queue_wait_seconds"
         );
+
+        // A dimensionless gauge is a ratio, and only a gauge. Without this
+        // the emitter's own scrape endpoint and this ingest path disagreed
+        // on the name of the same metric, and a dashboard written for one
+        // read nothing from the other.
         assert_eq!(
-            prometheus_metric_name("requests_total", "1", true),
+            prometheus_metric_name("system.memory.utilization", "1", false, true),
+            "system_memory_utilization_ratio"
+        );
+        assert_eq!(
+            prometheus_metric_name("system.cpu.utilization", "1", false, true),
+            "system_cpu_utilization_ratio",
+            "a dimensionless gauge is a ratio"
+        );
+        assert_eq!(
+            prometheus_metric_name("queue.depth", "1", false, false),
+            "queue_depth",
+            "a dimensionless histogram is a count, not a ratio"
+        );
+        assert_eq!(
+            prometheus_metric_name("error.ratio", "1", false, true),
+            "error_ratio",
+            "a producer already saying ratio must not be doubled up"
+        );
+        assert_eq!(
+            prometheus_metric_name("requests_total", "1", true, false),
             "requests_total"
         );
 
         // An unknown unit is left off rather than guessed at: appending it verbatim
         // would produce a name nobody queries, which is the failure being fixed.
         assert_eq!(
-            prometheus_metric_name("odd.thing", "furlongs", false),
+            prometheus_metric_name("odd.thing", "furlongs", false, false),
             "odd_thing"
         );
         assert_eq!(
-            prometheus_metric_name("plain.gauge", "", false),
+            prometheus_metric_name("plain.gauge", "", false, true),
             "plain_gauge"
         );
     }
