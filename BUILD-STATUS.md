@@ -246,6 +246,26 @@ what reading had not: `detected_level` on every line, Loki's flat response shape
 step grids of both, Tempo's base64 ids, and a dozen smaller rules — each now answered as
 upstream answers it.
 
+**Faster than Prometheus on the same data, and the same answers.** A day of one app's
+request histogram — 850 series, 2.5 million samples, pushed over OTLP to telemetryd,
+Prometheus 3.15 and Mimir 3.2.1 alike — and the eleven queries a Laravel dashboard sends
+for it: every one answered faster than Prometheus, and every answer Prometheus's own to
+within 1e-6; seven of the nine distinct ones match it byte for byte, the rest differ in
+`histogram_quantile`'s last digit, where Go on arm64 and amd64 differ from each other.
+Freshly pushed, the p95 over the day takes 21 ms (Prometheus 79, Mimir 21), the per-route
+counts 5 ms (9, 5), the p95 chart 33 ms (92, 35); sealed into hourly segments as a live
+server holds it, 3 ms, 1 ms and 39 ms. Over seven days, the p95 takes 83 ms against
+Prometheus's 473 and this release's predecessor's 9.2 seconds. `scripts/compare-backends.py`
+reproduces it, and `crates/query/tests/query_work.rs` fails if the dashboard's queries go
+back to reading series they do not name.
+
+What it took: metric segments sealed series by series, so a metric name's series are one
+stretch of rows the reader takes without decompressing the rest; the store handing out
+samples a series at a time, which the fold walks rather than searches; the buffer read
+through a per-series order; and the arithmetic of `rate`, `sum` and `avg` done in
+Prometheus's order. Ingest came out 7–11% faster and peak memory lower, from building a
+histogram series' label sets once per payload rather than once per point.
+
 **As a drop-in, all three ways in.** Loki's push API for log shippers, metric LogQL for
 Grafana's log volume and alerting, OTLP over gRPC on `server.grpc_listen`, TraceQL
 metrics on `/api/metrics/query_range`, and `[metrics_generator]` for the service graph and
