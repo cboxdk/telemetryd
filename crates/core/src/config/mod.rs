@@ -332,6 +332,19 @@ impl Config {
         // Half a TLS configuration is always a mistake, and the failure it causes
         // otherwise is a server that quietly keeps speaking plain HTTP.
         self.validate_server_tls()?;
+        for processor in &self.metrics_generator.processors {
+            if !matches!(processor.as_str(), "service-graphs" | "span-metrics") {
+                return Err(Error::Config(format!(
+                    "metrics_generator.processors has {processor:?}; the processors are \
+                     \"service-graphs\" and \"span-metrics\""
+                )));
+            }
+        }
+        if self.metrics_generator.is_enabled() && self.metrics_generator.interval.is_zero() {
+            return Err(Error::Config(
+                "metrics_generator.interval must be longer than zero".to_owned(),
+            ));
+        }
 
         self.validate_binds()?;
 

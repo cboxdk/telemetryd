@@ -31,6 +31,51 @@ pub struct Config {
     /// Who telemetryd trusts when it dials out.
     #[serde(default)]
     pub tls: TlsConfig,
+    /// Span metrics and service graphs from incoming spans. Off unless asked for.
+    #[serde(default)]
+    pub metrics_generator: MetricsGeneratorConfig,
+}
+
+/// What Tempo's metrics generator does, done at ingest: series derived from spans,
+/// stored as metrics, under Tempo's names — so Grafana's service graph and its RED
+/// table have something to read.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct MetricsGeneratorConfig {
+    /// `"service-graphs"` and `"span-metrics"`, as Tempo names them. Empty = off: span
+    /// metrics carry a series per span name, which is a cardinality decision to make on
+    /// purpose.
+    pub processors: Vec<String>,
+    /// How often the series are written, as Tempo's remote-write interval.
+    #[serde(with = "humantime_serde")]
+    pub interval: Duration,
+    /// How long a client span waits for its server's before it is an edge to a
+    /// virtual node, or unpaired.
+    #[serde(with = "humantime_serde")]
+    pub wait: Duration,
+}
+
+impl Default for MetricsGeneratorConfig {
+    fn default() -> Self {
+        Self {
+            processors: Vec::new(),
+            interval: Duration::from_secs(15),
+            wait: Duration::from_secs(10),
+        }
+    }
+}
+
+impl MetricsGeneratorConfig {
+    /// Whether either processor runs.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        !self.processors.is_empty()
+    }
+
+    #[must_use]
+    pub fn runs(&self, processor: &str) -> bool {
+        self.processors.iter().any(|p| p == processor)
+    }
 }
 
 /// Terminating TLS ourselves, for deployments with nowhere to put a proxy.

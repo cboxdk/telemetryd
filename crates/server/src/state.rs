@@ -66,6 +66,9 @@ pub struct AppState {
     pub oidc: Arc<crate::oidc::Oidc>,
     /// Forwarding upstream. `None` unless `relay.upstream` is set.
     pub relay: Option<Arc<crate::relay::Relay>>,
+    /// Span metrics and service graphs. `None` unless `metrics_generator` names a
+    /// processor.
+    pub generator: Option<Arc<std::sync::Mutex<telemetryd_ingest::generator::Generator>>>,
     /// Ingest requests in flight per client. Only ever holds clients with an active
     /// request, so it is bounded by the queue depth.
     in_flight: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
@@ -130,6 +133,26 @@ impl Credentials {
 }
 
 impl AppState {
+    /// Write what the metrics generator has gathered as samples, now. The serving loop
+    /// calls it every `metrics_generator.interval`; tests call it directly.
+    ///
+    /// # Errors
+    /// The store's, when the samples cannot be written.
+    pub fn flush_generator(&self) -> telemetryd_core::Result<usize> {
+        let Some(generator) = &self.generator else {
+            return Ok(0);
+        };
+        let samples = generator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .collect(telemetryd_store::now_nanos());
+        if samples.is_empty() {
+            return Ok(0);
+        }
+        let admitted = self.store.append_samples(&samples)?;
+        Ok(admitted.stored)
+    }
+
     /// The credentials in force now. A request holds the snapshot it started with, so a
     /// reload never changes the rules halfway through one.
     #[must_use]
@@ -254,6 +277,18 @@ impl AppState {
                 store.data_dir().root(),
             ))
         });
+        let generator = config.metrics_generator.is_enabled().then(|| {
+            let generator = &config.metrics_generator;
+            Arc::new(std::sync::Mutex::new(
+                telemetryd_ingest::generator::Generator::new(
+                    telemetryd_ingest::generator::Processors {
+                        span_metrics: generator.runs("span-metrics"),
+                        service_graphs: generator.runs("service-graphs"),
+                    },
+                    u64::try_from(generator.wait.as_nanos()).unwrap_or(u64::MAX),
+                ),
+            ))
+        });
         Ok(Self {
             credentials,
             config,
@@ -269,6 +304,7 @@ impl AppState {
             export_concurrency,
             oidc,
             relay,
+            generator,
             in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             queue_depth,
             tail,

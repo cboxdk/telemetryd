@@ -316,6 +316,8 @@ pub async fn serve_state(state: AppState) -> Result<()> {
         let _ = relay;
     }
 
+    let generating = spawn_generator(&state);
+
     let maintenance = maintenance::Maintenance::start_with(
         &store,
         config.storage.wal_sync_interval,
@@ -372,6 +374,9 @@ pub async fn serve_state(state: AppState) -> Result<()> {
     }
 
     // Stop the timers first, so nothing is mid-seal while we are trying to stop.
+    if let Some(generating) = generating {
+        generating.abort();
+    }
     maintenance.stop();
 
     // In-flight requests are drained by now; this is the last chance to make the
@@ -404,6 +409,33 @@ async fn load_oidc_keys(state: &AppState) {
             Err(error) => tracing::error!(%error, "the key fetch task panicked"),
         }
     }
+}
+
+/// Write the metrics generator's series every `metrics_generator.interval`, off the
+/// async runtime — appending is file I/O.
+fn spawn_generator(state: &AppState) -> Option<tokio::task::JoinHandle<()>> {
+    state.generator.as_ref()?;
+    let state = state.clone();
+    let every = state.config.metrics_generator.interval;
+    tracing::info!(
+        processors = ?state.config.metrics_generator.processors,
+        "generating span metrics and service graphs from incoming spans"
+    );
+    Some(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let state = state.clone();
+            match tokio::task::spawn_blocking(move || state.flush_generator()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "could not write generated metrics; retrying next interval");
+                }
+                Err(error) => tracing::error!(%error, "the generated-metrics task panicked"),
+            }
+        }
+    }))
 }
 
 /// The TLS configuration both listeners terminate with, when `[server.tls]` is on.

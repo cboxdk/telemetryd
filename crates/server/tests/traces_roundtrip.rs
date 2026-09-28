@@ -34,14 +34,19 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
+        Self::configured(|_| {})
+    }
+
+    fn configured(customise: impl FnOnce(&mut Config)) -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        let config = Config {
+        let mut config = Config {
             storage: StorageConfig {
                 data_dir: Some(tmp.path().join("data")),
                 ..StorageConfig::default()
             },
             ..Config::default()
         };
+        customise(&mut config);
         config.validate().unwrap();
 
         let store = Arc::new(Store::open(&config).unwrap());
@@ -880,4 +885,93 @@ async fn traceql_metrics_answer_in_tempo_s_shape() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _) = harness.get(&range("{ status = error }")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// With the metrics generator on, spans become the series Grafana's service graph and
+/// RED table read, under Tempo's names — answered by the Prometheus API beside them.
+#[tokio::test]
+async fn spans_become_service_graph_and_span_metrics() {
+    let harness = Harness::configured(|config| {
+        config.metrics_generator.processors = vec!["service-graphs".into(), "span-metrics".into()];
+        config.metrics_generator.wait = std::time::Duration::ZERO;
+    });
+    harness.post_traces(&trace_payload()).await;
+    // Settle the waiting halves, then write: twice, as two intervals would.
+    harness.state.flush_generator().unwrap();
+    assert!(harness.state.flush_generator().unwrap() > 0);
+
+    let ask = |query: &str| {
+        let path = format!("/api/v1/query?query={}", urlencode(query));
+        let harness = &harness;
+        async move {
+            let (status, body) = harness.get(&path).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let mut rows: Vec<(Value, String)> = body["data"]["result"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| {
+                    (
+                        r["metric"].clone(),
+                        r["value"][1].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect();
+            rows.sort_by_key(|(m, _)| m.to_string());
+            rows
+        }
+    };
+
+    // The checkout's root span is called by `user`; its SELECT goes to a database no
+    // span reports from, which is a virtual node named by `db.system`.
+    assert_eq!(
+        ask("sum by (client, server, connection_type) (traces_service_graph_request_total)").await,
+        vec![
+            (
+                json!({"client": "checkout", "connection_type": "database", "server": "mysql"}),
+                "1".to_owned()
+            ),
+            (
+                json!({"client": "user", "connection_type": "virtual_node", "server": "checkout"}),
+                "1".to_owned()
+            ),
+        ]
+    );
+    assert_eq!(
+        ask("sum by (client, server) (traces_service_graph_request_failed_total)").await,
+        vec![
+            (
+                json!({"client": "checkout", "server": "mysql"}),
+                "0".to_owned()
+            ),
+            (
+                json!({"client": "user", "server": "checkout"}),
+                "1".to_owned()
+            ),
+        ]
+    );
+    assert_eq!(
+        ask(r#"sum by (span_name, status_code) (traces_spanmetrics_calls_total{service="checkout"})"#)
+            .await,
+        vec![
+            (
+                json!({"span_name": "POST /checkout", "status_code": "STATUS_CODE_ERROR"}),
+                "1".to_owned()
+            ),
+            (
+                json!({"span_name": "SELECT orders", "status_code": "STATUS_CODE_UNSET"}),
+                "1".to_owned()
+            ),
+        ]
+    );
+    // The latency histogram answers `histogram_quantile`, as a RED panel asks it.
+    let p50 = ask(
+        r#"histogram_quantile(0.5, sum by (le) (traces_spanmetrics_latency_bucket{span_name="POST /checkout"}))"#,
+    )
+    .await;
+    let p50: f64 = p50[0].1.parse().unwrap();
+    assert!(
+        p50 > 0.128 && p50 <= 0.256,
+        "150 ms lands in the 128–256 ms bucket: {p50}"
+    );
 }

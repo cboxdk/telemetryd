@@ -443,6 +443,12 @@ pub async fn otlp_traces(
     );
 
     if !decoded.records.is_empty() {
+        if let Some(generator) = &state.generator {
+            generator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .observe(&decoded.records, telemetryd_store::now_nanos());
+        }
         let store = std::sync::Arc::clone(&state.store);
         let records = std::mem::take(&mut decoded.records);
 

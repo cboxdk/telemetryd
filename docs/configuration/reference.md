@@ -73,6 +73,12 @@ max_body_bytes   = "16MiB"           # per ingest request, before *and* after de
 request_timeout  = "30s"
 shutdown_grace   = "15s"             # drain in-flight requests, then flush WAL
 
+[metrics_generator]
+# Tempo's metrics generator, at ingest: series for Grafana's service graph and RED table.
+processors       = []                # "service-graphs", "span-metrics"; empty = off
+interval         = "15s"             # how often the series are written
+wait             = "10s"             # how long a client span waits for its server's
+
 [auth]
 # Omit or leave empty to disable auth on that surface.
 # Accepts a string or a list of strings (rotation).

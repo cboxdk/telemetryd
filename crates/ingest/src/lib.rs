@@ -17,6 +17,7 @@
 //! not, and undoing that is the first thing done with untrusted bytes on the write path.
 
 pub mod compression;
+pub mod generator;
 pub mod logs;
 pub mod loki_push;
 pub mod otlp;

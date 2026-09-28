@@ -106,6 +106,18 @@ pub(super) const ENV_KEYS: &[(&str, &str)] = &[
     ),
     // A list: `["service_name", "k8s_namespace_name"]`, as in the file.
     ("TELEMETRYD_INGEST_STREAM_LABELS", "ingest.stream_labels"),
+    (
+        "TELEMETRYD_METRICS_GENERATOR_PROCESSORS",
+        "metrics_generator.processors",
+    ),
+    (
+        "TELEMETRYD_METRICS_GENERATOR_INTERVAL",
+        "metrics_generator.interval",
+    ),
+    (
+        "TELEMETRYD_METRICS_GENERATOR_WAIT",
+        "metrics_generator.wait",
+    ),
     // Cbox ID / OIDC. Absent until now, which meant the one deployment shape that
     // most needs env-only configuration — a container — could not turn SSO on at all
     // without baking a file into the image.

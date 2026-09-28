@@ -474,9 +474,31 @@ as Tempo's). Computed from the stored spans at query time, with exact quantiles 
 Tempo reads them off a log-2 histogram, so the two can differ by up to a bucket's
 width. More than 1,000 series is refused.
 
+### Service graph and span metrics
+
+With `[metrics_generator] processors = ["service-graphs", "span-metrics"]`, telemetryd
+does what Tempo's metrics generator does, at ingest, and stores the series beside your
+other metrics — where Grafana's service graph, its RED table and any dashboard built on
+them read them through the Prometheus API. Names, labels and default buckets are
+Tempo's:
+
+- `traces_spanmetrics_calls_total` and `traces_spanmetrics_latency_{bucket,sum,count}` by
+  `service`, `span_name`, `span_kind` and `status_code`
+- `traces_service_graph_request_total`, `…_request_failed_total`,
+  `…_request_server_seconds_*` and `…_request_client_seconds_*` by `client`, `server` and
+  `connection_type`, and `traces_service_graph_unpaired_spans_total`
+
+An edge is a client or producer span and the server or consumer span whose parent it
+is. A client span whose callee never reports becomes, after `wait` (10 s), an edge to a
+virtual node named by `peer.service`, `db.name` or `db.system` — `connection_type =
+"database"` for a database — and a root server span an edge from `user`. Series are
+written every `interval` (15 s), cumulative from startup, and one untouched for 15 minutes
+is no longer written. Off by default: span metrics carry a series per span name, and a
+span name with an id in it is a cardinality decision to make on purpose; past 10,000
+series of either kind, new ones are dropped.
+
 *Not supported:* multiple spansets, `||` between conditions, structural operators
-(`>>`, `~`), spanset aggregates (`count() > 2`), `compare()`, and the service graph and
-span metrics, which Tempo's metrics generator writes to a Prometheus.
+(`>>`, `~`), spanset aggregates (`count() > 2`) and `compare()`.
 
 ---
 
