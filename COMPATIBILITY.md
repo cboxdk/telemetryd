@@ -92,7 +92,10 @@ already on that port. The `Export` methods of `LogsService`, `TraceService` and
 and stored exactly as a protobuf `POST /v1/…` is, behind the same ingest token (sent as
 `authorization` metadata), limits and `partialSuccess`. HTTP/2 with prior knowledge, or
 `h2` negotiated over TLS when `[server.tls]` is on. `grpc-encoding` gzip, deflate and
-zstd. Refusals map to the gRPC status an exporter acts on: `UNAVAILABLE` for overload
+zstd. Only a message's frame header is read before the OTLP handler takes over, so the
+token, ingest slots and memory budget apply before a message is held; a connection may
+carry 16 calls at once, shares the main port's connection budget, and is closed after
+60 s without one. Refusals map to the gRPC status an exporter acts on: `UNAVAILABLE` for overload
 and storage trouble (retried), `INVALID_ARGUMENT`, `UNAUTHENTICATED` and
 `RESOURCE_EXHAUSTED` for what resending cannot fix. Verified with the stock Python
 `opentelemetry-exporter-otlp-proto-grpc` sending all three signals, with and without
@@ -311,7 +314,8 @@ Supported:
   `{{ToUpper .path}}` and `{{default "none" .user}}`, or piped, as in
   `{{.path | trunc 3}}`, with Go's rule that a piped value is the last argument. A
   template using any other Go template feature is refused by name rather than rendered
-  wrong.
+  wrong. A rendering stops at 256 KiB — Loki's default line size — however templates
+  chain, and `replace` with nothing to replace is refused.
 - `drop` and `keep`, by name or by `name="value"` matcher, and `decolorize`
 - label filters, including `and` / `or` chains — `| status="500" or status="503"` is
   what the UI's compiler emits, so a single bare matcher would not have been enough
@@ -411,7 +415,9 @@ and asked of Tempo again in CI. What that pinned down, now as Tempo answers:
   `STATUS_CODE_ERROR`), `{}` for an unset status; its resource is every resource
   attribute under the name OTLP sent, not telemetryd's stream labels
 - a search row's `traceID` drops its leading zeros and `durationMs` is whole
-  milliseconds; `/api/traces/{id}` takes an id in any of those spellings
+  milliseconds; `/api/traces/{id}` takes an id in any of those spellings. Ids are stored
+  padded to their full length, as Tempo stores them, so a 64-bit id from Jaeger or
+  Zipkin is found by every spelling too
 - `minDuration`/`maxDuration` apply to a search by `tags`; with a TraceQL `q` — even
   `{}` — they change nothing, and the bound goes in the query as `duration > 1s`
 - the resource scope of the tag listing names attributes as OTLP spelled them
