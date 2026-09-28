@@ -658,8 +658,7 @@ impl Snapshot {
         // segment anyway.
         let whole_reads = 4usize.checked_div(points.len()).unwrap_or(0);
 
-        let mut labels: Vec<Labels> = Vec::new();
-        let mut index: HashMap<Labels, usize> = HashMap::new();
+        let mut table = telemetryd_core::series::SeriesTable::new();
         let mut prepared = Vec::with_capacity(calls.len());
 
         for (selector, range, per_second) in calls {
@@ -684,14 +683,7 @@ impl Snapshot {
                     let Some(value) = finish_fold(&summary, window, *per_second) else {
                         continue;
                     };
-                    let at_index = if let Some(at_index) = index.get(&series) {
-                        *at_index
-                    } else {
-                        let at_index = labels.len();
-                        index.insert(series.clone(), at_index);
-                        labels.push(series);
-                        at_index
-                    };
+                    let (at_index, _) = table.insert(&series);
                     by_step[point].push((at_index, value));
                 }
             }
@@ -704,10 +696,11 @@ impl Snapshot {
             });
         }
 
-        let series: Vec<Series> = labels
-            .iter()
+        let series: Vec<Series> = table
+            .into_series()
+            .into_iter()
             .map(|labels| Series {
-                labels: labels.clone(),
+                labels,
                 samples: Vec::new(),
             })
             .collect();
@@ -868,7 +861,7 @@ impl Snapshot {
         let (Some(&(first, _)), Some(&(_, last))) = (windows.first(), windows.last()) else {
             return Ok(true);
         };
-        let mut by_labels: HashMap<Labels, usize> = HashMap::new();
+        let mut by_labels = telemetryd_core::series::SeriesTable::new();
         // Per series: the last sample folded, and which source it came from.
         let mut latest: Vec<(u64, usize)> = Vec::new();
         // Per stream of the current source: unresolved, not selected, or a series.
@@ -899,12 +892,12 @@ impl Snapshot {
                     let labels = &run.streams[stream];
                     let found = if !telemetryd_core::matches_all(pushdown, labels) {
                         None
-                    } else if let Some(&index) = by_labels.get(labels) {
+                    } else if let Some(index) = by_labels.get(labels) {
                         Some(index)
                     } else {
                         match state.discover(labels) {
                             Ok(index) => {
-                                by_labels.insert(labels.clone(), index);
+                                by_labels.insert(labels);
                                 latest.push((0, usize::MAX));
                                 Some(index)
                             }
@@ -948,7 +941,9 @@ impl Snapshot {
         windows: &[(u64, u64)],
     ) -> Result<()> {
         let slice = duration_nanos(Self::FOLD_SLICE);
-        let mut identities: HashMap<usize, usize> = HashMap::new();
+        // By value behind the address: the same series can arrive in two allocations,
+        // and an address alone is only an identity while something holds it.
+        let mut identities = telemetryd_core::series::SeriesTable::new();
         for &(span_start, span_end) in windows {
             let mut cursor = span_start;
             while cursor <= span_end {
@@ -957,12 +952,11 @@ impl Snapshot {
                 // would refuse a query whose whole point is that it never holds the window.
                 let samples = store.query_bounded(cursor, slice_end, pushdown, &|_| true, 0)?;
                 for sample in samples {
-                    let id = sample.series.storage_id();
-                    let index = if let Some(index) = identities.get(&id) {
-                        *index
+                    let index = if let Some(index) = identities.get(&sample.series) {
+                        index
                     } else {
                         let index = state.discover(&sample.series)?;
-                        identities.insert(id, index);
+                        identities.insert(&sample.series);
                         index
                     };
                     state.add(index, sample.timestamp_nanos, sample.value);

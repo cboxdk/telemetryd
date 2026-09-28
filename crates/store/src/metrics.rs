@@ -119,8 +119,8 @@ impl crate::RecordStore<MetricSchema> {
                 continue;
             }
             source += 1;
-            let mut numbered: std::collections::HashMap<usize, u32> =
-                std::collections::HashMap::new();
+            let mut numbered: telemetryd_core::series::IdMap<u32> =
+                telemetryd_core::series::IdMap::default();
             let mut streams: Vec<Labels> = Vec::new();
             let mut stream_ids = Vec::with_capacity(chunk.records.len());
             let mut timestamps = Vec::with_capacity(chunk.records.len());
@@ -237,24 +237,15 @@ impl crate::RecordStore<MetricSchema> {
         whole_reads_allowed: usize,
     ) -> Result<Option<Vec<(Labels, crate::folds::StreamFold)>>> {
         use crate::folds::StreamFold;
-        use std::collections::HashMap;
 
         // Keyed by the label set itself, not by the allocation behind it. Segments
         // normally share one, so a pointer would do — but "normally" is not a property to
         // rest an answer on, and getting it wrong here multiplies a rate by the number of
-        // segments in the window while looking entirely ordinary. This runs once per
-        // stream per segment, not once per row.
-        let mut by_series: HashMap<Labels, StreamFold> = HashMap::new();
-        let mut order: Vec<Labels> = Vec::new();
-        let note = |by_series: &mut HashMap<Labels, StreamFold>,
-                    order: &mut Vec<Labels>,
-                    labels: &Labels| {
-            if !by_series.contains_key(labels) {
-                by_series.insert(labels.clone(), StreamFold::default());
-                order.push(labels.clone());
-            }
-            labels.clone()
-        };
+        // segments in the window while looking entirely ordinary. The table tries the
+        // allocation first and falls back to the set, so the shared case costs no hashing
+        // of names and values and the unshared case is still one series.
+        let mut table = telemetryd_core::series::SeriesTable::new();
+        let mut folds: Vec<StreamFold> = Vec::new();
 
         let segments = self.segments();
 
@@ -291,70 +282,136 @@ impl crate::RecordStore<MetricSchema> {
 
             let wholly_inside =
                 manifest.min_time_nanos > start_nanos && manifest.max_time_nanos <= end_nanos;
-            if wholly_inside && let Some(precomputed) = segment.folds() {
-                for (stream, labels) in manifest.streams.iter().enumerate() {
-                    if !allowed.get(stream).copied().unwrap_or(false) {
-                        continue;
-                    }
-                    let Some(fold) = precomputed.get(stream).filter(|f| f.seen > 0) else {
-                        continue;
-                    };
-                    // A summary sealed before staleness markers were skipped may have
-                    // folded one in, and its NaN cannot be taken back out. The rows can:
-                    // decline, and the ordinary scan leaves the marker out.
-                    if fold.increase.is_nan() || fold.last_value.is_nan() {
-                        return Ok(None);
-                    }
-                    let key = note(&mut by_series, &mut order, labels);
-                    if let Some(entry) = by_series.get_mut(&key) {
-                        if !entry.precedes(fold.first_nanos) {
-                            return Ok(None);
-                        }
-                        entry.merge_later(fold);
-                    }
+            let precomputed = if wholly_inside { segment.folds() } else { None };
+            let per_stream = if let Some(precomputed) = precomputed {
+                // A summary sealed before staleness markers were skipped may have folded
+                // one in, and its NaN cannot be taken back out. The rows can: decline, and
+                // the ordinary scan leaves the marker out.
+                if precomputed.0.iter().zip(&allowed).any(|(fold, ok)| {
+                    *ok && fold.seen > 0 && (fold.increase.is_nan() || fold.last_value.is_nan())
+                }) {
+                    return Ok(None);
+                }
+                precomputed.0
+            } else if manifest.streams.is_empty() {
+                // No dictionary to number the rows by: a segment from before there was
+                // one. Its records carry their own labels.
+                let rows = match segment.read::<MetricSchema>() {
+                    Ok(rows) => rows,
+                    Err(error) if crate::segment::is_gone(&error) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                if !fold_rows(
+                    rows.into_iter(),
+                    (start_nanos, end_nanos),
+                    matchers,
+                    &mut table,
+                    &mut folds,
+                ) {
+                    return Ok(None);
                 }
                 continue;
-            }
-
-            // Straddles an edge, or predates summaries: read this one segment. Reading the
-            // *segment* rather than a time range matters — a range scan would also touch
-            // its neighbours, which the loop has already taken from their summaries.
-            // Deleted by retention since it was listed: decline, and the ordinary scan
-            // answers from what is left. It used to fail the query.
-            let rows = match segment.read::<MetricSchema>() {
-                Ok(rows) => rows,
-                Err(error) if crate::segment::is_gone(&error) => return Ok(None),
-                Err(error) => return Err(error),
+            } else {
+                // Straddles an edge, or predates summaries: fold this one segment's
+                // columns. The *segment*, rather than a time range, because a range scan
+                // would also touch its neighbours, which this loop takes from their
+                // summaries.
+                match fold_segment_columns(segment, (start_nanos, end_nanos), &allowed)? {
+                    Some(per_stream) => per_stream,
+                    None => return Ok(None),
+                }
             };
-            if !fold_rows(
-                rows.into_iter(),
-                start_nanos,
-                end_nanos,
-                matchers,
-                &mut by_series,
-                &mut order,
-            ) {
-                return Ok(None);
+            for (stream, labels) in manifest.streams.iter().enumerate() {
+                if !allowed.get(stream).copied().unwrap_or(false) {
+                    continue;
+                }
+                let Some(fold) = per_stream.get(stream).filter(|f| f.seen > 0) else {
+                    continue;
+                };
+                let (index, added) = table.insert(labels);
+                if added {
+                    folds.push(StreamFold::default());
+                }
+                let entry = &mut folds[index];
+                if !entry.precedes(fold.first_nanos) {
+                    return Ok(None);
+                }
+                entry.merge_later(fold);
             }
         }
 
         if !fold_rows(
             self.buffered_between(start_nanos, end_nanos).into_iter(),
-            start_nanos,
-            end_nanos,
+            (start_nanos, end_nanos),
             matchers,
-            &mut by_series,
-            &mut order,
+            &mut table,
+            &mut folds,
         ) {
             return Ok(None);
         }
 
-        let mut out: Vec<(Labels, StreamFold)> = order
+        let mut out: Vec<(Labels, StreamFold)> = table
+            .into_series()
             .into_iter()
-            .filter_map(|labels| by_series.remove(&labels).map(|fold| (labels, fold)))
+            .zip(folds)
+            .filter(|(_, fold)| fold.seen > 0)
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(Some(out))
+    }
+}
+
+/// One segment's rows in `(start, end]`, folded per stream straight from its columns.
+///
+/// A segment's rows are in time order, so each stream's rows are too, and a fold walks
+/// them as they come: nothing is materialised and nothing is sorted. Reading the segment
+/// into records and sorting them by label set was two thirds of a day-long quantile.
+///
+/// `None` when the rows cannot be folded this way — a row naming a stream the dictionary
+/// does not hold, or a segment deleted by retention since it was listed — and the caller
+/// declines the shortcut.
+fn fold_segment_columns(
+    segment: &crate::segment::Segment,
+    (start_nanos, end_nanos): (u64, u64),
+    allowed: &[bool],
+) -> Result<Option<Vec<crate::folds::StreamFold>>> {
+    let mut folds = vec![crate::folds::StreamFold::default(); segment.manifest.streams.len()];
+    let mut usable = true;
+    let scanned = segment.scan_columns(
+        &["timestamp_nanos", "stream_id", "value"],
+        &[(start_nanos.saturating_add(1), end_nanos)],
+        |batch| {
+            let ids = u32_column(batch, "stream_id")?.values();
+            let timestamps = u64_column(batch, "timestamp_nanos")?.values();
+            let values = f64_column(batch, "value")?.values();
+            for ((&id, &at), &value) in ids.iter().zip(timestamps).zip(values) {
+                if at <= start_nanos || at > end_nanos {
+                    continue;
+                }
+                let stream = id as usize;
+                let (Some(true), Some(fold)) =
+                    (allowed.get(stream).copied(), folds.get_mut(stream))
+                else {
+                    if stream >= allowed.len() {
+                        usable = false;
+                        return Ok(crate::segment::Flow::Stop);
+                    }
+                    continue;
+                };
+                if !fold.precedes(at) {
+                    usable = false;
+                    return Ok(crate::segment::Flow::Stop);
+                }
+                fold.add(at, value);
+            }
+            Ok(crate::segment::Flow::Continue)
+        },
+    );
+    match scanned {
+        Ok(()) if usable => Ok(Some(folds)),
+        Ok(()) => Ok(None),
+        Err(error) if crate::segment::is_gone(&error) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -410,13 +467,12 @@ fn shortcut_pays(
 #[must_use]
 fn fold_rows(
     records: impl Iterator<Item = MetricSample>,
-    start_nanos: u64,
-    end_nanos: u64,
+    (start_nanos, end_nanos): (u64, u64),
     matchers: &[telemetryd_core::LabelMatcher],
-    by_series: &mut std::collections::HashMap<Labels, crate::folds::StreamFold>,
-    order: &mut Vec<Labels>,
+    table: &mut telemetryd_core::series::SeriesTable,
+    folds: &mut Vec<crate::folds::StreamFold>,
 ) -> bool {
-    let mut rows: Vec<(Labels, u64, f64)> = Vec::new();
+    let mut rows: Vec<(usize, u64, f64)> = Vec::new();
     for record in records {
         if record.timestamp_nanos <= start_nanos
             || record.timestamp_nanos > end_nanos
@@ -424,20 +480,21 @@ fn fold_rows(
         {
             continue;
         }
-        if !by_series.contains_key(&record.series) {
-            by_series.insert(record.series.clone(), crate::folds::StreamFold::default());
-            order.push(record.series.clone());
+        let (index, added) = table.insert(&record.series);
+        if added {
+            folds.push(crate::folds::StreamFold::default());
         }
-        rows.push((record.series, record.timestamp_nanos, record.value));
+        rows.push((index, record.timestamp_nanos, record.value));
     }
-    rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    for (key, at, value) in rows {
-        if let Some(entry) = by_series.get_mut(&key) {
-            if !entry.precedes(at) {
-                return false;
-            }
-            entry.add(at, value);
+    // By series and then time; the sort is stable, so two samples at one instant keep
+    // the order they were stored in.
+    rows.sort_by_key(|(index, at, _)| (*index, *at));
+    for (index, at, value) in rows {
+        let entry = &mut folds[index];
+        if !entry.precedes(at) {
+            return false;
         }
+        entry.add(at, value);
     }
     true
 }

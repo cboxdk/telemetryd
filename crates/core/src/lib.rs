@@ -12,6 +12,7 @@ pub mod matcher;
 pub mod metric;
 pub mod record;
 pub mod secret;
+pub mod series;
 pub mod signal;
 pub mod sizing;
 pub mod span;
