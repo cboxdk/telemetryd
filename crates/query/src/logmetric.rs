@@ -1018,7 +1018,7 @@ pub fn answer_range(
 ) -> Result<serde_json::Value> {
     let started = std::time::Instant::now();
     let (values, lines) = evaluate(store, query, steps, deadline)?;
-    let mut series: HashMap<Labels, Vec<(f64, String)>> = HashMap::new();
+    let mut series: HashMap<Labels, Vec<(crate::prometheus::Seconds, String)>> = HashMap::new();
     let mut points = 0u64;
     for (&at, value) in steps.iter().zip(values) {
         let samples = match value {

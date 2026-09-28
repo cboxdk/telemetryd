@@ -28,7 +28,8 @@ use crate::promql::{
 const NANOS_PER_SECOND: f64 = 1e9;
 
 /// A range vector: each series' label set and its samples in time order.
-type Matrix = Vec<(Labels, Vec<(u64, f64)>)>;
+/// Series with their samples, as a range vector holds them.
+pub type Matrix = Vec<(Labels, Vec<(u64, f64)>)>;
 
 /// The most evaluations one subquery may make for one outer step.
 const MAX_SUBQUERY_POINTS: u64 = 11_000;
@@ -187,7 +188,10 @@ struct Fold {
     last_nanos: u64,
     first_value: f64,
     last_value: f64,
-    increase: f64,
+    /// The value before each drop, summed. The increase is the last value less the first
+    /// plus these — Prometheus's arithmetic, which a running sum of the steps between
+    /// samples matches only to the last digit.
+    resets: f64,
 }
 
 impl Fold {
@@ -199,14 +203,10 @@ impl Fold {
         if self.seen == 0 {
             self.first_nanos = timestamp;
             self.first_value = value;
-        } else {
+        } else if value < self.last_value {
             // The same counter-reset rule the windowed form uses: a drop means the
-            // process restarted, so the new value *is* the increase.
-            self.increase += if value < self.last_value {
-                value
-            } else {
-                value - self.last_value
-            };
+            // process restarted, and everything counted before it is kept.
+            self.resets += self.last_value;
         }
         self.seen = self.seen.saturating_add(1);
         self.last_nanos = timestamp;
@@ -226,12 +226,8 @@ impl Fold {
             if self.seen == 0 {
                 self.first_nanos = at;
                 self.first_value = value;
-            } else {
-                self.increase += if value < self.last_value {
-                    value
-                } else {
-                    value - self.last_value
-                };
+            } else if value < self.last_value {
+                self.resets += self.last_value;
             }
             self.seen = self.seen.saturating_add(1);
             self.last_nanos = at;
@@ -247,7 +243,7 @@ impl Fold {
                 first_nanos: self.first_nanos,
                 last_nanos: self.last_nanos,
                 first_value: self.first_value,
-                increase: self.increase,
+                increase: (self.last_value - self.first_value) + self.resets,
             },
             window,
             per_second,
@@ -329,12 +325,13 @@ fn extrapolate(observed: Observed, window: Window, per_second: bool) -> Option<f
         to_end = average_interval / 2.0;
     }
 
-    let extrapolated = observed.increase * (sampled + to_start + to_end) / sampled;
-    Some(if per_second {
-        extrapolated / seconds(window.at.saturating_sub(window.floor))
-    } else {
-        extrapolated
-    })
+    // In Prometheus's order of operations, so the last digit agrees too: the factor
+    // first, then the rate's division of it, then the one multiplication.
+    let mut factor = (sampled + to_start + to_end) / sampled;
+    if per_second {
+        factor /= seconds(window.at.saturating_sub(window.floor));
+    }
+    Some(observed.increase * factor)
 }
 
 /// Prometheus's `rate` over one counter's samples in the window `(floor, at]`, resets
@@ -385,18 +382,17 @@ fn rate_over(samples: &[(u64, f64)], window: Window, per_second: bool) -> Option
         .copied()
         .filter(|(_, value)| !telemetryd_core::is_stale_marker(*value));
     let (first_nanos, first_value) = live.next()?;
-    let (mut seen, mut last_nanos, mut previous, mut increase) =
+    let (mut seen, mut last_nanos, mut previous, mut resets) =
         (1u64, first_nanos, first_value, 0.0);
     for (timestamp, current) in live {
-        increase += if current < previous {
-            current
-        } else {
-            current - previous
-        };
+        if current < previous {
+            resets += previous;
+        }
         previous = current;
         last_nanos = timestamp;
         seen += 1;
     }
+    let increase = (previous - first_value) + resets;
     extrapolate(
         Observed {
             seen,
@@ -604,6 +600,28 @@ impl<'a> FoldState<'a> {
     fn finish(self) -> FoldedSpan {
         (self.labels, self.folds)
     }
+}
+
+/// Series and their folds, reordered by label set.
+fn by_label_order(labels: Vec<Labels>, folds: Vec<Vec<Vec<Fold>>>) -> FoldedSpan {
+    let mut order: Vec<usize> = (0..labels.len()).collect();
+    order.sort_by(|a, b| labels[*a].cmp(&labels[*b]));
+    let folds = folds
+        .into_iter()
+        .map(|per_series| {
+            let mut per_series: Vec<Option<Vec<Fold>>> = per_series.into_iter().map(Some).collect();
+            order
+                .iter()
+                .map(|index| per_series[*index].take().unwrap_or_default())
+                .collect()
+        })
+        .collect();
+    let mut labels: Vec<Option<Labels>> = labels.into_iter().map(Some).collect();
+    let labels = order
+        .iter()
+        .map(|index| labels[*index].take().unwrap_or_default())
+        .collect();
+    (labels, folds)
 }
 
 /// Whether every sample this expression needs can come from a fold.
@@ -1150,6 +1168,11 @@ impl Snapshot {
             (from, through),
             max_samples,
         )?;
+        // In label order, the order Prometheus's storage hands series out in. The series
+        // were met in whatever order the store happened to read them, and an aggregation
+        // adds its inputs in the order they come: compensated or not, that order decides
+        // the last digit of a sum of fractions.
+        let (labels, folds) = by_label_order(labels, folds);
 
         let mut prepared = Vec::new();
         for (call, (selector, range, per_second)) in calls.iter().enumerate() {
@@ -1743,6 +1766,42 @@ impl Snapshot {
         Ok(Value::Vector(InstantVector { samples }))
     }
 
+    /// A range vector evaluated at one instant, as `/api/v1/query` answers `x[5m]`: each
+    /// series' raw samples in its window, name kept, or a subquery's points. `None` when
+    /// `expr` is not a range vector, and is evaluated the ordinary way.
+    ///
+    /// # Errors
+    /// A subquery's, as [`Self::eval`].
+    pub fn range_vector(&self, expr: &Expr, at_nanos: u64) -> Result<Option<Matrix>> {
+        let mut matrix = match expr {
+            Expr::Selector(selector) => {
+                let Some(range) = selector.range else {
+                    return Ok(None);
+                };
+                let at = self.time_of(selector, at_nanos);
+                let floor = at.saturating_sub(duration_nanos(range));
+                self.matching(selector)
+                    .into_iter()
+                    .filter_map(|index| {
+                        let series = &self.series[index];
+                        let first = series.samples.partition_point(|(ts, _)| *ts <= floor);
+                        let end = series.samples.partition_point(|(ts, _)| *ts <= at);
+                        let samples: Vec<(u64, f64)> = series.samples[first..end]
+                            .iter()
+                            .copied()
+                            .filter(|(_, value)| !telemetryd_core::is_stale_marker(*value))
+                            .collect();
+                        (!samples.is_empty()).then(|| (series.labels.clone(), samples))
+                    })
+                    .collect()
+            }
+            Expr::Subquery(subquery) => self.subquery_matrix(subquery, at_nanos)?.2,
+            _ => return Ok(None),
+        };
+        matrix.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(Some(matrix))
+    }
+
     /// A subquery as a range vector: its inner expression evaluated at every multiple of
     /// its step inside `(floor, at]`, one series per label set. Returns the window too.
     fn subquery_matrix(&self, subquery: &Subquery, at_nanos: u64) -> Result<(u64, u64, Matrix)> {
@@ -2194,9 +2253,11 @@ fn reduce(op: AggregateOp, values: &[f64], parameter: f64) -> f64 {
         AggregateOp::Stddev => crate::promfn::group_variance(values).sqrt(),
         AggregateOp::Stdvar => crate::promfn::group_variance(values),
         AggregateOp::Group => 1.0,
-        AggregateOp::Sum => values.iter().sum(),
-        #[allow(clippy::cast_precision_loss)]
-        AggregateOp::Avg => values.iter().sum::<f64>() / values.len() as f64,
+        // Compensated, as Prometheus adds: a plain sum differed from theirs in the last
+        // digit often enough that a panel read a different number from one backend to
+        // the other.
+        AggregateOp::Sum => crate::promfn::group_sum(values),
+        AggregateOp::Avg => crate::promfn::mean(values.iter().copied()),
         AggregateOp::Min => values.iter().copied().fold(f64::INFINITY, f64::min),
         AggregateOp::Max => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
         #[allow(clippy::cast_precision_loss)]
@@ -3878,6 +3939,20 @@ mod tests {
         assert_eq!(eval(&snapshot, "min(up)", T0).samples[0].1, 1.0);
         assert_eq!(eval(&snapshot, "max(up)", T0).samples[0].1, 4.0);
         assert!((eval(&snapshot, "avg(up)", T0).samples[0].1 - 7.0 / 3.0).abs() < 1e-9);
+    }
+
+    /// `sum` and `avg` add with compensation, as Prometheus does. A plain sum loses the 1
+    /// under the 1e16 and answers 0, where Prometheus answers 1 — and on real data the
+    /// same effect showed as a last digit that differed between the two backends.
+    #[test]
+    fn sum_and_avg_add_as_prometheus_adds() {
+        let snapshot = Snapshot::from_samples(vec![
+            sample("up", "a", T0, 1e16),
+            sample("up", "b", T0, 1.0),
+            sample("up", "c", T0, -1e16),
+        ]);
+        assert_eq!(eval(&snapshot, "sum(up)", T0).samples[0].1, 1.0);
+        assert_eq!(eval(&snapshot, "avg(up)", T0).samples[0].1, 1.0 / 3.0);
     }
 
     #[test]

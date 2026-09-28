@@ -17,6 +17,18 @@ fn seconds(nanos: u64) -> f64 {
     nanos as f64 / NANOS_PER_SECOND
 }
 
+/// The `sum` aggregation the way Prometheus adds a group up: from its first element,
+/// each further one added with compensation, the compensation added at the end.
+pub(crate) fn group_sum(values: &[f64]) -> f64 {
+    let Some((first, rest)) = values.split_first() else {
+        return 0.0;
+    };
+    let (sum, compensation) = rest
+        .iter()
+        .fold((*first, 0.0), |(sum, c), value| kahan_add(*value, sum, c));
+    sum + compensation
+}
+
 /// Kahan–Neumaier summation, one term at a time, as Prometheus's `kahanSumInc`.
 #[must_use]
 pub fn kahan_add(increment: f64, sum: f64, compensation: f64) -> (f64, f64) {
@@ -153,12 +165,20 @@ fn count_pairs(samples: &[(u64, f64)], counts: impl Fn(f64, f64) -> bool) -> f64
 /// `avg_over_time`: a compensated sum divided at the end, switching to an incremental
 /// mean only if the sum would overflow — Prometheus's own approach.
 fn average(samples: &[(u64, f64)]) -> f64 {
-    let Some((_, first)) = samples.first() else {
+    mean(samples.iter().map(|(_, value)| *value))
+}
+
+/// The mean the way Prometheus takes it, for `avg_over_time` and the `avg` aggregation
+/// alike: a compensated sum divided at the end, switching to an incremental mean only if
+/// the sum would overflow. `NaN` for no values.
+pub(crate) fn mean(mut values: impl Iterator<Item = f64>) -> f64 {
+    let Some(first) = values.next() else {
         return f64::NAN;
     };
-    let (mut sum, mut count, mut mean, mut compensation) = (*first, 1.0f64, 0.0, 0.0);
+    let (mut sum, mut count, mut mean, mut compensation) = (first, 1.0f64, 0.0, 0.0);
     let mut incremental = false;
-    for (_, value) in &samples[1..] {
+    for value in values {
+        let value = &value;
         count += 1.0;
         if !incremental {
             let (new_sum, new_c) = kahan_add(*value, sum, compensation);

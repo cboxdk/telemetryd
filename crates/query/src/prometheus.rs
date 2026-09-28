@@ -76,7 +76,9 @@ pub struct InstantData {
 #[serde(untagged)]
 pub enum InstantAnswer {
     Vector(Vec<InstantResult>),
-    Scalar((f64, String)),
+    /// A range vector asked for at one instant: `x[5m]`.
+    Matrix(Vec<RangeResult>),
+    Scalar((Seconds, String)),
 }
 
 impl InstantAnswer {
@@ -85,7 +87,7 @@ impl InstantAnswer {
     pub fn samples(&self) -> &[InstantResult] {
         match self {
             Self::Vector(samples) => samples,
-            Self::Scalar(_) => &[],
+            Self::Matrix(_) | Self::Scalar(_) => &[],
         }
     }
 }
@@ -94,7 +96,7 @@ impl InstantAnswer {
 pub struct InstantResult {
     pub metric: BTreeMap<String, String>,
     /// `[seconds, "value"]` — the value is a string, as Prometheus sends it.
-    pub value: (f64, String),
+    pub value: (Seconds, String),
 }
 
 #[derive(Debug, Serialize)]
@@ -107,7 +109,7 @@ pub struct RangeData {
 #[derive(Debug, Serialize)]
 pub struct RangeResult {
     pub metric: BTreeMap<String, String>,
-    pub values: Vec<(f64, String)>,
+    pub values: Vec<(Seconds, String)>,
 }
 
 #[derive(Debug, Serialize)]
@@ -152,9 +154,32 @@ pub(crate) fn format_value(value: f64) -> String {
     }
 }
 
-#[allow(clippy::cast_precision_loss)]
-pub(crate) fn to_seconds(nanos: u64) -> f64 {
-    nanos as f64 / 1e9
+/// A sample's time, written the way Prometheus and Loki write it: seconds, as a whole
+/// number when there is no fraction, and to the millisecond when there is.
+///
+/// Prometheus keeps time in milliseconds and writes `1790603509`, not `1790603509.0`.
+/// Both parse to the same number, but the second is a byte more per point — six per cent
+/// of a chart's answer — and not what the backend this replaces sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Seconds(pub u64);
+
+impl Serialize for Seconds {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let millis = self.0 / 1_000_000;
+        if millis.is_multiple_of(1_000) {
+            serializer.serialize_u64(millis / 1_000)
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            serializer.serialize_f64(millis as f64 / 1_000.0)
+        }
+    }
+}
+
+pub(crate) fn to_seconds(nanos: u64) -> Seconds {
+    Seconds(nanos)
 }
 
 fn labels_to_map(labels: &Labels) -> BTreeMap<String, String> {
@@ -260,6 +285,24 @@ pub fn instant(
     };
 
     let snapshot = Snapshot::load(store, &expr, at, at, max_samples)?;
+    // `x[5m]` asked for at one instant is the raw samples of each series in the window,
+    // a matrix, as Prometheus answers it. It came back as a vector of one value each.
+    if let Some(matrix) = snapshot.range_vector(&expr, at)? {
+        let result = matrix
+            .into_iter()
+            .map(|(labels, samples)| RangeResult {
+                metric: labels_to_map(&labels),
+                values: samples
+                    .into_iter()
+                    .map(|(at, value)| (to_seconds(at), format_value(value)))
+                    .collect(),
+            })
+            .collect();
+        return Ok(PromResponse::success(InstantData {
+            result_type: "matrix",
+            result: InstantAnswer::Matrix(result),
+        }));
+    }
     let vector = match snapshot.eval(&expr, at)? {
         Value::Vector(vector) => vector,
         // `resultType: scalar` and a bare pair, as Prometheus answers. It was a
@@ -330,7 +373,7 @@ pub fn range(
     // six-hour chart at a minute's resolution, hundreds of thousands of times — and an
     // ordered lookup pays for comparing whole label sets on every one. Order is restored
     // below, where it costs one sort instead of one per insert.
-    let mut series: HashMap<Labels, Vec<(f64, String)>> = HashMap::new();
+    let mut series: HashMap<Labels, Vec<(Seconds, String)>> = HashMap::new();
     // The answer is bounded like the read: every point returned is held, formatted and
     // serialised, and the loaded samples were never the only cost. A handful of series
     // multiplied by a fan-out and eleven thousand steps turned 200 input samples into
@@ -363,7 +406,7 @@ pub fn range(
         }
     }
 
-    let mut series: Vec<(Labels, Vec<(f64, String)>)> = series.into_iter().collect();
+    let mut series: Vec<(Labels, Vec<(Seconds, String)>)> = series.into_iter().collect();
     series.sort_by(|(a, _), (b, _)| a.cmp(b));
     let result = series
         .into_iter()
@@ -586,7 +629,7 @@ mod tests {
                 metric: [("app".to_owned(), "checkout".to_owned())]
                     .into_iter()
                     .collect(),
-                value: (1_750_000_000.0, "42".to_owned()),
+                value: (Seconds(1_750_000_000_000_000_000), "42".to_owned()),
             }]),
         });
         let json = serde_json::to_value(&response).unwrap();
@@ -601,11 +644,11 @@ mod tests {
         // A scalar is a bare pair, not a list.
         let scalar = PromResponse::success(InstantData {
             result_type: "scalar",
-            result: InstantAnswer::Scalar((1_750_000_000.0, "2".to_owned())),
+            result: InstantAnswer::Scalar((Seconds(1_750_000_000_000_000_000), "2".to_owned())),
         });
         assert_eq!(
             serde_json::to_value(&scalar).unwrap()["data"],
-            serde_json::json!({"resultType": "scalar", "result": [1_750_000_000.0, "2"]})
+            serde_json::json!({"resultType": "scalar", "result": [1_750_000_000u64, "2"]})
         );
     }
 
@@ -615,7 +658,7 @@ mod tests {
             result_type: "matrix",
             result: vec![RangeResult {
                 metric: BTreeMap::new(),
-                values: vec![(1_750_000_000.0, "1".to_owned())],
+                values: vec![(Seconds(1_750_000_000_000_000_000), "1".to_owned())],
             }],
         });
         let json = serde_json::to_value(&response).unwrap();
@@ -623,5 +666,16 @@ mod tests {
         assert_eq!(json["data"]["resultType"], "matrix");
         assert!(json["data"]["result"][0]["values"][0][0].is_number());
         assert!(json["data"]["result"][0]["values"][0][1].is_string());
+    }
+
+    /// Whole seconds are written without a fraction and anything finer to the
+    /// millisecond, as Prometheus's `MarshalTimestamp` writes them.
+    #[test]
+    fn times_are_written_as_prometheus_writes_them() {
+        let written = |nanos: u64| serde_json::to_string(&Seconds(nanos)).unwrap();
+        assert_eq!(written(1_790_603_509_000_000_000), "1790603509");
+        assert_eq!(written(1_790_603_509_781_000_000), "1790603509.781");
+        assert_eq!(written(1_790_603_509_781_999_999), "1790603509.781");
+        assert_eq!(written(0), "0");
     }
 }
