@@ -22,10 +22,16 @@ use telemetryd_store::metrics::MetricSchema;
 
 use crate::promql::{
     AggregateOp, BinaryModifier, BinaryOp, Expr, Function, Group, Grouping, Matching, Offset,
-    Selector,
+    Selector, Subquery,
 };
 
 const NANOS_PER_SECOND: f64 = 1e9;
+
+/// A range vector: each series' label set and its samples in time order.
+type Matrix = Vec<(Labels, Vec<(u64, f64)>)>;
+
+/// The most evaluations one subquery may make for one outer step.
+const MAX_SUBQUERY_POINTS: u64 = 11_000;
 
 /// One series' samples, ascending by time.
 #[derive(Debug, Clone)]
@@ -98,6 +104,9 @@ pub struct Snapshot {
     prepared: Vec<PreparedRate>,
     /// The step timestamps `prepared` was built for, so a lookup can find its index.
     prepared_steps: Vec<u64>,
+    /// The query's first and last evaluation times, which `@ start()` and `@ end()`
+    /// name.
+    bounds: (u64, u64),
     /// For each grouping the expression aggregates by, where each series lands.
     ///
     /// Keyed by [`Labels::storage_id`] rather than by the label set: every step is handed
@@ -513,6 +522,7 @@ fn collect_rate_calls<'a>(expr: &'a Expr, out: &mut Vec<(&'a Selector, Duration,
         Expr::Call { function, args } => {
             if matches!(function, Function::Rate | Function::Increase)
                 && let Some(Expr::Selector(selector)) = args.first()
+                && selector.at.is_none()
                 && let Some(range) = selector.range
             {
                 out.push((selector, range, *function == Function::Rate));
@@ -532,6 +542,7 @@ fn collect_rate_calls<'a>(expr: &'a Expr, out: &mut Vec<(&'a Selector, Duration,
             collect_rate_calls(right, out);
         }
         Expr::Negate(inner) => collect_rate_calls(inner, out),
+        Expr::Subquery(subquery) => collect_rate_calls(&subquery.inner, out),
         Expr::Selector(_) | Expr::Number(_) | Expr::String(_) => {}
     }
 }
@@ -602,7 +613,9 @@ impl Snapshot {
         // per point, which answers `rate` and `increase` exactly — and nothing else. A
         // bare selector wants the newest sample in a lookback, which no fold carries, so
         // an expression holding one is read the ordinary way however wide it is.
-        if !fully_foldable(expr) {
+        // Nor when time moves: a subquery evaluates at its own steps, and `@` at a time
+        // of its own, and a fold holds values for the query's points alone.
+        if !fully_foldable(expr) || expr.shifts_time() {
             return false;
         }
 
@@ -702,6 +715,7 @@ impl Snapshot {
             grouped,
             prepared,
             prepared_steps: points.to_vec(),
+            bounds: (0, 0),
         }))
     }
 
@@ -1101,6 +1115,7 @@ impl Snapshot {
             grouped,
             prepared,
             prepared_steps: points.to_vec(),
+            bounds: (0, 0),
         })
     }
 
@@ -1136,7 +1151,13 @@ impl Snapshot {
             .unwrap_or(0)
             .saturating_add(duration_nanos(expr.required_lookahead()));
         let lookback = expr.required_lookback();
-        let from = start_nanos.saturating_sub(duration_nanos(lookback));
+        let mut from = start_nanos.saturating_sub(duration_nanos(lookback));
+        // `@ 1609746000` reads around that time, wherever the query's own window is.
+        let mut end_nanos = end_nanos;
+        for fixed in expr.fixed_times() {
+            from = from.min(fixed.saturating_sub(duration_nanos(lookback)));
+            end_nanos = end_nanos.max(fixed);
+        }
 
         // One read covering every selector. A query's selectors usually differ only by
         // `offset`, so reading their union once and filtering per selector in memory is
@@ -1164,7 +1185,8 @@ impl Snapshot {
         // A window too large to hold is folded instead, which reads it a slice at a time
         // and keeps four numbers per series rather than every sample.
         if Self::should_fold(expr, points) {
-            return Self::load_folded(store, expr, points, &pushdown, max_samples);
+            return Self::load_folded(store, expr, points, &pushdown, max_samples)
+                .map(|snapshot| snapshot.bounded(points));
         }
 
         // One more than allowed, so a full collector is unambiguously an overflow rather
@@ -1216,10 +1238,27 @@ impl Snapshot {
             grouped,
             prepared: Vec::new(),
             prepared_steps: Vec::new(),
-        })
+            bounds: (0, 0),
+        }
+        .bounded(points))
     }
 
-    /// Build directly from samples, for testing and for the in-memory path.
+    /// With `@ start()` and `@ end()` resolved against these evaluation times.
+    fn bounded(mut self, points: &[u64]) -> Self {
+        self.bounds = (
+            points.iter().copied().min().unwrap_or(0),
+            points.iter().copied().max().unwrap_or(0),
+        );
+        self
+    }
+
+    /// The time a selector reads at for evaluation time `at_nanos`: its `@` if it has
+    /// one, then its `offset`.
+    fn time_of(&self, selector: &Selector, at_nanos: u64) -> u64 {
+        let at = selector.at.map_or(at_nanos, |at| at.resolve(self.bounds));
+        selector.offset.apply(at)
+    }
+
     /// Build directly from samples, for testing and for the in-memory path.
     pub fn from_samples(samples: Vec<MetricSample>) -> Self {
         let series = group_samples(samples);
@@ -1235,6 +1274,7 @@ impl Snapshot {
             grouped: Vec::new(),
             prepared: Vec::new(),
             prepared_steps: Vec::new(),
+            bounds: (0, 0),
         }
     }
 
@@ -1248,6 +1288,11 @@ impl Snapshot {
             Expr::Number(value) => Ok(Value::Scalar(*value)),
             Expr::String(_) => Err(Error::BadRequest(
                 "a string is not a value PromQL can answer with here".to_owned(),
+            )),
+            Expr::Subquery(_) => Err(Error::BadRequest(
+                "a subquery is a range vector; take it through a function such as \
+                 max_over_time(…[1h:1m])"
+                    .to_owned(),
             )),
             Expr::Selector(selector) => Ok(Value::Vector(self.instant(selector, at_nanos))),
             Expr::Negate(inner) => Ok(match self.eval(inner, at_nanos)? {
@@ -1486,7 +1531,7 @@ impl Snapshot {
         at_nanos: u64,
     ) -> InstantVector {
         if let Some(Expr::Selector(selector)) = arg {
-            let at = selector.offset.apply(at_nanos);
+            let at = self.time_of(selector, at_nanos);
             let floor = at.saturating_sub(duration_nanos(crate::promql::DEFAULT_LOOKBACK));
             let mut samples = Vec::new();
             for index in self.matching(selector) {
@@ -1516,6 +1561,9 @@ impl Snapshot {
         position: usize,
         at_nanos: u64,
     ) -> Result<Value> {
+        if let Some(Expr::Subquery(subquery)) = args.get(position) {
+            return self.eval_over_subquery(function, args, subquery, at_nanos);
+        }
         let Some(Expr::Selector(selector)) = args.get(position) else {
             return Err(Error::BadRequest(format!(
                 "`{}` needs a range vector, e.g. {}(metric[5m])",
@@ -1542,7 +1590,7 @@ impl Snapshot {
             Function::PredictLinear => self.scalar_argument(function, &args[1], at_nanos)?,
             _ => 0.0,
         };
-        let at = selector.offset.apply(at_nanos);
+        let at = self.time_of(selector, at_nanos);
         let floor = at.saturating_sub(duration_nanos(range));
         let mut samples = Vec::new();
         let mut any = false;
@@ -1573,6 +1621,98 @@ impl Snapshot {
         Ok(Value::Vector(InstantVector { samples }))
     }
 
+    /// A range function over a subquery's series.
+    fn eval_over_subquery(
+        &self,
+        function: Function,
+        args: &[Expr],
+        subquery: &Subquery,
+        at_nanos: u64,
+    ) -> Result<Value> {
+        let parameter = match function {
+            Function::QuantileOverTime => self.scalar_argument(function, &args[0], at_nanos)?,
+            Function::PredictLinear => self.scalar_argument(function, &args[1], at_nanos)?,
+            _ => 0.0,
+        };
+        let (floor, at, matrix) = self.subquery_matrix(subquery, at_nanos)?;
+        let mut samples = Vec::new();
+        let mut any = false;
+        for (labels, points) in matrix {
+            let points: Vec<(u64, f64)> = points
+                .into_iter()
+                .filter(|(_, value)| !telemetryd_core::is_stale_marker(*value))
+                .collect();
+            any |= !points.is_empty();
+            let value = match function {
+                Function::Rate | Function::Increase => {
+                    rate_over(&points, Window { floor, at }, function == Function::Rate)
+                }
+                _ => crate::promfn::over_range(function, &points, (floor, at), at_nanos, parameter),
+            };
+            if let Some(value) = value {
+                let labels = if function == Function::LastOverTime {
+                    labels
+                } else {
+                    strip_name(&labels)
+                };
+                samples.push((labels, value));
+            }
+        }
+        if function == Function::AbsentOverTime {
+            return Ok(Value::Vector(absent(any, None)));
+        }
+        Ok(Value::Vector(InstantVector { samples }))
+    }
+
+    /// A subquery as a range vector: its inner expression evaluated at every multiple of
+    /// its step inside `(floor, at]`, one series per label set. Returns the window too.
+    fn subquery_matrix(&self, subquery: &Subquery, at_nanos: u64) -> Result<(u64, u64, Matrix)> {
+        let end = subquery
+            .offset
+            .apply(subquery.at.map_or(at_nanos, |at| at.resolve(self.bounds)));
+        let floor = end.saturating_sub(duration_nanos(subquery.range));
+        let step = duration_nanos(
+            subquery
+                .step
+                .unwrap_or(crate::promql::DEFAULT_SUBQUERY_STEP),
+        )
+        .max(1);
+        // Each point is a full evaluation of the inner expression. Prometheus refuses a
+        // query past 11,000 points per series, and so does this, per subquery window.
+        if duration_nanos(subquery.range) / step > MAX_SUBQUERY_POINTS {
+            return Err(Error::BadRequest(format!(
+                "this subquery evaluates more than {MAX_SUBQUERY_POINTS} points per step; \
+                 use a larger step"
+            )));
+        }
+        let mut positions: HashMap<Labels, usize> = HashMap::new();
+        let mut matrix: Matrix = Vec::new();
+        let mut t = (floor / step) * step;
+        if t <= floor {
+            t += step;
+        }
+        while t <= end {
+            let vector = match self.eval(&subquery.inner, t)? {
+                Value::Vector(vector) => vector,
+                Value::Scalar(_) => {
+                    return Err(Error::BadRequest(
+                        "a subquery takes an expression that answers a vector, not a number"
+                            .to_owned(),
+                    ));
+                }
+            };
+            for (labels, value) in vector.samples {
+                let position = *positions.entry(labels.clone()).or_insert_with(|| {
+                    matrix.push((labels, Vec::new()));
+                    matrix.len() - 1
+                });
+                matrix[position].1.push((t, value));
+            }
+            t += step;
+        }
+        Ok((floor, end, matrix))
+    }
+
     /// An argument that has to be a number, like `histogram_quantile`'s first.
     fn scalar_argument(&self, function: Function, arg: &Expr, at_nanos: u64) -> Result<f64> {
         match self.eval(arg, at_nanos)? {
@@ -1586,7 +1726,7 @@ impl Snapshot {
 
     /// The most recent sample per matching series within the lookback window.
     fn instant(&self, selector: &Selector, at_nanos: u64) -> InstantVector {
-        let at = selector.offset.apply(at_nanos);
+        let at = self.time_of(selector, at_nanos);
         let floor = at.saturating_sub(duration_nanos(crate::promql::DEFAULT_LOOKBACK));
 
         let mut samples = Vec::new();
@@ -1619,6 +1759,12 @@ impl Snapshot {
     /// nothing to gain, so it does not call this and every lookup falls through to the
     /// per-step path — which stays correct and is what the unit tests exercise.
     pub fn prepare(&mut self, expr: &Expr, steps: &[u64]) {
+        if !steps.is_empty() {
+            self.bounds = (
+                steps.iter().copied().min().unwrap_or(0),
+                steps.iter().copied().max().unwrap_or(0),
+            );
+        }
         if steps.len() < 2 {
             return;
         }
@@ -1688,12 +1834,14 @@ impl Snapshot {
         // Prepared for this exact step? Then the work is already done and this is a
         // lookup. Falls through otherwise — an instant query, or a call the preparation
         // pass did not see.
-        if let Some(prepared) = self.prepared.iter().find(|p| {
-            p.matchers == selector.matchers
-                && p.range == range
-                && p.per_second == per_second
-                && p.offset == selector.offset
-        }) && let Ok(step) = self.prepared_steps.binary_search(&at_nanos)
+        if selector.at.is_none()
+            && let Some(prepared) = self.prepared.iter().find(|p| {
+                p.matchers == selector.matchers
+                    && p.range == range
+                    && p.per_second == per_second
+                    && p.offset == selector.offset
+            })
+            && let Ok(step) = self.prepared_steps.binary_search(&at_nanos)
             && let Some(at_step) = prepared.by_step.get(step)
         {
             return InstantVector {
@@ -1704,7 +1852,7 @@ impl Snapshot {
             };
         }
 
-        let at = selector.offset.apply(at_nanos);
+        let at = self.time_of(selector, at_nanos);
         let floor = at.saturating_sub(duration_nanos(range));
 
         let mut samples = Vec::new();
@@ -3079,6 +3227,39 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect()
+    }
+
+    /// Over a range query, `@ start()` and `@ end()` read the same instant at every step:
+    /// the query's first and its last.
+    #[test]
+    fn at_start_and_end_hold_still_across_a_range() {
+        let samples: Vec<MetricSample> = (0..20u64)
+            .map(|i| {
+                sample(
+                    "gauge",
+                    "a",
+                    T0 + i * 15 * SECOND,
+                    f64::from(u32::try_from(i).unwrap()),
+                )
+            })
+            .collect();
+        let points: Vec<u64> = (4..=12u64).map(|i| T0 + i * 15 * SECOND).collect();
+        for (query, expected) in [("gauge @ start()", 4.0), ("gauge @ end()", 12.0)] {
+            let expr = crate::promql::parse(query).unwrap();
+            let mut snapshot = Snapshot::from_samples(samples.clone());
+            snapshot.prepare(&expr, &points);
+            for at in &points {
+                let values: Vec<f64> = snapshot
+                    .eval(&expr, *at)
+                    .unwrap()
+                    .into_vector()
+                    .samples
+                    .iter()
+                    .map(|(_, v)| *v)
+                    .collect();
+                assert_eq!(values, [expected], "{query} at {at}");
+            }
+        }
     }
 
     /// `or` keeps the left side, and adds from the right what the left has no match

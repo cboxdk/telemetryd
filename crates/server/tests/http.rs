@@ -1618,7 +1618,7 @@ async fn a_refused_query_is_counted_by_reason() {
     let harness = Harness::new(|_| {});
 
     let request = Request::builder()
-        .uri("/api/v1/query?query=probe%20@%20end()")
+        .uri("/api/v1/query?query=holt_winters(probe%5B1h%5D%2C%200.5%2C%200.5)")
         .body(Body::empty())
         .unwrap();
     let (status, _, _) = harness.request(request).await;

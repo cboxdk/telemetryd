@@ -414,7 +414,8 @@ a range that straddles it has both. Nothing needs to be done about that beyond w
 Answers are held to Prometheus's own: `crates/query/tests/conformance/promql.json` is a
 promtool test file whose expectations Prometheus wrote, CI asks Prometheus for them again
 on every run, and telemetryd must give the same answer by each of its three read paths.
-A hundred and thirty-four expressions across every supported function and aggregation,
+A hundred and fifty-one expressions across every supported function and aggregation,
+subqueries, `@`,
 rates and increases with counter resets, histogram quantiles, offsets, staleness, gaps,
 operator precedence, comparisons and every kind of vector matching.
 
@@ -454,12 +455,16 @@ Driven by what `PromqlCompiler` actually generates:
   the refusals Prometheus gives for an ambiguous match
 - **`offset`**, including a negative one — `offset -5m` reads five minutes after the
   evaluation time, as Prometheus 3 allows
+- **subqueries**, `max_over_time(rate(x[5m])[1h:1m])`, evaluated at step-aligned times
+  inside the window as Prometheus does; `[1h:]` takes a one-minute step
+- **the `@` modifier** — `x @ 1700000000`, `@ start()`, `@ end()` — on selectors and
+  subqueries, in either order with `offset`
 - **`or` between vectors**, and **`clamp_min`** — with `offset`, required by the
   compiler's counter-increase form:
   `clamp_min(sel - (sel offset 5m or sel * 0), 0)`. Our first plan listed all three as
   out of scope; they are not.
 
-*Not supported:* subqueries, the `@` modifier, `holt_winters` /
+*Not supported:* `holt_winters` /
 `double_exponential_smoothing`, `sort_by_label`, the experimental `limitk`/`limit_ratio`,
 recording and alerting rules, `/api/v1/rules`, `/api/v1/alerts`, exemplars and native
 histograms.

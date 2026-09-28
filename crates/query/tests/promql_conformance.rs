@@ -58,7 +58,7 @@ fn every_expression_answers_as_prometheus_does() {
         let query = case["expr"].as_str().unwrap();
         let at = BASE + duration(case["eval_time"].as_str().unwrap());
         let expected = shifted(query, expected(&case["exp_samples"]));
-        let expr = promql::parse(query).unwrap();
+        let expr = promql::parse(&at_shifted(query)).unwrap();
 
         let mut in_memory = Snapshot::from_samples(samples.clone());
         in_memory.prepare(&expr, &[at]);
@@ -183,6 +183,24 @@ fn expected(samples: &Json) -> Vec<(Labels, f64)> {
         })
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// `@ 60` names an absolute time; moved to where this test put time zero.
+fn at_shifted(query: &str) -> String {
+    let mut out = String::new();
+    let mut rest = query;
+    while let Some(position) = rest.find("@ ") {
+        out.push_str(&rest[..position + 2]);
+        rest = &rest[position + 2..];
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        if digits > 0 {
+            let seconds: u64 = rest[..digits].parse().unwrap();
+            out.push_str(&(seconds + BASE_SECONDS).to_string());
+            rest = &rest[digits..];
+        }
+    }
+    out.push_str(rest);
     out
 }
 

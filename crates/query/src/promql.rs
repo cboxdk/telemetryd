@@ -49,6 +49,46 @@ pub enum Expr {
     },
     /// Unary minus.
     Negate(Box<Expr>),
+    /// `expr[range:step]`: the inner expression evaluated at step-aligned times across
+    /// the range, as a range vector.
+    Subquery(Box<Subquery>),
+}
+
+#[derive(Debug, Clone)]
+pub struct Subquery {
+    pub inner: Expr,
+    pub range: Duration,
+    /// `None` for `[5m:]`, which takes [`DEFAULT_SUBQUERY_STEP`].
+    pub step: Option<Duration>,
+    pub offset: Offset,
+    pub at: Option<At>,
+}
+
+/// The step a subquery takes when it names none, as Prometheus's default evaluation
+/// interval.
+pub const DEFAULT_SUBQUERY_STEP: Duration = Duration::from_secs(60);
+
+/// The `@` modifier: evaluate at a fixed time rather than at each step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum At {
+    /// `@ 1609746000`, in Unix nanoseconds.
+    Time(u64),
+    /// `@ start()`: the query's first evaluation time.
+    Start,
+    /// `@ end()`: its last.
+    End,
+}
+
+impl At {
+    /// The time this names, given the query's first and last evaluation times.
+    #[must_use]
+    pub fn resolve(self, (start, end): (u64, u64)) -> u64 {
+        match self {
+            Self::Time(nanos) => nanos,
+            Self::Start => start,
+            Self::End => end,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +98,8 @@ pub struct Selector {
     pub range: Option<Duration>,
     /// `offset 5m` looks back five minutes; `offset -5m` looks ahead.
     pub offset: Offset,
+    /// `@ …`: evaluated at this time instead of each step's.
+    pub at: Option<At>,
 }
 
 /// How far a selector shifts its evaluation time.
@@ -739,6 +781,7 @@ impl Parser<'_> {
     /// made them 36 and 64. The exponent may carry its own sign, `2^-1`.
     fn parse_power(&mut self) -> Result<Expr> {
         let base = self.parse_atom()?;
+        let base = self.parse_subquery_suffix(base)?;
         if self.peek() != Some(&Token::Caret) {
             return Ok(base);
         }
@@ -992,49 +1035,132 @@ impl Parser<'_> {
     fn finish_selector(&mut self, matchers: Vec<LabelMatcher>) -> Result<Expr> {
         let mut range = None;
         if self.peek() == Some(&Token::LeftBracket) {
-            self.pos += 1;
-            let Some(Token::Duration(nanos)) = self.peek().cloned() else {
-                return Err(self.unexpected("a duration inside `[…]`"));
-            };
-            self.pos += 1;
-
-            // `[5m:1m]` is a subquery — real PromQL, and out of the subset.
-            if self.peek() == Some(&Token::Colon) {
-                return Err(Error::unsupported_with_hint(
-                    "PromQL subqueries",
-                    "aggregate over a range vector instead, e.g. rate(metric[5m])",
-                ));
+            let (window, step) = self.parse_brackets()?;
+            match step {
+                Some(step) => {
+                    let (offset, at) = self.parse_offset_and_at()?;
+                    let inner = Expr::Selector(Selector {
+                        matchers,
+                        range: None,
+                        offset: Offset::default(),
+                        at: None,
+                    });
+                    return Ok(Expr::Subquery(Box::new(Subquery {
+                        inner,
+                        range: window,
+                        step,
+                        offset,
+                        at,
+                    })));
+                }
+                None => range = Some(window),
             }
-            self.expect(&Token::RightBracket, "`]`")?;
-            range = Some(Duration::from_nanos(nanos));
         }
-
-        let mut offset = Offset::default();
-        if matches!(self.peek(), Some(Token::Ident(word)) if word == "offset") {
-            self.pos += 1;
-            let ahead = self.peek() == Some(&Token::Minus);
-            if ahead {
-                self.pos += 1;
-            }
-            let Some(Token::Duration(nanos)) = self.peek().cloned() else {
-                return Err(self.unexpected("a duration after `offset`"));
-            };
-            self.pos += 1;
-            offset = Offset { nanos, ahead };
-        }
-
-        if self.peek() == Some(&Token::At) {
-            return Err(Error::unsupported_with_hint(
-                "the PromQL `@` modifier",
-                "use `offset` to shift the evaluation time",
-            ));
-        }
-
+        let (offset, at) = self.parse_offset_and_at()?;
         Ok(Expr::Selector(Selector {
             matchers,
             range,
             offset,
+            at,
         }))
+    }
+
+    /// `[5m]`, `[5m:1m]` or `[5m:]`: the range, and — for a subquery — its step, which
+    /// is `Some(None)` when left to the default.
+    #[allow(clippy::option_option)] // "not a subquery" and "a subquery with no step" differ
+    fn parse_brackets(&mut self) -> Result<(Duration, Option<Option<Duration>>)> {
+        self.expect(&Token::LeftBracket, "`[`")?;
+        let Some(Token::Duration(nanos)) = self.peek().cloned() else {
+            return Err(self.unexpected("a duration inside `[…]`"));
+        };
+        self.pos += 1;
+        let window = Duration::from_nanos(nanos);
+        let step = if self.peek() == Some(&Token::Colon) {
+            self.pos += 1;
+            if let Some(Token::Duration(step)) = self.peek().cloned() {
+                self.pos += 1;
+                if step == 0 {
+                    return Err(Error::BadRequest(
+                        "a subquery's step must be above zero".to_owned(),
+                    ));
+                }
+                Some(Some(Duration::from_nanos(step)))
+            } else {
+                Some(None)
+            }
+        } else {
+            None
+        };
+        self.expect(&Token::RightBracket, "`]`")?;
+        Ok((window, step))
+    }
+
+    /// `offset …` and `@ …`, in either order, each at most once.
+    fn parse_offset_and_at(&mut self) -> Result<(Offset, Option<At>)> {
+        let (mut offset, mut at) = (None, None);
+        loop {
+            if matches!(self.peek(), Some(Token::Ident(word)) if word == "offset")
+                && offset.is_none()
+            {
+                self.pos += 1;
+                let ahead = self.peek() == Some(&Token::Minus);
+                if ahead {
+                    self.pos += 1;
+                }
+                let Some(Token::Duration(nanos)) = self.peek().cloned() else {
+                    return Err(self.unexpected("a duration after `offset`"));
+                };
+                self.pos += 1;
+                offset = Some(Offset { nanos, ahead });
+            } else if self.peek() == Some(&Token::At) && at.is_none() {
+                self.pos += 1;
+                at = Some(self.parse_at()?);
+            } else {
+                return Ok((offset.unwrap_or_default(), at));
+            }
+        }
+    }
+
+    /// What follows `@`: a Unix time in seconds, `start()` or `end()`.
+    fn parse_at(&mut self) -> Result<At> {
+        match self.peek().cloned() {
+            Some(Token::Number(seconds)) if seconds.is_finite() && seconds >= 0.0 => {
+                self.pos += 1;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                Ok(At::Time((seconds * 1e9).round() as u64))
+            }
+            Some(Token::Ident(word)) if word == "start" || word == "end" => {
+                self.pos += 1;
+                self.expect(&Token::LeftParen, "`(`")?;
+                self.expect(&Token::RightParen, "`)`")?;
+                Ok(if word == "start" { At::Start } else { At::End })
+            }
+            _ => Err(self.unexpected("a Unix time, `start()` or `end()` after `@`")),
+        }
+    }
+
+    /// `(expr)[5m:1m]`, `rate(x[5m])[1h:]`: a subquery on something other than a bare
+    /// selector, which `finish_selector` handles itself.
+    fn parse_subquery_suffix(&mut self, mut expr: Expr) -> Result<Expr> {
+        while self.peek() == Some(&Token::LeftBracket) {
+            let (window, step) = self.parse_brackets()?;
+            let Some(step) = step else {
+                return Err(Error::BadRequest(
+                    "a range like `[5m]` belongs on a selector; to take a range of an \
+                     expression, make it a subquery: `(…)[5m:1m]`"
+                        .to_owned(),
+                ));
+            };
+            let (offset, at) = self.parse_offset_and_at()?;
+            expr = Expr::Subquery(Box::new(Subquery {
+                inner: expr,
+                range: window,
+                step,
+                offset,
+                at,
+            }));
+        }
+        Ok(expr)
     }
 
     // -- token helpers -----------------------------------------------------
@@ -1096,7 +1222,7 @@ fn is_scalar(expr: &Expr) -> bool {
         Expr::Negate(inner) => is_scalar(inner),
         Expr::Binary { left, right, .. } => is_scalar(left) && is_scalar(right),
         Expr::Call { function, .. } => function.returns_scalar(),
-        Expr::Selector(_) | Expr::Aggregation { .. } | Expr::String(_) => false,
+        Expr::Selector(_) | Expr::Aggregation { .. } | Expr::String(_) | Expr::Subquery(_) => false,
     }
 }
 
@@ -1170,6 +1296,7 @@ impl Expr {
                 right.collect_groupings(out);
             }
             Self::Negate(inner) => inner.collect_groupings(out),
+            Self::Subquery(subquery) => subquery.inner.collect_groupings(out),
             Self::Selector(_) | Self::Number(_) | Self::String(_) => {}
         }
     }
@@ -1183,6 +1310,7 @@ impl Expr {
                 }
             }
             Self::Aggregation { inner, .. } | Self::Negate(inner) => inner.collect_selectors(out),
+            Self::Subquery(subquery) => subquery.inner.collect_selectors(out),
             Self::Binary { left, right, .. } => {
                 left.collect_selectors(out);
                 right.collect_selectors(out);
@@ -1196,26 +1324,92 @@ impl Expr {
     /// Used to widen the storage read so a `rate(x[5m])` at the start of a range still
     /// has samples behind it — without this the first points of every chart are empty.
     pub fn required_lookback(&self) -> Duration {
-        let mut widest = DEFAULT_LOOKBACK;
-        self.walk(&mut |expr| {
-            if let Self::Selector(selector) = expr {
-                let needed = selector.range.unwrap_or(DEFAULT_LOOKBACK) + selector.offset.behind();
-                widest = widest.max(needed);
+        match self {
+            Self::Selector(selector) => (selector.range.unwrap_or(DEFAULT_LOOKBACK)
+                + selector.offset.behind())
+            .max(DEFAULT_LOOKBACK),
+            // The subquery reaches back its range, then each step it evaluates at reaches
+            // back as far as its inner expression does — and the first step may sit a
+            // step before the window's start.
+            Self::Subquery(subquery) => {
+                subquery.range
+                    + subquery.offset.behind()
+                    + subquery.step.unwrap_or(DEFAULT_SUBQUERY_STEP)
+                    + subquery.inner.required_lookback()
             }
-        });
-        widest
+            _ => {
+                let mut widest = DEFAULT_LOOKBACK;
+                self.children(&mut |child| widest = widest.max(child.required_lookback()));
+                widest
+            }
+        }
     }
 
     /// How far past the last evaluation time any part of this expression reads — a
     /// negative `offset`'s reach. Zero for everything else.
     pub fn required_lookahead(&self) -> Duration {
-        let mut furthest = Duration::ZERO;
-        self.walk(&mut |expr| {
-            if let Self::Selector(selector) = expr {
-                furthest = furthest.max(selector.offset.beyond());
+        match self {
+            Self::Selector(selector) => selector.offset.beyond(),
+            Self::Subquery(subquery) => {
+                subquery.offset.beyond() + subquery.inner.required_lookahead()
             }
+            _ => {
+                let mut furthest = Duration::ZERO;
+                self.children(&mut |child| furthest = furthest.max(child.required_lookahead()));
+                furthest
+            }
+        }
+    }
+
+    /// Every fixed time an `@` names, for widening the read to cover it.
+    #[must_use]
+    pub fn fixed_times(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        self.walk(&mut |expr| match expr {
+            Self::Selector(Selector {
+                at: Some(At::Time(t)),
+                ..
+            }) => out.push(*t),
+            Self::Subquery(subquery) => {
+                if let Some(At::Time(t)) = subquery.at {
+                    out.push(t);
+                }
+            }
+            _ => {}
         });
-        furthest
+        out
+    }
+
+    /// Whether any part is a subquery or carries `@` — what a fold cannot answer.
+    #[must_use]
+    pub fn shifts_time(&self) -> bool {
+        let mut shifts = false;
+        self.walk(&mut |expr| {
+            shifts |= matches!(
+                expr,
+                Self::Subquery(_) | Self::Selector(Selector { at: Some(_), .. })
+            );
+        });
+        shifts
+    }
+
+    fn children(&self, visit: &mut impl FnMut(&Self)) {
+        match self {
+            Self::Call { args, .. } => args.iter().for_each(&mut *visit),
+            Self::Aggregation { param, inner, .. } => {
+                if let Some(param) = param {
+                    visit(param);
+                }
+                visit(inner);
+            }
+            Self::Negate(inner) => visit(inner),
+            Self::Subquery(subquery) => visit(&subquery.inner),
+            Self::Binary { left, right, .. } => {
+                visit(left);
+                visit(right);
+            }
+            Self::Number(_) | Self::String(_) | Self::Selector(_) => {}
+        }
     }
 
     fn walk(&self, visit: &mut impl FnMut(&Self)) {
@@ -1227,6 +1421,7 @@ impl Expr {
                 }
             }
             Self::Aggregation { inner, .. } | Self::Negate(inner) => inner.walk(visit),
+            Self::Subquery(subquery) => subquery.inner.walk(visit),
             Self::Binary { left, right, .. } => {
                 left.walk(visit);
                 right.walk(visit);
@@ -1471,12 +1666,43 @@ mod tests {
     }
 
     #[test]
-    fn subqueries_and_the_at_modifier_are_named() {
-        let err = parse("rate(up[5m:1m])").unwrap_err();
-        assert!(err.to_string().contains("subquer"), "{err}");
+    fn subqueries_and_the_at_modifier_parse() {
+        let Expr::Call { args, .. } = parse("rate(up[5m:1m] offset 1m)").unwrap() else {
+            panic!("a call");
+        };
+        let Expr::Subquery(subquery) = &args[0] else {
+            panic!("a subquery");
+        };
+        assert_eq!(subquery.range, Duration::from_secs(300));
+        assert_eq!(subquery.step, Some(Duration::from_secs(60)));
+        assert_eq!(subquery.offset.nanos, 60_000_000_000);
 
-        let err = parse("up @ 1700000000").unwrap_err();
-        assert!(err.to_string().contains('@'), "{err}");
+        let Expr::Call { args, .. } = parse("max_over_time(rate(up[1m])[1h:])").unwrap() else {
+            panic!("a call");
+        };
+        assert!(matches!(&args[0], Expr::Subquery(s) if s.step.is_none()));
+
+        assert_eq!(
+            selector_of(&parse("up @ 1700000000.5").unwrap()).at,
+            Some(At::Time(1_700_000_000_500_000_000))
+        );
+        assert_eq!(
+            selector_of(&parse("up offset 5m @ end()").unwrap()).at,
+            Some(At::End)
+        );
+        assert_eq!(
+            selector_of(&parse("up @ start() offset 5m").unwrap()).at,
+            Some(At::Start)
+        );
+
+        for (query, says) in [
+            ("sum(up)[5m]", "make it a subquery"),
+            ("up[5m:0s]", "above zero"),
+            ("up @ now()", "after `@`"),
+        ] {
+            let err = parse(query).unwrap_err().to_string();
+            assert!(err.contains(says), "{query}: {err}");
+        }
     }
 
     fn binary_parts(expr: &Expr) -> (BinaryOp, &Expr, &Expr, &BinaryModifier) {
