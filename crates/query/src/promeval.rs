@@ -213,6 +213,32 @@ impl Fold {
         self.last_value = value;
     }
 
+    /// [`Self::add`] for each sample of a run, in order.
+    ///
+    /// The same arithmetic, in one tight loop: an instant query over a day folds a
+    /// series' whole run into one cell, and placing each sample separately cost as much
+    /// as reading it.
+    fn add_all(&mut self, timestamps: &[u64], values: &[f64]) {
+        for (&at, &value) in timestamps.iter().zip(values) {
+            if telemetryd_core::is_stale_marker(value) {
+                continue;
+            }
+            if self.seen == 0 {
+                self.first_nanos = at;
+                self.first_value = value;
+            } else {
+                self.increase += if value < self.last_value {
+                    value
+                } else {
+                    value - self.last_value
+                };
+            }
+            self.seen = self.seen.saturating_add(1);
+            self.last_nanos = at;
+            self.last_value = value;
+        }
+    }
+
     /// The same answer [`rate_over`] gives for the same samples.
     fn finish(&self, window: Window, per_second: bool) -> Option<f64> {
         extrapolate(
@@ -538,7 +564,27 @@ impl<'a> FoldState<'a> {
             let cells = &mut self.folds[call][index];
             // `lo`: the first point whose window ends at or after the sample. `hi`: the
             // first whose window starts at or after it. The sample belongs to `lo..hi`.
-            let (mut lo, mut hi) = (0usize, 0usize);
+            // Found by bisection for the run's first sample, then walked: a buffered run
+            // is a handful of samples, and walking from the first point for each of them
+            // cost a pass over every point per run.
+            let Some(&first) = timestamps.first() else {
+                continue;
+            };
+            let mut lo = bounds.partition_point(|(_, end)| first > *end);
+            let mut hi = bounds.partition_point(|(floor, _)| first > *floor);
+            // Every sample inside the same points' windows — the run lies within each of
+            // them — and each of those cells takes the whole run at once.
+            let last = timestamps[timestamps.len() - 1];
+            if bounds[lo..hi]
+                .iter()
+                .all(|(floor, end)| first > *floor && last <= *end)
+                && bounds.get(hi).is_none_or(|(floor, _)| last <= *floor)
+            {
+                for cell in &mut cells[lo..hi] {
+                    cell.add_all(timestamps, values);
+                }
+                continue;
+            }
             for (&at, &value) in timestamps.iter().zip(values) {
                 while lo < bounds.len() && at > bounds[lo].1 {
                     lo += 1;

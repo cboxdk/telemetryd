@@ -194,6 +194,9 @@ pub(crate) struct SeriesOrder {
     pub(crate) rows: Vec<u32>,
     /// `rows[start..end]` for each run of one label set.
     pub(crate) runs: Vec<(u32, u32)>,
+    /// The address of each run's label set, ascending, so a query can decide on a run
+    /// without reaching into the records.
+    pub(crate) keys: Vec<usize>,
 }
 
 impl<S: RecordSchema> Chunk<S> {
@@ -223,6 +226,7 @@ impl<S: RecordSchema> Chunk<S> {
             // Stable: two records of one series at one instant keep arrival order.
             rows.sort_by_key(|row| key(*row));
             let mut runs = Vec::new();
+            let mut keys = Vec::new();
             let mut start = 0usize;
             for at in 1..=rows.len() {
                 if at == rows.len() || key(rows[at]).0 != key(rows[start]).0 {
@@ -230,10 +234,11 @@ impl<S: RecordSchema> Chunk<S> {
                         u32::try_from(start).unwrap_or(u32::MAX),
                         u32::try_from(at).unwrap_or(u32::MAX),
                     ));
+                    keys.push(key(rows[start]).0);
                     start = at;
                 }
             }
-            SeriesOrder { rows, runs }
+            SeriesOrder { rows, runs, keys }
         })
     }
 }
@@ -1462,12 +1467,13 @@ impl<S: RecordSchema> RecordStore<S> {
 
         let mut oldest = segments.iter().map(|s| s.manifest.min_time_nanos).min();
         let mut newest = segments.iter().map(|s| s.manifest.max_time_nanos).max();
-        for chunk in &buffered {
-            for record in &chunk.records {
-                let ts = S::timestamp(record);
-                oldest = Some(oldest.map_or(ts, |o| o.min(ts)));
-                newest = Some(newest.map_or(ts, |n| n.max(ts)));
-            }
+        // From each chunk's bounds, which are exact: kept as records are appended. Walking
+        // the records instead cost every folded query a pass over the whole buffer — the
+        // query layer asks for the oldest record to clamp its window — and that was a
+        // quarter of a query over two and a half million buffered samples.
+        for chunk in buffered.iter().filter(|chunk| !chunk.records.is_empty()) {
+            oldest = Some(oldest.map_or(chunk.min_nanos, |o| o.min(chunk.min_nanos)));
+            newest = Some(newest.map_or(chunk.max_nanos, |n| n.max(chunk.max_nanos)));
         }
 
         RecordStoreStatus {

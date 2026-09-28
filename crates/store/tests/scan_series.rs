@@ -261,3 +261,18 @@ fn a_segment_without_the_layout_flag_is_read_by_time_range() {
         );
     }
 }
+
+/// One series out of the middle of a segment laid out series by series: a few rows the
+/// row selection has to find inside pages holding others.
+#[test]
+fn one_series_from_the_middle_of_a_segment() {
+    let (_dir, store) = filled();
+    let span = (205 * SECOND, 1_395 * SECOND);
+    for route in [0, 7, 57, 119] {
+        let matchers =
+            vec![LabelMatcher::new("route", MatchOp::Equal, format!("/r{route}")).unwrap()];
+        let scanned = by_scan(&store, &[span], &matchers);
+        assert_eq!(scanned.len(), 1, "route {route}");
+        assert_eq!(scanned, by_rows(&store, span, &matchers), "route {route}");
+    }
+}
