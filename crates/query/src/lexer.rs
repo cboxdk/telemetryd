@@ -50,6 +50,8 @@ pub enum Token {
     Number(f64),
     /// A duration literal such as `5m` or `1h30m`, in nanoseconds.
     Duration(u64),
+    /// A byte size such as `20MB` or `1.5KiB`, in bytes — LogQL's size comparisons.
+    Bytes(u64),
     /// `@` — PromQL's `@` modifier. Tokenised so it can be *named* as unsupported.
     At,
     /// `:` — subquery separator, likewise.
@@ -92,6 +94,7 @@ impl fmt::Display for Token {
             Self::String(value) => write!(f, "{value:?}"),
             Self::Number(value) => write!(f, "{value}"),
             Self::Duration(nanos) => write!(f, "{nanos}ns"),
+            Self::Bytes(bytes) => write!(f, "{bytes}B"),
         }
     }
 }
@@ -355,6 +358,20 @@ impl<'a> Lexer<'a> {
             self.pos += 1;
         }
 
+        // A byte unit makes it a size: 20MB, 1.5KiB. Checked first, since `b` and the
+        // two-letter units are no duration's.
+        let unit_end = self.bytes[self.pos..]
+            .iter()
+            .position(|c| !c.is_ascii_alphabetic())
+            .map_or(self.bytes.len(), |i| self.pos + i);
+        if let Some(scale) = byte_unit(&self.input[self.pos..unit_end])
+            && let Ok(number) = self.input[start..self.pos].parse::<f64>()
+        {
+            self.pos = unit_end;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            return Ok(Token::Bytes((number * scale).round() as u64));
+        }
+
         // A trailing unit makes this a duration: 5m, 1h30m, 500ms.
         if self.peek(0).is_some_and(|c| c.is_ascii_alphabetic()) {
             self.pos = start;
@@ -459,6 +476,29 @@ impl<'a> Lexer<'a> {
     }
 }
 
+/// How many bytes a size unit means, case-insensitively: decimal `KB`, binary `KiB`.
+#[must_use]
+pub fn byte_unit(unit: &str) -> Option<f64> {
+    let unit = unit.to_ascii_lowercase();
+    let power = |base: f64, exponent: i32| base.powi(exponent);
+    Some(match unit.as_str() {
+        "b" => 1.0,
+        "kb" => power(1000.0, 1),
+        "mb" => power(1000.0, 2),
+        "gb" => power(1000.0, 3),
+        "tb" => power(1000.0, 4),
+        "pb" => power(1000.0, 5),
+        "eb" => power(1000.0, 6),
+        "kib" => power(1024.0, 1),
+        "mib" => power(1024.0, 2),
+        "gib" => power(1024.0, 3),
+        "tib" => power(1024.0, 4),
+        "pib" => power(1024.0, 5),
+        "eib" => power(1024.0, 6),
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -552,6 +592,9 @@ mod tests {
         assert_eq!(tokens("1.5"), vec![Token::Number(1.5)]);
         assert_eq!(tokens("1e3"), vec![Token::Number(1000.0)]);
         assert_eq!(tokens("30s"), vec![Token::Duration(30_000_000_000)]);
+        assert_eq!(tokens("20MB"), vec![Token::Bytes(20_000_000)]);
+        assert_eq!(tokens("1.5KiB"), vec![Token::Bytes(1536)]);
+        assert_eq!(tokens("5m"), vec![Token::Duration(300_000_000_000)]);
     }
 
     #[test]

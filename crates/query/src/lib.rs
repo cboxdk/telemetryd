@@ -20,6 +20,7 @@
 
 pub mod lexer;
 pub mod logql;
+pub mod logstage;
 pub mod loki;
 pub mod meta;
 pub mod prometheus;

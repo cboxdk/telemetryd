@@ -12,6 +12,7 @@ use regex::Regex;
 use telemetryd_core::{Error, LabelMatcher, Labels, MatchOp, Result};
 
 use crate::lexer::{Spanned, Token, tokenize};
+use crate::logstage::{Pattern, Template};
 
 /// A parsed and lowered log query.
 #[derive(Debug, Clone)]
@@ -28,7 +29,54 @@ pub enum Stage {
     Json,
     /// Parse the line as logfmt and merge its fields into the label set.
     Logfmt,
+    /// A regular expression's named groups become labels.
+    Regexp(Regex),
+    /// A `pattern` parser's captures become labels.
+    Pattern(Pattern),
+    /// ANSI colour escapes are taken out of the line.
+    Decolorize,
+    /// The line is replaced by a template's rendering.
+    LineFormat(Template),
+    /// Labels are renamed or set from templates.
+    LabelFormat(Vec<(String, LabelSource)>),
+    /// Labels are removed — all of a name, or where a matcher holds.
+    Drop(Vec<Selection>),
+    /// Only these labels are kept.
+    Keep(Vec<Selection>),
     Label(LabelPredicate),
+}
+
+/// Where a `label_format` label's value comes from.
+#[derive(Debug, Clone)]
+pub enum LabelSource {
+    /// `new=old`: the old label's value, which the old label gives up.
+    Rename(String),
+    /// `new="{{.a}}-{{.b}}"`.
+    Template(Template),
+}
+
+/// A `drop`/`keep` entry: a label name, or a name with a matcher on its value.
+#[derive(Debug, Clone)]
+pub struct Selection {
+    pub name: String,
+    pub matcher: Option<LabelMatcher>,
+}
+
+impl Selection {
+    fn selects(&self, labels: &Labels) -> bool {
+        self.matcher
+            .as_ref()
+            .map_or(labels.get(&self.name).is_some(), |m| m.matches(labels))
+    }
+}
+
+/// What a line has become after the pipeline: its text, the labels it carries, and
+/// which of those the pipeline itself made.
+#[derive(Debug, Clone)]
+pub struct Processed {
+    pub line: String,
+    pub labels: Labels,
+    pub extracted: Labels,
 }
 
 /// A label filter stage: one or more matchers combined with `and` / `or`.
@@ -39,16 +87,110 @@ pub enum Stage {
 #[derive(Debug, Clone)]
 pub enum LabelPredicate {
     Match(LabelMatcher),
+    /// `status >= 500`, `duration > 250ms`, `size < 1MB`: the label read as a number,
+    /// a duration or a byte size.
+    Compare(Comparison),
     And(Box<LabelPredicate>, Box<LabelPredicate>),
     Or(Box<LabelPredicate>, Box<LabelPredicate>),
 }
 
 impl LabelPredicate {
+    /// Whether the labels pass, for a predicate of string matchers only — the fast
+    /// path, which may not write `__error__`. See `apply` for the general case.
     pub fn matches(&self, labels: &Labels) -> bool {
         match self {
             Self::Match(matcher) => matcher.matches(labels),
+            Self::Compare(_) => {
+                let mut labels = labels.clone();
+                self.apply(&mut labels)
+            }
             Self::And(left, right) => left.matches(labels) && right.matches(labels),
             Self::Or(left, right) => left.matches(labels) || right.matches(labels),
+        }
+    }
+
+    /// Whether the labels pass, recording a value that is no number in `__error__`.
+    ///
+    /// As in Loki: a missing label fails a comparison; a value that does not read as
+    /// the literal's kind keeps the line and marks it `LabelFilterErr`; and a line that
+    /// already carries an error passes every comparison, so only `__error__` filters
+    /// decide its fate. `or` does not try its right side once the left has passed.
+    pub fn apply(&self, labels: &mut Labels) -> bool {
+        match self {
+            Self::Match(matcher) => matcher.matches(labels),
+            Self::Compare(comparison) => comparison.apply(labels),
+            Self::And(left, right) => left.apply(labels) && right.apply(labels),
+            Self::Or(left, right) => left.apply(labels) || right.apply(labels),
+        }
+    }
+
+    fn compares(&self) -> bool {
+        match self {
+            Self::Match(_) => false,
+            Self::Compare(_) => true,
+            Self::And(left, right) | Self::Or(left, right) => left.compares() || right.compares(),
+        }
+    }
+}
+
+/// A numeric label filter: which label, how it compares, and to what.
+#[derive(Debug, Clone)]
+pub struct Comparison {
+    pub name: String,
+    pub op: CompareOp,
+    pub threshold: Threshold,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareOp {
+    Equal,
+    NotEqual,
+    Greater,
+    GreaterEqual,
+    Less,
+    LessEqual,
+}
+
+/// The literal a label is compared with. Its kind decides how the label is read:
+/// `500` as a number, `250ms` as a Go duration, `20MB` as a byte size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Threshold {
+    Number(f64),
+    /// Seconds.
+    Duration(f64),
+    Bytes(f64),
+}
+
+impl Comparison {
+    fn apply(&self, labels: &mut Labels) -> bool {
+        if labels
+            .get("__error__")
+            .is_some_and(|error| !error.is_empty())
+        {
+            return true;
+        }
+        let Some(value) = labels.get(&self.name) else {
+            return false;
+        };
+        let (read, threshold, kind) = match self.threshold {
+            Threshold::Number(n) => (value.trim().parse::<f64>().ok(), n, "a number"),
+            Threshold::Duration(d) => (crate::logstage::parse_duration(value), d, "a duration"),
+            Threshold::Bytes(b) => (crate::logstage::parse_bytes(value), b, "a byte size"),
+        };
+        let Some(read) = read else {
+            let details = format!("{value:?} is not {kind}");
+            labels.insert("__error__", "LabelFilterErr");
+            labels.insert("__error_details__", details);
+            return true;
+        };
+        #[allow(clippy::float_cmp)]
+        match self.op {
+            CompareOp::Equal => read == threshold,
+            CompareOp::NotEqual => read != threshold,
+            CompareOp::Greater => read > threshold,
+            CompareOp::GreaterEqual => read >= threshold,
+            CompareOp::Less => read < threshold,
+            CompareOp::LessEqual => read <= threshold,
         }
     }
 }
@@ -83,10 +225,22 @@ impl LogQuery {
     /// soundly as several, and stopping there keeps the rule easy to check.
     #[must_use]
     pub fn required_substring(&self) -> Option<&str> {
-        self.stages.iter().find_map(|stage| match stage {
-            Stage::Line(filter) if filter.op == LineOp::Contains => Some(filter.pattern.as_str()),
-            _ => None,
-        })
+        self.raw_line_filters()
+            .find(|filter| filter.op == LineOp::Contains)
+            .map(|filter| filter.pattern.as_str())
+    }
+
+    /// The line filters that see the line as it was stored: those before any stage that
+    /// rewrites it. Only these may be checked against storage — one after `line_format`
+    /// matches the rewritten line, and pushed down it would drop lines that pass.
+    pub fn raw_line_filters(&self) -> impl Iterator<Item = &LineFilter> {
+        self.stages
+            .iter()
+            .take_while(|stage| !matches!(stage, Stage::LineFormat(_) | Stage::Decolorize))
+            .filter_map(|stage| match stage {
+                Stage::Line(filter) => Some(filter),
+                _ => None,
+            })
     }
 }
 
@@ -273,26 +427,36 @@ impl<'a> Parser<'a> {
             }
             "logfmt" => Ok(Stage::Logfmt),
 
-            // Recognised specifically so the error can name them.
-            "line_format" | "label_format" => Err(Error::unsupported_with_hint(
-                format!("LogQL `| {name}`"),
-                "formatting is not applied server-side; render the line client-side",
-            )),
-            "unwrap" => Err(Error::unsupported_with_hint(
-                "LogQL `| unwrap`",
-                "unwrap only feeds metric queries, which telemetryd does not run over logs",
-            )),
-            "pattern" | "regexp" => Err(Error::unsupported_with_hint(
-                format!("LogQL `| {name}` parser"),
-                "use `| json` or `| logfmt`, or filter the line with `|~`",
-            )),
-            "drop" | "keep" => Err(Error::unsupported_with_hint(
-                format!("LogQL `| {name}`"),
-                "select the labels you want client-side",
-            )),
-            "decolorize" | "distinct" | "ip" => {
-                Err(Error::unsupported(format!("LogQL `| {name}`")))
+            "regexp" => {
+                let pattern = self.expect_string("a quoted regular expression after `regexp`")?;
+                let regex = telemetryd_core::matcher::compile_regex(&pattern).map_err(|e| {
+                    Error::BadRequest(format!("invalid regular expression {pattern:?}: {e}"))
+                })?;
+                if regex.capture_names().flatten().next().is_none() {
+                    return Err(Error::BadRequest(format!(
+                        "the regexp {pattern:?} names no group, like (?P<status>\\d+)"
+                    )));
+                }
+                Ok(Stage::Regexp(regex))
             }
+            "pattern" => {
+                let pattern = self.expect_string("a quoted pattern after `pattern`")?;
+                Ok(Stage::Pattern(Pattern::parse(&pattern)?))
+            }
+            "decolorize" => Ok(Stage::Decolorize),
+            "line_format" => {
+                let template = self.expect_string("a quoted template after `line_format`")?;
+                Ok(Stage::LineFormat(Template::parse(&template)?))
+            }
+            "label_format" => Ok(Stage::LabelFormat(self.label_format_items()?)),
+            "drop" => Ok(Stage::Drop(self.selections()?)),
+            "keep" => Ok(Stage::Keep(self.selections()?)),
+            "unwrap" => Err(Error::BadRequest(
+                "`| unwrap` belongs inside a metric query, like \
+                 sum_over_time({app=\"x\"} | unwrap duration [5m])"
+                    .to_owned(),
+            )),
+            "distinct" | "ip" => Err(Error::unsupported(format!("LogQL `| {name}`"))),
 
             // Anything else in this position is a label filter.
             _ => {
@@ -302,11 +466,121 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse one `name op "value"` matcher, given the already-consumed name.
+    /// `new=old, other="{{.a}}"` after `label_format`.
+    fn label_format_items(&mut self) -> Result<Vec<(String, LabelSource)>> {
+        let mut items = Vec::new();
+        loop {
+            let name = self.expect_ident("a label name in `label_format`")?;
+            self.expect(&Token::Equal, "`=`")?;
+            let source = match self.peek().cloned() {
+                Some(Token::String(template)) => {
+                    self.pos += 1;
+                    LabelSource::Template(Template::parse(&template)?)
+                }
+                Some(Token::Ident(old)) => {
+                    self.pos += 1;
+                    LabelSource::Rename(old)
+                }
+                _ => return Err(self.unexpected("a label name or a quoted template")),
+            };
+            items.push((name, source));
+            if self.peek() == Some(&Token::Comma) {
+                self.pos += 1;
+            } else {
+                return Ok(items);
+            }
+        }
+    }
+
+    /// `a, b, c="x"` after `drop` or `keep`.
+    fn selections(&mut self) -> Result<Vec<Selection>> {
+        let mut selections = Vec::new();
+        loop {
+            let name = self.expect_ident("a label name")?;
+            let matcher = if matches!(
+                self.peek(),
+                Some(
+                    Token::Equal
+                        | Token::EqualEqual
+                        | Token::NotEqual
+                        | Token::RegexMatch
+                        | Token::RegexNotMatch
+                )
+            ) {
+                let op = self.expect_match_op()?;
+                let value = self.expect_string("a quoted value")?;
+                Some(LabelMatcher::new(name.clone(), op, value)?)
+            } else {
+                None
+            };
+            selections.push(Selection { name, matcher });
+            if self.peek() == Some(&Token::Comma) {
+                self.pos += 1;
+            } else {
+                return Ok(selections);
+            }
+        }
+    }
+
+    /// Parse one `name op "value"` matcher or `name op 500` comparison, given the
+    /// already-consumed name.
     fn label_matcher(&mut self, name: String) -> Result<LabelPredicate> {
+        let op = match self.peek() {
+            Some(Token::Greater) => Some(CompareOp::Greater),
+            Some(Token::GreaterEqual) => Some(CompareOp::GreaterEqual),
+            Some(Token::Less) => Some(CompareOp::Less),
+            Some(Token::LessEqual) => Some(CompareOp::LessEqual),
+            Some(Token::Equal | Token::EqualEqual) if self.literal_follows() => {
+                Some(CompareOp::Equal)
+            }
+            Some(Token::NotEqual) if self.literal_follows() => Some(CompareOp::NotEqual),
+            _ => None,
+        };
+        if let Some(op) = op {
+            self.pos += 1;
+            let threshold = self.threshold()?;
+            return Ok(LabelPredicate::Compare(Comparison {
+                name,
+                op,
+                threshold,
+            }));
+        }
         let op = self.expect_match_op()?;
         let value = self.expect_string("a quoted value in a label filter")?;
         Ok(LabelPredicate::Match(LabelMatcher::new(name, op, value)?))
+    }
+
+    /// Whether the token after the operator is an unquoted literal, which makes `=` a
+    /// numeric comparison rather than a string match.
+    fn literal_follows(&self) -> bool {
+        let next = |i: usize| self.tokens.get(self.pos + i).map(|s| &s.token);
+        match next(1) {
+            Some(Token::Number(_) | Token::Duration(_) | Token::Bytes(_)) => true,
+            Some(Token::Minus) => matches!(next(2), Some(Token::Number(_))),
+            _ => false,
+        }
+    }
+
+    /// The literal a comparison is made against: a number, a duration or a byte size.
+    fn threshold(&mut self) -> Result<Threshold> {
+        let negative = self.peek() == Some(&Token::Minus);
+        if negative {
+            self.pos += 1;
+        }
+        let threshold = match self.peek() {
+            Some(Token::Number(n)) => Threshold::Number(if negative { -n } else { *n }),
+            #[allow(clippy::cast_precision_loss)]
+            Some(Token::Duration(nanos)) if !negative => Threshold::Duration(*nanos as f64 / 1e9),
+            #[allow(clippy::cast_precision_loss)]
+            Some(Token::Bytes(bytes)) if !negative => Threshold::Bytes(*bytes as f64),
+            _ => {
+                return Err(self.unexpected(
+                    "a number, a duration like `250ms` or a size like `20MB` to compare with",
+                ));
+            }
+        };
+        self.pos += 1;
+        Ok(threshold)
     }
 
     /// Extend a matcher with any `and` / `or` continuation.
@@ -379,13 +653,6 @@ impl<'a> Parser<'a> {
             Some(Token::NotEqual) => MatchOp::NotEqual,
             Some(Token::RegexMatch) => MatchOp::Regex,
             Some(Token::RegexNotMatch) => MatchOp::NotRegex,
-            // Numeric comparisons are a real LogQL feature we do not run.
-            Some(Token::Greater | Token::GreaterEqual | Token::Less | Token::LessEqual) => {
-                return Err(Error::unsupported_with_hint(
-                    "LogQL numeric label filters (`>`, `>=`, `<`, `<=`)",
-                    "compare as strings with `=` or `=~`, or filter client-side",
-                ));
-            }
             _ => return Err(self.unexpected("a matcher operator (`=`, `!=`, `=~`, `!~`)")),
         };
         self.pos += 1;
@@ -411,78 +678,122 @@ impl<'a> Parser<'a> {
 // ---------------------------------------------------------------------------
 
 impl LogQuery {
-    /// Run the pipeline against one line.
-    ///
-    /// `base` is the label set available to label filters before any parser stage:
-    /// the stream labels plus the record's own attributes. Exposing record attributes
-    /// without requiring a parser stage is a deliberate superset of Loki — the data is
-    /// already structured, so making a user write `| json` to reach it would be
-    /// theatre. Documented in `COMPATIBILITY.md`.
-    /// What a parser stage pulled out of this line, for a record that already matched.
-    ///
-    /// # Why this is a second pass
-    ///
-    /// [`Self::evaluate`] builds the same set to answer label filters and then drops it,
-    /// because it runs inside the scan on every candidate row and returning a `Labels`
-    /// per row would allocate for records that are about to be rejected. This runs only
-    /// on the records actually being returned — at most `limit` of them — so the cost is
-    /// bounded by the response rather than by the search.
-    ///
-    /// # The bug this closes
-    ///
-    /// `| json` and `| logfmt` were filter-only: they parsed the body to decide whether a
-    /// record matched, and nothing about the extraction reached the caller. Asking for
-    /// `| json | level="error"` returned the line and a stream whose `level` label said
-    /// `info` — telemetryd's severity-derived label, not the one the filter matched on. A
-    /// user could not see the value their own query had selected, and the answer looked
-    /// like it contradicted the question.
-    ///
-    /// Returns an empty set when the query has no parser stage, so a caller can merge it
-    /// unconditionally.
-    pub fn extracted(&self, line: &str, stream: &Labels) -> Labels {
-        let mut labels = Labels::new();
-        for stage in &self.stages {
-            match stage {
-                Stage::Json | Stage::Logfmt => absorb(&mut labels, &stage.parse(line), stream),
-                Stage::Line(_) | Stage::Label(_) => {}
-            }
-        }
-        labels
-    }
-
-    /// Whether this query parses the line at all, so a caller can skip the second pass.
+    /// Whether this query parses or rewrites the line at all, so a caller can skip the
+    /// second pass that builds what is shown.
     pub fn has_parser_stage(&self) -> bool {
-        self.stages
-            .iter()
-            .any(|stage| matches!(stage, Stage::Json | Stage::Logfmt))
+        self.stages.iter().any(|stage| match stage {
+            Stage::Line(_) => false,
+            // A comparison may write `__error__`, which later stages and the response see.
+            Stage::Label(predicate) => predicate.compares(),
+            _ => true,
+        })
     }
 
     /// Whether a line passes every stage. `base` is what a label filter sees before any
     /// parser runs — the stream labels and the record's attributes; `stream` is the
     /// stream labels alone, which decide whether a parsed field is renamed.
     pub fn evaluate(&self, line: &str, base: &Labels, stream: &Labels) -> bool {
-        let mut extracted: Option<Labels> = None;
+        // Only filters: nothing to build, and nothing to clone. This is almost every
+        // query, and it runs once per scanned line.
+        if !self.has_parser_stage() {
+            return self.stages.iter().all(|stage| match stage {
+                Stage::Line(filter) => filter.matches(line),
+                Stage::Label(predicate) => predicate.matches(base),
+                _ => true,
+            });
+        }
+        self.process(line, base, stream).is_some()
+    }
 
+    /// Run the pipeline over a line: `None` if a filter drops it, otherwise the line as
+    /// the stages left it and the labels it carries.
+    pub fn process(&self, line: &str, base: &Labels, stream: &Labels) -> Option<Processed> {
+        let mut out = Processed {
+            line: line.to_owned(),
+            labels: base.clone(),
+            extracted: Labels::new(),
+        };
         for stage in &self.stages {
             match stage {
                 Stage::Line(filter) => {
-                    if !filter.matches(line) {
-                        return false;
+                    if !filter.matches(&out.line) {
+                        return None;
                     }
-                }
-                Stage::Json | Stage::Logfmt => {
-                    let labels = extracted.get_or_insert_with(|| base.clone());
-                    absorb(labels, &stage.parse(line), stream);
                 }
                 Stage::Label(predicate) => {
-                    let labels = extracted.as_ref().unwrap_or(base);
-                    if !predicate.matches(labels) {
-                        return false;
+                    if !predicate.apply(&mut out.labels) {
+                        return None;
                     }
+                    if let Some(error) = out.labels.get("__error__") {
+                        let error = error.to_owned();
+                        out.extracted.insert("__error__", error);
+                        if let Some(details) = out.labels.get("__error_details__") {
+                            let details = details.to_owned();
+                            out.extracted.insert("__error_details__", details);
+                        }
+                    }
+                }
+                Stage::Json | Stage::Logfmt | Stage::Regexp(_) | Stage::Pattern(_) => {
+                    let parsed = stage.parse(&out.line);
+                    absorb(&mut out.labels, &parsed, stream);
+                    absorb(&mut out.extracted, &parsed, stream);
+                }
+                Stage::Decolorize => out.line = crate::logstage::decolorize(&out.line),
+                Stage::LineFormat(template) => {
+                    out.line = template.render(&out.labels, &out.line);
+                }
+                Stage::LabelFormat(items) => {
+                    for (name, source) in items {
+                        let value = match source {
+                            LabelSource::Rename(old) => {
+                                let value = out.labels.get(old).unwrap_or("").to_owned();
+                                out.labels.remove(old);
+                                out.extracted.remove(old);
+                                value
+                            }
+                            LabelSource::Template(template) => {
+                                template.render(&out.labels, &out.line)
+                            }
+                        };
+                        out.labels.insert(name.clone(), value.clone());
+                        out.extracted.insert(name.clone(), value);
+                    }
+                }
+                Stage::Drop(selections) => {
+                    for selection in selections {
+                        if selection.selects(&out.labels) {
+                            out.labels.remove(&selection.name);
+                            out.extracted.remove(&selection.name);
+                        }
+                    }
+                }
+                Stage::Keep(selections) => {
+                    let kept: Vec<String> = out
+                        .labels
+                        .names()
+                        .filter(|name| {
+                            selections
+                                .iter()
+                                .any(|s| s.name == *name && s.selects(&out.labels))
+                        })
+                        .map(str::to_owned)
+                        .collect();
+                    out.labels = out
+                        .labels
+                        .iter()
+                        .filter(|(name, _)| kept.iter().any(|k| k == name))
+                        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                        .collect();
+                    out.extracted = out
+                        .extracted
+                        .iter()
+                        .filter(|(name, _)| kept.iter().any(|k| k == name))
+                        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                        .collect();
                 }
             }
         }
-        true
+        Some(out)
     }
 
     /// Whether any stage can reject a line. A selector-only query skips per-line work.
@@ -500,7 +811,24 @@ impl Stage {
         match self {
             Self::Json => merge_json(&mut labels, line),
             Self::Logfmt => merge_logfmt(&mut labels, line),
-            Self::Line(_) | Self::Label(_) => {}
+            Self::Regexp(regex) => {
+                if let Some(captures) = regex.captures(line) {
+                    for name in regex.capture_names().flatten() {
+                        if let Some(value) = captures.name(name) {
+                            labels.insert(
+                                telemetryd_core::record::sanitize_label_name(name),
+                                value.as_str(),
+                            );
+                        }
+                    }
+                }
+            }
+            Self::Pattern(pattern) => {
+                for (name, value) in pattern.captures(line) {
+                    labels.insert(name, value);
+                }
+            }
+            _ => {}
         }
         labels
     }
@@ -817,17 +1145,63 @@ mod tests {
         }
     }
 
+    fn run(query: &str, line: &str) -> Option<Processed> {
+        let stream = labels(&[("app", "x"), ("level", "info")]);
+        parse(query).unwrap().process(line, &stream, &stream)
+    }
+
+    #[test]
+    fn parsers_and_formats_transform_the_line_and_its_labels() {
+        let out = run(
+            r#"{app="x"} | regexp "(?P<method>[A-Z]+) (?P<path>\S+)" | line_format "{{.method}} → {{.path | ToUpper}}""#,
+            "GET /checkout 200",
+        )
+        .unwrap();
+        assert_eq!(out.line, "GET → /CHECKOUT");
+        assert_eq!(out.labels.get("path"), Some("/checkout"));
+
+        let out = run(
+            r#"{app="x"} | pattern "<_> <status> <_>" | label_format code=status, where="{{.app}}""#,
+            "GET 503 12ms",
+        )
+        .unwrap();
+        assert_eq!(out.labels.get("code"), Some("503"));
+        assert!(out.labels.get("status").is_none(), "renamed away");
+        assert_eq!(out.labels.get("where"), Some("x"));
+
+        let out = run(
+            r#"{app="x"} | logfmt | drop user, level="info""#,
+            "user=42 route=/a",
+        )
+        .unwrap();
+        assert!(out.labels.get("user").is_none());
+        assert!(out.labels.get("level").is_none());
+        assert_eq!(out.labels.get("route"), Some("/a"));
+
+        let out = run(r#"{app="x"} | logfmt | keep route"#, "user=42 route=/a").unwrap();
+        assert_eq!(out.labels.iter().count(), 1);
+
+        // A filter after `line_format` sees the rewritten line.
+        assert!(run(r#"{app="x"} | line_format "hidden" |= "GET""#, "GET /").is_none());
+        let query = parse(r#"{app="x"} |= "GET" | line_format "x" |= "x""#).unwrap();
+        assert_eq!(
+            query.raw_line_filters().count(),
+            1,
+            "only the first reaches storage"
+        );
+        assert_eq!(
+            run(r#"{app="x"} | decolorize"#, "\u{1b}[31mred\u{1b}[0m")
+                .unwrap()
+                .line,
+            "red"
+        );
+    }
+
     #[test]
     fn unsupported_pipeline_stages_name_themselves() {
         let cases = [
-            (r#"{app="x"} | line_format "{{.msg}}""#, "line_format"),
-            (r#"{app="x"} | label_format foo="bar""#, "label_format"),
-            (r#"{app="x"} | unwrap duration"#, "unwrap"),
-            (r#"{app="x"} | pattern "<_> foo""#, "pattern"),
-            (r#"{app="x"} | regexp "(?P<a>.*)""#, "regexp"),
-            (r#"{app="x"} | drop foo"#, "drop"),
-            (r#"{app="x"} | keep foo"#, "keep"),
-            (r#"{app="x"} | decolorize"#, "decolorize"),
+            (r#"{app="x"} | distinct foo"#, "distinct"),
+            (r#"{app="x"} | ip("10.0.0.0/8")"#, "ip"),
         ];
         for (query, feature) in cases {
             let err = parse(query).unwrap_err();
@@ -839,16 +1213,96 @@ mod tests {
         }
     }
 
+    fn passes(query: &str, line: &str) -> Option<Labels> {
+        let q = parse(query).unwrap();
+        let stream: Labels = [("app", "x")]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        q.process(line, &stream, &stream).map(|p| p.labels)
+    }
+
     #[test]
-    fn numeric_label_filters_are_named() {
-        let err = parse(r#"{app="x"} | status > 400"#).unwrap_err();
-        assert!(matches!(err, Error::Unsupported { .. }));
-        assert!(err.to_string().contains("numeric label filters"), "{err}");
+    fn numeric_label_filters_compare_as_numbers() {
+        let q = r#"{app="x"} | logfmt | status >= 500"#;
+        assert!(passes(q, "status=503").is_some());
+        assert!(passes(q, "status=500").is_some());
+        assert!(passes(q, "status=404").is_none());
+        // As a string, "1000" < "500"; as a number it is not.
+        assert!(passes(q, "status=1000").is_some());
+        assert!(passes(r#"{app="x"} | logfmt | status == 200"#, "status=200").is_some());
+        assert!(passes(r#"{app="x"} | logfmt | status = 200"#, "status=200.0").is_some());
+        assert!(passes(r#"{app="x"} | logfmt | status != 200"#, "status=200").is_none());
+        assert!(passes(r#"{app="x"} | logfmt | delta > -1"#, "delta=0").is_some());
+        // `=` against a quoted value is still a string match.
+        assert!(passes(r#"{app="x"} | logfmt | status = "200""#, "status=200.0").is_none());
+    }
+
+    #[test]
+    fn a_missing_label_fails_a_comparison() {
+        assert!(passes(r#"{app="x"} | logfmt | status > 1"#, "other=5").is_none());
+    }
+
+    #[test]
+    fn a_value_that_is_no_number_is_kept_and_marked() {
+        let labels = passes(r#"{app="x"} | logfmt | status > 400"#, "status=oops").unwrap();
+        assert_eq!(labels.get("__error__"), Some("LabelFilterErr"));
+        assert!(
+            passes(
+                r#"{app="x"} | logfmt | status > 400 | __error__="""#,
+                "status=oops"
+            )
+            .is_none()
+        );
+        // An earlier error passes every comparison: only `__error__` filters decide.
+        let labels = passes(r#"{app="x"} | json | status > 400"#, "not json").unwrap();
+        assert_eq!(labels.get("__error__"), Some("JSONParserErr"));
+    }
+
+    #[test]
+    fn durations_and_sizes_compare_in_their_units() {
+        let q = r#"{app="x"} | logfmt | took > 250ms"#;
+        assert!(passes(q, "took=1.5s").is_some());
+        assert!(passes(q, "took=300ms").is_some());
+        assert!(passes(q, "took=250ms").is_none());
+        assert!(passes(q, "took=1m").is_some());
+        assert!(passes(q, "took=90us").is_none());
+        let q = r#"{app="x"} | logfmt | size >= 20MB"#;
+        assert!(passes(q, "size=20000000").is_some());
+        assert!(passes(q, "size=19.9MB").is_none());
+        assert!(passes(q, "size=1GiB").is_some());
+        assert!(passes(q, r#"size="25 mb""#).is_some());
+    }
+
+    #[test]
+    fn comparisons_combine_with_matchers() {
+        let q = r#"{app="x"} | logfmt | status >= 500 or level="error" and took > 1s"#;
+        assert!(passes(q, "status=502 level=info took=0s").is_some());
+        assert!(passes(q, "status=200 level=error took=2s").is_some());
+        assert!(passes(q, "status=200 level=error took=0.5s").is_none());
+        // Without a parser, a comparison reads the stream labels and attributes.
+        let q = parse(r#"{app="x"} | code > 400"#).unwrap();
+        let base: Labels = [("app", "x"), ("code", "404")]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        assert!(q.evaluate("line", &base, &base));
+        let base: Labels = [("app", "x"), ("code", "200")]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        assert!(!q.evaluate("line", &base, &base));
+    }
+
+    #[test]
+    fn a_comparison_needs_a_literal() {
+        let err = parse(r#"{app="x"} | status > "400""#).unwrap_err();
+        assert!(err.to_string().contains("a number, a duration"), "{err}");
     }
 
     #[test]
     fn every_unsupported_error_links_the_compatibility_doc() {
-        let err = parse(r#"{app="x"} | unwrap duration"#).unwrap_err();
+        let err = parse(r#"{app="x"} | distinct foo"#).unwrap_err();
         let body = serde_json::to_value(err.to_body()).unwrap();
         assert!(
             body["error"]["docs"]

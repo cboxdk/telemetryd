@@ -603,15 +603,13 @@ type Prefilter =
     Box<dyn Fn(&arrow::record_batch::RecordBatch, &mut Vec<u32>) -> Result<()> + Send + Sync>;
 
 fn build_line_prefilter(query: &LogQuery) -> Option<Prefilter> {
+    // Only the filters that see the stored line: after `line_format` or `decolorize`
+    // they test a line the store never held.
     let contains: Vec<(bool, String)> = query
-        .stages
-        .iter()
-        .filter_map(|stage| match stage {
-            logql::Stage::Line(filter) => match filter.op {
-                logql::LineOp::Contains => Some((true, filter.pattern.clone())),
-                logql::LineOp::NotContains => Some((false, filter.pattern.clone())),
-                _ => None,
-            },
+        .raw_line_filters()
+        .filter_map(|filter| match filter.op {
+            logql::LineOp::Contains => Some((true, filter.pattern.clone())),
+            logql::LineOp::NotContains => Some((false, filter.pattern.clone())),
             _ => None,
         })
         .filter(|(_, pattern)| !pattern.is_empty())
@@ -679,32 +677,44 @@ fn group_into_streams(
         // them — what Grafana's derived fields and the UI's log→trace link read.
         let mut metadata: BTreeMap<String, String> = record.structured_metadata();
 
-        // Fields a `| json` or `| logfmt` stage pulled out of the body. Without these a
+        // Fields a parser stage pulled out of the body, the line as the pipeline left it,
+        // and the labels it carries after `drop`/`keep`/`label_format`. Without these a
         // filter selected on a value the caller could never see. Kept apart from the
-        // attributes so the categorised shape can put each where Loki does.
+        // attributes so the categorised shape can put each where Loki does. Parsed
+        // fields are renamed where they collide with a stream label, exactly as the
+        // filter saw them — see `logql::absorb` — and outrank structured metadata of
+        // the same name, as in Loki.
+        let base = if parses {
+            record.filter_labels()
+        } else {
+            Labels::new()
+        };
+        let mut stream = record.stream.clone();
+        let mut line = record.body;
         let mut extracted: BTreeMap<String, String> = BTreeMap::new();
-        if parses {
-            // Renamed where they collide with a stream label, exactly as the filter saw
-            // them — see `logql::absorb`. `level` is both telemetryd's severity and, on
-            // a JSON line, the application's own idea of level, and they routinely
-            // disagree; Loki spells the parsed one `level_extracted`.
-            for (name, value) in query.extracted(&record.body, &record.stream).iter() {
-                // A parsed label outranks structured metadata of the same name, as in
-                // Loki: the value a filter selected on is the value shown.
+        if parses && let Some(processed) = query.process(&line, &base, &stream) {
+            line = processed.line;
+            metadata.retain(|name, _| processed.labels.get(name).is_some());
+            let dropped: Vec<String> = stream
+                .names()
+                .filter(|name| processed.labels.get(name).is_none())
+                .map(str::to_owned)
+                .collect();
+            for name in dropped {
+                stream.remove(&name);
+            }
+            for (name, value) in processed.extracted.iter() {
                 metadata.remove(name);
                 extracted.insert(name.to_owned(), value.to_owned());
             }
         }
         let entry = if categorize {
-            Entry::categorized(record.timestamp_nanos, record.body, metadata, extracted)
+            Entry::categorized(record.timestamp_nanos, line, metadata, extracted)
         } else {
             metadata.extend(extracted);
-            Entry::new(record.timestamp_nanos, record.body, metadata)
+            Entry::new(record.timestamp_nanos, line, metadata)
         };
-        grouped
-            .entry(record.stream.clone())
-            .or_default()
-            .push(entry);
+        grouped.entry(stream).or_default().push(entry);
     }
 
     grouped

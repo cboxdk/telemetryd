@@ -282,8 +282,19 @@ Supported:
   `__error_details__`, so `| __error__=""` drops it — the filter Grafana's builder adds —
   and `| __error__!=""` finds it. Before 0.61.0 the filter read the parsed field while the
   response showed `_extracted`, and `__error__` was never set.
+- the `regexp` and `pattern` parsers — named groups and `<name>` captures become labels,
+  under the same collision rule
+- `line_format` and `label_format` templates: `{{.label}}`, `{{__line__}}`, literals and
+  the functions `ToUpper`/`upper`, `ToLower`/`lower`, `Title`, `TrimSpace`/`trim`,
+  `default`, `replace` and `trunc`. A template using any other Go template feature is
+  refused by name rather than rendered wrong.
+- `drop` and `keep`, by name or by `name="value"` matcher, and `decolorize`
 - label filters, including `and` / `or` chains — `| status="500" or status="503"` is
   what the UI's compiler emits, so a single bare matcher would not have been enough
+- numeric label filters: `| status >= 500`, `| took > 250ms`, `| size < 20MB`. The
+  literal decides how the label is read — a number, a Go duration, a byte size. As in
+  Loki, a missing label fails the comparison, and a value that does not read as the
+  literal's kind keeps the line with `__error__="LabelFilterErr"`.
 
 **telemetryd superset:** label filters can read per-record attributes without a parser
 stage. OTLP records are already structured, so requiring `| json` to reach them would
@@ -294,8 +305,7 @@ The selector must contain at least one matcher that requires a value. `{}` and
 default, `{service_name=~".+"}`, satisfies this.
 
 *Not supported:* metric queries (`rate`, `count_over_time`, `sum by …`), `unwrap`,
-`pattern`, `regexp`, `line_format`, `label_format`, `drop`, `keep`, `decolorize`,
-`distinct`, `ip`, and numeric label filters (`| status > 400`).
+`distinct`, `ip`, and Go template features beyond those listed.
 
 ---
 
