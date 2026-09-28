@@ -142,10 +142,17 @@ impl AppState {
         let Some(generator) = &self.generator else {
             return Ok(0);
         };
-        let samples = generator
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .collect(telemetryd_store::now_nanos());
+        let (samples, dropped) = {
+            let mut generator = generator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let samples = generator.collect(telemetryd_store::now_nanos());
+            (samples, std::mem::take(&mut generator.dropped))
+        };
+        if dropped > 0 {
+            self.metrics
+                .add("telemetryd_generator_dropped_total", &[], dropped);
+        }
         if samples.is_empty() {
             return Ok(0);
         }

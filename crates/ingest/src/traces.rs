@@ -16,7 +16,7 @@ use telemetryd_core::span::{
 use crate::logs::{DecodeContext, normalize_timestamp};
 use crate::otlp::{
     FlexEnum, FlexU64, InstrumentationScope, KeyValue, Resource, extend_attributes, extend_labels,
-    normalize_id,
+    normalize_span_id, normalize_trace_id,
 };
 use crate::{Decoded, RejectReason, Rejection};
 
@@ -173,13 +173,13 @@ fn convert(
 ) -> Result<SpanRecord, Rejection> {
     // A span with no ids cannot be joined to a trace or to a parent, so storing it
     // would produce a row nothing can ever retrieve.
-    let trace_id = normalize_id(&raw.trace_id).ok_or_else(|| {
+    let trace_id = normalize_trace_id(&raw.trace_id).ok_or_else(|| {
         Rejection::new(
             RejectReason::MissingTraceId,
             format!("span {:?} has no usable traceId", raw.name),
         )
     })?;
-    let span_id = normalize_id(&raw.span_id).ok_or_else(|| {
+    let span_id = normalize_span_id(&raw.span_id).ok_or_else(|| {
         Rejection::new(
             RejectReason::MissingSpanId,
             format!("span {:?} has no usable spanId", raw.name),
@@ -228,12 +228,18 @@ fn convert(
     // limit because they are stored in the same place.
     keep_unpromoted_resource(&mut attributes, inherited_attributes, &stream);
 
-    if attributes.len() > ctx.limits.max_attrs_per_record as usize {
+    // The span's own, and the scope's: the resource's are one set per batch, kept on
+    // each span only so a trace can show its resource, and a pod's forty labels must not
+    // push a span with a handful of its own past the limit.
+    let own = attributes
+        .names()
+        .filter(|name| !name.starts_with(RESOURCE_ATTRIBUTE_PREFIX))
+        .count();
+    if own > ctx.limits.max_attrs_per_record as usize {
         return Err(Rejection::new(
             RejectReason::TooManyAttributes,
             format!(
-                "{} span attributes exceeds max_attrs_per_record ({})",
-                attributes.len(),
+                "{own} span attributes exceeds max_attrs_per_record ({})",
                 ctx.limits.max_attrs_per_record
             ),
         ));
@@ -261,7 +267,7 @@ fn convert(
     Ok(SpanRecord {
         trace_id,
         span_id,
-        parent_span_id: normalize_id(&raw.parent_span_id),
+        parent_span_id: normalize_span_id(&raw.parent_span_id),
         name: raw.name.clone(),
         kind,
         start_nanos,
@@ -280,8 +286,8 @@ fn convert(
 fn links(raw: &[SpanLinkJson]) -> Vec<SpanLink> {
     raw.iter()
         .filter_map(|link| {
-            let trace_id = normalize_id(&link.trace_id)?;
-            let span_id = normalize_id(&link.span_id)?;
+            let trace_id = normalize_trace_id(&link.trace_id)?;
+            let span_id = normalize_span_id(&link.span_id)?;
             let mut attributes = Labels::new();
             extend_attributes(&mut attributes, &link.attributes);
             Some(SpanLink {

@@ -443,19 +443,25 @@ pub async fn otlp_traces(
     );
 
     if !decoded.records.is_empty() {
+        let store = std::sync::Arc::clone(&state.store);
+        let records = std::mem::take(&mut decoded.records);
+
+        let (admitted, records) = crate::fatal::storage(
+            tokio::task::spawn_blocking(move || {
+                let admitted = store.append_spans(&records);
+                (admitted, records)
+            })
+            .await
+            .map(|(admitted, records)| admitted.map(|admitted| (admitted, records))),
+            "appending spans",
+        )??;
+        // Only what was stored: a refused batch comes again, and would count twice.
         if let Some(generator) = &state.generator {
             generator
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .observe(&decoded.records, telemetryd_store::now_nanos());
+                .observe(&records, telemetryd_store::now_nanos());
         }
-        let store = std::sync::Arc::clone(&state.store);
-        let records = std::mem::take(&mut decoded.records);
-
-        let admitted = crate::fatal::storage(
-            tokio::task::spawn_blocking(move || store.append_spans(&records)).await,
-            "appending spans",
-        )??;
         decoded.note_series_rejections(admitted.rejected, admitted.reason);
 
         // Counted here, after the store has spoken, rather than before it.

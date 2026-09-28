@@ -123,22 +123,26 @@ async fn call(gateway: &Gateway, request: Request) -> Result<Response, (Code, St
     }
 
     let (parts, body) = request.into_parts();
-    // One frame: a flag byte, a four-byte length, the message.
-    let limit = gateway.max_message.saturating_add(5);
-    let bytes = axum::body::to_bytes(body, limit).await.map_err(|_| {
-        (
+    // Only the frame's five-byte header is read here. The message itself streams on to
+    // the OTLP/HTTP handler, whose token check, ingest slot, memory reservation, body
+    // limit and timeout then all apply before it is held. Reading it whole here first
+    // let a client with no token pin a message per stream before any of them looked.
+    let (header, stream) = frame_header(body).await?;
+    let (compressed, length) = header;
+    if length > gateway.max_message {
+        return Err((
             Code::ResourceExhausted,
             format!(
-                "the message is larger than server.max_body_bytes ({} bytes)",
+                "the message is {length} bytes, more than server.max_body_bytes ({} bytes)",
                 gateway.max_message
             ),
-        )
-    })?;
-    let (compressed, message) = unframe(&bytes)?;
+        ));
+    }
 
     let mut inner = Request::post(path)
         .header(header::CONTENT_TYPE, "application/x-protobuf")
-        .body(Body::from(message))
+        .header(header::CONTENT_LENGTH, length)
+        .body(Body::from_stream(stream))
         .map_err(|e| (Code::Internal, e.to_string()))?;
     // Metadata is headers: the bearer token, and whatever else the handlers read.
     for (name, value) in &parts.headers {
@@ -185,29 +189,71 @@ async fn call(gateway: &Gateway, request: Request) -> Result<Response, (Code, St
     }
 }
 
-/// The message inside one uncompressed-or-compressed frame.
-fn unframe(bytes: &[u8]) -> Result<(bool, Bytes), (Code, String)> {
-    let malformed = |why: &str| {
-        (
-            Code::InvalidArgument,
-            format!("malformed gRPC frame: {why}"),
-        )
-    };
-    let [flag, a, b, c, d, rest @ ..] = bytes else {
-        return Err(malformed("shorter than its five-byte header"));
-    };
-    let length = u32::from_be_bytes([*a, *b, *c, *d]) as usize;
-    if rest.len() != length {
-        return Err(malformed(&format!(
-            "the header says {length} bytes and {} followed; one message per call",
-            rest.len()
-        )));
+type Chunks =
+    std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, axum::Error>> + Send>>;
+
+fn malformed(why: &str) -> (Code, String) {
+    (
+        Code::InvalidArgument,
+        format!("malformed gRPC frame: {why}"),
+    )
+}
+
+/// Read a frame's header — the compression flag and the message's length — and return
+/// the message as a stream of exactly that many bytes, which fails if the body holds
+/// fewer or more: a unary call carries one message.
+async fn frame_header(body: Body) -> Result<((bool, usize), Chunks), (Code, String)> {
+    use futures_util::StreamExt;
+    let mut chunks = body.into_data_stream();
+    let mut head = Vec::with_capacity(5);
+    let mut first = Bytes::new();
+    while head.len() < 5 {
+        match chunks.next().await {
+            Some(Ok(chunk)) => {
+                let need = 5 - head.len();
+                if chunk.len() <= need {
+                    head.extend_from_slice(&chunk);
+                } else {
+                    head.extend_from_slice(&chunk[..need]);
+                    first = chunk.slice(need..);
+                }
+            }
+            Some(Err(error)) => return Err((Code::Internal, error.to_string())),
+            None => return Err(malformed("shorter than its five-byte header")),
+        }
     }
-    match flag {
-        0 => Ok((false, Bytes::copy_from_slice(rest))),
-        1 => Ok((true, Bytes::copy_from_slice(rest))),
-        _ => Err(malformed("the compression flag is neither 0 nor 1")),
-    }
+    let compressed = match head[0] {
+        0 => false,
+        1 => true,
+        _ => return Err(malformed("the compression flag is neither 0 nor 1")),
+    };
+    let length = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+    let state = (Some(first), chunks, length);
+    let message = futures_util::stream::unfold(state, |(first, mut chunks, left)| async move {
+        let chunk = match first {
+            Some(first) if !first.is_empty() => Ok(first),
+            _ => match chunks.next().await {
+                Some(chunk) => chunk,
+                None if left == 0 => return None,
+                None => {
+                    let error = format!("the header says {left} more bytes than followed");
+                    return Some((Err(axum::Error::new(error)), (None, chunks, 0)));
+                }
+            },
+        };
+        match chunk {
+            Ok(chunk) if chunk.len() > left => {
+                let error = "more than one message; a unary call carries one".to_owned();
+                Some((Err(axum::Error::new(error)), (None, chunks, 0)))
+            }
+            Ok(chunk) => {
+                let left = left - chunk.len();
+                Some((Ok(chunk), (None, chunks, left)))
+            }
+            Err(error) => Some((Err(error), (None, chunks, 0))),
+        }
+    });
+    Ok(((compressed, length), Box::pin(message)))
 }
 
 /// Headers passed on to the OTLP/HTTP handler: metadata, not HTTP/2 or gRPC framing.
@@ -296,16 +342,32 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn a_frame_carries_one_message() {
+    async fn read(bytes: &'static [u8]) -> Result<(bool, Vec<u8>), String> {
+        use futures_util::StreamExt;
+        let ((compressed, _), mut stream) = frame_header(Body::from(bytes))
+            .await
+            .map_err(|(_, message)| message)?;
+        let mut out = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            out.extend_from_slice(&chunk.map_err(|e| e.to_string())?);
+        }
+        Ok((compressed, out))
+    }
+
+    #[tokio::test]
+    async fn a_frame_carries_one_message() {
         assert_eq!(
-            unframe(&[0, 0, 0, 0, 2, 7, 8]).unwrap(),
-            (false, Bytes::from_static(&[7, 8]))
+            read(&[0, 0, 0, 0, 2, 7, 8]).await.unwrap(),
+            (false, vec![7, 8])
         );
-        assert!(unframe(&[1, 0, 0, 0, 0]).unwrap().0);
-        assert!(unframe(&[0, 0, 0]).is_err());
-        assert!(unframe(&[0, 0, 0, 0, 3, 1]).is_err());
-        assert!(unframe(&[2, 0, 0, 0, 0]).is_err());
+        assert!(read(&[1, 0, 0, 0, 0]).await.unwrap().0);
+        assert!(read(&[0, 0, 0]).await.is_err());
+        assert!(read(&[0, 0, 0, 0, 3, 1]).await.is_err(), "short");
+        assert!(
+            read(&[0, 0, 0, 0, 1, 1, 2]).await.is_err(),
+            "a second message"
+        );
+        assert!(read(&[2, 0, 0, 0, 0]).await.is_err());
     }
 
     #[test]

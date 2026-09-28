@@ -110,9 +110,12 @@ pub struct Generator {
     spans: HashMap<Labels, SpanSeries>,
     edges: HashMap<Labels, Edge>,
     unpaired: HashMap<Labels, (u64, u64)>,
-    /// Client halves by `(trace, span)`, server halves by `(trace, parent)`.
-    clients: HashMap<(String, String), Half>,
-    servers: HashMap<(String, String), Half>,
+    /// Client halves by `(trace, span)`, and whether one has been paired yet: a producer
+    /// can have several consumers, so a client waits out its time either way.
+    clients: HashMap<(String, String), (Half, bool)>,
+    /// Server halves by `(trace, parent)`, every one: consumers of one producer share it.
+    servers: HashMap<(String, String), Vec<Half>>,
+    waiting: usize,
     /// Series refused for being past [`MAX_SERIES`].
     pub dropped: u64,
 }
@@ -204,11 +207,16 @@ impl Generator {
         match span.kind {
             SpanKind::Client | SpanKind::Producer => {
                 let key = (span.trace_id.clone(), span.span_id.clone());
-                if let Some(server) = self.servers.remove(&key) {
-                    self.pair(&half(), &server, now);
-                } else if self.clients.len() < MAX_PENDING {
-                    self.clients.insert(key, half());
-                } else {
+                let client = half();
+                let servers = self.servers.remove(&key).unwrap_or_default();
+                self.waiting = self.waiting.saturating_sub(servers.len());
+                for server in &servers {
+                    self.pair(&client, server, now);
+                }
+                if self.waiting < MAX_PENDING {
+                    self.waiting += 1;
+                    self.clients.insert(key, (client, !servers.is_empty()));
+                } else if servers.is_empty() {
                     self.dropped += 1;
                 }
             }
@@ -228,10 +236,13 @@ impl Generator {
                     return;
                 };
                 let key = (span.trace_id.clone(), parent.clone());
-                if let Some(client) = self.clients.remove(&key) {
+                if let Some((client, paired)) = self.clients.get_mut(&key) {
+                    *paired = true;
+                    let client = client.clone();
                     self.pair(&client, &half(), now);
-                } else if self.servers.len() < MAX_PENDING {
-                    self.servers.insert(key, half());
+                } else if self.waiting < MAX_PENDING {
+                    self.waiting += 1;
+                    self.servers.entry(key).or_default().push(half());
                 } else {
                     self.dropped += 1;
                 }
@@ -357,17 +368,23 @@ impl Generator {
     /// Halves whose other half never came: a client with somewhere to point becomes an
     /// edge to a virtual node; the rest are counted unpaired.
     fn expire(&mut self, now: u64) {
-        let due = |half: &Half| now.saturating_sub(half.arrived) >= self.wait_nanos;
-        let clients: Vec<Half> = self
+        let wait = self.wait_nanos;
+        let due = move |half: &Half| now.saturating_sub(half.arrived) >= wait;
+        let expired: Vec<(Half, bool)> = self
             .clients
-            .extract_if(|_, half| due(half))
-            .map(|(_, half)| half)
+            .extract_if(|_, (half, _)| due(half))
+            .map(|(_, client)| client)
             .collect();
         let servers: Vec<Half> = self
             .servers
-            .extract_if(|_, half| due(half))
-            .map(|(_, half)| half)
+            .extract_if(|_, halves| halves.first().is_some_and(due))
+            .flat_map(|(_, halves)| halves)
             .collect();
+        self.waiting = self.waiting.saturating_sub(expired.len() + servers.len());
+        // A client that met its server has said all it had to.
+        let clients = expired
+            .into_iter()
+            .filter_map(|(client, paired)| (!paired).then_some(client));
         for client in clients {
             if let Some((node, database)) = client.virtual_node.clone() {
                 let connection = if database { "database" } else { "virtual_node" };
@@ -604,6 +621,39 @@ mod tests {
                 &[("server", "api")]
             ),
             Some(1.0)
+        );
+    }
+
+    #[test]
+    fn every_consumer_of_one_message_is_an_edge() {
+        let mut g = both();
+        g.observe(&[span("shop", "p", None, SpanKind::Producer, 1, &[])], 0);
+        g.observe(
+            &[
+                span("mailer", "c1", Some("p"), SpanKind::Consumer, 5, &[]),
+                span("audit", "c2", Some("p"), SpanKind::Consumer, 5, &[]),
+            ],
+            0,
+        );
+        let samples = g.collect(11 * SECOND);
+        for server in ["mailer", "audit"] {
+            assert_eq!(
+                value(
+                    &samples,
+                    "traces_service_graph_request_total",
+                    &[
+                        ("client", "shop"),
+                        ("server", server),
+                        ("connection_type", "messaging_system")
+                    ]
+                ),
+                Some(1.0),
+                "{server}"
+            );
+        }
+        assert!(
+            value(&samples, "traces_service_graph_unpaired_spans_total", &[]).is_none(),
+            "a paired producer is not unpaired when its wait ends"
         );
     }
 

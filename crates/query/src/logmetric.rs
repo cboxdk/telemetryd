@@ -35,6 +35,30 @@ pub const MAX_SERIES: usize = 10_000;
 /// How many extracted samples one query may hold before it is refused.
 pub const MAX_SAMPLES: usize = 10_000_000;
 
+/// Samples one query may visit across all its windows. Every step reads its whole
+/// window, so a day's window at a minute's step over a week reads each line ten thousand
+/// times; and a quantile sorts what it reads.
+pub const MAX_WINDOW_WORK: u64 = 2_000_000_000;
+
+/// When a query stops: past its deadline — the request timeout, after which the client
+/// has already been answered 503 and the work would only hold a query slot.
+#[derive(Debug, Clone, Copy)]
+pub struct Deadline(pub Option<std::time::Instant>);
+
+impl Deadline {
+    fn passed(self) -> bool {
+        self.0.is_some_and(|at| std::time::Instant::now() >= at)
+    }
+}
+
+fn timed_out() -> Error {
+    Error::BadRequest(
+        "this query ran past server.request_timeout and was stopped; narrow the range, widen \
+         `step`, or add a line filter"
+            .to_owned(),
+    )
+}
+
 /// A parsed metric query: the PromQL expression over placeholders, and what each
 /// placeholder stands for.
 #[derive(Debug, Clone)]
@@ -571,14 +595,15 @@ pub fn evaluate(
     store: &RecordStore<LogSchema>,
     query: &MetricQuery,
     steps: &[u64],
+    deadline: Deadline,
 ) -> Result<(Vec<Value>, u64)> {
     let mut samples = Vec::new();
     let mut lines = 0;
     for (index, range) in query.ranges.iter().enumerate() {
-        let (series, read) = range.extract(store, steps)?;
+        let (series, read) = range.extract(store, steps, deadline)?;
         lines += read;
         pipeline_error(&series)?;
-        range.emit(index, &series, steps, &mut samples)?;
+        range.emit(index, &series, steps, &mut samples, deadline)?;
     }
     let mut snapshot = Snapshot::from_samples(samples);
     snapshot.prepare(&query.expr, steps);
@@ -641,19 +666,33 @@ impl RangeAggregation {
     }
 
     /// Read every line any step's window covers, once, into series.
-    fn extract(&self, store: &RecordStore<LogSchema>, steps: &[u64]) -> Result<(Extracted, u64)> {
+    fn extract(
+        &self,
+        store: &RecordStore<LogSchema>,
+        steps: &[u64],
+        deadline: Deadline,
+    ) -> Result<(Extracted, u64)> {
         let (Some(&first), Some(&last)) = (steps.first(), steps.last()) else {
             return Ok((Vec::new(), 0));
         };
         let (floor, _) = self.window(first);
         let (_, top) = self.window(last);
         let collector = Mutex::new(Collector::default());
+        let stopped = std::sync::atomic::AtomicBool::new(false);
         // The predicate is the visitor: it records the line and declines it, so the scan
         // holds nothing and memory follows the series, not the lines.
         let visit = |record: &LogRecord| {
+            if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                return false;
+            }
             let sample = self.sample(record);
             let mut collector = collector.lock().unwrap_or_else(PoisonError::into_inner);
             collector.lines += 1;
+            if collector.lines.is_multiple_of(4096) && deadline.passed() {
+                collector.refused.get_or_insert_with(timed_out);
+                stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
             if let Some((labels, value)) = sample {
                 collector.push(labels, record.timestamp_nanos, value);
             }
@@ -757,7 +796,30 @@ impl RangeAggregation {
         series: &Extracted,
         steps: &[u64],
         out: &mut Vec<MetricSample>,
+        deadline: Deadline,
     ) -> Result<()> {
+        let mut work = 0u64;
+        let mut windows = 0u64;
+        let mut account = |window: usize| -> Result<()> {
+            let window = window as u64;
+            // A quantile sorts its window; count it as the sort's comparisons.
+            work += if self.function == RangeFunction::QuantileOverTime {
+                window * u64::from(window.max(2).ilog2())
+            } else {
+                window
+            };
+            windows += 1;
+            if work > MAX_WINDOW_WORK {
+                return Err(Error::BadRequest(format!(
+                    "this query would read more than {MAX_WINDOW_WORK} samples across its \
+                     windows; widen `step`, shorten the range in `[…]`, or narrow the query"
+                )));
+            }
+            if windows.is_multiple_of(1024) && deadline.passed() {
+                return Err(timed_out());
+            }
+            Ok(())
+        };
         let name = format!("{PLACEHOLDER}{index}");
         let sample = |labels: &Labels, at: u64, value: f64| MetricSample {
             timestamp_nanos: at,
@@ -790,7 +852,9 @@ impl RangeAggregation {
             let mut present = false;
             for &at in steps {
                 let (floor, top) = self.window(at);
-                match self.value(in_window(samples, floor, top), floor, top) {
+                let window = in_window(samples, floor, top);
+                account(window.len())?;
+                match self.value(window, floor, top) {
                     Some(value) => {
                         out.push(sample(&labels, at, value));
                         present = true;
@@ -950,9 +1014,10 @@ pub fn answer_range(
     store: &RecordStore<LogSchema>,
     query: &MetricQuery,
     steps: &[u64],
+    deadline: Deadline,
 ) -> Result<serde_json::Value> {
     let started = std::time::Instant::now();
-    let (values, lines) = evaluate(store, query, steps)?;
+    let (values, lines) = evaluate(store, query, steps, deadline)?;
     let mut series: HashMap<Labels, Vec<(f64, String)>> = HashMap::new();
     let mut points = 0u64;
     for (&at, value) in steps.iter().zip(values) {
@@ -994,10 +1059,11 @@ pub fn answer_instant(
     store: &RecordStore<LogSchema>,
     query: &MetricQuery,
     at: u64,
+    deadline: Deadline,
 ) -> Result<serde_json::Value> {
     use crate::prometheus::{format_value, to_seconds};
     let started = std::time::Instant::now();
-    let (mut values, lines) = evaluate(store, query, &[at])?;
+    let (mut values, lines) = evaluate(store, query, &[at], deadline)?;
     let (kind, result, points) = match values.pop() {
         Some(Value::Scalar(value)) => (
             "scalar",

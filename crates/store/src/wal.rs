@@ -185,11 +185,18 @@ impl Wal {
         self.appended_bytes += frames;
         if matches!(self.sync, WalSync::Always) {
             self.unsynced_records = 0;
-            Ok(())
         } else {
             self.unsynced_records += payloads.len() as u64;
-            self.maybe_sync()
+            // The batch is written and in the kernel's hands, which is what "interval"
+            // promises; the periodic fsync that may fall due here covers every batch
+            // since the last one. Failing it would tell this client its batch was refused
+            // while its frames stay in the log, to be sent again and replayed twice. It is
+            // retried at the next interval, and said out loud now.
+            if let Err(error) = self.maybe_sync() {
+                tracing::warn!(%error, "a periodic write-ahead log sync failed; it is retried");
+            }
         }
+        Ok(())
     }
 
     /// Cut the segment back to the frames acknowledged before the batch that failed,

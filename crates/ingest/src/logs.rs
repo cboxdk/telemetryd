@@ -12,7 +12,7 @@ use telemetryd_core::{Labels, LogRecord, Severity};
 
 use crate::otlp::{
     AnyValue, FlexEnum, FlexU64, InstrumentationScope, KeyValue, Resource, extend_attributes,
-    extend_labels, keep_unpromoted, normalize_id,
+    extend_labels, keep_unpromoted, normalize_span_id, normalize_trace_id,
 };
 use crate::{Decoded, RejectReason, Rejection};
 
@@ -286,8 +286,8 @@ fn convert(
         severity_text: raw.severity_text.clone(),
         body,
         attributes,
-        trace_id: normalize_id(&raw.trace_id),
-        span_id: normalize_id(&raw.span_id),
+        trace_id: normalize_trace_id(&raw.trace_id),
+        span_id: normalize_span_id(&raw.span_id),
     })
 }
 

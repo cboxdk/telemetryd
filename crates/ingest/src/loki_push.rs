@@ -140,10 +140,14 @@ pub fn decode_protobuf(
         .decompress_vec(compressed)
         .map_err(|e| Error::BadRequest(format!("the Loki push body is not valid snappy: {e}")))?;
     let mut decoded = Decoded::bounded(ctx.limits).drawing_from(ctx.pool);
+    // What the entries may become while a stream is gathered, before any is charged to
+    // `decoded`: an empty entry is two bytes on the wire and a fifty-six byte `Entry`, so
+    // a body within its limit could build half a gigabyte of them.
+    let mut budget = usize::try_from(ctx.limits.max_decoded_bytes.as_u64()).unwrap_or(usize::MAX);
     let mut request = Reader::new(&body);
     while let Some((field, wire)) = request.next_field()? {
         if field == 1 && wire == WireType::LengthDelimited {
-            let (labels, entries) = read_stream(request.message()?)?;
+            let (labels, entries) = read_stream(request.message()?, &mut budget)?;
             let labels = parse_label_string(&labels).map_err(|e| {
                 Error::BadRequest(format!(
                     "a pushed stream's labels {labels:?} do not parse: {e}"
@@ -158,12 +162,29 @@ pub fn decode_protobuf(
 }
 
 /// `StreamAdapter`: `labels` (1) and `entries` (2).
-fn read_stream(mut stream: Reader<'_>) -> Result<(String, Vec<Entry>)> {
+fn read_stream(mut stream: Reader<'_>, budget: &mut usize) -> Result<(String, Vec<Entry>)> {
     let (mut labels, mut entries) = (String::new(), Vec::new());
     while let Some((field, wire)) = stream.next_field()? {
         match (field, wire) {
             (1, WireType::LengthDelimited) => stream.string()?.clone_into(&mut labels),
-            (2, WireType::LengthDelimited) => entries.push(read_entry(stream.message()?)?),
+            (2, WireType::LengthDelimited) => {
+                let entry = read_entry(stream.message()?)?;
+                let size = std::mem::size_of::<Entry>()
+                    + entry.line.len()
+                    + entry
+                        .metadata
+                        .iter()
+                        .map(|(k, v)| std::mem::size_of::<(String, String)>() + k.len() + v.len())
+                        .sum::<usize>();
+                *budget = budget
+                    .checked_sub(size)
+                    .ok_or_else(|| Error::LimitExceeded {
+                        limit: "limits.max_decoded_bytes",
+                        detail: "the push body expands past what one request may decode to"
+                            .to_owned(),
+                    })?;
+                entries.push(entry);
+            }
             _ => stream.skip(wire)?,
         }
     }
@@ -325,8 +346,16 @@ fn record(
     let mut attributes = Labels::new();
     for (name, value) in entry.metadata {
         match name.as_str() {
-            "trace_id" | "traceID" | "traceId" => trace_id = Some(value.to_ascii_lowercase()),
-            "span_id" | "spanID" | "spanId" => span_id = Some(value.to_ascii_lowercase()),
+            // An id that is one becomes the record's, padded as OTLP's are. One that is
+            // not — all zeros, not hex — stays metadata as it was sent, as Loki keeps it.
+            "trace_id" | "traceID" | "traceId" => match crate::otlp::normalize_trace_id(&value) {
+                Some(id) => trace_id = Some(id),
+                None => attributes.insert(name, value),
+            },
+            "span_id" | "spanID" | "spanId" => match crate::otlp::normalize_span_id(&value) {
+                Some(id) => span_id = Some(id),
+                None => attributes.insert(name, value),
+            },
             _ => attributes.insert(name, value),
         }
     }
@@ -448,6 +477,34 @@ mod tests {
             now_nanos: 1_750_000_000_000_000_000,
             pool: None,
         }
+    }
+
+    /// Empty entries are two bytes each on the wire and far more once gathered; a body
+    /// of them is refused when what it gathers passes the decode budget, not after.
+    #[test]
+    fn a_push_of_tiny_entries_cannot_outgrow_its_budget() {
+        let labels = br#"{job="x"}"#;
+        let mut stream = vec![0x0a, u8::try_from(labels.len()).unwrap()];
+        stream.extend_from_slice(labels);
+        for _ in 0..10_000 {
+            stream.extend_from_slice(&[0x12, 0x00]);
+        }
+        let mut body = vec![0x0a];
+        let mut length = stream.len();
+        while length >= 0x80 {
+            body.push(u8::try_from(length & 0x7f).unwrap() | 0x80);
+            length >>= 7;
+        }
+        body.push(u8::try_from(length).unwrap());
+        body.extend_from_slice(&stream);
+        let compressed = snap::raw::Encoder::new().compress_vec(&body).unwrap();
+        let limits = LimitsConfig {
+            max_decoded_bytes: bytesize::ByteSize::kib(64),
+            ..LimitsConfig::default()
+        };
+        let ingest = IngestConfig::default();
+        let error = decode_protobuf(&compressed, 1 << 20, context(&limits, &ingest)).unwrap_err();
+        assert!(error.to_string().contains("max_decoded_bytes"), "{error}");
     }
 
     #[test]

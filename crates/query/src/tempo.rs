@@ -544,25 +544,44 @@ pub fn trace(store: &RecordStore<SpanSchema>, trace_id: &str) -> Result<TraceRes
              left off, or base64"
         ))
     })?;
+    // Ingest pads ids to 32 digits since 0.69.3. A span stored before kept the id as
+    // sent — a 64-bit id as 16 digits — and its search row shows it without leading
+    // zeros, so those spellings are tried too before the trace is called missing.
+    let mut candidates = vec![wanted.clone()];
+    let short = wanted.trim_start_matches('0');
+    if short.len() <= 16 {
+        candidates.push(format!("{short:0>16}"));
+    }
+    let raw = trace_id.trim().to_ascii_lowercase();
+    if raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        candidates.push(raw);
+    }
+    candidates.dedup();
 
-    // The whole retention window, but not the whole store: `exact_key` lets each
-    // segment's Bloom filter answer "this trace is definitely not here" without any
-    // I/O. Without it a trace lookup reads every segment, which is the difference
-    // between a millisecond and several seconds on a full disk.
-    let spans = store.scan(
-        telemetryd_store::Scan {
-            abort_over: 0,
-            start_nanos: 0,
-            end_nanos: u64::MAX,
-            limit: 0,
-            order: telemetryd_store::Order::Ascending,
-            exact_key: Some(&wanted),
-            columns: None,
-            required_text: None,
-        },
-        &[],
-        &|span: &SpanRecord| span.trace_id == wanted,
-    )?;
+    let mut spans = Vec::new();
+    for candidate in &candidates {
+        // The whole retention window, but not the whole store: `exact_key` lets each
+        // segment's Bloom filter answer "this trace is definitely not here" without any
+        // I/O. Without it a trace lookup reads every segment, which is the difference
+        // between a millisecond and several seconds on a full disk.
+        spans = store.scan(
+            telemetryd_store::Scan {
+                abort_over: 0,
+                start_nanos: 0,
+                end_nanos: u64::MAX,
+                limit: 0,
+                order: telemetryd_store::Order::Ascending,
+                exact_key: Some(candidate),
+                columns: None,
+                required_text: None,
+            },
+            &[],
+            &|span: &SpanRecord| span.trace_id == *candidate,
+        )?;
+        if !spans.is_empty() {
+            break;
+        }
+    }
 
     // One batch per distinct resource, as OTLP models it; each span once. A resource is
     // its stream labels and the resource attributes kept on its spans.

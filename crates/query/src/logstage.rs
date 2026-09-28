@@ -97,6 +97,8 @@ impl Function {
                     value
                 }
             }
+            // An empty `old` would insert `new` between every character; refused at parse.
+            Self::Replace if args[0].is_empty() => value,
             Self::Replace => value.replace(args[0].as_str(), &args[1]),
             Self::Truncate => {
                 let length = args[0].trim().parse::<i64>().unwrap_or(0);
@@ -123,6 +125,11 @@ impl Function {
         }
     }
 }
+
+/// The most a template renders, as Loki's default `max_line_size`. Past it the output
+/// stops. Stages chain and `{{__line__}}{{__line__}}` doubles a line, so without a cap
+/// ten stages asked for gigabytes a line — and an allocation that fails ends the process.
+pub const MAX_RENDERED_BYTES: usize = 256 * 1024;
 
 impl Template {
     /// Parse a template.
@@ -169,13 +176,19 @@ impl Template {
                     for command in commands {
                         let mut args: Vec<String> = command.args.iter().map(operand).collect();
                         args.extend(piped.take());
-                        piped = Some(match command.function {
+                        let mut value = match command.function {
                             Some(function) => function.apply(&args),
                             None => args.pop().unwrap_or_default(),
-                        });
+                        };
+                        truncate(&mut value, MAX_RENDERED_BYTES);
+                        piped = Some(value);
                     }
                     out.push_str(&piped.unwrap_or_default());
                 }
+            }
+            if out.len() > MAX_RENDERED_BYTES {
+                truncate(&mut out, MAX_RENDERED_BYTES);
+                break;
             }
         }
         out
@@ -195,6 +208,14 @@ fn parse_action(action: &str) -> Result<Part> {
                 .map(|word| parse_operand(word).ok_or_else(|| unsupported_action(action)))
                 .collect::<Result<Vec<_>>>()?;
             let piped = usize::from(index > 0);
+            if matches!(function, Function::Replace)
+                && matches!(args.first(), Some(Operand::Literal(old)) if old.is_empty())
+            {
+                return Err(Error::BadRequest(format!(
+                    "`replace` needs something to replace; \"\" in `{{{{{action}}}}}` \
+                     would insert between every character"
+                )));
+            }
             if args.len() + piped != function.arity() {
                 return Err(Error::BadRequest(format!(
                     "`{first}` takes {} argument(s) in the template action `{{{{{action}}}}}`",
@@ -226,6 +247,17 @@ fn parse_action(action: &str) -> Result<Part> {
         commands.push(command);
     }
     Ok(Part::Action(commands))
+}
+
+/// Cut `text` to at most `max` bytes, at a character boundary.
+fn truncate(text: &mut String, max: usize) {
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
 }
 
 fn parse_operand(word: &str) -> Option<Operand> {
@@ -367,7 +399,10 @@ impl Pattern {
                 rest = &inner[end + 1..];
                 continue;
             }
-            let next = rest[1..].find('<').map_or(rest.len(), |i| i + 1);
+            // Past the first character, whatever its width: slicing one byte in split a
+            // multi-byte character and panicked on `<a>é<b>`.
+            let skip = rest.chars().next().map_or(0, char::len_utf8);
+            let next = rest[skip..].find('<').map_or(rest.len(), |i| i + skip);
             match parts.last_mut() {
                 Some(PatternPart::Literal(text)) => text.push_str(&rest[..next]),
                 _ => parts.push(PatternPart::Literal(rest[..next].to_owned())),
@@ -502,6 +537,31 @@ pub fn parse_bytes(text: &str) -> Option<f64> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_template_cannot_render_without_bound() {
+        let labels = Labels::new();
+        let mut out = "x".repeat(1000);
+        let doubling = Template::parse("{{__line__}}{{__line__}}").unwrap();
+        for _ in 0..20 {
+            out = doubling.render(&labels, &out);
+        }
+        assert_eq!(out.len(), MAX_RENDERED_BYTES);
+        assert!(Template::parse(r#"{{ replace "" "x" .a }}"#).is_err());
+    }
+
+    #[test]
+    fn a_pattern_with_wide_characters_parses() {
+        let pattern = Pattern::parse("<a>é<b>").unwrap();
+        assert_eq!(
+            pattern.captures("1é2"),
+            vec![
+                ("a".to_owned(), "1".to_owned()),
+                ("b".to_owned(), "2".to_owned())
+            ]
+        );
+        assert!(Pattern::parse("é<a>").is_ok());
+    }
 
     fn labels(pairs: &[(&str, &str)]) -> Labels {
         pairs

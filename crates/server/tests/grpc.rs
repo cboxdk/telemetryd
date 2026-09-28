@@ -208,7 +208,9 @@ async fn what_is_not_an_export_is_refused_in_grpc_terms() {
 
     let answer = h.call(LOGS, vec![0, 0, 0, 0, 9, 1], &[]).await;
     assert_eq!(answer.grpc_status.as_deref(), Some("3"));
-    assert!(answer.grpc_message.unwrap().contains("malformed"));
+    // The message streams on to the OTLP handler, which reports the short read.
+    let message = answer.grpc_message.unwrap();
+    assert!(message.contains("more bytes than followed"), "{message}");
 
     // A payload the protobuf decoder refuses is INVALID_ARGUMENT, with its reason.
     let answer = h.call(LOGS, frame(0, &[0xff, 0xff]), &[]).await;

@@ -975,3 +975,42 @@ async fn spans_become_service_graph_and_span_metrics() {
         "150 ms lands in the 128–256 ms bucket: {p50}"
     );
 }
+
+/// A 64-bit trace id — Jaeger's, Zipkin's — is stored padded to 32 digits, as Tempo
+/// stores it, and found by every spelling a client may hold: as sent, padded, without
+/// its leading zeros as a search row shows it, and in base64 as trace JSON shows it.
+#[tokio::test]
+async fn a_short_trace_id_is_found_by_every_spelling() {
+    let harness = Harness::new();
+    let short = "00f067aa0ba902b7";
+    harness
+        .post_traces(&json!({"resourceSpans": [{
+            "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "jaeger"}}]},
+            "scopeSpans": [{"spans": [{
+                "traceId": short, "spanId": "1111111111111111", "name": "op", "kind": 2,
+                "startTimeUnixNano": NOW_NANOS.to_string(),
+                "endTimeUnixNano": (NOW_NANOS + MS).to_string()
+            }]}]
+        }]}))
+        .await;
+    let (_, search) = harness
+        .get(&format!(
+            "/api/search?q={}&{}",
+            urlencode(r#"{ resource.service.name = "jaeger" }"#),
+            window()
+        ))
+        .await;
+    let shown = search["traces"][0]["traceID"].as_str().unwrap().to_owned();
+    assert_eq!(shown, "f067aa0ba902b7", "{search}");
+    for id in [
+        short.to_owned(),
+        format!("{short:0>32}"),
+        shown,
+        "AAAAAAAAAAAA8GeqC6kCtw==".to_owned(),
+    ] {
+        let (status, body) = harness
+            .get(&format!("/api/traces/{}", urlencode(&id)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{id}: {body}");
+    }
+}

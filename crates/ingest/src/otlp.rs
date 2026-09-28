@@ -370,6 +370,26 @@ pub fn normalize_id(raw: &str) -> Option<String> {
     Some(hex)
 }
 
+/// A trace id as 32 hex digits: shorter ones — a 64-bit id from Jaeger or Zipkin, hex
+/// that lost its leading zeros — are padded on the left, as Tempo pads them, so a lookup
+/// by any spelling of it finds it.
+pub fn normalize_trace_id(raw: &str) -> Option<String> {
+    normalize_id(raw).map(|hex| pad(hex, 32))
+}
+
+/// A span id as 16 hex digits, padded as [`normalize_trace_id`] pads.
+pub fn normalize_span_id(raw: &str) -> Option<String> {
+    normalize_id(raw).map(|hex| pad(hex, 16))
+}
+
+fn pad(hex: String, width: usize) -> String {
+    if hex.len() >= width {
+        hex
+    } else {
+        format!("{hex:0>width$}")
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

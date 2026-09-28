@@ -44,7 +44,21 @@ pub(crate) enum Protocol {
 
 /// How many requests one HTTP/2 connection may have in flight — a gRPC exporter sends
 /// a handful, and each one holds an ingest slot while it is stored.
-const MAX_CONCURRENT_STREAMS: u32 = 64;
+const MAX_CONCURRENT_STREAMS: u32 = 16;
+
+/// How long an HTTP/2 connection may go without starting a request before it is asked
+/// to close. HTTP/1's header timeout closes an idle keep-alive connection; HTTP/2 has no
+/// such thing, and its keep-alive pings only find peers that have gone. Without this a
+/// client holding connections open and sending nothing kept their slots for good.
+const HTTP2_IDLE: Duration = Duration::from_secs(60);
+
+/// The connections both listeners may hold between them — one budget, so the gRPC
+/// port cannot spend the descriptors the main one and the store need.
+pub(crate) fn connection_permits() -> Arc<Semaphore> {
+    let limit = connection_limit();
+    tracing::debug!(limit, "serving at most this many connections at once");
+    Arc::new(Semaphore::new(limit))
+}
 
 /// Serve `app` on `listener` until `shutdown` resolves, then let open connections finish
 /// their current request and return once every one has closed.
@@ -52,12 +66,9 @@ pub(crate) async fn serve(
     listener: Bound,
     app: Router,
     protocol: Protocol,
+    permits: Arc<Semaphore>,
     shutdown: impl Future<Output = ()>,
 ) {
-    let limit = connection_limit();
-    tracing::debug!(limit, "serving at most this many connections at once");
-    let permits = Arc::new(Semaphore::new(limit));
-
     // Dropping `stop` tells every connection to finish; `done` closes once they all have.
     let (stop, stopped) = watch::channel(());
     let (done, finished) = watch::channel(());
@@ -77,10 +88,17 @@ pub(crate) async fn serve(
             () = &mut shutdown => break,
         };
 
-        let service = TowerToHyperService::new(
-            app.clone()
-                .map_request(|request: hyper::Request<Incoming>| request.map(Body::new)),
-        );
+        // When the connection last started a request, for closing an idle HTTP/2 one.
+        let started_at = std::time::Instant::now();
+        let last_request = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let touched = Arc::clone(&last_request);
+        let service = TowerToHyperService::new(app.clone().map_request(
+            move |request: hyper::Request<Incoming>| {
+                let at = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                touched.store(at, std::sync::atomic::Ordering::Relaxed);
+                request.map(Body::new)
+            },
+        ));
         let stop = stop.clone();
         let finished = finished.clone();
         tokio::spawn(async move {
@@ -109,6 +127,24 @@ pub(crate) async fn serve(
                     .keep_alive_interval(Some(Duration::from_secs(30)))
                     .keep_alive_timeout(Duration::from_secs(20));
                 let connection = builder.serve_connection(TokioIo::new(io), service);
+                let idle = async move {
+                    let mut tick = tokio::time::interval(Duration::from_secs(5));
+                    loop {
+                        tick.tick().await;
+                        let last = Duration::from_millis(
+                            last_request.load(std::sync::atomic::Ordering::Relaxed),
+                        );
+                        if started_at.elapsed().saturating_sub(last) >= HTTP2_IDLE {
+                            return;
+                        }
+                    }
+                };
+                let stopping = async move {
+                    tokio::select! {
+                        () = stopping => {}
+                        () = idle => {}
+                    }
+                };
                 drive(
                     pin!(connection),
                     stopping,

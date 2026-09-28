@@ -264,6 +264,11 @@ impl Parser<'_> {
                 self.pos += 1;
                 quantiles.push(q);
             }
+            if quantiles.len() > 10 {
+                return Err(Error::BadRequest(
+                    "quantile_over_time takes at most ten quantiles".to_owned(),
+                ));
+            }
             if quantiles.is_empty() {
                 return Err(Error::BadRequest(
                     "quantile_over_time needs at least one quantile, like \

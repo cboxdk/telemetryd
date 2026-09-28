@@ -77,7 +77,10 @@ async fn metric_range(
     let end = end.div_ceil(step).saturating_mul(step);
     let steps = prometheus::step_grid(start, end, step)?;
     let store = std::sync::Arc::clone(&state.store);
-    crate::auth::spawn_read(move || logmetric::answer_range(store.logs(), &query, &steps))
+    let deadline = logmetric::Deadline(Some(
+        std::time::Instant::now() + state.config.server.request_timeout,
+    ));
+    crate::auth::spawn_read(move || logmetric::answer_range(store.logs(), &query, &steps, deadline))
         .await
         .map_err(|e| Error::Config(format!("query task panicked: {e}")))?
 }
@@ -99,12 +102,15 @@ pub async fn instant(
     if logmetric::is_metric(&expression) {
         let query = logmetric::parse(&expression)
             .inspect_err(|error| state.refused_query("logql", &expression, error))?;
+        let timeout = state.config.server.request_timeout;
         let store = std::sync::Arc::clone(&state.store);
-        let answer =
-            crate::auth::spawn_read(move || logmetric::answer_instant(store.logs(), &query, at))
-                .await
-                .map_err(|e| Error::Config(format!("query task panicked: {e}")))?
-                .inspect_err(|error| state.refused_query("logql", &expression, error))?;
+        let answer = crate::auth::spawn_read(move || {
+            let deadline = logmetric::Deadline(Some(std::time::Instant::now() + timeout));
+            logmetric::answer_instant(store.logs(), &query, at, deadline)
+        })
+        .await
+        .map_err(|e| Error::Config(format!("query task panicked: {e}")))?
+        .inspect_err(|error| state.refused_query("logql", &expression, error))?;
         return Ok(Json(answer).into_response());
     }
 

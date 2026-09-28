@@ -24,6 +24,11 @@ use crate::traceql::{self, MetricsFunction, MetricsStage, TraceQuery};
 pub const MAX_SERIES: usize = 1_000;
 /// Steps one range may be cut into.
 pub const MAX_STEPS: u64 = 11_000;
+/// Points one answer may hold, across its series, steps and quantiles — what is
+/// allocated before a span is read, and what is written out after.
+pub const MAX_POINTS: usize = 2_000_000;
+/// Values one query may keep for its quantiles.
+pub const MAX_VALUES: usize = 5_000_000;
 
 /// `GET /api/metrics/query_range` and `/api/metrics/query` parameters.
 #[derive(Debug, Default, Deserialize)]
@@ -162,9 +167,11 @@ pub enum LabelValue {
 pub fn evaluate(store: &RecordStore<SpanSchema>, request: &MetricsRequest) -> Result<Vec<Series>> {
     let stage = request.stage();
     let steps = request.steps();
+    let per_series = steps.saturating_mul(stage.quantiles.len().max(1));
     let mut series: HashMap<Key, Vec<Bucket>> = HashMap::new();
     let mut refused = None;
-    let gathered = std::sync::Mutex::new((&mut series, &mut refused));
+    let mut kept_values = 0usize;
+    let gathered = std::sync::Mutex::new((&mut series, &mut refused, &mut kept_values));
     let visit = |span: &SpanRecord| {
         if !request.query.matches(span) {
             return false;
@@ -183,15 +190,29 @@ pub fn evaluate(store: &RecordStore<SpanSchema>, request: &MetricsRequest) -> Re
         let mut guard = gathered
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (series, refused) = &mut *guard;
+        let (series, refused, kept_values) = &mut *guard;
         if refused.is_some() {
             return false;
         }
-        if !series.contains_key(&key) && series.len() >= MAX_SERIES {
+        if !series.contains_key(&key)
+            && (series.len() >= MAX_SERIES
+                || (series.len() + 1).saturating_mul(per_series) > MAX_POINTS)
+        {
             **refused = Some(Error::BadRequest(format!(
-                "more than {MAX_SERIES} series; group by fewer fields or filter the spans"
+                "this would be more than {MAX_SERIES} series or {MAX_POINTS} points; widen \
+                 `step`, group by fewer fields, or filter the spans"
             )));
             return false;
+        }
+        if stage.function == MetricsFunction::QuantileOverTime && value.flatten().is_some() {
+            **kept_values += 1;
+            if **kept_values > MAX_VALUES {
+                **refused = Some(Error::BadRequest(format!(
+                    "quantiles over more than {MAX_VALUES} spans; narrow the range or filter \
+                     the spans"
+                )));
+                return false;
+            }
         }
         let bucket = &mut series
             .entry(key)

@@ -283,38 +283,9 @@ pub async fn serve_state(state: AppState) -> Result<()> {
         None => None,
     };
 
-    let local = bound.local_addr().unwrap_or(config.server.listen);
-    if let Some(grpc) = &grpc {
-        tracing::info!(
-            listen = %grpc.local_addr().map_or_else(String::new, |a| a.to_string()),
-            "serving OTLP/gRPC"
-        );
-    }
-    tracing::info!(
-        listen = %local,
-        scheme = if config.server.tls.is_enabled() { "https" } else { "http" },
-        data_dir = %store.data_dir().root().display(),
-        version = telemetryd_core::VERSION,
-        "telemetryd is serving"
-    );
-    if config.server.insecure {
-        tracing::warn!(
-            listen = %local,
-            "running with --insecure: this instance accepts unauthenticated requests \
-             from the network"
-        );
-    }
+    announce(&state, &bound, grpc.as_ref());
 
     load_oidc_keys(&state).await;
-
-    if let Some(relay) = &state.relay {
-        tracing::info!(
-            upstream = %telemetryd_core::http::redact_url(&config.relay.upstream),
-            trust_client_identity = config.relay.trust_client_identity,
-            "relay mode: forwarding sealed segments upstream"
-        );
-        let _ = relay;
-    }
 
     let generating = spawn_generator(&state);
 
@@ -338,22 +309,36 @@ pub async fn serve_state(state: AppState) -> Result<()> {
     let (signalled, mut wait_for_signal) = tokio::sync::watch::channel(false);
     let max_body = usize::try_from(config.server.max_body_bytes.as_u64()).unwrap_or(usize::MAX);
     let app = router(state);
+    let permits = connections::connection_permits();
     let grpc_serving = {
+        let permits = Arc::clone(&permits);
         let mut signal = wait_for_signal.clone();
         let app = grpc::router(app.clone(), max_body);
         async move {
             if let Some(grpc) = grpc {
-                connections::serve(grpc, app, connections::Protocol::Http2, async move {
-                    let _ = signal.wait_for(|started| *started).await;
-                })
+                connections::serve(
+                    grpc,
+                    app,
+                    connections::Protocol::Http2,
+                    permits,
+                    async move {
+                        let _ = signal.wait_for(|started| *started).await;
+                    },
+                )
                 .await;
             }
         }
     };
-    let main_serving = connections::serve(bound, app, connections::Protocol::Http1, async move {
-        shutdown_signal().await;
-        let _ = signalled.send(true);
-    });
+    let main_serving = connections::serve(
+        bound,
+        app,
+        connections::Protocol::Http1,
+        permits,
+        async move {
+            shutdown_signal().await;
+            let _ = signalled.send(true);
+        },
+    );
     let serving = async move {
         tokio::join!(main_serving, grpc_serving);
     };
@@ -408,6 +393,40 @@ async fn load_oidc_keys(state: &AppState) {
             ),
             Err(error) => tracing::error!(%error, "the key fetch task panicked"),
         }
+    }
+}
+
+/// Say what is being served, and how.
+fn announce(state: &AppState, bound: &Bound, grpc: Option<&Bound>) {
+    let config = &state.config;
+    let local = bound.local_addr().unwrap_or(config.server.listen);
+    if let Some(grpc) = grpc {
+        tracing::info!(
+            listen = %grpc.local_addr().map_or_else(String::new, |a| a.to_string()),
+            "serving OTLP/gRPC"
+        );
+    }
+    tracing::info!(
+        listen = %local,
+        scheme = if config.server.tls.is_enabled() { "https" } else { "http" },
+        data_dir = %state.store.data_dir().root().display(),
+        version = telemetryd_core::VERSION,
+        "telemetryd is serving"
+    );
+    if config.server.insecure {
+        tracing::warn!(
+            listen = %local,
+            "running with --insecure: this instance accepts unauthenticated requests \
+             from the network"
+        );
+    }
+    if let Some(relay) = &state.relay {
+        tracing::info!(
+            upstream = %telemetryd_core::http::redact_url(&config.relay.upstream),
+            trust_client_identity = config.relay.trust_client_identity,
+            "relay mode: forwarding sealed segments upstream"
+        );
+        let _ = relay;
     }
 }
 
