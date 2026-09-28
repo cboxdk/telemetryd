@@ -532,7 +532,7 @@ fn collect_rate_calls<'a>(expr: &'a Expr, out: &mut Vec<(&'a Selector, Duration,
             collect_rate_calls(right, out);
         }
         Expr::Negate(inner) => collect_rate_calls(inner, out),
-        Expr::Selector(_) | Expr::Number(_) => {}
+        Expr::Selector(_) | Expr::Number(_) | Expr::String(_) => {}
     }
 }
 
@@ -1246,6 +1246,9 @@ impl Snapshot {
     pub fn eval(&self, expr: &Expr, at_nanos: u64) -> Result<Value> {
         match expr {
             Expr::Number(value) => Ok(Value::Scalar(*value)),
+            Expr::String(_) => Err(Error::BadRequest(
+                "a string is not a value PromQL can answer with here".to_owned(),
+            )),
             Expr::Selector(selector) => Ok(Value::Vector(self.instant(selector, at_nanos))),
             Expr::Negate(inner) => Ok(match self.eval(inner, at_nanos)? {
                 Value::Scalar(value) => Value::Scalar(-value),
@@ -1287,7 +1290,32 @@ impl Snapshot {
                     };
                     return Ok(Value::Vector(select_elements(*op, grouping, &vector, k)));
                 }
-                Ok(Value::Vector(self.aggregate(*op, grouping, &vector)))
+                if *op == AggregateOp::CountValues {
+                    let Some(Expr::String(label)) = param.as_deref() else {
+                        return Err(Error::BadRequest(
+                            "`count_values` needs a label name as its first argument, like \
+                             `count_values(\"value\", …)`"
+                                .to_owned(),
+                        ));
+                    };
+                    return Ok(Value::Vector(count_values(label, grouping, &vector)));
+                }
+                let parameter = match (op, param.as_deref()) {
+                    (AggregateOp::Quantile, Some(expr)) => match self.eval(expr, at_nanos)? {
+                        Value::Scalar(value) => value,
+                        Value::Vector(_) => {
+                            return Err(Error::BadRequest(
+                                "`quantile` needs a number as its first argument, like \
+                                 `quantile(0.9, …)`"
+                                    .to_owned(),
+                            ));
+                        }
+                    },
+                    _ => 0.0,
+                };
+                Ok(Value::Vector(
+                    self.aggregate(*op, grouping, &vector, parameter),
+                ))
             }
             Expr::Binary {
                 op,
@@ -1306,76 +1334,253 @@ impl Snapshot {
     }
 
     fn eval_call(&self, function: Function, args: &[Expr], at_nanos: u64) -> Result<Value> {
+        if let Some(position) = function.range_argument() {
+            return self.eval_range_call(function, args, position, at_nanos);
+        }
         match function {
-            Function::Rate | Function::Increase => {
-                let Expr::Selector(selector) = &args[0] else {
-                    return Err(Error::BadRequest(format!(
-                        "`{}` needs a range vector, e.g. {}(metric[5m])",
-                        function.as_str(),
-                        function.as_str()
-                    )));
-                };
-                let Some(range) = selector.range else {
-                    return Err(Error::BadRequest(format!(
-                        "`{}` needs a range selector like `metric[5m]`",
-                        function.as_str()
-                    )));
-                };
-                Ok(Value::Vector(self.rate(
-                    selector,
-                    range,
-                    at_nanos,
-                    function == Function::Rate,
-                )))
-            }
             Function::HistogramQuantile => {
-                let quantile = match self.eval(&args[0], at_nanos)? {
-                    Value::Scalar(value) => value,
-                    Value::Vector(_) => {
-                        return Err(Error::BadRequest(
-                            "histogram_quantile needs a scalar quantile as its first argument"
-                                .to_owned(),
-                        ));
-                    }
-                };
+                let quantile = self.scalar_argument(function, &args[0], at_nanos)?;
                 let vector = self.eval(&args[1], at_nanos)?.into_vector();
                 Ok(Value::Vector(histogram_quantile(quantile, &vector)))
             }
-            Function::ClampMin | Function::ClampMax => {
-                let bound = match self.eval(&args[1], at_nanos)? {
-                    Value::Scalar(value) => value,
-                    Value::Vector(_) => {
-                        return Err(Error::BadRequest(format!(
-                            "`{}` needs a scalar bound as its second argument",
-                            function.as_str()
-                        )));
-                    }
+            Function::ClampMin | Function::ClampMax | Function::Clamp => {
+                let (low, high) = match function {
+                    Function::ClampMin => (
+                        self.scalar_argument(function, &args[1], at_nanos)?,
+                        f64::INFINITY,
+                    ),
+                    Function::ClampMax => (
+                        f64::NEG_INFINITY,
+                        self.scalar_argument(function, &args[1], at_nanos)?,
+                    ),
+                    _ => (
+                        self.scalar_argument(function, &args[1], at_nanos)?,
+                        self.scalar_argument(function, &args[2], at_nanos)?,
+                    ),
                 };
                 let mut vector = self.drop_names(self.eval(&args[0], at_nanos)?.into_vector());
+                // `clamp` with its bounds crossed answers nothing, as in Prometheus.
+                if low > high {
+                    vector.samples.clear();
+                }
                 for (_, value) in &mut vector.samples {
-                    *value = if function == Function::ClampMin {
-                        value.max(bound)
-                    } else {
-                        value.min(bound)
-                    };
+                    *value = value.max(low).min(high);
                 }
                 Ok(Value::Vector(vector))
             }
-            Function::Abs => {
-                let mut vector = self.drop_names(self.eval(&args[0], at_nanos)?.into_vector());
-                for (_, value) in &mut vector.samples {
-                    *value = value.abs();
-                }
-                Ok(Value::Vector(vector))
-            }
-            Function::Vector => match self.eval(&args[0], at_nanos)? {
-                Value::Scalar(value) => Ok(Value::Vector(InstantVector {
+            Function::Pi => Ok(Value::Scalar(std::f64::consts::PI)),
+            Function::Time => Ok(Value::Scalar(at_seconds(at_nanos))),
+            Function::Vector => {
+                let value = self.scalar_argument(function, &args[0], at_nanos)?;
+                Ok(Value::Vector(InstantVector {
                     samples: vec![(Labels::new(), value)],
-                })),
-                Value::Vector(_) => Err(Error::BadRequest(
-                    "`vector` needs a scalar argument".to_owned(),
-                )),
+                }))
+            }
+            Function::Scalar => {
+                let vector = self.eval(&args[0], at_nanos)?.into_vector();
+                Ok(Value::Scalar(match vector.samples.as_slice() {
+                    [(_, value)] => *value,
+                    _ => f64::NAN,
+                }))
+            }
+            _ => self.eval_vector_call(function, args, at_nanos),
+        }
+    }
+
+    /// The functions of one instant vector: math, dates, sorting, labels, `absent`.
+    fn eval_vector_call(&self, function: Function, args: &[Expr], at_nanos: u64) -> Result<Value> {
+        // The date functions default to `vector(time())`.
+        let vector = match args.first() {
+            Some(arg) => self.eval(arg, at_nanos)?.into_vector(),
+            None => InstantVector {
+                samples: vec![(Labels::new(), at_seconds(at_nanos))],
             },
+        };
+        let vector = match function {
+            Function::Sort | Function::SortDesc => {
+                let mut vector = vector;
+                vector.samples.sort_by(|a, b| {
+                    let order = a.1.total_cmp(&b.1);
+                    if function == Function::Sort {
+                        order
+                    } else {
+                        order.reverse()
+                    }
+                });
+                vector
+            }
+            Function::Absent => absent(!vector.samples.is_empty(), args.first()),
+            Function::Timestamp => self.timestamps(args.first(), vector, at_nanos),
+            Function::LabelReplace => {
+                let text = |i: usize| string_argument(&args[i]);
+                let pattern = format!("^(?s:{})$", text(4));
+                let regex = regex::RegexBuilder::new(&pattern)
+                    .size_limit(1 << 20)
+                    .build()
+                    .map_err(|e| {
+                        Error::BadRequest(format!(
+                            "invalid regular expression in label_replace: {e}"
+                        ))
+                    })?;
+                InstantVector {
+                    samples: vector
+                        .samples
+                        .into_iter()
+                        .map(|(labels, value)| {
+                            (
+                                crate::promfn::label_replace(
+                                    &labels,
+                                    text(1),
+                                    text(2),
+                                    text(3),
+                                    &regex,
+                                ),
+                                value,
+                            )
+                        })
+                        .collect(),
+                }
+            }
+            Function::LabelJoin => {
+                let sources: Vec<String> = args[3..]
+                    .iter()
+                    .map(|a| string_argument(a).to_owned())
+                    .collect();
+                InstantVector {
+                    samples: vector
+                        .samples
+                        .into_iter()
+                        .map(|(labels, value)| {
+                            let joined = crate::promfn::label_join(
+                                &labels,
+                                string_argument(&args[1]),
+                                string_argument(&args[2]),
+                                &sources,
+                            );
+                            (joined, value)
+                        })
+                        .collect(),
+                }
+            }
+            _ => {
+                let parameter = match (function, args.get(1)) {
+                    (Function::Round, Some(to)) => self.scalar_argument(function, to, at_nanos)?,
+                    _ => 1.0,
+                };
+                let mut vector = self.drop_names(vector);
+                for (_, value) in &mut vector.samples {
+                    *value = crate::promfn::of_value(function, *value, parameter);
+                }
+                vector
+            }
+        };
+        Ok(Value::Vector(vector))
+    }
+
+    /// `timestamp(v)`: when each element's sample was taken, in seconds. Of a selector,
+    /// the sample's own time; of anything computed, the evaluation time.
+    fn timestamps(
+        &self,
+        arg: Option<&Expr>,
+        vector: InstantVector,
+        at_nanos: u64,
+    ) -> InstantVector {
+        if let Some(Expr::Selector(selector)) = arg {
+            let at = selector.offset.apply(at_nanos);
+            let floor = at.saturating_sub(duration_nanos(crate::promql::DEFAULT_LOOKBACK));
+            let mut samples = Vec::new();
+            for index in self.matching(selector) {
+                let series = &self.series[index];
+                let end = series.samples.partition_point(|(ts, _)| *ts <= at);
+                if let Some((ts, value)) = end.checked_sub(1).map(|i| series.samples[i])
+                    && ts > floor
+                    && !telemetryd_core::is_stale_marker(value)
+                {
+                    samples.push((self.stripped[index].clone(), at_seconds(ts)));
+                }
+            }
+            return InstantVector { samples };
+        }
+        let mut vector = self.drop_names(vector);
+        for (_, value) in &mut vector.samples {
+            *value = at_seconds(at_nanos);
+        }
+        vector
+    }
+
+    /// A function over a range vector: `rate`, `irate`, the `*_over_time` family.
+    fn eval_range_call(
+        &self,
+        function: Function,
+        args: &[Expr],
+        position: usize,
+        at_nanos: u64,
+    ) -> Result<Value> {
+        let Some(Expr::Selector(selector)) = args.get(position) else {
+            return Err(Error::BadRequest(format!(
+                "`{}` needs a range vector, e.g. {}(metric[5m])",
+                function.as_str(),
+                function.as_str()
+            )));
+        };
+        let Some(range) = selector.range else {
+            return Err(Error::BadRequest(format!(
+                "`{}` needs a range selector like `metric[5m]`",
+                function.as_str()
+            )));
+        };
+        if matches!(function, Function::Rate | Function::Increase) {
+            return Ok(Value::Vector(self.rate(
+                selector,
+                range,
+                at_nanos,
+                function == Function::Rate,
+            )));
+        }
+        let parameter = match function {
+            Function::QuantileOverTime => self.scalar_argument(function, &args[0], at_nanos)?,
+            Function::PredictLinear => self.scalar_argument(function, &args[1], at_nanos)?,
+            _ => 0.0,
+        };
+        let at = selector.offset.apply(at_nanos);
+        let floor = at.saturating_sub(duration_nanos(range));
+        let mut samples = Vec::new();
+        let mut any = false;
+        for index in self.matching(selector) {
+            let series = &self.series[index];
+            let start = series.samples.partition_point(|(ts, _)| *ts <= floor);
+            let end = series.samples.partition_point(|(ts, _)| *ts <= at);
+            let window: Vec<(u64, f64)> = series.samples[start..end]
+                .iter()
+                .copied()
+                .filter(|(_, value)| !telemetryd_core::is_stale_marker(*value))
+                .collect();
+            any |= !window.is_empty();
+            if let Some(value) =
+                crate::promfn::over_range(function, &window, (floor, at), at_nanos, parameter)
+            {
+                let labels = if function == Function::LastOverTime {
+                    series.labels.clone()
+                } else {
+                    self.stripped[index].clone()
+                };
+                samples.push((labels, value));
+            }
+        }
+        if function == Function::AbsentOverTime {
+            return Ok(Value::Vector(absent(any, args.first())));
+        }
+        Ok(Value::Vector(InstantVector { samples }))
+    }
+
+    /// An argument that has to be a number, like `histogram_quantile`'s first.
+    fn scalar_argument(&self, function: Function, arg: &Expr, at_nanos: u64) -> Result<f64> {
+        match self.eval(arg, at_nanos)? {
+            Value::Scalar(value) => Ok(value),
+            Value::Vector(_) => Err(Error::BadRequest(format!(
+                "`{}` needs a number here, not a vector",
+                function.as_str()
+            ))),
         }
     }
 
@@ -1704,9 +1909,10 @@ impl Snapshot {
         op: AggregateOp,
         grouping: &Grouping,
         vector: &InstantVector,
+        parameter: f64,
     ) -> InstantVector {
         let Some(index) = self.grouped.iter().find(|g| g.grouping == *grouping) else {
-            return aggregate(op, grouping, vector);
+            return aggregate(op, grouping, vector, parameter);
         };
 
         let mut values: Vec<Vec<f64>> = vec![Vec::new(); index.keys.len()];
@@ -1722,19 +1928,23 @@ impl Snapshot {
             .into_iter()
             .enumerate()
             .filter(|(_, group)| !group.is_empty())
-            .map(|(position, group)| (index.keys[position].clone(), reduce(op, &group)))
+            .map(|(position, group)| (index.keys[position].clone(), reduce(op, &group, parameter)))
             .collect();
         if !spilled.samples.is_empty() {
-            samples.extend(aggregate(op, grouping, &spilled).samples);
+            samples.extend(aggregate(op, grouping, &spilled, parameter).samples);
         }
         samples.sort_by(|(a, _), (b, _)| a.cmp(b));
         InstantVector { samples }
     }
 }
 
-/// Reduce one group to a single value.
-fn reduce(op: AggregateOp, values: &[f64]) -> f64 {
+/// Reduce one group to a single value. `parameter` is `quantile`'s φ.
+fn reduce(op: AggregateOp, values: &[f64], parameter: f64) -> f64 {
     match op {
+        AggregateOp::Quantile => crate::promfn::quantile(parameter, &mut values.to_vec()),
+        AggregateOp::Stddev => crate::promfn::group_variance(values).sqrt(),
+        AggregateOp::Stdvar => crate::promfn::group_variance(values),
+        AggregateOp::Group => 1.0,
         AggregateOp::Sum => values.iter().sum(),
         #[allow(clippy::cast_precision_loss)]
         AggregateOp::Avg => values.iter().sum::<f64>() / values.len() as f64,
@@ -1744,11 +1954,37 @@ fn reduce(op: AggregateOp, values: &[f64]) -> f64 {
         AggregateOp::Count => values.len() as f64,
         // Handled by `select_elements`, which keeps each element rather than reducing a
         // group to one number.
-        AggregateOp::TopK | AggregateOp::BottomK => f64::NAN,
+        AggregateOp::TopK | AggregateOp::BottomK | AggregateOp::CountValues => f64::NAN,
     }
 }
 
-fn aggregate(op: AggregateOp, grouping: &Grouping, vector: &InstantVector) -> InstantVector {
+/// `count_values("label", v)`: per group, how many elements hold each value, with the
+/// value itself as `label`, spelled as Prometheus spells it.
+fn count_values(label: &str, grouping: &Grouping, vector: &InstantVector) -> InstantVector {
+    let mut counts: HashMap<Labels, f64> = HashMap::new();
+    for (labels, value) in &vector.samples {
+        let mut key = group_key(labels, grouping);
+        let spelled = if value.is_nan() {
+            "NaN".to_owned()
+        } else if value.is_infinite() {
+            if *value > 0.0 { "+Inf" } else { "-Inf" }.to_owned()
+        } else {
+            value.to_string()
+        };
+        key.insert(label, spelled);
+        *counts.entry(key).or_insert(0.0) += 1.0;
+    }
+    let mut samples: Vec<(Labels, f64)> = counts.into_iter().collect();
+    samples.sort_by(|(a, _), (b, _)| a.cmp(b));
+    InstantVector { samples }
+}
+
+fn aggregate(
+    op: AggregateOp,
+    grouping: &Grouping,
+    vector: &InstantVector,
+    parameter: f64,
+) -> InstantVector {
     // Keyed by hash with the label set carried alongside, so the common case — a sample
     // joining a group that already exists — allocates nothing. A bucket holds a list
     // because a hash is not an identity; `group_matches` picks the right member.
@@ -1768,11 +2004,55 @@ fn aggregate(op: AggregateOp, grouping: &Grouping, vector: &InstantVector) -> In
 
     let mut samples: Vec<(Labels, f64)> = groups
         .into_iter()
-        .map(|(labels, values)| (labels, reduce(op, &values)))
+        .map(|(labels, values)| (labels, reduce(op, &values, parameter)))
         .collect();
     samples.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     InstantVector { samples }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn at_seconds(nanos: u64) -> f64 {
+    nanos as f64 / NANOS_PER_SECOND
+}
+
+/// A string argument's text. The parser has made sure it is one.
+fn string_argument(arg: &Expr) -> &str {
+    match arg {
+        Expr::String(text) => text,
+        _ => "",
+    }
+}
+
+/// `absent` and `absent_over_time`: nothing when something was there; otherwise one
+/// element valued 1, labelled by the selector's equality matchers — a name matched twice
+/// with different values is left out, as Prometheus leaves it out.
+fn absent(present: bool, arg: Option<&Expr>) -> InstantVector {
+    if present {
+        return InstantVector::default();
+    }
+    let mut labels = Labels::new();
+    if let Some(Expr::Selector(selector)) = arg {
+        // Prometheus's rule, quirks included: the first `=` for a name sets it, and any
+        // later matcher on that name removes it again.
+        let mut has: Vec<&str> = Vec::new();
+        for matcher in &selector.matchers {
+            if matcher.name == telemetryd_core::METRIC_NAME_LABEL {
+                continue;
+            }
+            if matcher.op == telemetryd_core::MatchOp::Equal
+                && !has.contains(&matcher.name.as_str())
+            {
+                labels.insert(matcher.name.clone(), matcher.value.clone());
+                has.push(&matcher.name);
+            } else {
+                labels.remove(&matcher.name);
+            }
+        }
+    }
+    InstantVector {
+        samples: vec![(labels, 1.0)],
+    }
 }
 
 /// One operation on two numbers: the value it makes, and — for a comparison — whether
@@ -2538,6 +2818,7 @@ mod group_index_tests {
             AggregateOp::Sum,
             &Grouping::By(vec!["route".to_owned()]),
             &vector,
+            0.0,
         );
         assert_eq!(out.samples.len(), 1);
         assert!((out.samples[0].1 - 5.0).abs() < f64::EPSILON);
@@ -2561,6 +2842,7 @@ mod group_index_tests {
             AggregateOp::Sum,
             &Grouping::By(vec!["route".to_owned()]),
             &vector,
+            0.0,
         );
         let routes: Vec<&str> = out
             .samples

@@ -27,6 +27,8 @@ pub const DEFAULT_LOOKBACK: Duration = Duration::from_secs(300);
 #[derive(Debug, Clone)]
 pub enum Expr {
     Number(f64),
+    /// A quoted string, as `label_replace` and `count_values` take.
+    String(String),
     Selector(Selector),
     Call {
         function: Function,
@@ -110,58 +112,236 @@ impl Offset {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Function {
+    // Over a range vector, `f(sel[5m])`.
     Rate,
     Increase,
+    Irate,
+    Delta,
+    Idelta,
+    Deriv,
+    Changes,
+    Resets,
+    /// `predict_linear(sel[5m], seconds)`.
+    PredictLinear,
+    AvgOverTime,
+    MinOverTime,
+    MaxOverTime,
+    SumOverTime,
+    CountOverTime,
+    LastOverTime,
+    PresentOverTime,
+    StddevOverTime,
+    StdvarOverTime,
+    /// `quantile_over_time(φ, sel[5m])`.
+    QuantileOverTime,
+    AbsentOverTime,
+    // Over an instant vector or a number.
     HistogramQuantile,
     ClampMin,
     ClampMax,
+    Clamp,
     Abs,
+    Ceil,
+    Floor,
+    Round,
+    Sqrt,
+    Exp,
+    Ln,
+    Log2,
+    Log10,
+    Sgn,
+    Acos,
+    Asin,
+    Atan,
+    Cos,
+    Sin,
+    Tan,
+    Acosh,
+    Asinh,
+    Atanh,
+    Cosh,
+    Sinh,
+    Tanh,
+    Deg,
+    Rad,
+    Pi,
     /// `vector(s)`: a scalar as a one-element vector with no labels. Grafana's Loki
     /// health check is `vector(1)+vector(1)`.
     Vector,
+    Scalar,
+    Time,
+    Timestamp,
+    Sort,
+    SortDesc,
+    Absent,
+    LabelReplace,
+    LabelJoin,
+    DayOfMonth,
+    DayOfWeek,
+    DayOfYear,
+    DaysInMonth,
+    Hour,
+    Minute,
+    Month,
+    Year,
 }
+
+/// Every function by its PromQL name.
+const FUNCTIONS: &[(&str, Function)] = &[
+    ("rate", Function::Rate),
+    ("increase", Function::Increase),
+    ("irate", Function::Irate),
+    ("delta", Function::Delta),
+    ("idelta", Function::Idelta),
+    ("deriv", Function::Deriv),
+    ("changes", Function::Changes),
+    ("resets", Function::Resets),
+    ("predict_linear", Function::PredictLinear),
+    ("avg_over_time", Function::AvgOverTime),
+    ("min_over_time", Function::MinOverTime),
+    ("max_over_time", Function::MaxOverTime),
+    ("sum_over_time", Function::SumOverTime),
+    ("count_over_time", Function::CountOverTime),
+    ("last_over_time", Function::LastOverTime),
+    ("present_over_time", Function::PresentOverTime),
+    ("stddev_over_time", Function::StddevOverTime),
+    ("stdvar_over_time", Function::StdvarOverTime),
+    ("quantile_over_time", Function::QuantileOverTime),
+    ("absent_over_time", Function::AbsentOverTime),
+    ("histogram_quantile", Function::HistogramQuantile),
+    ("clamp_min", Function::ClampMin),
+    ("clamp_max", Function::ClampMax),
+    ("clamp", Function::Clamp),
+    ("abs", Function::Abs),
+    ("ceil", Function::Ceil),
+    ("floor", Function::Floor),
+    ("round", Function::Round),
+    ("sqrt", Function::Sqrt),
+    ("exp", Function::Exp),
+    ("ln", Function::Ln),
+    ("log2", Function::Log2),
+    ("log10", Function::Log10),
+    ("sgn", Function::Sgn),
+    ("acos", Function::Acos),
+    ("asin", Function::Asin),
+    ("atan", Function::Atan),
+    ("cos", Function::Cos),
+    ("sin", Function::Sin),
+    ("tan", Function::Tan),
+    ("acosh", Function::Acosh),
+    ("asinh", Function::Asinh),
+    ("atanh", Function::Atanh),
+    ("cosh", Function::Cosh),
+    ("sinh", Function::Sinh),
+    ("tanh", Function::Tanh),
+    ("deg", Function::Deg),
+    ("rad", Function::Rad),
+    ("pi", Function::Pi),
+    ("vector", Function::Vector),
+    ("scalar", Function::Scalar),
+    ("time", Function::Time),
+    ("timestamp", Function::Timestamp),
+    ("sort", Function::Sort),
+    ("sort_desc", Function::SortDesc),
+    ("absent", Function::Absent),
+    ("label_replace", Function::LabelReplace),
+    ("label_join", Function::LabelJoin),
+    ("day_of_month", Function::DayOfMonth),
+    ("day_of_week", Function::DayOfWeek),
+    ("day_of_year", Function::DayOfYear),
+    ("days_in_month", Function::DaysInMonth),
+    ("hour", Function::Hour),
+    ("minute", Function::Minute),
+    ("month", Function::Month),
+    ("year", Function::Year),
+];
 
 impl Function {
     fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "rate" => Self::Rate,
-            "increase" => Self::Increase,
-            "histogram_quantile" => Self::HistogramQuantile,
-            "clamp_min" => Self::ClampMin,
-            "clamp_max" => Self::ClampMax,
-            "abs" => Self::Abs,
-            "vector" => Self::Vector,
-            _ => return None,
-        })
+        FUNCTIONS
+            .iter()
+            .find(|(spelled, _)| *spelled == name)
+            .map(|(_, function)| *function)
     }
 
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Rate => "rate",
-            Self::Increase => "increase",
-            Self::HistogramQuantile => "histogram_quantile",
-            Self::ClampMin => "clamp_min",
-            Self::ClampMax => "clamp_max",
-            Self::Abs => "abs",
-            Self::Vector => "vector",
-        }
+        FUNCTIONS
+            .iter()
+            .find(|(_, function)| *function == self)
+            .map_or("?", |(name, _)| name)
     }
 
     /// Whether the function answers a number rather than a vector.
     #[must_use]
     pub fn returns_scalar(self) -> bool {
-        false
+        matches!(self, Self::Pi | Self::Scalar | Self::Time)
+    }
+
+    /// Which argument is a range vector (`sel[5m]`), if one is.
+    #[must_use]
+    pub fn range_argument(self) -> Option<usize> {
+        match self {
+            Self::Rate
+            | Self::Increase
+            | Self::Irate
+            | Self::Delta
+            | Self::Idelta
+            | Self::Deriv
+            | Self::Changes
+            | Self::Resets
+            | Self::PredictLinear
+            | Self::AvgOverTime
+            | Self::MinOverTime
+            | Self::MaxOverTime
+            | Self::SumOverTime
+            | Self::CountOverTime
+            | Self::LastOverTime
+            | Self::PresentOverTime
+            | Self::StddevOverTime
+            | Self::StdvarOverTime
+            | Self::AbsentOverTime => Some(0),
+            Self::QuantileOverTime => Some(1),
+            _ => None,
+        }
     }
 
     /// Whether the function takes a range vector (`sel[5m]`) as its argument.
     pub fn wants_range(self) -> bool {
-        matches!(self, Self::Rate | Self::Increase)
+        self.range_argument().is_some()
     }
 
-    fn arity(self) -> usize {
+    /// The fewest and most arguments it takes; `None` for no upper bound.
+    fn arity(self) -> (usize, Option<usize>) {
         match self {
-            Self::Rate | Self::Increase | Self::Abs | Self::Vector => 1,
-            Self::HistogramQuantile | Self::ClampMin | Self::ClampMax => 2,
+            Self::Pi | Self::Time => (0, Some(0)),
+            Self::DayOfMonth
+            | Self::DayOfWeek
+            | Self::DayOfYear
+            | Self::DaysInMonth
+            | Self::Hour
+            | Self::Minute
+            | Self::Month
+            | Self::Year => (0, Some(1)),
+            Self::Round => (1, Some(2)),
+            Self::HistogramQuantile
+            | Self::ClampMin
+            | Self::ClampMax
+            | Self::PredictLinear
+            | Self::QuantileOverTime => (2, Some(2)),
+            Self::Clamp => (3, Some(3)),
+            Self::LabelReplace => (5, Some(5)),
+            Self::LabelJoin => (3, None),
+            _ => (1, Some(1)),
+        }
+    }
+
+    /// Whether argument `index` is a string literal, as `label_replace`'s are.
+    #[must_use]
+    pub fn takes_string_at(self, index: usize) -> bool {
+        match self {
+            Self::LabelReplace => (1..=4).contains(&index),
+            Self::LabelJoin => index >= 1,
+            _ => false,
         }
     }
 }
@@ -177,13 +357,24 @@ pub enum AggregateOp {
     TopK,
     /// `bottomk(k, v)` — the `k` smallest.
     BottomK,
+    /// `quantile(φ, v)`.
+    Quantile,
+    Stddev,
+    Stdvar,
+    /// 1 for every group present.
+    Group,
+    /// `count_values("label", v)`: how many elements hold each value.
+    CountValues,
 }
 
 impl AggregateOp {
     /// Whether the operator takes a scalar before the vector, as `topk(5, x)` does.
     #[must_use]
     pub fn takes_parameter(self) -> bool {
-        matches!(self, Self::TopK | Self::BottomK)
+        matches!(
+            self,
+            Self::TopK | Self::BottomK | Self::Quantile | Self::CountValues
+        )
     }
 
     /// Whether the result keeps each element's own labels instead of the grouping's.
@@ -208,6 +399,11 @@ impl AggregateOp {
             "count" => Self::Count,
             "topk" => Self::TopK,
             "bottomk" => Self::BottomK,
+            "quantile" => Self::Quantile,
+            "stddev" => Self::Stddev,
+            "stdvar" => Self::Stdvar,
+            "group" => Self::Group,
+            "count_values" => Self::CountValues,
             _ => return None,
         })
     }
@@ -221,6 +417,11 @@ impl AggregateOp {
             Self::Count => "count",
             Self::TopK => "topk",
             Self::BottomK => "bottomk",
+            Self::Quantile => "quantile",
+            Self::Stddev => "stddev",
+            Self::Stdvar => "stdvar",
+            Self::Group => "group",
+            Self::CountValues => "count_values",
         }
     }
 }
@@ -560,6 +761,10 @@ impl Parser<'_> {
                 self.pos += 1;
                 Ok(Expr::Number(value))
             }
+            Some(Token::String(text)) => {
+                self.pos += 1;
+                Ok(Expr::String(text))
+            }
             // A bare duration in value position is a scalar in some dialects; refuse
             // it clearly rather than silently coercing.
             Some(Token::Duration(_)) => Err(Error::BadRequest(
@@ -640,7 +845,7 @@ impl Parser<'_> {
         self.expect(&Token::LeftParen, "`(` after an aggregation")?;
         let param = if op.takes_parameter() {
             let k = self.parse_expr()?;
-            self.expect(&Token::Comma, "`,` after the count in `topk`/`bottomk`")?;
+            self.expect(&Token::Comma, "`,` after the aggregation's parameter")?;
             Some(Box::new(k))
         } else {
             None
@@ -711,13 +916,33 @@ impl Parser<'_> {
             }
         }
 
-        if args.len() != function.arity() {
+        let (fewest, most) = function.arity();
+        if args.len() < fewest || most.is_some_and(|most| args.len() > most) {
+            let expected = match most {
+                Some(most) if most == fewest => format!("{fewest}"),
+                Some(most) => format!("{fewest} to {most}"),
+                None => format!("at least {fewest}"),
+            };
             return Err(Error::BadRequest(format!(
-                "`{}` takes {} argument(s), got {}",
+                "`{}` takes {expected} argument(s), got {}",
                 function.as_str(),
-                function.arity(),
                 args.len()
             )));
+        }
+        for (index, arg) in args.iter().enumerate() {
+            let is_string = matches!(arg, Expr::String(_));
+            if function.takes_string_at(index) != is_string {
+                return Err(Error::BadRequest(format!(
+                    "argument {} of `{}` must be {}",
+                    index + 1,
+                    function.as_str(),
+                    if is_string {
+                        "an expression, not a string"
+                    } else {
+                        "a quoted string"
+                    }
+                )));
+            }
         }
 
         Ok(Expr::Call { function, args })
@@ -871,7 +1096,7 @@ fn is_scalar(expr: &Expr) -> bool {
         Expr::Negate(inner) => is_scalar(inner),
         Expr::Binary { left, right, .. } => is_scalar(left) && is_scalar(right),
         Expr::Call { function, .. } => function.returns_scalar(),
-        Expr::Selector(_) | Expr::Aggregation { .. } => false,
+        Expr::Selector(_) | Expr::Aggregation { .. } | Expr::String(_) => false,
     }
 }
 
@@ -945,7 +1170,7 @@ impl Expr {
                 right.collect_groupings(out);
             }
             Self::Negate(inner) => inner.collect_groupings(out),
-            Self::Selector(_) | Self::Number(_) => {}
+            Self::Selector(_) | Self::Number(_) | Self::String(_) => {}
         }
     }
 
@@ -962,7 +1187,7 @@ impl Expr {
                 left.collect_selectors(out);
                 right.collect_selectors(out);
             }
-            Self::Number(_) => {}
+            Self::Number(_) | Self::String(_) => {}
         }
     }
 
@@ -1006,7 +1231,7 @@ impl Expr {
                 left.walk(visit);
                 right.walk(visit);
             }
-            Self::Number(_) | Self::Selector(_) => {}
+            Self::Number(_) | Self::String(_) | Self::Selector(_) => {}
         }
     }
 }
@@ -1235,14 +1460,9 @@ mod tests {
     #[test]
     fn unsupported_functions_are_named() {
         for (query, needle) in [
-            ("predict_linear(up[1h], 3600)", "predict_linear"),
             ("holt_winters(up[1h], 0.5, 0.5)", "holt_winters"),
-            ("quantile(0.9, up)", "quantile"),
-            ("count_values(\"v\", up)", "count_values"),
-            (
-                "label_replace(up, \"a\", \"b\", \"c\", \"d\")",
-                "label_replace",
-            ),
+            ("sort_by_label(up, \"a\")", "sort_by_label"),
+            ("histogram_count(up)", "histogram_count"),
         ] {
             let err = parse(query).unwrap_err();
             assert!(matches!(err, Error::Unsupported { .. }), "{query}: {err:?}");

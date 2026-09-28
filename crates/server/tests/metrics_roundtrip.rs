@@ -433,7 +433,7 @@ async fn an_unsupported_promql_function_is_named_with_a_400() {
     let (status, response) = harness
         .get(&format!(
             "/api/v1/query?query={}",
-            urlencode("predict_linear(up[1h], 3600)")
+            urlencode("holt_winters(up[1h], 0.5, 0.5)")
         ))
         .await;
 
@@ -446,7 +446,7 @@ async fn an_unsupported_promql_function_is_named_with_a_400() {
         response["error"]
             .as_str()
             .unwrap()
-            .contains("predict_linear"),
+            .contains("holt_winters"),
         "{response}"
     );
     assert!(

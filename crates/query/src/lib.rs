@@ -24,6 +24,7 @@ pub mod loki;
 pub mod meta;
 pub mod prometheus;
 pub mod promeval;
+pub mod promfn;
 pub mod promql;
 pub mod tempo;
 pub mod traceql;

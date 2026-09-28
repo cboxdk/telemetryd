@@ -21,9 +21,12 @@ use telemetryd_query::promql;
 use telemetryd_store::Store;
 
 const SECOND: u64 = 1_000_000_000;
-/// Where promtool's time zero lands. Any instant well clear of the epoch will do; the
-/// answers are relative to it.
-const BASE: u64 = 1_700_000_000 * SECOND;
+/// Where promtool's time zero lands: well clear of the epoch, so a window reaching back
+/// from an early evaluation time still has room, and at a UTC midnight, so the date
+/// functions read the same hour and minute Prometheus does. Answers that are absolute
+/// times — `time()`, `timestamp()` — are shifted by it; see `shifted`.
+const BASE_SECONDS: u64 = 19_676 * 86_400;
+const BASE: u64 = BASE_SECONDS * SECOND;
 
 #[test]
 fn every_expression_answers_as_prometheus_does() {
@@ -54,7 +57,7 @@ fn every_expression_answers_as_prometheus_does() {
     for case in cases {
         let query = case["expr"].as_str().unwrap();
         let at = BASE + duration(case["eval_time"].as_str().unwrap());
-        let expected = expected(&case["exp_samples"]);
+        let expected = shifted(query, expected(&case["exp_samples"]));
         let expr = promql::parse(query).unwrap();
 
         let mut in_memory = Snapshot::from_samples(samples.clone());
@@ -181,6 +184,19 @@ fn expected(samples: &Json) -> Vec<(Labels, f64)> {
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
+}
+
+/// Expectations that are points in time, moved to where this test put time zero.
+fn shifted(query: &str, mut expected: Vec<(Labels, f64)>) -> Vec<(Labels, f64)> {
+    if query.contains("time()") || query.contains("timestamp(") {
+        for (_, value) in &mut expected {
+            #[allow(clippy::cast_precision_loss)]
+            {
+                *value += BASE_SECONDS as f64;
+            }
+        }
+    }
+    expected
 }
 
 fn answer(value: Value) -> Vec<(Labels, f64)> {

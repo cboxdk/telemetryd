@@ -414,15 +414,25 @@ a range that straddles it has both. Nothing needs to be done about that beyond w
 Answers are held to Prometheus's own: `crates/query/tests/conformance/promql.json` is a
 promtool test file whose expectations Prometheus wrote, CI asks Prometheus for them again
 on every run, and telemetryd must give the same answer by each of its three read paths.
-Sixty-eight expressions across rates and increases with counter resets, aggregations,
-`topk`/`bottomk`, histogram quantiles, offsets, staleness, gaps, operator precedence,
-comparisons and every kind of vector matching.
+A hundred and thirty-four expressions across every supported function and aggregation,
+rates and increases with counter resets, histogram quantiles, offsets, staleness, gaps,
+operator precedence, comparisons and every kind of vector matching.
 
 Driven by what `PromqlCompiler` actually generates:
 
 - selectors: `name{label="value", …}` with `=`, `!=`, `=~`, `!~`
-- `rate(sel[5m])`, `increase(sel[5m])`
-- aggregations `sum`, `avg`, `min`, `max`, `count`, with `by (…)` / `without (…)`
+- `rate(sel[5m])`, `increase(sel[5m])`, `irate`, `delta`, `idelta`, `deriv`,
+  `predict_linear`, `changes`, `resets`
+- `avg_over_time`, `min_over_time`, `max_over_time`, `sum_over_time`, `count_over_time`,
+  `last_over_time`, `present_over_time`, `stddev_over_time`, `stdvar_over_time`,
+  `quantile_over_time`, `absent_over_time`, and `absent`
+- `abs`, `ceil`, `floor`, `round`, `sqrt`, `exp`, `ln`, `log2`, `log10`, `sgn`, `clamp`,
+  the trigonometric functions, `deg`, `rad`, `pi`
+- `scalar`, `time`, `timestamp`, `sort`, `sort_desc`, `label_replace`, `label_join`, and
+  the date functions `hour`, `minute`, `month`, `year`, `day_of_month`, `day_of_week`,
+  `day_of_year`, `days_in_month`
+- aggregations `sum`, `avg`, `min`, `max`, `count`, `group`, `stddev`, `stdvar`,
+  `quantile` and `count_values`, with `by (…)` / `without (…)`
 - **`topk(k, …)` and `bottomk(k, …)`**, which select elements rather than reducing them:
   the result keeps each series' own labels, and `by`/`without` decides within which set
   the selection happens. Added because the UI's Duration panel uses it — it was listed as
@@ -449,9 +459,10 @@ Driven by what `PromqlCompiler` actually generates:
   `clamp_min(sel - (sel offset 5m or sel * 0), 0)`. Our first plan listed all three as
   out of scope; they are not.
 
-*Not supported:* subqueries, the `@` modifier, `quantile`, `count_values`,
-`predict_linear`, `holt_winters`, recording and alerting rules, `/api/v1/rules`,
-`/api/v1/alerts`, exemplars and native histograms.
+*Not supported:* subqueries, the `@` modifier, `holt_winters` /
+`double_exponential_smoothing`, `sort_by_label`, the experimental `limitk`/`limit_ratio`,
+recording and alerting rules, `/api/v1/rules`, `/api/v1/alerts`, exemplars and native
+histograms.
 
 *Limits:* an expression may nest at most 128 levels deep, counting parentheses, unary
 minus, function and aggregation arguments, and each link in a chain of binary operators.

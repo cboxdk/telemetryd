@@ -104,6 +104,18 @@
     {
      "series": "node_cpu{instance=\"b\",cpu=\"0\"}",
      "values": "0.75x40"
+    },
+    {
+     "series": "temperature{room=\"a\"}",
+     "values": "20 21 23 22 25 24 26 27 26 28 30x30"
+    },
+    {
+     "series": "temperature{room=\"b\"}",
+     "values": "15 15 16 16 16 17 17 17 18 18 18x30"
+    },
+    {
+     "series": "build_info{version=\"1.2.3\",commit=\"abc\"}",
+     "values": "1x40"
     }
    ],
    "promql_expr_test": [
@@ -1091,6 +1103,912 @@
       {
        "labels": "{cpu=\"1\", instance=\"a\", team=\"red\"}",
        "value": 0.0
+      }
+     ]
+    },
+    {
+     "expr": "irate(http_requests_total[1m])",
+     "eval_time": "5m",
+     "exp_samples": [
+      {
+       "labels": "{code=\"200\", instance=\"a\", job=\"api\"}",
+       "value": 0.6666666666666666
+      },
+      {
+       "labels": "{code=\"200\", instance=\"b\", job=\"api\"}",
+       "value": 1.3333333333333333
+      },
+      {
+       "labels": "{code=\"200\", instance=\"c\", job=\"web\"}",
+       "value": 0.3333333333333333
+      },
+      {
+       "labels": "{code=\"500\", instance=\"a\", job=\"api\"}",
+       "value": 0.06666666666666667
+      },
+      {
+       "labels": "{code=\"500\", instance=\"c\", job=\"web\"}",
+       "value": 0.0
+      }
+     ]
+    },
+    {
+     "expr": "irate(http_requests_total{instance=\"b\"}[1m])",
+     "eval_time": "5m15s",
+     "exp_samples": [
+      {
+       "labels": "{code=\"200\", instance=\"b\", job=\"api\"}",
+       "value": 0.2
+      }
+     ]
+    },
+    {
+     "expr": "idelta(queue_depth[1m])",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{instance=\"a\", job=\"api\"}",
+       "value": -6.0
+      },
+      {
+       "labels": "{instance=\"b\", job=\"api\"}",
+       "value": -1.0
+      },
+      {
+       "labels": "{instance=\"c\", job=\"web\"}",
+       "value": 0.5
+      }
+     ]
+    },
+    {
+     "expr": "delta(queue_depth[2m])",
+     "eval_time": "2m",
+     "exp_samples": [
+      {
+       "labels": "{instance=\"a\", job=\"api\"}",
+       "value": -1.1428571428571428
+      },
+      {
+       "labels": "{instance=\"b\", job=\"api\"}",
+       "value": -8.0
+      },
+      {
+       "labels": "{instance=\"c\", job=\"web\"}",
+       "value": 4.0
+      }
+     ]
+    },
+    {
+     "expr": "delta(temperature[1m])",
+     "eval_time": "2m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 2.6666666666666665
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 1.3333333333333333
+      }
+     ]
+    },
+    {
+     "expr": "deriv(temperature[2m])",
+     "eval_time": "2m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 0.05238095238095238
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 0.023809523809523808
+      }
+     ]
+    },
+    {
+     "expr": "predict_linear(temperature[2m], 60)",
+     "eval_time": "2m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 30.142857142857142
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 19.178571428571427
+      }
+     ]
+    },
+    {
+     "expr": "changes(temperature[3m])",
+     "eval_time": "3m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 9.0
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 3.0
+      }
+     ]
+    },
+    {
+     "expr": "resets(http_requests_total[10m])",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{code=\"200\", instance=\"a\", job=\"api\"}",
+       "value": 0.0
+      },
+      {
+       "labels": "{code=\"200\", instance=\"b\", job=\"api\"}",
+       "value": 1.0
+      },
+      {
+       "labels": "{code=\"200\", instance=\"c\", job=\"web\"}",
+       "value": 0.0
+      },
+      {
+       "labels": "{code=\"500\", instance=\"a\", job=\"api\"}",
+       "value": 0.0
+      },
+      {
+       "labels": "{code=\"500\", instance=\"c\", job=\"web\"}",
+       "value": 0.0
+      }
+     ]
+    },
+    {
+     "expr": "avg_over_time(temperature[2m])",
+     "eval_time": "2m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 24.25
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 16.5
+      }
+     ]
+    },
+    {
+     "expr": "min_over_time(temperature[2m])",
+     "eval_time": "2m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 21.0
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 15.0
+      }
+     ]
+    },
+    {
+     "expr": "max_over_time(temperature[2m])",
+     "eval_time": "2m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 27.0
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 18.0
+      }
+     ]
+    },
+    {
+     "expr": "sum_over_time(temperature[1m])",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 91.0
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 63.0
+      }
+     ]
+    },
+    {
+     "expr": "count_over_time(temperature[1m])",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 4.0
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 4.0
+      }
+     ]
+    },
+    {
+     "expr": "last_over_time(temperature[1m])",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{__name__=\"temperature\", room=\"a\"}",
+       "value": 25.0
+      },
+      {
+       "labels": "{__name__=\"temperature\", room=\"b\"}",
+       "value": 16.0
+      }
+     ]
+    },
+    {
+     "expr": "present_over_time(temperature[1m])",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 1.0
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 1.0
+      }
+     ]
+    },
+    {
+     "expr": "stddev_over_time(temperature[2m])",
+     "eval_time": "2m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 1.984313483298443
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 0.8660254037844387
+      }
+     ]
+    },
+    {
+     "expr": "stdvar_over_time(temperature[2m])",
+     "eval_time": "2m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 3.9375
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 0.7500000000000001
+      }
+     ]
+    },
+    {
+     "expr": "quantile_over_time(0.9, temperature[2m])",
+     "eval_time": "2m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 26.3
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 17.3
+      }
+     ]
+    },
+    {
+     "expr": "quantile_over_time(0.5, temperature[2m])",
+     "eval_time": "2m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 24.5
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 16.5
+      }
+     ]
+    },
+    {
+     "expr": "absent_over_time(nonexistent{job=\"x\"}[1m])",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{job=\"x\"}",
+       "value": 1.0
+      }
+     ]
+    },
+    {
+     "expr": "absent_over_time(temperature[1m])",
+     "eval_time": "1m",
+     "exp_samples": []
+    },
+    {
+     "expr": "absent(nonexistent{job=\"x\", env=\"prod\"})",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{env=\"prod\", job=\"x\"}",
+       "value": 1.0
+      }
+     ]
+    },
+    {
+     "expr": "absent(temperature)",
+     "eval_time": "1m",
+     "exp_samples": []
+    },
+    {
+     "expr": "ceil(queue_depth / 3)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{instance=\"a\", job=\"api\"}",
+       "value": 1.0
+      },
+      {
+       "labels": "{instance=\"b\", job=\"api\"}",
+       "value": 12.0
+      },
+      {
+       "labels": "{instance=\"c\", job=\"web\"}",
+       "value": -0.0
+      }
+     ]
+    },
+    {
+     "expr": "floor(queue_depth / 3)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{instance=\"a\", job=\"api\"}",
+       "value": 0.0
+      },
+      {
+       "labels": "{instance=\"b\", job=\"api\"}",
+       "value": 12.0
+      },
+      {
+       "labels": "{instance=\"c\", job=\"web\"}",
+       "value": -1.0
+      }
+     ]
+    },
+    {
+     "expr": "round(queue_depth / 3)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{instance=\"a\", job=\"api\"}",
+       "value": 1.0
+      },
+      {
+       "labels": "{instance=\"b\", job=\"api\"}",
+       "value": 12.0
+      },
+      {
+       "labels": "{instance=\"c\", job=\"web\"}",
+       "value": 0.0
+      }
+     ]
+    },
+    {
+     "expr": "round(temperature, 5)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 25.0
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 15.0
+      }
+     ]
+    },
+    {
+     "expr": "sqrt(temperature)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 5.0
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 4.0
+      }
+     ]
+    },
+    {
+     "expr": "exp(queue_depth{instance=\"a\"})",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{instance=\"a\", job=\"api\"}",
+       "value": 7.38905609893065
+      }
+     ]
+    },
+    {
+     "expr": "ln(temperature)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 3.2188758248682006
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 2.772588722239781
+      }
+     ]
+    },
+    {
+     "expr": "log2(temperature)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 4.643856189774724
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 4.0
+      }
+     ]
+    },
+    {
+     "expr": "log10(temperature)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 1.3979400086720375
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 1.2041199826559248
+      }
+     ]
+    },
+    {
+     "expr": "sgn(queue_depth)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{instance=\"a\", job=\"api\"}",
+       "value": 1.0
+      },
+      {
+       "labels": "{instance=\"b\", job=\"api\"}",
+       "value": 1.0
+      },
+      {
+       "labels": "{instance=\"c\", job=\"web\"}",
+       "value": -1.0
+      }
+     ]
+    },
+    {
+     "expr": "abs(queue_depth)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{instance=\"a\", job=\"api\"}",
+       "value": 2.0
+      },
+      {
+       "labels": "{instance=\"b\", job=\"api\"}",
+       "value": 36.0
+      },
+      {
+       "labels": "{instance=\"c\", job=\"web\"}",
+       "value": 1.0
+      }
+     ]
+    },
+    {
+     "expr": "clamp(queue_depth, 0, 10)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{instance=\"a\", job=\"api\"}",
+       "value": 2.0
+      },
+      {
+       "labels": "{instance=\"b\", job=\"api\"}",
+       "value": 10.0
+      },
+      {
+       "labels": "{instance=\"c\", job=\"web\"}",
+       "value": 0.0
+      }
+     ]
+    },
+    {
+     "expr": "sin(temperature)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": -0.13235175009777303
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": -0.2879033166650653
+      }
+     ]
+    },
+    {
+     "expr": "cos(temperature)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 0.9912028118634736
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": -0.9576594803233847
+      }
+     ]
+    },
+    {
+     "expr": "deg(temperature)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 1432.3944878270581
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 916.7324722093172
+      }
+     ]
+    },
+    {
+     "expr": "rad(temperature)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 0.4363323129985824
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 0.2792526803190927
+      }
+     ]
+    },
+    {
+     "expr": "pi()",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 3.141592653589793
+      }
+     ]
+    },
+    {
+     "expr": "time()",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 60.0
+      }
+     ]
+    },
+    {
+     "expr": "scalar(sum(up))",
+     "eval_time": "5m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 2.0
+      }
+     ]
+    },
+    {
+     "expr": "vector(time())",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 60.0
+      }
+     ]
+    },
+    {
+     "expr": "timestamp(temperature)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 60.0
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 60.0
+      }
+     ]
+    },
+    {
+     "expr": "timestamp(temperature offset 30s)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 30.0
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 30.0
+      }
+     ]
+    },
+    {
+     "expr": "sort(queue_depth)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{__name__=\"queue_depth\", instance=\"a\", job=\"api\"}",
+       "value": 2.0
+      },
+      {
+       "labels": "{__name__=\"queue_depth\", instance=\"b\", job=\"api\"}",
+       "value": 36.0
+      },
+      {
+       "labels": "{__name__=\"queue_depth\", instance=\"c\", job=\"web\"}",
+       "value": -1.0
+      }
+     ]
+    },
+    {
+     "expr": "sort_desc(queue_depth)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{__name__=\"queue_depth\", instance=\"a\", job=\"api\"}",
+       "value": 2.0
+      },
+      {
+       "labels": "{__name__=\"queue_depth\", instance=\"b\", job=\"api\"}",
+       "value": 36.0
+      },
+      {
+       "labels": "{__name__=\"queue_depth\", instance=\"c\", job=\"web\"}",
+       "value": -1.0
+      }
+     ]
+    },
+    {
+     "expr": "label_replace(up, \"host\", \"$1\", \"instance\", \"(.*)\")",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{__name__=\"up\", host=\"a\", instance=\"a\", job=\"api\"}",
+       "value": 1.0
+      },
+      {
+       "labels": "{__name__=\"up\", host=\"b\", instance=\"b\", job=\"api\"}",
+       "value": 1.0
+      },
+      {
+       "labels": "{__name__=\"up\", host=\"c\", instance=\"c\", job=\"web\"}",
+       "value": 0.0
+      }
+     ]
+    },
+    {
+     "expr": "label_replace(up, \"tier\", \"backend-$1\", \"job\", \"a(.*)\")",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{__name__=\"up\", instance=\"a\", job=\"api\", tier=\"backend-pi\"}",
+       "value": 1.0
+      },
+      {
+       "labels": "{__name__=\"up\", instance=\"b\", job=\"api\", tier=\"backend-pi\"}",
+       "value": 1.0
+      },
+      {
+       "labels": "{__name__=\"up\", instance=\"c\", job=\"web\"}",
+       "value": 0.0
+      }
+     ]
+    },
+    {
+     "expr": "label_join(build_info, \"id\", \"-\", \"version\", \"commit\")",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{__name__=\"build_info\", commit=\"abc\", id=\"1.2.3-abc\", version=\"1.2.3\"}",
+       "value": 1.0
+      }
+     ]
+    },
+    {
+     "expr": "hour()",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 0.0
+      }
+     ]
+    },
+    {
+     "expr": "minute(vector(3700))",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 1.0
+      }
+     ]
+    },
+    {
+     "expr": "day_of_week(vector(1709214300))",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 4.0
+      }
+     ]
+    },
+    {
+     "expr": "month(vector(1709214300))",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 2.0
+      }
+     ]
+    },
+    {
+     "expr": "year(vector(1709214300))",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 2024.0
+      }
+     ]
+    },
+    {
+     "expr": "day_of_month(vector(1709214300))",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 29.0
+      }
+     ]
+    },
+    {
+     "expr": "day_of_year(vector(1709214300))",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 60.0
+      }
+     ]
+    },
+    {
+     "expr": "days_in_month(vector(1709214300))",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 29.0
+      }
+     ]
+    },
+    {
+     "expr": "quantile(0.5, queue_depth)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 2.0
+      }
+     ]
+    },
+    {
+     "expr": "quantile by (job) (0.9, queue_depth)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{job=\"api\"}",
+       "value": 32.6
+      },
+      {
+       "labels": "{job=\"web\"}",
+       "value": -1.0
+      }
+     ]
+    },
+    {
+     "expr": "stddev(queue_depth)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{}",
+       "value": 16.779617264870957
+      }
+     ]
+    },
+    {
+     "expr": "stdvar by (job) (queue_depth)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{job=\"api\"}",
+       "value": 289.0
+      },
+      {
+       "labels": "{job=\"web\"}",
+       "value": 0.0
+      }
+     ]
+    },
+    {
+     "expr": "group by (job) (queue_depth)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{job=\"api\"}",
+       "value": 1.0
+      },
+      {
+       "labels": "{job=\"web\"}",
+       "value": 1.0
+      }
+     ]
+    },
+    {
+     "expr": "count_values(\"depth\", queue_depth)",
+     "eval_time": "1m",
+     "exp_samples": [
+      {
+       "labels": "{depth=\"-1\"}",
+       "value": 1.0
+      },
+      {
+       "labels": "{depth=\"2\"}",
+       "value": 1.0
+      },
+      {
+       "labels": "{depth=\"36\"}",
+       "value": 1.0
+      }
+     ]
+    },
+    {
+     "expr": "count_values by (job) (\"v\", up)",
+     "eval_time": "5m",
+     "exp_samples": [
+      {
+       "labels": "{job=\"api\", v=\"1\"}",
+       "value": 1.0
+      },
+      {
+       "labels": "{job=\"web\", v=\"1\"}",
+       "value": 1.0
       }
      ]
     }
