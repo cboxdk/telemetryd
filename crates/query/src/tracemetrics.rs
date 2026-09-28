@@ -206,7 +206,9 @@ pub fn evaluate(store: &RecordStore<SpanSchema>, request: &MetricsRequest) -> Re
     };
     let scan = telemetryd_store::Scan::range(request.start_nanos, request.end_nanos - 1);
     store.scan(scan, &[], &visit)?;
-    drop(gathered);
+    // Given back, not dropped: `Mutex` has no `Drop` on Linux, so clippy there calls a
+    // drop pointless, while on macOS the borrow would outlive it without one.
+    let _ = gathered.into_inner();
     if let Some(error) = refused {
         return Err(error);
     }

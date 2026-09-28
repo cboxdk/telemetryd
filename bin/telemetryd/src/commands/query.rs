@@ -362,7 +362,7 @@ fn print(response: &Value, output: Output, forward: bool) {
                 if let Some(labels) = row.labels {
                     record.insert("labels".into(), Value::Object(labels.clone()));
                 }
-                // A server before 0.69.0 sent structured metadata as a third element;
+                // A server before 0.69.1 sent structured metadata as a third element;
                 // later ones put it among the labels, as Loki does.
                 if let Some(extra) = row.metadata {
                     record.insert("metadata".into(), extra.clone());

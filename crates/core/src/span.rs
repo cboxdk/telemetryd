@@ -249,7 +249,7 @@ impl SpanRecord {
     }
 
     /// The resource as OTLP sent it: every resource attribute under its own name, as a
-    /// trace view shows it. A span stored before 0.69.0 kept only its unpromoted ones, so
+    /// trace view shows it. A span stored before 0.69.1 kept only its unpromoted ones, so
     /// its stream labels stand in for the rest — `service.name` restored, the derived
     /// `app` left out when it only repeats the service.
     pub fn resource_for_display(&self) -> Labels {

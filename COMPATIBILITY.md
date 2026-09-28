@@ -272,7 +272,7 @@ failed to parse there.
 and a line's structured metadata — per-record OTLP attributes such as `order_id` and
 `trace_id`, and `detected_level` — and any labels its pipeline parsed are labels of its
 stream, so lines whose metadata differ are in streams of their own. That is what Loki
-answers; `laravel-telemetry-ui` reads the labels either way. Before 0.69.0 the metadata
+answers; `laravel-telemetry-ui` reads the labels either way. Before 0.69.1 the metadata
 travelled as a third element of the entry instead. They are *response* labels: nothing
 is promoted to the stored stream, whose cardinality stays bounded. Timestamps are
 **strings** of nanoseconds, because a JSON number cannot hold them without loss in
@@ -450,7 +450,7 @@ exporter's retry can leave it, is returned once. Before 0.61.0 each of these dif
 `resource.X` reaches every resource attribute, not only the ones promoted to stream
 labels: the rest are kept on each span apart from its own attributes, and a trace shows
 them on its resource, where OTLP put them. `resource.k8s.pod.name` and
-`span.k8s.pod.name` are different fields, as in Tempo. Spans stored before 0.69.0 kept
+`span.k8s.pod.name` are different fields, as in Tempo. Spans stored before 0.69.1 kept
 unpromoted resource attributes among their own, and still show them there.
 
 An unscoped `.attribute` searches span attributes first, then resource attributes — the
