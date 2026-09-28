@@ -5,7 +5,7 @@
 //! `/api/v1/status/buildinfo` exists because the UI probes it first and shows a
 //! degraded backend without it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -368,12 +368,13 @@ pub fn range(
     // load, which already produced values for these points.
     snapshot.prepare(&expr, &timestamps);
 
-    // Keyed by label set so a series' points stay together across steps. A hash map
-    // rather than an ordered one: this is entered once per result series per step — for a
-    // six-hour chart at a minute's resolution, hundreds of thousands of times — and an
-    // ordered lookup pays for comparing whole label sets on every one. Order is restored
-    // below, where it costs one sort instead of one per insert.
-    let mut series: HashMap<Labels, Vec<(Seconds, String)>> = HashMap::new();
+    // Keyed by label set so a series' points stay together across steps. This is entered
+    // once per result series per step — for a six-hour chart at a minute's resolution,
+    // hundreds of thousands of times — so it finds a set by the address it shares with
+    // the step before, and by value only the first time; hashing each set whole was a
+    // tenth of a chart's time. Order is restored below, where it costs one sort.
+    let mut table = telemetryd_core::series::SeriesTable::new();
+    let mut points: Vec<Vec<(Seconds, String)>> = Vec::new();
     // The answer is bounded like the read: every point returned is held, formatted and
     // serialised, and the loaded samples were never the only cost. A handful of series
     // multiplied by a fan-out and eleven thousand steps turned 200 input samples into
@@ -398,15 +399,17 @@ pub fn range(
                 )));
             }
             for (labels, value) in vector.samples {
-                series
-                    .entry(labels)
-                    .or_default()
-                    .push((to_seconds(at), format_value(value)));
+                let (index, added) = table.insert(&labels);
+                if added {
+                    points.push(Vec::new());
+                }
+                points[index].push((to_seconds(at), format_value(value)));
             }
         }
     }
 
-    let mut series: Vec<(Labels, Vec<(Seconds, String)>)> = series.into_iter().collect();
+    let mut series: Vec<(Labels, Vec<(Seconds, String)>)> =
+        table.into_series().into_iter().zip(points).collect();
     series.sort_by(|(a, _), (b, _)| a.cmp(b));
     let result = series
         .into_iter()

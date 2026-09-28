@@ -52,8 +52,14 @@ fn main() {
         step.max(1) * 1_000_000_000,
     )
     .unwrap();
-    let (mut parse, mut scan, mut load, mut eval, mut encode) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut parse, mut scan, mut load, mut eval, mut encode, mut whole) = (
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
     let mut scanned = 0usize;
     for _ in 0..rounds {
         let at = Instant::now();
@@ -97,18 +103,21 @@ fn main() {
             step: Some(step.to_string()),
             timeout: None,
         };
+        let at = Instant::now();
         let answered = range(metrics, &params, 0, 0).unwrap();
+        whole.push(at.elapsed());
         let at = Instant::now();
         std::hint::black_box(serde_json::to_vec(&answered).unwrap());
         encode.push(at.elapsed());
     }
     println!(
-        "samples read {scanned}\nparse {:?}\nstore read alone {:?}\nload (read + fold) {:?}\neval {} points {:?}\nencode {:?}",
+        "samples read {scanned}\nparse {:?}\nstore read alone {:?}\nload (read + fold) {:?}\neval {} points {:?}\nencode {:?}\nthe whole range handler, before encoding {:?}",
         median(parse),
         median(scan),
         median(load),
         points.len(),
         median(eval),
-        median(encode)
+        median(encode),
+        median(whole)
     );
 }

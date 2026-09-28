@@ -1259,6 +1259,12 @@ impl Snapshot {
             end_nanos = end_nanos.max(fixed);
         }
 
+        // Nothing to read: `vector(1)`, `1 + 1`, `time()`. With no selector there are no
+        // matchers to push down, and the read below took every sample in the lookback.
+        if expr.selectors().is_empty() {
+            return Ok(Self::from_samples(Vec::new()).bounded(points));
+        }
+
         // One read covering every selector. A query's selectors usually differ only by
         // `offset`, so reading their union once and filtering per selector in memory is
         // both simpler and fewer segment opens than reading each separately.
