@@ -70,6 +70,17 @@ pub trait RecordSchema: Send + Sync + 'static {
     /// that silently mislabels rows the first time the two walks diverge.
     fn to_batch(records: &[Self::Record]) -> Result<(RecordBatch, Vec<Labels>)>;
 
+    /// [`Self::to_batch`] for a signal laid out series by series: streams numbered in
+    /// label-set order and the rows grouped by stream, each stream's in the order the
+    /// records came — time order, as a seal hands them over.
+    ///
+    /// Built in that order rather than built and then reordered: reordering copies every
+    /// column, and at a seal of a quarter of a gigabyte of records that copy was the
+    /// largest thing the process held.
+    fn to_batch_by_stream(records: &[Self::Record]) -> Result<(RecordBatch, Vec<Labels>)> {
+        Self::to_batch(records)
+    }
+
     fn from_batch(batch: &RecordBatch) -> Result<Vec<Self::Record>>;
 
     /// Select rows by time range and permitted streams, **without decoding them**.

@@ -980,11 +980,10 @@ fn write_staged<S: RecordSchema>(
     (index, bloom, text): (LabelIndexBuilder, Option<Bloom>, Option<TrigramIndex>),
     (min_time, max_time): (u64, u64),
 ) -> Result<Segment> {
-    let (batch, streams) = S::to_batch(records)?;
     let (batch, streams) = if S::STREAM_MAJOR {
-        stream_major(&batch, &streams)?
+        S::to_batch_by_stream(records)?
     } else {
-        (batch, streams)
+        S::to_batch(records)?
     };
     // Shared with every other segment holding the same sets, exactly as `load` does.
     //
@@ -1078,60 +1077,6 @@ fn write_staged<S: RecordSchema>(
         upgraded: Arc::new(AtomicBool::new(false)),
         metadata: Arc::new(OnceLock::new()),
     })
-}
-
-/// Reorder a time-ordered batch series by series: streams in label-set order, each
-/// stream's rows keeping the order they had, which is time order.
-///
-/// A counting sort by stream and one `take` per column, so it costs a pass over the rows
-/// rather than a comparison sort of them. The stream ids are renumbered to match, and the
-/// dictionary comes back in the new order.
-fn stream_major(batch: &RecordBatch, streams: &[Labels]) -> Result<(RecordBatch, Vec<Labels>)> {
-    let failed = |e: arrow::error::ArrowError| Error::Config(format!("ordering a segment: {e}"));
-    let ids = crate::schema::arrow_util::u32_column(batch, "stream_id")?.values();
-
-    let mut ordered: Vec<usize> = (0..streams.len()).collect();
-    ordered.sort_by(|a, b| streams[*a].cmp(&streams[*b]));
-    let mut rank = vec![0u32; streams.len()];
-    for (new, old) in ordered.iter().enumerate() {
-        rank[*old] = u32::try_from(new).unwrap_or(u32::MAX);
-    }
-
-    let mut starts = vec![0usize; streams.len() + 1];
-    for id in ids {
-        starts[rank[*id as usize] as usize + 1] += 1;
-    }
-    for at in 1..starts.len() {
-        starts[at] += starts[at - 1];
-    }
-    let mut positions = vec![0u32; ids.len()];
-    let mut renumbered = vec![0u32; ids.len()];
-    for (row, id) in ids.iter().enumerate() {
-        let new = rank[*id as usize];
-        let slot = &mut starts[new as usize];
-        positions[*slot] = u32::try_from(row).unwrap_or(u32::MAX);
-        renumbered[*slot] = new;
-        *slot += 1;
-    }
-
-    let positions = arrow::array::UInt32Array::from(positions);
-    let renumbered: arrow::array::ArrayRef =
-        std::sync::Arc::new(arrow::array::UInt32Array::from(renumbered));
-    let schema = batch.schema();
-    let mut columns = Vec::with_capacity(batch.num_columns());
-    for (field, column) in schema.fields().iter().zip(batch.columns()) {
-        if field.name() == "stream_id" {
-            columns.push(std::sync::Arc::clone(&renumbered));
-        } else {
-            columns.push(arrow::compute::take(column, &positions, None).map_err(failed)?);
-        }
-    }
-    let batch = RecordBatch::try_new(schema, columns).map_err(failed)?;
-    let streams = ordered
-        .into_iter()
-        .map(|old| streams[old].clone())
-        .collect();
-    Ok((batch, streams))
 }
 
 fn write_parquet(

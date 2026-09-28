@@ -939,6 +939,62 @@ impl RecordSchema for MetricSchema {
         Ok((batch, interner.into_streams()))
     }
 
+    fn to_batch_by_stream(records: &[Self::Record]) -> Result<(RecordBatch, Vec<Labels>)> {
+        let mut interner = crate::segment::StreamInterner::default();
+        let met: Vec<u32> = records.iter().map(|s| interner.intern(&s.series)).collect();
+        let streams = interner.into_streams();
+
+        // Each stream's place in label-set order.
+        let mut ordered: Vec<usize> = (0..streams.len()).collect();
+        ordered.sort_by(|a, b| streams[*a].cmp(&streams[*b]));
+        let mut rank = vec![0u32; streams.len()];
+        for (new, old) in ordered.iter().enumerate() {
+            rank[*old] = u32::try_from(new).unwrap_or(u32::MAX);
+        }
+
+        // The rows grouped by stream with a counting sort, which keeps each stream's rows
+        // in the order they came.
+        let mut next = vec![0usize; streams.len() + 1];
+        for id in &met {
+            next[rank[*id as usize] as usize + 1] += 1;
+        }
+        for at in 1..next.len() {
+            next[at] += next[at - 1];
+        }
+        let mut order = vec![0u32; records.len()];
+        for (row, id) in met.iter().enumerate() {
+            let slot = &mut next[rank[*id as usize] as usize];
+            order[*slot] = u32::try_from(row).unwrap_or(u32::MAX);
+            *slot += 1;
+        }
+        let row = |at: &u32| &records[*at as usize];
+
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(UInt64Array::from_iter_values(
+                order.iter().map(|at| row(at).timestamp_nanos),
+            )),
+            Arc::new(UInt32Array::from_iter_values(
+                order.iter().map(|at| rank[met[*at as usize] as usize]),
+            )),
+            Arc::new(Float64Array::from_iter_values(
+                order.iter().map(|at| row(at).value),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                order.iter().map(|at| row(at).name()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                order.iter().map(|at| row(at).kind.as_str()),
+            )),
+        ];
+        let batch = RecordBatch::try_new(Self::arrow_schema(), columns)
+            .map_err(|e| Error::Config(format!("building a metric record batch: {e}")))?;
+        let streams = ordered
+            .into_iter()
+            .map(|old| streams[old].clone())
+            .collect();
+        Ok((batch, streams))
+    }
+
     fn from_batch(batch: &RecordBatch) -> Result<Vec<Self::Record>> {
         let rows: Rows = (0..u32::try_from(batch.num_rows()).unwrap_or(u32::MAX)).collect();
         Self::materialize(batch, &rows, &[])
