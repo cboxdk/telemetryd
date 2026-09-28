@@ -57,6 +57,15 @@ jobs:
       - name: cargo test
         run: cargo test --locked --workspace --all-features
 
+      # A real full disk: a 4 MiB tmpfs the write-ahead log fills. See
+      # crates/store/tests/full_disk.rs for what it proves.
+      - name: the write-ahead log meets a full disk
+        run: |
+          sudo mkdir -p /mnt/full
+          sudo mount -t tmpfs -o size=4m tmpfs /mnt/full
+          sudo chown "$(id -u):$(id -g)" /mnt/full
+          TELEMETRYD_FULL_DISK_DIR=/mnt/full cargo test --locked -p telemetryd-store --test full_disk
+
       # `-D warnings` here, not just on clippy. Without it this step has never failed
       # anything: a broken intra-doc link sat in `out.rs` through several releases while
       # the gate looked as strict as the rest of CI.

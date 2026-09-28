@@ -118,6 +118,95 @@ impl Wal {
         })
     }
 
+    /// Append a batch of records as one: on success every frame is in the kernel's
+    /// hands (and on disk, as the sync policy says); on failure none of them stays in the
+    /// log.
+    ///
+    /// A batch was a frame per record, each rolled back alone, so a full disk that
+    /// refused the third record of a batch left the first two in the log. The store told
+    /// the client the batch was refused, the client sent it again, and the next restart
+    /// replayed the first two a second time — found by filling a real filesystem.
+    ///
+    /// The batch goes in one segment: it rotates first if it would not fit, and a batch
+    /// larger than a segment still goes in whole, as an oversized record always has.
+    pub fn append_batch(&mut self, payloads: &[Vec<u8>]) -> Result<()> {
+        let mut frames = 0u64;
+        for payload in payloads {
+            let len = u32::try_from(payload.len())
+                .ok()
+                .filter(|len| *len <= MAX_FRAME_LEN)
+                .ok_or_else(|| Error::LimitExceeded {
+                    limit: "wal_frame_len",
+                    detail: format!(
+                        "record of {} bytes exceeds the {MAX_FRAME_LEN} byte frame limit",
+                        payload.len()
+                    ),
+                })?;
+            frames += FRAME_HEADER_LEN as u64 + u64::from(len);
+        }
+        // Whatever an earlier append left buffered goes to disk first, so that from
+        // here the file holds exactly the complete frames and nothing else.
+        self.hand_off()?;
+        if self.poisoned
+            || (self.segment_bytes > HEADER_LEN_U64
+                && self.segment_bytes + frames > self.max_segment_bytes)
+        {
+            self.rotate()?;
+            self.poisoned = false;
+        }
+
+        let written = payloads.iter().try_for_each(|payload| {
+            let len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+            let mut header = [0u8; FRAME_HEADER_LEN];
+            header[..4].copy_from_slice(&len.to_le_bytes());
+            header[4..].copy_from_slice(&crc32fast::hash(payload).to_le_bytes());
+            self.write_all(&header)
+                .and_then(|()| self.write_all(payload))
+        });
+        let durable = written.and_then(|()| {
+            self.writer.flush().map_err(|e| {
+                Error::io(format!("writing WAL segment {}", self.path().display()), e)
+            })?;
+            if matches!(self.sync, WalSync::Always) {
+                self.writer.get_ref().sync_data().map_err(|e| {
+                    Error::io(format!("syncing WAL segment {}", self.path().display()), e)
+                })?;
+                self.last_sync = Instant::now();
+            }
+            Ok(())
+        });
+        if let Err(error) = durable {
+            self.discard_unacknowledged();
+            return Err(error);
+        }
+
+        self.segment_bytes += frames;
+        self.appended_records += payloads.len() as u64;
+        self.appended_bytes += frames;
+        if matches!(self.sync, WalSync::Always) {
+            self.unsynced_records = 0;
+            Ok(())
+        } else {
+            self.unsynced_records += payloads.len() as u64;
+            self.maybe_sync()
+        }
+    }
+
+    /// Cut the segment back to the frames acknowledged before the batch that failed,
+    /// dropping whatever of it is still buffered. If the cut fails too, the segment is
+    /// poisoned and the next batch starts a new one.
+    fn discard_unacknowledged(&mut self) {
+        let Ok(spare) = self.writer.get_ref().try_clone() else {
+            self.poisoned = true;
+            return;
+        };
+        let (file, _unwritten) =
+            std::mem::replace(&mut self.writer, BufWriter::new(spare)).into_parts();
+        if file.set_len(self.segment_bytes).is_err() {
+            self.poisoned = true;
+        }
+    }
+
     /// Append one record, rotating to a new segment first if this one is full.
     pub fn append(&mut self, payload: &[u8]) -> Result<()> {
         let len = u32::try_from(payload.len()).map_err(|_| Error::LimitExceeded {
@@ -940,6 +1029,40 @@ mod rollback_tests {
         assert_eq!(
             records(tmp.path()),
             vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+        );
+    }
+
+    /// A batch never straddles two segments: one that would not fit starts the next.
+    #[test]
+    fn a_batch_stays_in_one_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let frame = FRAME_HEADER_LEN as u64 + 4;
+        let mut wal = Wal::open(
+            tmp.path(),
+            WalSync::Interval,
+            Duration::ZERO,
+            HEADER_LEN_U64 + 3 * frame,
+        )
+        .unwrap();
+        let first = wal.current_sequence();
+        wal.append_batch(&[b"aaaa".to_vec(), b"bbbb".to_vec()])
+            .unwrap();
+        wal.append_batch(&[b"cccc".to_vec(), b"dddd".to_vec()])
+            .unwrap();
+        assert_eq!(
+            wal.current_sequence(),
+            first + 1,
+            "the second batch rotated"
+        );
+        drop(wal);
+        assert_eq!(
+            records(tmp.path()),
+            vec![
+                b"aaaa".to_vec(),
+                b"bbbb".to_vec(),
+                b"cccc".to_vec(),
+                b"dddd".to_vec()
+            ]
         );
     }
 

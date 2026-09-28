@@ -572,12 +572,9 @@ impl<S: RecordSchema> RecordStore<S> {
                     S::SIGNAL
                 )));
             }
-            for payload in &payloads {
-                writer.wal.append(payload)?;
-            }
-            // In the kernel's hands before they are queryable or acknowledged; see
-            // `Wal::hand_off`.
-            writer.wal.hand_off()?;
+            // All or nothing, and in the kernel's hands before they are queryable or
+            // acknowledged; see `Wal::append_batch` and `Wal::hand_off`.
+            writer.wal.append_batch(&payloads)?;
             for (record, fingerprint) in records.iter().zip(&fingerprints) {
                 writer
                     .buffer
