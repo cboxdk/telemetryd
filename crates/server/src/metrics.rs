@@ -280,6 +280,11 @@ pub const DESCRIPTORS: &[Descriptor] = &[
         help: "Segments queries skipped with no I/O, via time range, label index, Bloom filter or limit cutoff",
     },
     Descriptor {
+        name: "telemetryd_query_rows_read_total",
+        kind: Kind::Counter,
+        help: "Metric rows queries took out of the store, decoded from segments or read from the buffer — against the samples a query needed, what it read that it did not",
+    },
+    Descriptor {
         name: "telemetryd_retention_deleted_total",
         kind: Kind::Counter,
         help: "Segments deleted by retention, by reason (age or disk_budget)",

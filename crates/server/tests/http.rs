@@ -257,6 +257,7 @@ async fn the_exported_metric_names_cannot_change_by_accident() {
         "telemetryd_query_concurrency_limit",
         "telemetryd_query_queued_total",
         "telemetryd_query_rejected_total",
+        "telemetryd_query_rows_read_total",
         "telemetryd_query_segments_pruned_total",
         "telemetryd_query_segments_scanned_total",
         "telemetryd_records_appended_total",

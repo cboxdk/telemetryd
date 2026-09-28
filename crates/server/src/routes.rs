@@ -398,6 +398,7 @@ fn push_per_signal_gauges(snapshot: &telemetryd_store::StoreStatus, samples: &mu
                 "telemetryd_query_segments_pruned_total",
                 stats.segments_pruned as f64,
             ),
+            ("telemetryd_query_rows_read_total", stats.rows_read as f64),
             ("telemetryd_wal_segments", stats.wal.segments as f64),
             (
                 "telemetryd_wal_records_total",

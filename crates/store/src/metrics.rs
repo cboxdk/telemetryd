@@ -36,6 +36,8 @@ pub struct SeriesRun<'a> {
 /// segments so a scan allocates once, not once per segment.
 #[derive(Debug, Default)]
 struct Gathered {
+    /// Rows the reader decoded for the last segment gathered, wanted or not.
+    decoded: usize,
     streams: Vec<u32>,
     timestamps: Vec<u64>,
     values: Vec<f64>,
@@ -48,6 +50,7 @@ struct Gathered {
 
 impl Gathered {
     fn clear(&mut self) {
+        self.decoded = 0;
         self.streams.clear();
         self.timestamps.clear();
         self.values.clear();
@@ -66,6 +69,7 @@ impl Gathered {
         self.clear();
         let mut named = true;
         let outcome = scan_wanted(segment, windows, allowed, |batch| {
+            self.decoded += batch.num_rows();
             let ids = u32_column(batch, "stream_id")?.values();
             let timestamps = u64_column(batch, "timestamp_nanos")?.values();
             let values = f64_column(batch, "value")?.values();
@@ -190,6 +194,9 @@ impl crate::RecordStore<MetricSchema> {
             source += 1;
 
             let (outcome, named) = gathered.gather(segment, windows, (start, end), &allowed);
+            self.stats
+                .rows_read
+                .fetch_add(gathered.decoded as u64, Ordering::Relaxed);
             self.settle_scan(segment, outcome)?;
             if !named {
                 return Ok(false);
@@ -212,13 +219,17 @@ impl crate::RecordStore<MetricSchema> {
             }
         }
 
+        let rows_read = &self.stats.rows_read;
         Ok(visit_buffered(
             &chunks,
             (start, end),
             matchers,
             &|min, max| wanted(min, max),
             source,
-            visit,
+            &mut |run| {
+                rows_read.fetch_add(run.timestamps.len() as u64, Ordering::Relaxed);
+                visit(run)
+            },
         ))
     }
 
@@ -424,7 +435,12 @@ impl crate::RecordStore<MetricSchema> {
                 // columns. The *segment*, rather than a time range, because a range scan
                 // would also touch its neighbours, which this loop takes from their
                 // summaries.
-                match fold_segment_columns(segment, (start_nanos, end_nanos), &allowed)? {
+                match fold_segment_columns(
+                    segment,
+                    (start_nanos, end_nanos),
+                    &allowed,
+                    &self.stats.rows_read,
+                )? {
                     Some(per_stream) => per_stream,
                     None => return Ok(None),
                 }
@@ -717,6 +733,7 @@ fn fold_segment_columns(
     segment: &crate::segment::Segment,
     (start_nanos, end_nanos): (u64, u64),
     allowed: &[bool],
+    rows_read: &std::sync::atomic::AtomicU64,
 ) -> Result<Option<Vec<crate::folds::StreamFold>>> {
     let mut folds = vec![crate::folds::StreamFold::default(); segment.manifest.streams.len()];
     let mut usable = true;
@@ -725,6 +742,10 @@ fn fold_segment_columns(
         &[(start_nanos.saturating_add(1), end_nanos)],
         allowed,
         |batch| {
+            rows_read.fetch_add(
+                batch.num_rows() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let ids = u32_column(batch, "stream_id")?.values();
             let timestamps = u64_column(batch, "timestamp_nanos")?.values();
             let values = f64_column(batch, "value")?.values();

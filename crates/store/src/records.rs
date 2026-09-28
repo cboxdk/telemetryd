@@ -373,6 +373,10 @@ pub(crate) struct Stats {
     /// Segments a query skipped without any I/O — by time range, label index, Bloom
     /// filter, or the limit cutoff.
     pub(crate) segments_pruned: AtomicU64,
+    /// Metric rows a series read took out of the store: rows decoded from segments, and
+    /// buffered samples handed out. Against the samples a query needed, how much it read
+    /// that it did not — the number that says whether a query reads only its own series.
+    pub(crate) rows_read: AtomicU64,
 }
 
 /// A bounded query request.
@@ -495,6 +499,8 @@ pub struct RecordStoreStatus {
     pub newest_record_nanos: Option<u64>,
     pub segments_scanned: u64,
     pub segments_pruned: u64,
+    /// Metric rows series reads have taken out of the store. See `Stats::rows_read`.
+    pub rows_read: u64,
     /// The write-ahead log's own numbers. `unsynced_records` is the one to watch: it
     /// is how much would be lost to a power cut right now.
     pub wal: crate::wal::WalStats,
@@ -1490,6 +1496,7 @@ impl<S: RecordSchema> RecordStore<S> {
             newest_record_nanos: newest,
             wal: lock(&self.writer).wal.stats(),
             segments_scanned: self.stats.segments_scanned.load(Ordering::Relaxed),
+            rows_read: self.stats.rows_read.load(Ordering::Relaxed),
             segments_pruned: self.stats.segments_pruned.load(Ordering::Relaxed),
         }
     }

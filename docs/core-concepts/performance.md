@@ -102,6 +102,12 @@ curl -s http://127.0.0.1:4319/metrics | grep query_segments
 A high scan count means something is defeating pruning — usually a query with no
 selective matcher.
 
+`telemetryd_query_rows_read_total` counts the metric rows queries took out of the store —
+decoded from segments or read from the buffer. A metric query reads only the series it
+names: a chart of one app's request counts reads those counts, not the histogram buckets
+stored beside them. When this grows far faster than the answers queries return, a query
+is reading series it then throws away.
+
 ## Where a general engine stays ahead
 
 Named so the trade is explicit: large aggregations over billions of rows, arbitrary
