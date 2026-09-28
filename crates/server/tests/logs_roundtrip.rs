@@ -313,6 +313,59 @@ async fn label_filters_reach_record_attributes() {
     assert_eq!(bodies, vec!["b"]);
 }
 
+/// A log line carries its trace and span ids where Loki puts them — structured
+/// metadata named `trace_id` and `span_id` — and a label filter reaches them. That is
+/// what the UI's log→trace link and Grafana's "trace to logs" read. They were stored
+/// and never shown, so both came up empty against telemetryd and full against Loki.
+#[tokio::test]
+async fn a_log_line_carries_its_trace_where_loki_puts_it() {
+    let harness = Harness::new();
+    harness
+        .post_logs(&otlp_logs(&[(0, "error", "boom", "1001")]))
+        .await;
+
+    let (status, response) = harness
+        .get(&range("/loki/api/v1/query_range", r#"{app="checkout"}"#))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let metadata = &response["data"]["result"][0]["values"][0][2];
+    assert_eq!(metadata["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736");
+    assert_eq!(metadata["span_id"], "00f067aa0ba902b7");
+    assert_eq!(metadata["severity_text"], "ERROR");
+    assert_eq!(metadata["order_id"], "1001");
+
+    // Trace → logs: the filter Grafana and the UI send.
+    for query in [
+        r#"{app="checkout"} | trace_id="4bf92f3577b34da6a3ce929d0e0e4736""#,
+        r#"{app="checkout"} | span_id="00f067aa0ba902b7""#,
+    ] {
+        let (_, response) = harness.get(&range("/loki/api/v1/query_range", query)).await;
+        assert_eq!(
+            response["data"]["result"][0]["values"][0][1], "boom",
+            "{query}"
+        );
+    }
+    let (_, response) = harness
+        .get(&range(
+            "/loki/api/v1/query_range",
+            r#"{app="checkout"} | trace_id="00000000000000000000000000000000""#,
+        ))
+        .await;
+    assert!(response["data"]["result"].as_array().unwrap().is_empty());
+
+    // Grafana's categorised form puts them under structuredMetadata.
+    let request = Request::get(range("/loki/api/v1/query_range", r#"{app="checkout"}"#))
+        .header("X-Loki-Response-Encoding-Flags", "categorize-labels")
+        .body(Body::empty())
+        .unwrap();
+    let (_, body) = harness.send(request).await;
+    let response: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        response["data"]["result"][0]["values"][0][2]["structuredMetadata"]["trace_id"],
+        "4bf92f3577b34da6a3ce929d0e0e4736"
+    );
+}
+
 #[tokio::test]
 async fn level_selects_by_normalised_severity() {
     let harness = Harness::new();

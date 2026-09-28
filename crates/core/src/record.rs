@@ -304,6 +304,65 @@ pub struct LogRecord {
 }
 
 impl LogRecord {
+    /// The fields Loki keeps as structured metadata beside a record's attributes when
+    /// it ingests OTLP: the trace and span ids and the producer's severity text, under
+    /// Loki's names.
+    ///
+    /// They were stored and never shown. So a log line carried no `trace_id` a client
+    /// could read, `| trace_id="…"` matched nothing, and neither the UI's log→trace
+    /// link nor Grafana's "trace to logs" found anything — while the same data sent to
+    /// Loki linked both ways.
+    pub fn record_fields(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        [
+            ("trace_id", self.trace_id.as_deref()),
+            ("span_id", self.span_id.as_deref()),
+            ("severity_text", Some(self.severity_text.as_str())),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| value.filter(|v| !v.is_empty()).map(|v| (name, v)))
+    }
+
+    /// The record as Loki's structured metadata: every attribute under its label-safe
+    /// name — the first of two that sanitise alike wins, so a record always renders the
+    /// same — then [`Self::record_fields`] where no attribute took the name.
+    #[must_use]
+    pub fn structured_metadata(&self) -> std::collections::BTreeMap<String, String> {
+        let mut metadata = std::collections::BTreeMap::new();
+        for (key, value) in self.attributes.iter() {
+            metadata
+                .entry(sanitize_label_name(key))
+                .or_insert_with(|| value.to_owned());
+        }
+        for (name, value) in self.record_fields() {
+            metadata
+                .entry(name.to_owned())
+                .or_insert_with(|| value.to_owned());
+        }
+        metadata
+    }
+
+    /// What a LogQL label filter sees: the stream labels, every attribute under both
+    /// its own spelling and the label-safe one — `| exception.type="x"` and
+    /// `| exception_type="x"` reach the same attribute — and [`Self::record_fields`].
+    /// An attribute outranks a record field of the same name, as in Loki.
+    #[must_use]
+    pub fn filter_labels(&self) -> Labels {
+        let mut labels = self.stream.clone();
+        for (name, value) in self.attributes.iter() {
+            labels.insert(name, value);
+            let sanitized = sanitize_label_name(name);
+            if sanitized != name {
+                labels.insert(sanitized, value);
+            }
+        }
+        for (name, value) in self.record_fields() {
+            if labels.get(name).is_none() {
+                labels.insert(name, value);
+            }
+        }
+        labels
+    }
+
     /// The `app` this record belongs to. Always present: the decoder assigns
     /// [`UNKNOWN_APP`] rather than allowing an unattributed record, so retention,
     /// quotas and queries never have to handle a missing tenant.

@@ -538,20 +538,11 @@ pub fn query_range(
 
     let filter = |record: &LogRecord| {
         scanned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Label filters see stream labels *and* record attributes; see
-        // `LogQuery::evaluate`.
-        // Attributes keep the producer's key spelling, so both it and the
-        // label-safe form are exposed — `| exception_type="x"` and
-        // `| exception.type="x"` should reach the same attribute.
-        let mut base = record.stream.clone();
-        for (name, value) in record.attributes.iter() {
-            base.insert(name, value);
-            let sanitized = telemetryd_core::record::sanitize_label_name(name);
-            if sanitized != name {
-                base.insert(sanitized, value);
-            }
-        }
-        request.query.evaluate(&record.body, &base, &record.stream)
+        // Label filters see stream labels, attributes and the record's own fields;
+        // see `LogRecord::filter_labels` and `LogQuery::evaluate`.
+        request
+            .query
+            .evaluate(&record.body, &record.filter_labels(), &record.stream)
     };
 
     // The limit and the direction go all the way down to storage. Collecting every
@@ -684,12 +675,9 @@ fn group_into_streams(
         // whichever happened to be inserted last: losing a value silently is the thing
         // this whole change is about, and at least this way the same record always
         // renders the same.
-        let mut metadata: BTreeMap<String, String> = BTreeMap::new();
-        for (key, value) in record.attributes.iter() {
-            metadata
-                .entry(telemetryd_core::record::sanitize_label_name(key))
-                .or_insert_with(|| value.to_owned());
-        }
+        // Attributes, then `trace_id`, `span_id` and `severity_text` where Loki puts
+        // them — what Grafana's derived fields and the UI's log→trace link read.
+        let mut metadata: BTreeMap<String, String> = record.structured_metadata();
 
         // Fields a `| json` or `| logfmt` stage pulled out of the body. Without these a
         // filter selected on a value the caller could never see. Kept apart from the

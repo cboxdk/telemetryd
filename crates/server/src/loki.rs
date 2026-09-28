@@ -194,7 +194,9 @@ struct TailResponse {
 #[derive(Debug, Serialize)]
 struct TailStream {
     stream: std::collections::BTreeMap<String, String>,
-    values: Vec<[String; 2]>,
+    /// `[ts, line]`, or `[ts, line, {structured metadata}]` when the line has any —
+    /// Loki's shape, and the only place a tailed line's `trace_id` can travel.
+    values: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -261,10 +263,7 @@ async fn run_tail(
                                         .iter()
                                         .map(|(k, v)| (k.to_owned(), v.to_owned()))
                                         .collect(),
-                                    values: vec![[
-                                        record.timestamp_nanos.to_string(),
-                                        record.body.clone(),
-                                    ]],
+                                    values: vec![tail_entry(&record)],
                                 }],
                                 dropped_entries: Vec::new(),
                             };
@@ -311,19 +310,20 @@ async fn report_dropped(socket: &mut WebSocket, state: &AppState, missed: u64) -
     socket.send(Message::Text(json.into())).await.is_ok()
 }
 
+fn tail_entry(record: &LogRecord) -> serde_json::Value {
+    let metadata = record.structured_metadata();
+    if metadata.is_empty() {
+        serde_json::json!([record.timestamp_nanos.to_string(), record.body])
+    } else {
+        serde_json::json!([record.timestamp_nanos.to_string(), record.body, metadata])
+    }
+}
+
 fn matches_tail(query: &logql::LogQuery, record: &LogRecord) -> bool {
     if !telemetryd_core::matches_all(&query.matchers, &record.stream) {
         return false;
     }
-    let mut base = record.stream.clone();
-    for (name, value) in record.attributes.iter() {
-        base.insert(name, value);
-        let sanitized = telemetryd_core::record::sanitize_label_name(name);
-        if sanitized != name {
-            base.insert(sanitized, value);
-        }
-    }
-    query.evaluate(&record.body, &base, &record.stream)
+    query.evaluate(&record.body, &record.filter_labels(), &record.stream)
 }
 
 #[cfg(test)]
@@ -383,7 +383,7 @@ mod tests {
                 stream: [("app".to_owned(), "checkout".to_owned())]
                     .into_iter()
                     .collect(),
-                values: vec![["1750000000000000000".to_owned(), "hello".to_owned()]],
+                values: vec![serde_json::json!(["1750000000000000000", "hello"])],
             }],
             dropped_entries: Vec::new(),
         };
