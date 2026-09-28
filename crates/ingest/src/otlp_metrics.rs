@@ -13,6 +13,8 @@
 //!   an `le` label. The running total is built here so `histogram_quantile` works.
 //! - **Sums carry monotonicity**, which becomes counter vs gauge.
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
 use telemetryd_core::Labels;
 use telemetryd_core::config::{IngestConfig, LimitsConfig};
@@ -327,8 +329,9 @@ fn convert_metric(
         // `_count`, `_sum` and `_bucket` are the counter-ish suffixes here; `_total` is
         // not part of the histogram convention.
         let name = prometheus_metric_name(&metric.name, &metric.unit, false);
+        let mut derived = HistogramSeries::default();
         for point in &histogram.data_points {
-            push_histogram(&name, point, resource, app, ctx, decoded);
+            push_histogram(&name, point, (resource, app), ctx, &mut derived, decoded);
         }
     }
     for (kind, points) in [
@@ -389,14 +392,81 @@ fn push_number(
     });
 }
 
+/// The series one histogram's points expand into, kept across its data points.
+///
+/// A histogram point becomes a series per bucket and one each for its sum and count, and
+/// the next point of the same series — the same attributes a scrape interval later —
+/// becomes the same ones again. Built afresh, each is a copy of every label, and an
+/// export carrying a minute of fifty route histograms builds fifty thousand of them to
+/// arrive at 850. Here each is built once per payload and shared after.
+#[derive(Default)]
+struct HistogramSeries {
+    /// Keyed by the point's own series and its bucket bounds, bit for bit.
+    by_base: HashMap<(Labels, Vec<u64>), std::sync::Arc<Expanded>>,
+}
+
+/// One histogram series expanded: a label set per bucket, then the sum's and count's.
+struct Expanded {
+    buckets: Vec<Labels>,
+    sum: Labels,
+    count: Labels,
+}
+
+impl HistogramSeries {
+    fn expand(
+        &mut self,
+        name: &str,
+        base: Labels,
+        point: &HistogramPoint,
+    ) -> std::sync::Arc<Expanded> {
+        let bounds: Vec<u64> = point.explicit_bounds.iter().map(|b| b.to_bits()).collect();
+        let key = (base, bounds);
+        if let Some(expanded) = self.by_base.get(&key)
+            && expanded.buckets.len() >= point.bucket_counts.len()
+        {
+            return std::sync::Arc::clone(expanded);
+        }
+        let base = &key.0;
+        let with = |metric: String, le: Option<String>| {
+            let mut series = base.clone();
+            series.insert(METRIC_NAME_LABEL, metric);
+            if let Some(le) = le {
+                series.insert("le", le);
+            }
+            series
+        };
+        // `bucket_counts` has one more entry than `explicit_bounds`: the last is the
+        // overflow bucket, which is `+Inf`.
+        let buckets = (0..point
+            .bucket_counts
+            .len()
+            .max(point.explicit_bounds.len() + 1))
+            .map(|index| {
+                let bound = point
+                    .explicit_bounds
+                    .get(index)
+                    .map_or_else(|| "+Inf".to_owned(), |value| format_bound(*value));
+                with(format!("{name}_bucket"), Some(bound))
+            })
+            .collect();
+        let expanded = std::sync::Arc::new(Expanded {
+            buckets,
+            sum: with(format!("{name}_sum"), None),
+            count: with(format!("{name}_count"), None),
+        });
+        self.by_base.insert(key, std::sync::Arc::clone(&expanded));
+        expanded
+    }
+}
+
 /// Expand an OTLP histogram into the `_bucket` / `_sum` / `_count` series Prometheus
 /// expects, with cumulative bucket counts.
 fn push_histogram(
     name: &str,
     point: &HistogramPoint,
-    resource: &Labels,
-    app: &str,
+    (resource, app): (&Labels, &str),
     ctx: MetricContext<'_>,
+    derived: &mut HistogramSeries,
     decoded: &mut Decoded<MetricSample>,
 ) {
     let timestamp_nanos = resolve_time(point.time_unix_nano, ctx, decoded);
@@ -408,50 +478,35 @@ fn push_histogram(
         decoded.refuse(rejection);
         return;
     }
+    let expanded = derived.expand(name, base, point);
 
     // OTLP sends per-bucket counts; Prometheus wants a running total.
     let mut cumulative = 0u64;
-    for (index, count) in point.bucket_counts.iter().enumerate() {
+    for (count, series) in point.bucket_counts.iter().zip(&expanded.buckets) {
         cumulative = cumulative.saturating_add(count.get().unwrap_or(0));
-
-        // `bucket_counts` has one more entry than `explicit_bounds`: the last is the
-        // overflow bucket, which is `+Inf`.
-        let bound = point
-            .explicit_bounds
-            .get(index)
-            .map_or_else(|| "+Inf".to_owned(), |value| format_bound(*value));
-
-        let mut series = base.clone();
-        series.insert(METRIC_NAME_LABEL, format!("{name}_bucket"));
-        series.insert("le", bound);
-
         #[allow(clippy::cast_precision_loss)]
         decoded.keep(MetricSample {
             timestamp_nanos,
-            series,
+            series: series.shared_with(),
             value: cumulative as f64,
             kind: MetricKind::Histogram,
         });
     }
 
     if let Some(sum) = point.sum {
-        let mut series = base.clone();
-        series.insert(METRIC_NAME_LABEL, format!("{name}_sum"));
         decoded.keep(MetricSample {
             timestamp_nanos,
-            series,
+            series: expanded.sum.shared_with(),
             value: sum,
             kind: MetricKind::Counter,
         });
     }
 
     if let Some(count) = point.count.get() {
-        let mut series = base;
-        series.insert(METRIC_NAME_LABEL, format!("{name}_count"));
         #[allow(clippy::cast_precision_loss)]
         decoded.keep(MetricSample {
             timestamp_nanos,
-            series,
+            series: expanded.count.shared_with(),
             value: count as f64,
             kind: MetricKind::Counter,
         });
@@ -683,6 +738,38 @@ mod tests {
 
         assert_eq!(find(&decoded, "http_duration_sum")[0].value, 4.5);
         assert_eq!(find(&decoded, "http_duration_count")[0].value, 10.0);
+    }
+
+    /// A histogram's next point of the same series reuses the label sets the first one
+    /// built — one allocation shared, not a copy of every label per bucket per point —
+    /// while a point with other bounds gets its own.
+    #[test]
+    fn points_of_one_histogram_series_share_their_label_sets() {
+        let point = |ts: &str, bounds: &str, counts: &str| {
+            format!(
+                r#"{{"timeUnixNano":"{ts}","count":"3","sum":1.5,
+                    "bucketCounts":[{counts}],"explicitBounds":[{bounds}],
+                    "attributes":[{{"key":"route","value":{{"stringValue":"/a"}}}}]}}"#
+            )
+        };
+        let decoded = decode_str(&format!(
+            r#"{{"resourceMetrics":[{{"scopeMetrics":[{{"metrics":[{{
+                "name":"latency","histogram":{{"aggregationTemporality":2,"dataPoints":[{},{},{}]}}
+            }}]}}]}}]}}"#,
+            point("1750000000000000000", "0.1,0.5", r#""1","1","1""#),
+            point("1750000030000000000", "0.1,0.5", r#""2","2","2""#),
+            point("1750000060000000000", "0.1,1", r#""1","1","1""#),
+        ));
+        let buckets = find(&decoded, "latency_bucket");
+        assert_eq!(buckets.len(), 9);
+        // The same series a point later: the same allocation, and the same labels.
+        assert!(buckets[0].series.shares_storage_with(&buckets[3].series));
+        assert_eq!(buckets[3].value, 2.0);
+        // Other bounds are other series.
+        assert_eq!(buckets[1].series.get("le"), Some("0.5"));
+        assert_eq!(buckets[7].series.get("le"), Some("1"));
+        assert_eq!(buckets[8].series.get("le"), Some("+Inf"));
+        assert_eq!(find(&decoded, "latency_count").len(), 3);
     }
 
     #[test]
