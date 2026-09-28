@@ -670,3 +670,80 @@ async fn a_span_sent_twice_is_one_span() {
         .sum();
     assert_eq!(spans, 2);
 }
+
+/// Every resource attribute is reachable as `resource.X` and shown on the resource, not
+/// only the few promoted to stream labels — and never confused with a span's own
+/// attribute of the same name.
+#[tokio::test]
+async fn resource_attributes_beyond_the_stream_are_the_resource_s() {
+    let harness = Harness::new();
+    let mut payload = trace_payload();
+    payload["resourceSpans"][0]["resource"]["attributes"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"key": "k8s.pod.name", "value": {"stringValue": "checkout-7f9"}}));
+    payload["resourceSpans"][0]["scopeSpans"][0]["spans"][1]["attributes"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"key": "k8s.pod.name", "value": {"stringValue": "span-own"}}));
+    let (status, _) = harness.post_traces(&payload).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let count = |response: &Value| response["traces"].as_array().unwrap().len();
+    for (query, expected) in [
+        (r#"{ resource.k8s.pod.name = "checkout-7f9" }"#, 1),
+        (r#"{ resource.k8s.pod.name = "span-own" }"#, 0),
+        (r#"{ span.k8s.pod.name = "span-own" }"#, 1),
+        (r#"{ span.k8s.pod.name = "checkout-7f9" }"#, 0),
+        (r#"{ .k8s.pod.name = "checkout-7f9" }"#, 1),
+    ] {
+        let (_, response) = harness
+            .get(&format!("/api/search?q={}&{}", urlencode(query), window()))
+            .await;
+        assert_eq!(count(&response), expected, "{query}: {response}");
+    }
+
+    let (_, response) = harness.get(&format!("/api/traces/{TRACE}")).await;
+    let batch = &response["batches"][0];
+    let resource = batch["resource"]["attributes"].as_array().unwrap();
+    assert!(
+        resource
+            .iter()
+            .any(|kv| kv["key"] == "k8s.pod.name" && kv["value"]["stringValue"] == "checkout-7f9"),
+        "{resource:?}"
+    );
+    let spans = batch["scopeSpans"][0]["spans"].as_array().unwrap();
+    for span in spans {
+        let keys: Vec<&str> = span["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|kv| kv["key"].as_str().unwrap())
+            .collect();
+        assert!(
+            keys.iter().all(|k| !k.starts_with("resource.")),
+            "a resource attribute shown as the span's: {keys:?}"
+        );
+    }
+    let child = spans.iter().find(|s| s["name"] == "SELECT orders").unwrap();
+    assert!(
+        child["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kv| kv["key"] == "k8s.pod.name" && kv["value"]["stringValue"] == "span-own")
+    );
+
+    // Tag listing and values put it under the resource scope.
+    let (_, tags) = harness
+        .get(&format!("/api/v2/search/tags?scope=resource&{}", window()))
+        .await;
+    assert!(tags.to_string().contains("k8s.pod.name"), "{tags}");
+    let (_, values) = harness
+        .get(&format!(
+            "/api/v2/search/tag/resource.k8s.pod.name/values?{}",
+            window()
+        ))
+        .await;
+    assert_eq!(values["tagValues"][0]["value"], "checkout-7f9", "{values}");
+}

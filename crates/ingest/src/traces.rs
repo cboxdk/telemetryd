@@ -9,12 +9,14 @@ use serde::Deserialize;
 use telemetryd_core::Labels;
 use telemetryd_core::config::{IngestConfig, LimitsConfig};
 use telemetryd_core::record::{APP_LABEL, UNKNOWN_APP, sanitize_label_name};
-use telemetryd_core::span::{SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus};
+use telemetryd_core::span::{
+    RESOURCE_ATTRIBUTE_PREFIX, SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus,
+};
 
 use crate::logs::{DecodeContext, normalize_timestamp};
 use crate::otlp::{
     FlexEnum, FlexU64, InstrumentationScope, KeyValue, Resource, extend_attributes, extend_labels,
-    keep_unpromoted, normalize_id,
+    normalize_id,
 };
 use crate::{Decoded, RejectReason, Rejection};
 
@@ -112,6 +114,17 @@ pub fn convert_data(data: &TracesData, ctx: DecodeContext<'_>) -> Decoded<SpanRe
             extend_labels(&mut resource_labels, &resource.attributes);
             extend_attributes(&mut resource_attributes, &resource.attributes);
         }
+        // Kept apart from the span's own attributes by their prefix; see
+        // `RESOURCE_ATTRIBUTE_PREFIX`.
+        let resource_attributes: Labels = resource_attributes
+            .iter()
+            .map(|(name, value)| {
+                (
+                    format!("{RESOURCE_ATTRIBUTE_PREFIX}{name}"),
+                    value.to_owned(),
+                )
+            })
+            .collect();
 
         for scope_spans in &resource_spans.scope_spans {
             let mut scope_labels = resource_labels.clone();
@@ -134,6 +147,18 @@ pub fn convert_data(data: &TracesData, ctx: DecodeContext<'_>) -> Decoded<SpanRe
     }
 
     decoded
+}
+
+/// Keep what the stream labels do not already hold: resource attributes under
+/// their prefix, scope attributes as they are, and never over one the span set itself.
+fn keep_unpromoted_resource(target: &mut Labels, inherited: &Labels, stream: &Labels) {
+    for (name, value) in inherited.iter() {
+        let bare = name.strip_prefix(RESOURCE_ATTRIBUTE_PREFIX).unwrap_or(name);
+        if stream.get(&sanitize_label_name(bare)).is_some() || target.get(name).is_some() {
+            continue;
+        }
+        target.insert(name.to_owned(), value.to_owned());
+    }
 }
 
 fn convert(
@@ -197,8 +222,8 @@ fn convert(
     let stream = build_stream_labels(inherited, ctx)?;
 
     // Resource and scope attributes no stream label claimed, counted against the same
-    // limit because they are stored in the same place. See `keep_unpromoted`.
-    keep_unpromoted(&mut attributes, inherited_attributes, &stream);
+    // limit because they are stored in the same place.
+    keep_unpromoted_resource(&mut attributes, inherited_attributes, &stream);
 
     if attributes.len() > ctx.limits.max_attrs_per_record as usize {
         return Err(Rejection::new(

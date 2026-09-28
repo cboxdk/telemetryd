@@ -216,7 +216,38 @@ impl From<SpanRecordWithoutLinks> for SpanRecord {
     }
 }
 
+/// Where a span keeps the resource attributes no stream label holds: among its
+/// attributes, under this prefix, so a resource attribute is never read as the span's
+/// own — and `resource.k8s.pod.name` reaches it, rather than only the promoted few.
+pub const RESOURCE_ATTRIBUTE_PREFIX: &str = "resource.";
+
 impl SpanRecord {
+    /// A resource attribute by its OTLP name: a stream label, or one kept on the span.
+    pub fn resource_attribute(&self, name: &str) -> Option<&str> {
+        self.stream
+            .get(&crate::record::sanitize_label_name(name))
+            .or_else(|| {
+                self.attributes
+                    .get(&format!("{RESOURCE_ATTRIBUTE_PREFIX}{name}"))
+            })
+    }
+
+    /// The span's own attributes, without the resource attributes kept among them.
+    pub fn span_attributes(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.attributes
+            .iter()
+            .filter(|(name, _)| !name.starts_with(RESOURCE_ATTRIBUTE_PREFIX))
+    }
+
+    /// The resource attributes kept on the span, by their OTLP names. The stream labels
+    /// are the rest of the resource.
+    pub fn kept_resource_attributes(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.attributes.iter().filter_map(|(name, value)| {
+            name.strip_prefix(RESOURCE_ATTRIBUTE_PREFIX)
+                .map(|name| (name, value))
+        })
+    }
+
     pub fn app(&self) -> &str {
         self.stream
             .get(crate::record::APP_LABEL)

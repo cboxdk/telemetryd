@@ -13,7 +13,6 @@
 //! syntax error.
 
 use regex::Regex;
-use telemetryd_core::record::sanitize_label_name;
 use telemetryd_core::span::{SpanKind, SpanRecord, SpanStatus};
 use telemetryd_core::{Error, Result};
 
@@ -201,7 +200,9 @@ impl Parser<'_> {
         }
 
         Ok(match path.split_once('.') {
-            Some(("resource", rest)) => Field::Resource(sanitize_label_name(rest)),
+            // Kept as written: a stream label is found by its sanitised form, an attribute
+            // kept on the span by this one. See `SpanRecord::resource_attribute`.
+            Some(("resource", rest)) => Field::Resource(rest.to_owned()),
             // Span attributes keep the producer's spelling; `get_relaxed` accepts either.
             Some(("span", rest)) => Field::Span(rest.to_owned()),
             _ => match path.as_str() {
@@ -396,7 +397,7 @@ impl Condition {
             Field::Intrinsic(Intrinsic::StatusMessage) => {
                 self.compare_text(Some(span.status_message.as_str()))
             }
-            Field::Resource(name) => self.compare_text(span.stream.get(name)),
+            Field::Resource(name) => self.compare_text(span.resource_attribute(name)),
             Field::Span(name) => self.compare_text(span.attributes.get_relaxed(name)),
             // Unscoped: span attributes take precedence, then resource labels — the
             // narrower scope wins, as in TraceQL.
@@ -407,6 +408,7 @@ impl Condition {
             Field::Unscoped(name) => self.compare_text(
                 span.attributes
                     .get_relaxed(name)
+                    .or_else(|| span.resource_attribute(name))
                     .or_else(|| span.stream.get_relaxed(name)),
             ),
         }

@@ -400,7 +400,13 @@ and its duration — while its span set lists the spans that matched. `minDurati
 `maxDuration` bound the trace's duration, as in Tempo. A span stored twice, as an
 exporter's retry can leave it, is returned once. Before 0.61.0 each of these differed.
 
-An unscoped `.attribute` searches span attributes first, then resource labels — the
+`resource.X` reaches every resource attribute, not only the ones promoted to stream
+labels: the rest are kept on each span apart from its own attributes, and a trace shows
+them on its resource, where OTLP put them. `resource.k8s.pod.name` and
+`span.k8s.pod.name` are different fields, as in Tempo. Spans stored before 0.69.0 kept
+unpromoted resource attributes among their own, and still show them there.
+
+An unscoped `.attribute` searches span attributes first, then resource attributes — the
 narrower scope wins, as in TraceQL. The leading dot is significant: `name` is the
 span's name, `.name` is an attribute a producer happened to call `name`. Because
 ingest sanitizes stream labels but leaves attribute keys in the producer's own

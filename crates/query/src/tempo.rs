@@ -486,13 +486,15 @@ pub fn trace(store: &RecordStore<SpanSchema>, trace_id: &str) -> Result<TraceRes
         &|span: &SpanRecord| span.trace_id == wanted,
     )?;
 
-    // One batch per distinct resource, as OTLP models it; each span once.
+    // One batch per distinct resource, as OTLP models it; each span once. A resource is
+    // its stream labels and the resource attributes kept on its spans.
     let mut by_resource: BTreeMap<telemetryd_core::Labels, Vec<SpanRecord>> = BTreeMap::new();
     for span in distinct_spans(spans) {
-        by_resource
-            .entry(span.stream.clone())
-            .or_default()
-            .push(span);
+        let mut resource = span.stream.clone();
+        for (name, value) in span.kept_resource_attributes() {
+            resource.insert(name, value);
+        }
+        by_resource.entry(resource).or_default().push(span);
     }
 
     let batches = by_resource
@@ -533,7 +535,7 @@ fn to_span_json(span: &SpanRecord) -> SpanJson {
         kind: span.kind.as_otlp_number(),
         start_time_unix_nano: span.start_nanos.to_string(),
         end_time_unix_nano: span.end_nanos.to_string(),
-        attributes: key_values(span.attributes.iter()),
+        attributes: key_values(span.span_attributes()),
         status: StatusJson {
             code: span.status.as_otlp_number(),
             message: span.status_message.clone(),
@@ -611,13 +613,18 @@ fn scoped_tags(
     start_nanos: u64,
     end_nanos: u64,
 ) -> Result<Vec<(&'static str, BTreeSet<String>)>> {
-    let resource: BTreeSet<String> = store
+    let mut resource: BTreeSet<String> = store
         .label_names(start_nanos, end_nanos)
         .into_iter()
         .collect();
     let mut span: BTreeSet<String> = BTreeSet::new();
     for record in store.scan(newest(start_nanos, end_nanos), &[], &|_| true)? {
-        span.extend(record.attributes.names().map(str::to_owned));
+        span.extend(record.span_attributes().map(|(name, _)| name.to_owned()));
+        resource.extend(
+            record
+                .kept_resource_attributes()
+                .map(|(name, _)| name.to_owned()),
+        );
     }
     // Intrinsics are filterable, so they belong in the tag list a UI offers.
     let intrinsic: BTreeSet<String> = ["name", "status", "duration", "kind"]
@@ -638,8 +645,9 @@ pub fn tag_values(
     request: &SearchRequest,
 ) -> Result<TagValuesResponse> {
     // Accept the scoped spellings the UI may send, since TraceQL uses them.
+    let tag = tag.trim();
+    let resource_only = tag.starts_with("resource.");
     let name = tag
-        .trim()
         .trim_start_matches("resource.")
         .trim_start_matches("span.")
         .trim_start_matches('.');
@@ -656,9 +664,13 @@ pub fn tag_values(
             "status" => values.insert(span.status.as_str().to_owned()),
             "kind" => values.insert(span.kind.as_str().to_owned()),
             other => {
-                match span
-                    .attributes
-                    .get_relaxed(other)
+                let own = if resource_only {
+                    None
+                } else {
+                    span.attributes.get_relaxed(other)
+                };
+                match own
+                    .or_else(|| span.resource_attribute(other))
                     .or_else(|| span.stream.get(other))
                     .or_else(|| {
                         // Stream labels are stored sanitised, so a dotted query name

@@ -198,12 +198,24 @@ fn encode_links(links: &[SpanLink]) -> Value {
 /// `{"resourceSpans":[…]}`, ready to POST at `/v1/traces`.
 #[must_use]
 pub fn encode_spans(records: &[SpanRecord]) -> Value {
-    let resources: Vec<Value> = group(records, |record| &record.stream)
+    // The resource attributes kept on a span go back to its resource, where a receiver
+    // — another telemetryd, or anything else — expects them.
+    let with_resource: Vec<(Labels, &SpanRecord)> = records
+        .iter()
+        .map(|record| {
+            let mut resource = record.stream.clone();
+            for (name, value) in record.kept_resource_attributes() {
+                resource.insert(name, value);
+            }
+            (resource, record)
+        })
+        .collect();
+    let resources: Vec<Value> = group(&with_resource, |(resource, _)| resource)
         .into_iter()
         .map(|(stream, records)| {
             let spans: Vec<Value> = records
                 .iter()
-                .map(|record| {
+                .map(|(_, record)| {
                     let mut span = Map::new();
                     span.insert("traceId".into(), json!(record.trace_id));
                     span.insert("spanId".into(), json!(record.span_id));
@@ -214,7 +226,11 @@ pub fn encode_spans(records: &[SpanRecord]) -> Value {
                     span.insert("kind".into(), json!(span_kind_number(record.kind)));
                     span.insert("startTimeUnixNano".into(), nanos(record.start_nanos));
                     span.insert("endTimeUnixNano".into(), nanos(record.end_nanos));
-                    span.insert("attributes".into(), attributes(&record.attributes, false));
+                    let own: Labels = record
+                        .span_attributes()
+                        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                        .collect();
+                    span.insert("attributes".into(), attributes(&own, false));
                     // Only when set: an empty status object round trips as `Unset`
                     // anyway, and TraceQL's `status = error` must not match a span
                     // nobody gave a status.
@@ -547,7 +563,12 @@ mod tests {
             status: SpanStatus::Error,
             status_message: "card declined".into(),
             stream: labels(&[("app", "checkout"), ("service_name", "checkout")]),
-            attributes: labels(&[("http.method", "POST")]),
+            // A resource attribute kept on the span goes out on the resource and comes
+            // back where it was.
+            attributes: labels(&[
+                ("http.method", "POST"),
+                ("resource.k8s.pod.name", "checkout-7f9"),
+            ]),
             events: vec![SpanEvent {
                 time_nanos: 1_760_000_000_050_000_000,
                 name: "retry".into(),
