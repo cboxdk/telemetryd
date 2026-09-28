@@ -348,25 +348,51 @@ fn extend(target: &mut Labels, attributes: &[KeyValue], sanitize: bool) {
     }
 }
 
-/// Normalise a hex trace or span id.
+/// Normalise a trace or span id to lowercase hex.
+///
+/// Hex is OTLP/JSON's spelling. Base64 is protobuf's JSON mapping, and so what Tempo's
+/// trace API writes: a trace read from one and posted here — `telemetryd import`, or
+/// any tool doing the same — arrives spelled so, and is taken as meant. An eight- or
+/// sixteen-byte base64 id is read as one; anything else stays refused.
 ///
 /// An all-zero id is the OTLP encoding for "absent"; treating it as a real id would
 /// make every unsampled record look like it belonged to trace `000…0`.
 pub fn normalize_id(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.bytes().all(|b| b == b'0') {
+    let hex = if trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        trimmed.to_ascii_lowercase()
+    } else {
+        telemetryd_core::ids::base64_to_hex(trimmed).filter(|hex| matches!(hex.len(), 16 | 32))?
+    };
+    if hex.is_empty() || hex.bytes().all(|b| b == b'0') {
         return None;
     }
-    if !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    Some(trimmed.to_ascii_lowercase())
+    Some(hex)
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// Tempo's trace JSON spells ids in base64; one read from it and posted here is the
+    /// same span. The soak's import from a read API found this.
+    #[test]
+    fn a_base64_id_is_read_as_its_hex() {
+        assert_eq!(
+            normalize_id("S/kvNXezTaajzpKdDg5HNg==").as_deref(),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736")
+        );
+        assert_eq!(
+            normalize_id("APBnqgupArc=").as_deref(),
+            Some("00f067aa0ba902b7")
+        );
+        assert!(
+            normalize_id("AAAAAAAAAAA=").is_none(),
+            "all zeros is absent"
+        );
+        assert!(normalize_id("nope!").is_none());
+    }
 
     fn any(json: &str) -> AnyValue {
         serde_json::from_str(json).unwrap()

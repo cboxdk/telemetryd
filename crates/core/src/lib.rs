@@ -7,6 +7,7 @@
 pub mod config;
 pub mod error;
 pub mod http;
+pub mod ids;
 pub mod matcher;
 pub mod metric;
 pub mod record;

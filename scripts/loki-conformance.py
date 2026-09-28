@@ -270,6 +270,10 @@ def wait_for_ingester(base: str) -> None:
 
 
 def close(a, b) -> bool:
+    # An error matches on its status: the message names whichever series failed first,
+    # which is not an order either side promises.
+    if isinstance(a, dict) and isinstance(b, dict) and "error" in b:
+        return a.get("error") == b["error"]
     if isinstance(a, float) and isinstance(b, float):
         return a == b or abs(a - b) <= 1e-9 * max(abs(a), abs(b), 1.0)
     if isinstance(a, list) and isinstance(b, list):

@@ -345,35 +345,10 @@ pub struct EventJson {
 
 /// Trace and span ids as Tempo spells them.
 pub mod ids {
-    use std::fmt::Write as _;
-
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    fn bytes(hex: &str) -> Vec<u8> {
-        (0..hex.len() / 2)
-            .filter_map(|i| u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok())
-            .collect()
-    }
-
     /// A hex id as standard base64, protobuf's JSON spelling of bytes.
     #[must_use]
     pub fn to_base64(hex: &str) -> String {
-        let data = bytes(hex);
-        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-        for chunk in data.chunks(3) {
-            let n = chunk
-                .iter()
-                .enumerate()
-                .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
-            for i in 0..4 {
-                if i <= chunk.len() {
-                    out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
-                } else {
-                    out.push('=');
-                }
-            }
-        }
-        out
+        telemetryd_core::ids::hex_to_base64(hex)
     }
 
     /// An id in any spelling a client may send back — full hex, hex with its leading
@@ -385,18 +360,7 @@ pub mod ids {
         if !id.is_empty() && id.len() <= hex_len && id.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Some(format!("{:0>hex_len$}", id.to_ascii_lowercase()));
         }
-        let mut bits = 0u32;
-        let mut held = 0;
-        let mut out = String::new();
-        for c in id.trim_end_matches('=').bytes() {
-            let value = ALPHABET.iter().position(|a| *a == c)?;
-            bits = bits << 6 | u32::try_from(value).ok()?;
-            held += 6;
-            if held >= 8 {
-                held -= 8;
-                let _ = write!(out, "{:02x}", (bits >> held) & 0xff);
-            }
-        }
+        let out = telemetryd_core::ids::base64_to_hex(id)?;
         (out.len() == hex_len).then_some(out)
     }
 
