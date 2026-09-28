@@ -266,6 +266,24 @@ through a per-series order; and the arithmetic of `rate`, `sum` and `avg` done i
 Prometheus's order. Ingest came out 7–11% faster and peak memory lower, from building a
 histogram series' label sets once per payload rather than once per point.
 
+**A week pushed at once no longer leaves two gigabytes behind.** The same histogram over
+seven days, 17 million samples, held about 2.1 GiB resident during the push and after it,
+while the store itself held 18 MiB of live data at rest. The rest was transient. Each seal
+of a full buffer built the whole segment as one Arrow batch — the metric name spelled out
+on every row — beside a sorted copy of every sample for the counter summaries, a gigabyte
+over the buffer; each drain moved the buffer into one allocation while its chunks were
+still held; and each dashboard query over the week gathered a whole segment's rows before
+folding any. mimalloc returns freed memory to the system only on later allocator
+activity, so an idle process kept most of it. Now a seal hands Parquet a row group at a
+time from the chunks as they lie, the summaries come from one pass in time order, and a
+segment laid out series by series is read a series at a time. Measured in alternating
+pairs on an M-series Mac: peak resident 2,090 → 576 MiB, peak physical footprint 1.5 GB
+→ 490 MB, footprint at rest 0.5–1.3 GB → 125 MB, a query's peak live heap 415 → 36 MiB,
+and ingest 526,000 → 636,000 samples a second. The segment files are byte for byte what
+they were. On macOS, `ps` counts pages mimalloc has already handed back until the system
+wants them, so the physical footprint (`vmmap --summary`, `footprint`) is the number to
+compare; a day of data, which never seals, is unchanged.
+
 **As a drop-in, all three ways in.** Loki's push API for log shippers, metric LogQL for
 Grafana's log volume and alerting, OTLP over gRPC on `server.grpc_listen`, TraceQL
 metrics on `/api/metrics/query_range`, and `[metrics_generator]` for the service graph and
