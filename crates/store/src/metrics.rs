@@ -941,58 +941,79 @@ impl RecordSchema for MetricSchema {
 
     fn to_batch_by_stream(records: &[Self::Record]) -> Result<(RecordBatch, Vec<Labels>)> {
         let mut interner = crate::segment::StreamInterner::default();
-        let met: Vec<u32> = records.iter().map(|s| interner.intern(&s.series)).collect();
+        let mut ranked: Vec<u32> = records.iter().map(|s| interner.intern(&s.series)).collect();
         let streams = interner.into_streams();
 
-        // Each stream's place in label-set order.
+        // Each stream's place in label-set order, which the ids are rewritten to.
         let mut ordered: Vec<usize> = (0..streams.len()).collect();
         ordered.sort_by(|a, b| streams[*a].cmp(&streams[*b]));
         let mut rank = vec![0u32; streams.len()];
         for (new, old) in ordered.iter().enumerate() {
             rank[*old] = u32::try_from(new).unwrap_or(u32::MAX);
         }
+        for id in &mut ranked {
+            *id = rank[*id as usize];
+        }
 
-        // The rows grouped by stream with a counting sort, which keeps each stream's rows
-        // in the order they came.
-        let mut next = vec![0usize; streams.len() + 1];
-        for id in &met {
-            next[rank[*id as usize] as usize + 1] += 1;
+        // Where each stream's rows begin once grouped.
+        let mut counts = vec![0usize; streams.len()];
+        for id in &ranked {
+            counts[*id as usize] += 1;
         }
-        for at in 1..next.len() {
-            next[at] += next[at - 1];
+        let mut next = Vec::with_capacity(streams.len());
+        let mut at = 0usize;
+        for count in &counts {
+            next.push(at);
+            at += count;
         }
-        let mut order = vec![0u32; records.len()];
-        for (row, id) in met.iter().enumerate() {
-            let slot = &mut next[rank[*id as usize] as usize];
-            order[*slot] = u32::try_from(row).unwrap_or(u32::MAX);
+
+        // Scattered, not gathered: the records are read once, in the order they lie, and
+        // each written to its stream's next slot. Every stream writes forward through its
+        // own stretch, so the writes stay in cache where reading the records out of order
+        // — once per column — missed it on nearly every row.
+        let mut timestamps = vec![0u64; records.len()];
+        let mut values = vec![0f64; records.len()];
+        let mut kinds = vec![MetricKind::Unknown; records.len()];
+        for (record, id) in records.iter().zip(&ranked) {
+            let slot = &mut next[*id as usize];
+            timestamps[*slot] = record.timestamp_nanos;
+            values[*slot] = record.value;
+            kinds[*slot] = record.kind;
             *slot += 1;
         }
-        let row = |at: &u32| &records[*at as usize];
+        drop(ranked);
 
+        let sorted: Vec<Labels> = ordered
+            .into_iter()
+            .map(|old| streams[old].clone())
+            .collect();
+        // `counts` is by new id, so the grouped ids and names are each stream's, repeated
+        // for its rows, in order.
+        let ids =
+            UInt32Array::from_iter_values(counts.iter().enumerate().flat_map(|(id, count)| {
+                std::iter::repeat_n(u32::try_from(id).unwrap_or(u32::MAX), *count)
+            }));
+        let mut names =
+            arrow::array::StringBuilder::with_capacity(records.len(), records.len() * 16);
+        for (series, count) in sorted.iter().zip(&counts) {
+            let name = series.get(METRIC_NAME_LABEL).unwrap_or("");
+            for _ in 0..*count {
+                names.append_value(name);
+            }
+        }
+        let names = names.finish();
         let columns: Vec<ArrayRef> = vec![
-            Arc::new(UInt64Array::from_iter_values(
-                order.iter().map(|at| row(at).timestamp_nanos),
-            )),
-            Arc::new(UInt32Array::from_iter_values(
-                order.iter().map(|at| rank[met[*at as usize] as usize]),
-            )),
-            Arc::new(Float64Array::from_iter_values(
-                order.iter().map(|at| row(at).value),
-            )),
+            Arc::new(UInt64Array::from(timestamps)),
+            Arc::new(ids),
+            Arc::new(Float64Array::from(values)),
+            Arc::new(names),
             Arc::new(StringArray::from_iter_values(
-                order.iter().map(|at| row(at).name()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                order.iter().map(|at| row(at).kind.as_str()),
+                kinds.iter().map(|k| k.as_str()),
             )),
         ];
         let batch = RecordBatch::try_new(Self::arrow_schema(), columns)
             .map_err(|e| Error::Config(format!("building a metric record batch: {e}")))?;
-        let streams = ordered
-            .into_iter()
-            .map(|old| streams[old].clone())
-            .collect();
-        Ok((batch, streams))
+        Ok((batch, sorted))
     }
 
     fn from_batch(batch: &RecordBatch) -> Result<Vec<Self::Record>> {
