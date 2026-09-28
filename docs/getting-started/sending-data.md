@@ -25,8 +25,17 @@ cannot differ by encoding. A request with no `Content-Type` is read as JSON.
 JSON is what `cboxdk/laravel-telemetry` emits, which is why it exists at all: no protobuf
 library and no C extension on the client, which is what makes it work under PHP-FPM.
 
-OTLP/gRPC is out of scope — it needs HTTP/2 with trailers and a second server, and these
-endpoints carry the same payloads.
+**OTLP/gRPC** is served on a port of its own once you ask for one:
+
+```toml
+[server]
+grpc_listen = "127.0.0.1:4317"
+```
+
+Then `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` and `OTEL_EXPORTER_OTLP_ENDPOINT=http://<host>:4317`
+work, as does a collector's `otlp` exporter. The ingest token goes in as metadata —
+`OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer <token>"`. Behind the scenes a call is
+stored exactly as the matching `POST /v1/…` would be.
 
 ## Log shippers
 
@@ -148,8 +157,9 @@ Loki and Prometheus APIs telemetryd deliberately does not implement.
 
 telemetryd accepts **OTLP over HTTP** in either encoding — the SDK default
 (`http/protobuf`) and `http/json` both work, so there is nothing to set. Configure the
-application's existing OpenTelemetry SDK to point at it. Do not add a collector, and do
-not use the gRPC exporters — telemetryd serves only the HTTP endpoints.
+application's existing OpenTelemetry SDK to point at it. Do not add a collector. Prefer
+the HTTP exporters: OTLP/gRPC is served only where the operator set
+`server.grpc_listen`, so do not assume port 4317 is open.
 
 ## Endpoints
 

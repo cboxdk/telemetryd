@@ -21,7 +21,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use hyper::body::Incoming;
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use tokio::sync::{Semaphore, watch};
 use tower::ServiceExt;
@@ -33,9 +33,27 @@ use crate::tls::Bound;
 /// for the next.
 pub(crate) const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Which protocol a listener speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Protocol {
+    /// Everything on the main port, WebSocket upgrades included.
+    Http1,
+    /// OTLP/gRPC: HTTP/2 with prior knowledge, or negotiated over TLS.
+    Http2,
+}
+
+/// How many requests one HTTP/2 connection may have in flight — a gRPC exporter sends
+/// a handful, and each one holds an ingest slot while it is stored.
+const MAX_CONCURRENT_STREAMS: u32 = 64;
+
 /// Serve `app` on `listener` until `shutdown` resolves, then let open connections finish
 /// their current request and return once every one has closed.
-pub(crate) async fn serve(listener: Bound, app: Router, shutdown: impl Future<Output = ()>) {
+pub(crate) async fn serve(
+    listener: Bound,
+    app: Router,
+    protocol: Protocol,
+    shutdown: impl Future<Output = ()>,
+) {
     let limit = connection_limit();
     tracing::debug!(limit, "serving at most this many connections at once");
     let permits = Arc::new(Semaphore::new(limit));
@@ -66,27 +84,37 @@ pub(crate) async fn serve(listener: Bound, app: Router, shutdown: impl Future<Ou
         let stop = stop.clone();
         let finished = finished.clone();
         tokio::spawn(async move {
-            let mut builder = hyper::server::conn::http1::Builder::new();
-            builder
-                .timer(TokioTimer::new())
-                .header_read_timeout(HEADER_READ_TIMEOUT);
-            // Upgrades for the live tail's WebSocket.
-            let mut connection = pin!(
+            let stopping = stop.closed();
+            if protocol == Protocol::Http1 {
+                let mut builder = hyper::server::conn::http1::Builder::new();
                 builder
+                    .timer(TokioTimer::new())
+                    .header_read_timeout(HEADER_READ_TIMEOUT);
+                // Upgrades for the live tail's WebSocket.
+                let connection = builder
                     .serve_connection(TokioIo::new(io), service)
-                    .with_upgrades()
-            );
-            let mut stopping = pin!(stop.closed());
-            loop {
-                tokio::select! {
-                    result = connection.as_mut() => {
-                        if let Err(error) = result {
-                            tracing::trace!(%error, "connection ended with an error");
-                        }
-                        break;
-                    }
-                    () = &mut stopping => connection.as_mut().graceful_shutdown(),
-                }
+                    .with_upgrades();
+                drive(
+                    pin!(connection),
+                    stopping,
+                    hyper::server::conn::http1::UpgradeableConnection::graceful_shutdown,
+                )
+                .await;
+            } else {
+                let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+                builder
+                    .timer(TokioTimer::new())
+                    .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+                    // A peer that stops answering pings is gone; its streams are freed.
+                    .keep_alive_interval(Some(Duration::from_secs(30)))
+                    .keep_alive_timeout(Duration::from_secs(20));
+                let connection = builder.serve_connection(TokioIo::new(io), service);
+                drive(
+                    pin!(connection),
+                    stopping,
+                    hyper::server::conn::http2::Connection::graceful_shutdown,
+                )
+                .await;
             }
             drop(permit);
             drop(finished);
@@ -96,6 +124,33 @@ pub(crate) async fn serve(listener: Bound, app: Router, shutdown: impl Future<Ou
     drop(stopped);
     drop(finished);
     done.closed().await;
+}
+
+/// Run a connection to its end, asking it to finish once `stopping` resolves.
+async fn drive<C, E>(
+    mut connection: std::pin::Pin<&mut C>,
+    stopping: impl Future<Output = ()>,
+    graceful: impl Fn(std::pin::Pin<&mut C>),
+) where
+    C: Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    let mut stopping = pin!(stopping);
+    let mut asked = false;
+    loop {
+        tokio::select! {
+            result = connection.as_mut() => {
+                if let Err(error) = result {
+                    tracing::trace!(%error, "connection ended with an error");
+                }
+                return;
+            }
+            () = &mut stopping, if !asked => {
+                graceful(connection.as_mut());
+                asked = true;
+            }
+        }
+    }
 }
 
 /// How many connections may be open at once: half the file descriptors this process

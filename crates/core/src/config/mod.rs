@@ -288,13 +288,8 @@ impl Config {
         open
     }
 
-    /// Cross-field rules. Run at load time rather than at first use, so a bad
-    /// configuration fails at startup instead of at 3am on the first query.
-    pub fn validate(&self) -> Result<()> {
-        // Half a TLS configuration is always a mistake, and the failure it causes
-        // otherwise is a server that quietly keeps speaking plain HTTP.
-        self.validate_server_tls()?;
-
+    /// The listeners: an exposed one must not leave a surface it serves unguarded.
+    fn validate_binds(&self) -> Result<()> {
         // Fail closed on an exposed bind — surface by surface.
         //
         // This used to ask only whether *any* token was set, while a surface with no
@@ -313,6 +308,32 @@ impl Config {
                 )));
             }
         }
+        // The gRPC port serves ingest alone, and is held to the same rule for it.
+        if let Some(grpc) = self.server.grpc_listen
+            && !grpc.ip().is_loopback()
+            && !self.server.insecure
+            && self.unguarded_surfaces().contains(&"ingest")
+        {
+            return Err(Error::Config(exposed_bind_message(grpc, &["ingest"])));
+        }
+        if self.server.grpc_listen == Some(self.server.listen) {
+            return Err(Error::Config(format!(
+                "server.grpc_listen and server.listen are both {}; OTLP/gRPC needs a port \
+                 of its own, conventionally 4317",
+                self.server.listen
+            )));
+        }
+        Ok(())
+    }
+
+    /// Cross-field rules. Run at load time rather than at first use, so a bad
+    /// configuration fails at startup instead of at 3am on the first query.
+    pub fn validate(&self) -> Result<()> {
+        // Half a TLS configuration is always a mistake, and the failure it causes
+        // otherwise is a server that quietly keeps speaking plain HTTP.
+        self.validate_server_tls()?;
+
+        self.validate_binds()?;
 
         let segment = self.storage.segment_duration.get();
         if segment.is_zero() {

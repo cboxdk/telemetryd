@@ -35,7 +35,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 tower = { version = "0.5", features = ["util"] }
 # Already in the tree through axum, at these versions. Named directly to serve
 # connections with a timer — see crates/server/src/connections.rs.
-hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper = { version = "1", default-features = false, features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio", "service"] }
 tower-http = { version = "0.7", features = ["trace", "limit", "timeout", "catch-panic"] }
 http-body-util = "0.1"

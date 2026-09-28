@@ -11,6 +11,7 @@ pub mod debug;
 pub mod error;
 pub mod export;
 mod fatal;
+pub mod grpc;
 pub mod index;
 pub mod ingest;
 pub mod loki;
@@ -272,35 +273,21 @@ pub async fn serve_state(state: AppState) -> Result<()> {
     // the key fetch, the maintenance timers, the graceful drain — is identical whether
     // or not we terminate TLS. A second copy of the shutdown logic is how one of them
     // ends up subtly different.
-    let bound = if config.server.tls.is_enabled() {
-        let (cert_file, key_file) = if config.server.tls.is_self_signed() {
-            let dir = store.data_dir().root().join("tls");
-            tls::ensure_self_signed(&dir, &config.server.tls.self_signed_names())?
-        } else {
-            // Validation guarantees both are present together, so a missing one here
-            // would be a bug rather than a configuration mistake.
-            match (&config.server.tls.cert_file, &config.server.tls.key_file) {
-                (Some(cert), Some(key)) => (cert.clone(), key.clone()),
-                _ => {
-                    return Err(telemetryd_core::Error::Config(
-                        "server.tls is enabled without both cert_file and key_file".to_owned(),
-                    ));
-                }
-            }
-        };
-        let tls_config = tls::server_config(&cert_file, &key_file)?;
-        let listener = tls::TlsListener::bind(config.server.listen, tls_config).await?;
-        Bound::Tls(Box::new(listener))
-    } else {
-        let listener = tokio::net::TcpListener::bind(config.server.listen)
-            .await
-            .map_err(|e| {
-                telemetryd_core::Error::io(format!("binding {}", config.server.listen), e)
-            })?;
-        Bound::Plain(listener)
+    let tls_config = tls_config(&config, &store)?;
+    let bound = bind(config.server.listen, tls_config.clone(), &[]).await?;
+    // OTLP/gRPC, when asked for: HTTP/2, and `h2` negotiated when there is TLS.
+    let grpc = match config.server.grpc_listen {
+        Some(addr) => Some(bind(addr, tls_config, &[b"h2"]).await?),
+        None => None,
     };
 
     let local = bound.local_addr().unwrap_or(config.server.listen);
+    if let Some(grpc) = &grpc {
+        tracing::info!(
+            listen = %grpc.local_addr().map_or_else(String::new, |a| a.to_string()),
+            "serving OTLP/gRPC"
+        );
+    }
     tracing::info!(
         listen = %local,
         scheme = if config.server.tls.is_enabled() { "https" } else { "http" },
@@ -316,28 +303,7 @@ pub async fn serve_state(state: AppState) -> Result<()> {
         );
     }
 
-    // Fetch the key set before serving, so the first request does not pay for it —
-    // but do not *require* it. An identity provider that is down must not stop
-    // telemetryd starting: static tokens keep working, and the refresh loop recovers
-    // when it returns. Failing closed here would be the coupling this design exists to
-    // avoid, in its worst form.
-    if state.oidc.is_enabled() {
-        let oidc = Arc::clone(&state.oidc);
-        match tokio::task::spawn_blocking(move || oidc.refresh()).await {
-            Ok(Ok(keys)) => tracing::info!(
-                issuer = %config.auth.oidc.issuer,
-                keys,
-                "accepting OIDC access tokens"
-            ),
-            Ok(Err(error)) => tracing::warn!(
-                issuer = %config.auth.oidc.issuer,
-                %error,
-                "could not load the OIDC key set at startup; those tokens will be \
-                 refused until it can be fetched. Static tokens are unaffected."
-            ),
-            Err(error) => tracing::error!(%error, "the key fetch task panicked"),
-        }
-    }
+    load_oidc_keys(&state).await;
 
     if let Some(relay) = &state.relay {
         tracing::info!(
@@ -366,10 +332,27 @@ pub async fn serve_state(state: AppState) -> Result<()> {
     // whole serve future in a timeout would have exited a healthy process after
     // `shutdown_grace` seconds of ordinary uptime.
     let (signalled, mut wait_for_signal) = tokio::sync::watch::channel(false);
-    let serving = connections::serve(bound, router(state), async move {
+    let max_body = usize::try_from(config.server.max_body_bytes.as_u64()).unwrap_or(usize::MAX);
+    let app = router(state);
+    let grpc_serving = {
+        let mut signal = wait_for_signal.clone();
+        let app = grpc::router(app.clone(), max_body);
+        async move {
+            if let Some(grpc) = grpc {
+                connections::serve(grpc, app, connections::Protocol::Http2, async move {
+                    let _ = signal.wait_for(|started| *started).await;
+                })
+                .await;
+            }
+        }
+    };
+    let main_serving = connections::serve(bound, app, connections::Protocol::Http1, async move {
         shutdown_signal().await;
         let _ = signalled.send(true);
     });
+    let serving = async move {
+        tokio::join!(main_serving, grpc_serving);
+    };
     let deadline = async move {
         // Ignore a send error: the sender is dropped once serving finishes, which is
         // exactly the case where the deadline no longer matters.
@@ -394,6 +377,74 @@ pub async fn serve_state(state: AppState) -> Result<()> {
     tracing::info!("draining complete, flushing write-ahead log");
     store.sync_all()?;
     Ok(())
+}
+
+/// Fetch the key set before serving, so the first request does not pay for it —
+/// but do not *require* it. An identity provider that is down must not stop
+/// telemetryd starting: static tokens keep working, and the refresh loop recovers
+/// when it returns. Failing closed here would be the coupling this design exists to
+/// avoid, in its worst form.
+async fn load_oidc_keys(state: &AppState) {
+    if state.oidc.is_enabled() {
+        let oidc = Arc::clone(&state.oidc);
+        match tokio::task::spawn_blocking(move || oidc.refresh()).await {
+            Ok(Ok(keys)) => tracing::info!(
+                issuer = %state.config.auth.oidc.issuer,
+                keys,
+                "accepting OIDC access tokens"
+            ),
+            Ok(Err(error)) => tracing::warn!(
+                issuer = %state.config.auth.oidc.issuer,
+                %error,
+                "could not load the OIDC key set at startup; those tokens will be \
+                 refused until it can be fetched. Static tokens are unaffected."
+            ),
+            Err(error) => tracing::error!(%error, "the key fetch task panicked"),
+        }
+    }
+}
+
+/// The TLS configuration both listeners terminate with, when `[server.tls]` is on.
+fn tls_config(config: &Config, store: &Store) -> Result<Option<rustls::ServerConfig>> {
+    Ok(if config.server.tls.is_enabled() {
+        let (cert_file, key_file) = if config.server.tls.is_self_signed() {
+            let dir = store.data_dir().root().join("tls");
+            tls::ensure_self_signed(&dir, &config.server.tls.self_signed_names())?
+        } else {
+            // Validation guarantees both are present together, so a missing one here
+            // would be a bug rather than a configuration mistake.
+            match (&config.server.tls.cert_file, &config.server.tls.key_file) {
+                (Some(cert), Some(key)) => (cert.clone(), key.clone()),
+                _ => {
+                    return Err(telemetryd_core::Error::Config(
+                        "server.tls is enabled without both cert_file and key_file".to_owned(),
+                    ));
+                }
+            }
+        };
+        Some(tls::server_config(&cert_file, &key_file)?)
+    } else {
+        None
+    })
+}
+
+/// Bind `addr`, terminating TLS with `tls` when it is set and offering `alpn`.
+async fn bind(
+    addr: std::net::SocketAddr,
+    tls: Option<rustls::ServerConfig>,
+    alpn: &[&[u8]],
+) -> Result<Bound> {
+    if let Some(mut tls) = tls {
+        if !alpn.is_empty() {
+            tls.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        }
+        let listener = tls::TlsListener::bind(addr, tls).await?;
+        return Ok(Bound::Tls(Box::new(listener)));
+    }
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| telemetryd_core::Error::io(format!("binding {addr}"), e))?;
+    Ok(Bound::Plain(listener))
 }
 
 async fn shutdown_signal() {

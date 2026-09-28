@@ -12,6 +12,7 @@
 /// variable instead of ignoring it silently.
 pub(super) const ENV_KEYS: &[(&str, &str)] = &[
     ("TELEMETRYD_SERVER_LISTEN", "server.listen"),
+    ("TELEMETRYD_SERVER_GRPC_LISTEN", "server.grpc_listen"),
     ("TELEMETRYD_SERVER_INSECURE", "server.insecure"),
     ("TELEMETRYD_SERVER_MAX_BODY_BYTES", "server.max_body_bytes"),
     (

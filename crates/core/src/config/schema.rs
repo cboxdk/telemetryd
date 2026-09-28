@@ -180,6 +180,9 @@ impl Default for IngestConfig {
 pub struct ServerConfig {
     /// One port serves ingest, query and the UI-facing APIs.
     pub listen: SocketAddr,
+    /// OTLP/gRPC ingest, conventionally `127.0.0.1:4317`. Unset = not served: a second
+    /// port is opt-in, so an upgrade never collides with a collector already on it.
+    pub grpc_listen: Option<SocketAddr>,
     /// Permit a non-loopback bind with no token configured.
     pub insecure: bool,
     /// Terminate TLS here rather than at a proxy. Unset = plain HTTP.
@@ -196,6 +199,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen: SocketAddr::from(([127, 0, 0, 1], 4319)),
+            grpc_listen: None,
             insecure: false,
             tls: ServerTlsConfig::default(),
             max_body_bytes: ByteSize::mib(16),

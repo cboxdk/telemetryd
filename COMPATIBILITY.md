@@ -85,8 +85,18 @@ decides nothing else: both decode into the same structures and share one convers
 limits, rejections and `partialSuccess` cannot differ by encoding. A request with no
 `Content-Type` is read as JSON.
 
-**OTLP/gRPC is out of scope for v1.** gRPC needs HTTP/2 with trailers and a second
-server; the HTTP endpoints above carry the same payloads.
+**OTLP/gRPC is served when `server.grpc_listen` is set** — conventionally
+`127.0.0.1:4317`; it is off by default, so an upgrade never collides with a collector
+already on that port. The `Export` methods of `LogsService`, `TraceService` and
+`MetricsService` are answered by the OTLP/HTTP handlers above: the message is unframed
+and stored exactly as a protobuf `POST /v1/…` is, behind the same ingest token (sent as
+`authorization` metadata), limits and `partialSuccess`. HTTP/2 with prior knowledge, or
+`h2` negotiated over TLS when `[server.tls]` is on. `grpc-encoding` gzip, deflate and
+zstd. Refusals map to the gRPC status an exporter acts on: `UNAVAILABLE` for overload
+and storage trouble (retried), `INVALID_ARGUMENT`, `UNAUTHENTICATED` and
+`RESOURCE_EXHAUSTED` for what resending cannot fix. Verified with the stock Python
+`opentelemetry-exporter-otlp-proto-grpc` sending all three signals, with and without
+gzip.
 
 ### Sending from something other than laravel-telemetry
 

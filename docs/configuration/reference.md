@@ -63,6 +63,9 @@ dangerous outcome, and it is the one case that cannot happen.
 ```toml
 [server]
 listen           = "127.0.0.1:4319"  # one port: ingest + query + UI APIs
+# grpc_listen    = "127.0.0.1:4317"  # OTLP/gRPC ingest on a port of its own; unset = off.
+                                     # Behind the ingest token; `h2` over TLS when
+                                     # [server.tls] is on
 insecure         = false             # allow non-loopback bind with a surface left unguarded
 max_body_bytes   = "16MiB"           # per ingest request, before *and* after decompression
                                      # bounds the body; what it parses into is bounded
