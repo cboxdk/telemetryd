@@ -12,7 +12,7 @@ query layer rather than two more storage engines.
 
 | | Logs | Traces | Metrics |
 |---|---|---|---|
-| Ingest | `POST /v1/logs` | `POST /v1/traces` | `POST /v1/metrics`, `POST /api/v1/write` |
+| Ingest | `POST /v1/logs`, `POST /loki/api/v1/push` | `POST /v1/traces` | `POST /v1/metrics`, `POST /api/v1/write` |
 | Query API | Loki | Tempo | Prometheus |
 | Query language | LogQL subset | TraceQL subset | PromQL subset |
 | Default retention | 7 days | 7 days | 30 days |

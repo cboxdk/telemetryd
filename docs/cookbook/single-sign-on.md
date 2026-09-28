@@ -23,7 +23,7 @@ holder should be able to do:
 
 | Scope | Opens |
 |---|---|
-| `telemetry:write` | `/v1/logs`, `/v1/traces`, `/v1/metrics`, `/api/v1/write` |
+| `telemetry:write` | `/v1/logs`, `/v1/traces`, `/v1/metrics`, `/api/v1/write`, `/loki/api/v1/push` |
 | `telemetry:read` | the Loki, Tempo and Prometheus read APIs |
 | `telemetry:admin` | `/status` and `/metrics` |
 

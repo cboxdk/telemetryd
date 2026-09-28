@@ -70,12 +70,17 @@ pub const SURFACES: &[Surface] = &[
             Route {
                 method: "POST",
                 paths: &["/v1/logs", "/v1/traces", "/v1/metrics"],
-                note: "OTLP over HTTP, JSON encoding — no protobuf, no gRPC",
+                note: "OTLP over HTTP, JSON or protobuf",
             },
             Route {
                 method: "POST",
                 paths: &["/api/v1/write"],
                 note: "Prometheus remote_write",
+            },
+            Route {
+                method: "POST",
+                paths: &["/loki/api/v1/push"],
+                note: "Loki push: promtail, Alloy, Fluent Bit, Vector",
             },
         ],
     },

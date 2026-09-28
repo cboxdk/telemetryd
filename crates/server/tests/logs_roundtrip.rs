@@ -366,6 +366,124 @@ async fn a_log_line_carries_its_trace_where_loki_puts_it() {
     );
 }
 
+/// One line as promtail sends it: a snappy-compressed `logproto.PushRequest`.
+fn promtail_push(labels: &[u8], seconds: u64, line: &[u8]) -> Vec<u8> {
+    fn field(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag, u8::try_from(payload.len()).unwrap()];
+        out.extend_from_slice(payload);
+        out
+    }
+    let mut timestamp = vec![0x08];
+    let mut value = seconds;
+    while value >= 0x80 {
+        timestamp.push(u8::try_from(value & 0x7f).unwrap() | 0x80);
+        value >>= 7;
+    }
+    timestamp.push(u8::try_from(value).unwrap());
+    let entry = [field(0x0a, &timestamp), field(0x12, line)].concat();
+    let stream = [field(0x0a, labels), field(0x12, &entry)].concat();
+    snap::raw::Encoder::new()
+        .compress_vec(&field(0x0a, &stream))
+        .unwrap()
+}
+
+/// Loki's push API, as promtail and Alloy use it: snappy protobuf by default, JSON when
+/// asked. Shipped lines are queryable like any other, keep their stream labels, gain
+/// `service_name` and a level, and link to their trace.
+#[tokio::test]
+async fn log_shippers_can_push_the_way_they_push_to_loki() {
+    let harness = Harness::new();
+    let json = json!({"streams": [{
+        "stream": {"job": "nginx", "host": "web-1"},
+        "values": [
+            [(NOW).to_string(), "GET /checkout 200"],
+            [(NOW + MS).to_string(), "level=error upstream timed out", {"trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"}]
+        ]
+    }]});
+    let request = Request::post("/loki/api/v1/push")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json.to_string()))
+        .unwrap();
+    let (status, body) = harness.send(request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // promtail's default: snappy-compressed logproto.PushRequest.
+    let compressed = promtail_push(
+        br#"{job="nginx", host="web-2"}"#,
+        (NOW + 2 * MS) / 1_000_000_000,
+        b"WARN disk almost full",
+    );
+    let request = Request::post("/loki/api/v1/push")
+        .header(header::CONTENT_TYPE, "application/x-protobuf")
+        .body(Body::from(compressed))
+        .unwrap();
+    let (status, body) = harness.send(request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let (_, response) = harness
+        .get(&range(
+            "/loki/api/v1/query_range",
+            r#"{service_name="nginx"}"#,
+        ))
+        .await;
+    let mut lines: Vec<(String, String, String)> = Vec::new();
+    for stream in response["data"]["result"].as_array().unwrap() {
+        for value in stream["values"].as_array().unwrap() {
+            lines.push((
+                stream["stream"]["host"].as_str().unwrap().to_owned(),
+                stream["stream"]["level"].as_str().unwrap().to_owned(),
+                value[1].as_str().unwrap().to_owned(),
+            ));
+        }
+    }
+    lines.sort();
+    assert_eq!(
+        lines,
+        vec![
+            (
+                "web-1".into(),
+                "error".into(),
+                "level=error upstream timed out".into()
+            ),
+            ("web-1".into(), "unknown".into(), "GET /checkout 200".into()),
+            (
+                "web-2".into(),
+                "warn".into(),
+                "WARN disk almost full".into()
+            ),
+        ]
+    );
+
+    let (_, response) = harness
+        .get(&range(
+            "/loki/api/v1/query_range",
+            r#"{job="nginx"} | trace_id="4bf92f3577b34da6a3ce929d0e0e4736""#,
+        ))
+        .await;
+    assert_eq!(
+        response["data"]["result"][0]["values"][0][1],
+        "level=error upstream timed out"
+    );
+
+    // A line that cannot be read is refused by name, and the rest still lands.
+    let request = Request::post("/loki/api/v1/push")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"streams": [{"stream": {"job": "nginx"}, "values": [["soon", "x"], [(NOW + 3 * MS).to_string(), "kept"]]}]}).to_string(),
+        ))
+        .unwrap();
+    let (status, body) = harness.send(request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("not a timestamp"), "{body}");
+    let (_, response) = harness
+        .get(&range(
+            "/loki/api/v1/query_range",
+            r#"{job="nginx"} |= "kept""#,
+        ))
+        .await;
+    assert_eq!(response["data"]["result"][0]["values"][0][1], "kept");
+}
+
 #[tokio::test]
 async fn level_selects_by_normalised_severity() {
     let harness = Harness::new();

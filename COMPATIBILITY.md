@@ -77,6 +77,7 @@ halves — 2501 + 3500 records over a 6000-record set, union 6000, no gaps.
 | `POST /v1/traces` | OTLP/HTTP — JSON or protobuf | done |
 | `POST /v1/metrics` | OTLP/HTTP — JSON or protobuf | done |
 | `POST /api/v1/write` | Prometheus `remote_write` (snappy + protobuf) | done |
+| `POST /loki/api/v1/push` | Loki push — snappy protobuf or JSON, structured metadata included | done |
 
 **Both OTLP/HTTP encodings are served.** JSON is what `cboxdk/laravel-telemetry` emits —
 no protobuf library and no C extension on the client path — and protobuf is what every

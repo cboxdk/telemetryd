@@ -12,6 +12,7 @@ description: "What each ingest endpoint accepts, and what it does with awkward i
 | `POST /v1/traces` | OTLP/HTTP — JSON or protobuf |
 | `POST /v1/metrics` | OTLP/HTTP — JSON or protobuf |
 | `POST /api/v1/write` | Prometheus `remote_write` (snappy + protobuf) |
+| `POST /loki/api/v1/push` | Loki push — snappy protobuf or JSON, from promtail, Alloy, Fluent Bit, Vector |
 
 ## Either encoding, nothing to configure
 
@@ -26,6 +27,27 @@ library and no C extension on the client, which is what makes it work under PHP-
 
 OTLP/gRPC is out of scope — it needs HTTP/2 with trailers and a second server, and these
 endpoints carry the same payloads.
+
+## Log shippers
+
+Anything that ships to Loki ships here unchanged: point promtail, Grafana Alloy, Fluent
+Bit's `loki` output or Vector's `loki` sink at `http://<host>:4319/loki/api/v1/push`, with
+the ingest token as a bearer token if one is set. Both of Loki's encodings are served:
+snappy-compressed protobuf, every shipper's default, and JSON.
+
+A pushed stream keeps its labels as its stream labels — `job`, `host`, `filename`, as the
+shipper set them — under the same limits OTLP streams meet. Two things are added the way
+Loki adds them:
+
+- **`service_name`**, when the stream has none, from the first of `service`, `app`,
+  `application`, `name`, `container`, `component`, `workload` or `job` it carries; the
+  same value becomes `app`.
+- **`level`**, from a `level`, `detected_level` or `severity` label, else from the line:
+  a `level=` or `"level":` field, else the first level word in it (`ERROR`, `warn`, …).
+
+A line's structured metadata is kept beside it, and a `trace_id` or `span_id` there links
+the line to its trace. A push is answered `204`; one with lines that could not be stored
+is answered `400` naming them, and the rest of it is stored all the same.
 
 ## Compressed bodies
 
@@ -137,6 +159,7 @@ not use the gRPC exporters — telemetryd serves only the HTTP endpoints.
 | `POST /v1/traces` | OTLP/HTTP — JSON or protobuf |
 | `POST /v1/metrics` | OTLP/HTTP — JSON or protobuf |
 | `POST /api/v1/write` | Prometheus `remote_write` (snappy + protobuf) |
+| `POST /loki/api/v1/push` | Loki push — snappy protobuf or JSON, from promtail, Alloy, Fluent Bit, Vector |
 
 Base URL is the instance, e.g. `http://127.0.0.1:4319`. If an ingest token is
 configured, send `Authorization: Bearer <token>`; without one the write returns `401`.

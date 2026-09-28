@@ -18,6 +18,7 @@
 
 pub mod compression;
 pub mod logs;
+pub mod loki_push;
 pub mod otlp;
 pub mod otlp_encode;
 pub mod otlp_metrics;

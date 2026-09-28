@@ -196,6 +196,8 @@ fn ingest_routes(state: &AppState) -> Router<AppState> {
         // OTLP/HTTP JSON is the first-class ingest path; laravel-telemetry sends JSON,
         // so protobuf is never on the client's critical path.
         .route("/v1/logs", axum::routing::post(ingest::otlp_logs))
+        // Loki's own push API, for log shippers: promtail, Alloy, Fluent Bit, Vector.
+        .route("/loki/api/v1/push", axum::routing::post(ingest::loki_push))
         .route("/v1/traces", axum::routing::post(ingest::otlp_traces))
         .route("/v1/metrics", axum::routing::post(ingest::otlp_metrics))
         .route("/api/v1/write", axum::routing::post(ingest::remote_write))

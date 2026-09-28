@@ -187,7 +187,7 @@ tells you the three ways to fix it and generates a token to paste.
 
 ```toml
 [auth]
-ingest_token = "file:/run/secrets/ingest"   # guards /v1/*, /api/v1/write
+ingest_token = "file:/run/secrets/ingest"   # guards /v1/*, /api/v1/write, /loki/api/v1/push
 query_token  = ["old-token", "new-token"]   # guards the read APIs; a list rotates
 admin_token  = "env:TELEMETRYD_ADMIN"       # guards /status and /metrics
 ```

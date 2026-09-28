@@ -74,7 +74,7 @@ shutdown_grace   = "15s"             # drain in-flight requests, then flush WAL
 # Omit or leave empty to disable auth on that surface.
 # Accepts a string or a list of strings (rotation).
 # Indirection: "file:/run/secrets/tok" or "env:MY_VAR".
-ingest_token = []                    # guards /v1/*, /api/v1/write
+ingest_token = []                    # guards /v1/*, /api/v1/write, /loki/api/v1/push
 query_token  = []                    # guards the Prometheus/Loki/Tempo read APIs
 admin_token  = []                    # guards /status and /metrics
 

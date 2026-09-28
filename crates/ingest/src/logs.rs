@@ -293,6 +293,12 @@ fn convert(
 
 const TRUNCATION_MARK: &str = "…[truncated by telemetryd]";
 
+/// Cut `text` to fit `max` bytes, marked as cut — as an OTLP body over the limit is.
+pub(crate) fn truncate_marked(text: &mut String, max: usize) {
+    truncate_on_char_boundary(text, max.saturating_sub(TRUNCATION_MARK.len()));
+    text.push_str(TRUNCATION_MARK);
+}
+
 /// Truncate to at most `max` bytes without splitting a UTF-8 character.
 fn truncate_on_char_boundary(text: &mut String, max: usize) {
     if text.len() <= max {

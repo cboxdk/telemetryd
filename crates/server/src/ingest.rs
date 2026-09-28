@@ -231,6 +231,25 @@ pub async fn otlp_logs(
         decoded.records.iter_mut().map(|record| &mut record.stream),
     );
 
+    store_logs(&state, &mut decoded).await?;
+
+    let response = OtlpResponse {
+        partial_success: decoded.rejection_summary().map(|message| PartialSuccess {
+            rejected_log_records: Some(decoded.rejected().to_string()),
+            rejected_spans: None,
+            rejected_data_points: None,
+            error_message: message,
+        }),
+    };
+
+    Ok(answer(encoding, &response))
+}
+
+/// Tail, store and count decoded log records, however they arrived.
+async fn store_logs(
+    state: &AppState,
+    decoded: &mut telemetryd_ingest::Decoded<telemetryd_core::LogRecord>,
+) -> Result<(), ApiError> {
     if decoded.rescaled_timestamps > 0 {
         state.metrics.add(
             "telemetryd_ingest_timestamps_rescaled_total",
@@ -272,7 +291,7 @@ pub async fn otlp_logs(
         // empty, while every log record was being turned away. `partialSuccess` said so
         // on every response and nothing anyone monitors did, which is why it took an hour
         // to find something the server knew immediately.
-        count_rejections(&state, "logs", &decoded);
+        count_rejections(state, "logs", decoded);
         let accepted = admitted.stored as u64;
 
         state.metrics.add(
@@ -282,16 +301,84 @@ pub async fn otlp_logs(
         );
     }
 
-    let response = OtlpResponse {
-        partial_success: decoded.rejection_summary().map(|message| PartialSuccess {
-            rejected_log_records: Some(decoded.rejected().to_string()),
-            rejected_spans: None,
-            rejected_data_points: None,
-            error_message: message,
-        }),
-    };
+    Ok(())
+}
 
-    Ok(answer(encoding, &response))
+/// `POST /loki/api/v1/push` — what promtail, Alloy, Fluent Bit and Vector send.
+///
+/// Snappy-compressed protobuf by default, JSON when the content type says so, and a
+/// gzip around the JSON undone like any other `Content-Encoding`. Answered as Loki
+/// answers: `204` when every line was stored, `400` naming what was refused — the rest
+/// is stored all the same, and a shipper does not resend a `400`.
+pub async fn loki_push(
+    State(state): State<AppState>,
+    identity: Option<axum::Extension<ClientIdentity>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, ApiError> {
+    let identity = identity.map(|axum::Extension(identity)| identity);
+    let Some(_slot) = state.ingest_slot_for(identity.as_ref().map(|i| i.app.as_str())) else {
+        state.metrics.incr(
+            "telemetryd_ingest_rejected_total",
+            &[("signal", "logs"), ("reason", "queue_full")],
+        );
+        return Err(telemetryd_core::Error::Overloaded.into());
+    };
+    let (body, mut held) = receive(&state, &headers, body, "logs").await?;
+    let body = decompress(
+        &state,
+        &headers,
+        &body,
+        "logs",
+        compression::REMOTE_WRITE_PASSTHROUGH,
+        &mut held,
+    )?;
+    let json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+
+    let decoded = {
+        let limits = state.config.limits.clone();
+        let ingest = state.config.ingest.clone();
+        let ctx = DecodeContext {
+            pool: Some(&state.ingest_memory),
+            limits: &limits,
+            ingest: &ingest,
+            now_nanos: telemetryd_store::now_nanos(),
+        };
+        let max =
+            usize::try_from(state.config.server.max_body_bytes.as_u64()).unwrap_or(usize::MAX);
+        if json {
+            telemetryd_ingest::loki_push::decode_json(&body, ctx)
+        } else {
+            telemetryd_ingest::loki_push::decode_protobuf(&body, max, ctx)
+        }
+        .inspect_err(|_| {
+            reject(
+                &state,
+                "logs",
+                if json {
+                    "malformed_json"
+                } else {
+                    "malformed_protobuf"
+                },
+            );
+        })?
+    };
+    within_budget(&state, "logs", &decoded)?;
+    let mut decoded = decoded;
+    stamp(
+        &state,
+        identity.as_ref(),
+        decoded.records.iter_mut().map(|record| &mut record.stream),
+    );
+    store_logs(&state, &mut decoded).await?;
+
+    match decoded.rejection_summary() {
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+        Some(summary) => Err(Error::BadRequest(summary).into()),
+    }
 }
 
 /// `POST /v1/traces`
