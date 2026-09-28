@@ -281,14 +281,14 @@ pub fn parse(input: &str) -> Result<LogQuery> {
     Parser::new(input, tokens).parse_log_query()
 }
 
-struct Parser<'a> {
+pub(crate) struct Parser<'a> {
     input: &'a str,
-    tokens: Vec<Spanned>,
-    pos: usize,
+    pub(crate) tokens: Vec<Spanned>,
+    pub(crate) pos: usize,
 }
 
 impl<'a> Parser<'a> {
-    fn new(input: &'a str, tokens: Vec<Spanned>) -> Self {
+    pub(crate) fn new(input: &'a str, tokens: Vec<Spanned>) -> Self {
         Self {
             input,
             tokens,
@@ -310,35 +310,24 @@ impl<'a> Parser<'a> {
         Ok(LogQuery { matchers, stages })
     }
 
+    /// A metric query where a log query belongs — a tail, a label lookup — is refused
+    /// by name: `query` and `query_range` answer it, this route cannot.
     fn reject_metric_query(&self) -> Result<()> {
-        let Some(Token::Ident(name)) = self.tokens.first().map(|s| &s.token) else {
+        let token = |i: usize| self.tokens.get(i).map(|s| &s.token);
+        let call = matches!(token(0), Some(Token::Ident(_)))
+            && matches!(token(1), Some(Token::LeftParen))
+            || matches!(token(1), Some(Token::Ident(w)) if w == "by" || w == "without");
+        if !call {
             return Ok(());
-        };
-        // `sum by (app) (rate(...))` and `rate({...}[5m])` both start with an ident.
-        let hint = match name.as_str() {
-            "rate" | "count_over_time" | "bytes_rate" | "bytes_over_time" | "sum_over_time"
-            | "avg_over_time" | "max_over_time" | "min_over_time" | "quantile_over_time"
-            | "stdvar_over_time" | "stddev_over_time" | "first_over_time" | "last_over_time"
-            | "absent_over_time" => Some(
-                "aggregate the results client-side, or use the Prometheus API for pre-aggregated metrics",
-            ),
-            "sum" | "avg" | "min" | "max" | "count" | "topk" | "bottomk" | "stddev" | "stdvar" => {
-                Some(
-                    "aggregations over log streams are not available; select the streams and aggregate client-side",
-                )
-            }
-            _ => None,
-        };
-        if let Some(hint) = hint {
-            return Err(Error::unsupported_with_hint(
-                format!("LogQL metric query `{name}`"),
-                hint,
-            ));
         }
-        Ok(())
+        Err(Error::BadRequest(format!(
+            "{:?} is a metric query; /loki/api/v1/query and /loki/api/v1/query_range \
+             answer it, but this route takes a log selector like {{app=\"x\"}}",
+            self.input
+        )))
     }
 
-    fn parse_selector(&mut self) -> Result<Vec<LabelMatcher>> {
+    pub(crate) fn parse_selector(&mut self) -> Result<Vec<LabelMatcher>> {
         self.expect(
             &Token::LeftBrace,
             "a stream selector, e.g. {app=\"checkout\"}",
@@ -389,7 +378,7 @@ impl<'a> Parser<'a> {
         Ok(matchers)
     }
 
-    fn parse_stage(&mut self) -> Result<Stage> {
+    pub(crate) fn parse_stage(&mut self) -> Result<Stage> {
         match self.peek().cloned() {
             Some(Token::LineContains) => self.line_filter(LineOp::Contains),
             Some(Token::LineRegex) => self.line_filter(LineOp::Matches),
@@ -612,11 +601,11 @@ impl<'a> Parser<'a> {
 
     // -- token helpers -----------------------------------------------------
 
-    fn peek(&self) -> Option<&Token> {
+    pub(crate) fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos).map(|s| &s.token)
     }
 
-    fn expect(&mut self, expected: &Token, description: &str) -> Result<()> {
+    pub(crate) fn expect(&mut self, expected: &Token, description: &str) -> Result<()> {
         if self.peek() == Some(expected) {
             self.pos += 1;
             Ok(())
@@ -625,7 +614,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn expect_ident(&mut self, description: &str) -> Result<String> {
+    pub(crate) fn expect_ident(&mut self, description: &str) -> Result<String> {
         match self.peek() {
             Some(Token::Ident(name)) => {
                 let name = name.clone();
@@ -636,7 +625,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn expect_string(&mut self, description: &str) -> Result<String> {
+    pub(crate) fn expect_string(&mut self, description: &str) -> Result<String> {
         match self.peek() {
             Some(Token::String(value)) => {
                 let value = value.clone();
@@ -659,7 +648,7 @@ impl<'a> Parser<'a> {
         Ok(op)
     }
 
-    fn unexpected(&self, expected: &str) -> Error {
+    pub(crate) fn unexpected(&self, expected: &str) -> Error {
         match self.tokens.get(self.pos) {
             Some(spanned) => Error::BadRequest(format!(
                 "expected {expected} but found `{}` at position {} in {:?}",
@@ -1125,23 +1114,15 @@ mod tests {
     // -- the subset boundary ----------------------------------------------
 
     #[test]
-    fn metric_queries_are_named_not_rejected_as_syntax_errors() {
+    fn a_metric_query_is_sent_to_the_routes_that_answer_it() {
         for query in [
             r#"rate({app="x"}[5m])"#,
             r#"count_over_time({app="x"}[1h])"#,
             r#"sum by (app) (rate({app="x"}[5m]))"#,
         ] {
             let err = parse(query).unwrap_err();
-            assert!(
-                matches!(err, Error::Unsupported { .. }),
-                "{query} should be Unsupported, got {err:?}"
-            );
-            let body = serde_json::to_value(err.to_body()).unwrap();
-            assert_eq!(body["error"]["code"], "unsupported_feature");
-            assert!(
-                body["error"]["hint"].is_string(),
-                "{query} should suggest an alternative"
-            );
+            assert!(matches!(err, Error::BadRequest(_)), "{query}: {err:?}");
+            assert!(err.to_string().contains("query_range"), "{err}");
         }
     }
 

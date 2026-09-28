@@ -193,7 +193,7 @@ pub fn parse_time(raw: &str) -> Result<u64> {
 /// used to wrap the running sum back below `end`, and the loop then counted down one
 /// nanosecond at a time until memory ran out. And the grid is Prometheus's own: it stops
 /// at the last step that fits, rather than adding an extra point at an unaligned `end`.
-fn step_grid(start: u64, end: u64, step_nanos: u64) -> Result<Vec<u64>> {
+pub fn step_grid(start: u64, end: u64, step_nanos: u64) -> Result<Vec<u64>> {
     let intervals = (end - start) / step_nanos.max(1);
     let steps = usize::try_from(intervals)
         .ok()

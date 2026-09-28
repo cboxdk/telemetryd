@@ -27,9 +27,8 @@ Anything outside the subset returns a structured error naming the feature, with 
 {
   "error": {
     "code": "unsupported_feature",
-    "feature": "LogQL metric query `rate`",
-    "message": "LogQL metric query `rate` is not supported by telemetryd",
-    "hint": "aggregate the results client-side, or use the Prometheus API for pre-aggregated metrics",
+    "feature": "LogQL `| distinct`",
+    "message": "LogQL `| distinct` is not supported by telemetryd",
     "docs": "https://github.com/cboxdk/telemetryd/blob/main/COMPATIBILITY.md"
   }
 }
@@ -225,8 +224,8 @@ before 0.60.0 read back without links, as they were sent to an older version.
 | Endpoint | Used by | Notes |
 |---|---|---|
 | `GET /loki/api/v1/labels` | `LokiSource::probe()`, label discovery | Must answer `{"status":"success"}` — the UI uses this to decide the URL *is* a log backend. `query` scopes the names |
-| `GET /loki/api/v1/query_range` | `LokiSource::query()` | `query`, `start`/`end` in **nanoseconds**, `limit`, `direction=backward`. `limit` defaults to 100 and is **clamped to 5,000** |
-| `GET /loki/api/v1/query` | Grafana's "Save & test" | An instant query. `vector(1)+vector(1)` and other literal-only expressions are evaluated; a log query is answered over the hour before `time`; metric LogQL is refused by name |
+| `GET /loki/api/v1/query_range` | `LokiSource::query()`, Grafana's log volume | `query`, `start`/`end` in **nanoseconds**, `limit`, `direction=backward`. `limit` defaults to 100 and is **clamped to 5,000**. A metric query answers a matrix at every `step` (seconds or a duration; Loki's default, a 250th of the range, at least 1s) |
+| `GET /loki/api/v1/query` | Grafana's "Save & test" | An instant query. A metric query — `vector(1)+vector(1)` included — is answered at `time` as a vector or scalar; a log query is answered over the hour before `time` |
 | `GET /loki/api/v1/label/{name}/values` | `LokiSource::labelValues()` | optional `start`/`end`; `query` scopes the values to the streams that selector matches |
 | `GET /loki/api/v1/series` | — | Not used by the UI; implemented anyway, it is cheap and useful. Every `match[]` counts, as a union |
 | `GET /loki/api/v1/tail` | — | WebSocket live tail. **telemetryd's own feature**, not a UI requirement |
@@ -304,8 +303,43 @@ The selector must contain at least one matcher that requires a value. `{}` and
 `{app!="x"}` are refused, because both select every stream in the store. The UI's own
 default, `{service_name=~".+"}`, satisfies this.
 
-*Not supported:* metric queries (`rate`, `count_over_time`, `sum by …`), `unwrap`,
-`distinct`, `ip`, and Go template features beyond those listed.
+*Not supported:* `distinct`, `ip`, `approx_topk`, and Go template features beyond those
+listed.
+
+### Metric queries
+
+Range aggregations over log streams, with or without a pipeline, the range after the
+selector or after the pipeline, and `offset`:
+
+- over lines: `count_over_time`, `rate`, `bytes_over_time`, `bytes_rate`,
+  `absent_over_time`
+- over unwrapped values — `| unwrap took`, `| unwrap duration(took)`,
+  `| unwrap bytes(size)`, label filters after it: `sum_over_time`, `avg_over_time`,
+  `min_over_time`, `max_over_time`, `stdvar_over_time`, `stddev_over_time`,
+  `quantile_over_time`, `first_over_time`, `last_over_time`, `rate`, `rate_counter`,
+  each optionally `by (…)` or `without (…)`
+
+Above them, LogQL's vector grammar: `sum`, `avg`, `min`, `max`, `count`, `stddev`,
+`stdvar`, `topk`, `bottomk` with `by`/`without`; `sort`, `sort_desc`, `label_replace`,
+`vector`; arithmetic, comparison (`bool` too) and set operators with
+`on`/`ignoring`/`group_left`/`group_right`. That grammar is PromQL's, so the PromQL
+evaluator — the one held to Prometheus by the conformance suite — answers it.
+
+As in Loki:
+
+- a window is `(t - range, t]`, and a series with no line in it is absent at that step
+- a series carries every label its lines carry, structured metadata included, so
+  `count_over_time` over lines that each have a `trace_id` is a series per line.
+  `sum by (…)` directly above a summing aggregation groups as the lines are read, so the
+  usual form — Grafana's log volume, `sum by (level) (count_over_time(…))` — holds only
+  its groups. More than 10,000 series in one aggregation or answer is refused.
+- the unwrapped label leaves the series; a value that does not read marks the line
+  `__error__="SampleExtractionErr"`
+- a series carrying `__error__` refuses the query with Loki's `pipeline error: …`
+  message, until a filter like `| __error__=""` or `| drop __error__` handles it
+
+A PromQL series name, a subquery, or a function or aggregation LogQL does not have is
+refused by name — ask the Prometheus API for series.
 
 ---
 

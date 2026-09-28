@@ -25,9 +25,17 @@ ordinary tools is the difference between diagnosing a problem and describing it.
 
 ```bash
 # How many errors in the last hour, by app?
-telemetryd query '{level="error"}' --since 1h --limit 5000 --output json \
-  | jq -r '.labels.app' | sort | uniq -c | sort -rn
+telemetryd query 'sum by (app) (count_over_time({level="error"}[1h]))'
 ```
+
+```
+{app=checkout} 42
+{app=billing} 3
+```
+
+A metric query — anything that does not start with a `{…}` selector — is answered now,
+one line per series, largest first. It is counted on the server, so it is exact however
+many lines there are; `--limit` does not apply.
 
 It talks to a running instance, so it sees records still in the buffer and it obeys the
 configured tokens — but on the box where that instance runs it finds them itself, from
@@ -84,7 +92,7 @@ telemetryd implements a subset of LogQL and names the construct it does not supp
 rather than failing vaguely:
 
 ```
-error: the query was rejected: LogQL `| unwrap` is not supported by telemetryd
+error: the query was rejected: LogQL `| distinct` is not supported by telemetryd
 ```
 
 A malformed query says where it went wrong:

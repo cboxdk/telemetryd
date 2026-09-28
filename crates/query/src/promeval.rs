@@ -309,6 +309,13 @@ fn extrapolate(observed: Observed, window: Window, per_second: bool) -> Option<f
     })
 }
 
+/// Prometheus's `rate` over one counter's samples in the window `(floor, at]`, resets
+/// applied — what LogQL's `rate_counter` over unwrapped values answers.
+#[must_use]
+pub fn counter_rate(samples: &[(u64, f64)], floor: u64, at: u64) -> Option<f64> {
+    rate_over(samples, Window { floor, at }, true)
+}
+
 /// The same arithmetic as [`rate_over`], applied to a summary instead of to rows.
 ///
 /// It has to be the same: the two paths answer the same query, and a store that has

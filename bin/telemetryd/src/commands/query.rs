@@ -66,9 +66,12 @@ const EXAMPLES: &str = r#"Examples:
   telemetryd query '{app="api"}' --output json | jq -r .body
       One JSON object per line, for piping.
 
-Not supported here: metric queries over logs (`rate`, `count_over_time`,
-`sum`). Use the Prometheus API for those — telemetryd names the construct
-it refused rather than reporting a syntax error."#;
+  telemetryd query 'sum by (app) (count_over_time({level="error"}[1h]))'
+      A metric query is answered now, one line per series: how many
+      errors each application logged in the last hour.
+
+What telemetryd does not support it names, rather than reporting a syntax
+error."#;
 
 #[derive(Debug, Args)]
 #[command(after_help = EXAMPLES, after_long_help = EXAMPLES)]
@@ -138,12 +141,22 @@ pub fn run(args: &QueryArgs) -> anyhow::Result<()> {
     let since: std::time::Duration = args.since.into();
     let start = now.saturating_sub(since.as_nanos());
 
-    let url = format!(
-        "{base}/loki/api/v1/query_range?query={}&start={start}&end={now}&limit={}&direction={}",
-        urlencode(query),
-        args.limit,
-        if args.forward { "forward" } else { "backward" },
-    );
+    // A metric query is a number per series, answered at one instant; a log query is
+    // lines over a range. A log query begins with its stream selector.
+    let metric = !query.starts_with('{');
+    let url = if metric {
+        format!(
+            "{base}/loki/api/v1/query?query={}&time={now}",
+            urlencode(query)
+        )
+    } else {
+        format!(
+            "{base}/loki/api/v1/query_range?query={}&start={start}&end={now}&limit={}&direction={}",
+            urlencode(query),
+            args.limit,
+            if args.forward { "forward" } else { "backward" },
+        )
+    };
 
     let mut request = ureq::get(&url).header("user-agent", super::status::user_agent());
     // Same as `status`: a local instance's token is in the configuration on this
@@ -184,8 +197,62 @@ pub fn run(args: &QueryArgs) -> anyhow::Result<()> {
     };
 
     let parsed: Value = serde_json::from_str(&body).context("parsing the response")?;
-    print(&parsed, args.output, args.forward);
+    if metric {
+        print_samples(&parsed, args.output);
+    } else {
+        print(&parsed, args.output, args.forward);
+    }
     Ok(())
+}
+
+/// A metric answer: one line per series, labels then value, largest first.
+fn print_samples(response: &Value, output: Output) {
+    let data = response.get("data").unwrap_or(&Value::Null);
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    if data.get("resultType").and_then(Value::as_str) == Some("scalar") {
+        let value = data
+            .pointer("/result/1")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let _ = line(&mut out, value);
+        return;
+    }
+    let mut samples: Vec<(&Value, &str)> = data
+        .get("result")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|sample| {
+            (
+                sample.get("metric").unwrap_or(&Value::Null),
+                sample
+                    .pointer("/value/1")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            )
+        })
+        .collect();
+    let number = |value: &str| value.parse::<f64>().unwrap_or(f64::NEG_INFINITY);
+    samples.sort_by(|a, b| number(b.1).total_cmp(&number(a.1)));
+    for (metric, value) in samples {
+        let text = match output {
+            Output::Text => {
+                let labels = metric
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or("")))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{{{labels}}} {value}")
+            }
+            Output::Json => serde_json::json!({ "labels": metric, "value": value }).to_string(),
+        };
+        if line(&mut out, &text).is_break() {
+            return;
+        }
+    }
 }
 
 /// Write one line, or stop quietly when the reader has gone.

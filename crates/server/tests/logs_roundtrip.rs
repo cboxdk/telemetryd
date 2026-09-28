@@ -645,7 +645,7 @@ async fn an_unsupported_logql_feature_is_named_with_a_400() {
     let (status, response) = harness
         .get(&range(
             "/loki/api/v1/query_range",
-            r#"rate({app="checkout"}[5m])"#,
+            r#"{app="checkout"} | distinct order_id"#,
         ))
         .await;
 
@@ -655,7 +655,7 @@ async fn an_unsupported_logql_feature_is_named_with_a_400() {
         response["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("rate"),
+            .contains("distinct"),
         "{response}"
     );
     assert!(

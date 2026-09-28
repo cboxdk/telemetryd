@@ -6,8 +6,8 @@ use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use telemetryd_core::{Error, LogRecord};
-use telemetryd_query::logql;
 use telemetryd_query::loki::{self, QueryRangeParams, QueryRangeRequest};
+use telemetryd_query::{logmetric, logql, prometheus};
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -33,6 +33,12 @@ pub async fn query_range(
     // Parsed before the guard so a malformed selector is recorded too: a query refused
     // at parse time is exactly as invisible to the operator as one refused later.
     let expression = params.query.clone().unwrap_or_default();
+    if logmetric::is_metric(&expression) {
+        let answer = metric_range(&state, &params, &expression)
+            .await
+            .inspect_err(|error| state.refused_query("logql", &expression, error))?;
+        return Ok(Json(answer).into_response());
+    }
     let mut request = QueryRangeRequest::from_params(&params, telemetryd_store::now_nanos())
         .inspect_err(|error| state.refused_query("logql", &expression, error))?;
     request.categorize = wants_categorized(&headers);
@@ -47,12 +53,38 @@ pub async fn query_range(
     Ok(Json(response).into_response())
 }
 
+/// A metric query over a range: parsed, stepped as Loki steps, answered as a matrix.
+async fn metric_range(
+    state: &AppState,
+    params: &QueryRangeParams,
+    expression: &str,
+) -> telemetryd_core::Result<serde_json::Value> {
+    let query = logmetric::parse(expression)?;
+    let (start, end) = loki::resolve_range(
+        params.start.as_deref(),
+        params.end.as_deref(),
+        params.since.as_deref(),
+        telemetryd_store::now_nanos(),
+    )?;
+    let step = match params.step.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(raw) => u64::try_from(prometheus::parse_step(raw)?.as_nanos())
+            .unwrap_or(u64::MAX)
+            .max(1),
+        None => logmetric::default_step_nanos(start, end),
+    };
+    let steps = prometheus::step_grid(start, end, step)?;
+    let store = std::sync::Arc::clone(&state.store);
+    crate::auth::spawn_read(move || logmetric::answer_range(store.logs(), &query, &steps))
+        .await
+        .map_err(|e| Error::Config(format!("query task panicked: {e}")))?
+}
+
 /// `GET /loki/api/v1/query` — an instant query.
 ///
 /// Grafana's Loki datasource checks the connection with exactly this, evaluating
 /// `vector(1)+vector(1)` and expecting one point with the value 2; the route did not
-/// exist, so the datasource could not be added. A log query is answered over the hour
-/// before `time`; metric LogQL is refused by name, as on `query_range`.
+/// exist, so the datasource could not be added. A metric query is answered at `time`;
+/// a log query over the hour before it.
 pub async fn instant(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -61,9 +93,15 @@ pub async fn instant(
     let now = telemetryd_store::now_nanos();
     let at = params.at_nanos(now)?;
     let expression = params.query.clone().unwrap_or_default();
-    if params.is_literal() {
-        let answer = loki::instant_literal(&expression, at)
+    if logmetric::is_metric(&expression) {
+        let query = logmetric::parse(&expression)
             .inspect_err(|error| state.refused_query("logql", &expression, error))?;
+        let store = std::sync::Arc::clone(&state.store);
+        let answer =
+            crate::auth::spawn_read(move || logmetric::answer_instant(store.logs(), &query, at))
+                .await
+                .map_err(|e| Error::Config(format!("query task panicked: {e}")))?
+                .inspect_err(|error| state.refused_query("logql", &expression, error))?;
         return Ok(Json(answer).into_response());
     }
 

@@ -70,17 +70,6 @@ impl InstantParams {
             .map_or(Ok(now_nanos), parse_time)
     }
 
-    /// Whether this is an expression over literals alone — no stream selector at all.
-    ///
-    /// Grafana's Loki health check is `vector(1)+vector(1)`. Everything with a selector
-    /// is a log or metric query and goes through LogQL.
-    #[must_use]
-    pub fn is_literal(&self) -> bool {
-        self.query
-            .as_deref()
-            .is_some_and(|q| !q.trim().is_empty() && !q.contains('{'))
-    }
-
     /// The log query as a range ending at `time`, for the query-range path.
     #[must_use]
     pub fn as_range(&self, at_nanos: u64) -> QueryRangeParams {
@@ -95,35 +84,6 @@ impl InstantParams {
     }
 }
 
-/// Evaluate a literal-only expression the way Loki's instant query answers it.
-///
-/// LogQL's metric grammar over literals is PromQL's, so the PromQL evaluator answers it
-/// on an empty store.
-///
-/// # Errors
-/// A `400` when the expression does not parse or does not evaluate.
-pub fn instant_literal(query: &str, at_nanos: u64) -> Result<serde_json::Value> {
-    use crate::prometheus::{format_value, to_seconds};
-    use crate::promeval::{Snapshot, Value};
-
-    let expr = crate::promql::parse(query)?;
-    let at = to_seconds(at_nanos);
-    let data = match Snapshot::from_samples(Vec::new()).eval(&expr, at_nanos)? {
-        Value::Scalar(value) => serde_json::json!({
-            "resultType": "scalar",
-            "result": [at, format_value(value)],
-        }),
-        Value::Vector(vector) => serde_json::json!({
-            "resultType": "vector",
-            "result": vector.samples.iter().map(|(labels, value)| serde_json::json!({
-                "metric": labels.iter().collect::<BTreeMap<_, _>>(),
-                "value": [at, format_value(*value)],
-            })).collect::<Vec<_>>(),
-        }),
-    };
-    Ok(serde_json::json!({ "status": "success", "data": data }))
-}
-
 /// Raw query-string parameters, before validation.
 #[derive(Debug, Default, Deserialize)]
 pub struct QueryRangeParams {
@@ -133,8 +93,7 @@ pub struct QueryRangeParams {
     pub limit: Option<String>,
     pub direction: Option<String>,
     pub since: Option<String>,
-    /// Accepted and ignored — they only affect metric queries, which are out of the
-    /// subset. Rejecting them would break clients that always send them.
+    /// The resolution of a metric query; a log query ignores it, as Loki does.
     pub step: Option<String>,
     pub interval: Option<String>,
 }
@@ -599,10 +558,10 @@ pub fn query_range(
 /// column. Regex stages stay in the record predicate: the point is to reject most rows
 /// for almost nothing, not to reimplement evaluation twice. Over-selecting is safe by
 /// contract, so anything not handled here simply falls through.
-type Prefilter =
+pub(crate) type Prefilter =
     Box<dyn Fn(&arrow::record_batch::RecordBatch, &mut Vec<u32>) -> Result<()> + Send + Sync>;
 
-fn build_line_prefilter(query: &LogQuery) -> Option<Prefilter> {
+pub(crate) fn build_line_prefilter(query: &LogQuery) -> Option<Prefilter> {
     // Only the filters that see the stored line: after `line_format` or `decolorize`
     // they test a line the store never held.
     let contains: Vec<(bool, String)> = query

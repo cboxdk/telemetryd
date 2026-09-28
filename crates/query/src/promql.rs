@@ -229,7 +229,7 @@ pub enum Function {
 }
 
 /// Every function by its PromQL name.
-const FUNCTIONS: &[(&str, Function)] = &[
+pub(crate) const FUNCTIONS: &[(&str, Function)] = &[
     ("rate", Function::Rate),
     ("increase", Function::Increase),
     ("irate", Function::Irate),
@@ -1412,7 +1412,7 @@ impl Expr {
         }
     }
 
-    fn walk(&self, visit: &mut impl FnMut(&Self)) {
+    pub(crate) fn walk(&self, visit: &mut impl FnMut(&Self)) {
         visit(self);
         match self {
             Self::Call { args, .. } => {

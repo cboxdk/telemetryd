@@ -19,6 +19,7 @@
 //! | Prometheus | `query`, `query_range`, `labels`, `label/{name}/values`, `series` | M3        |
 
 pub mod lexer;
+pub mod logmetric;
 pub mod logql;
 pub mod logstage;
 pub mod loki;

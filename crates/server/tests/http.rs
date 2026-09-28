@@ -2063,7 +2063,7 @@ async fn the_loki_health_check_evaluates() {
     );
     assert_eq!(json["data"]["result"][0]["value"][1], "2", "{body}");
 
-    // A log query is answered as streams; metric LogQL is still refused by name.
+    // A log query is answered as streams, a metric query as a vector.
     let (status, _, body) = harness
         .get("/loki/api/v1/query?query=%7Bapp%3D%22x%22%7D")
         .await;
@@ -2072,7 +2072,8 @@ async fn the_loki_health_check_evaluates() {
     let (status, _, body) = harness
         .get("/loki/api/v1/query?query=count_over_time(%7Bapp%3D%22x%22%7D%5B5m%5D)")
         .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("\"resultType\":\"vector\""), "{body}");
 }
 
 /// Prometheus clients read `error` as a string in `{"status":"error",…}`. Ours was an
