@@ -396,6 +396,9 @@ struct FoldState<'a> {
     /// checking rather than trusting costs one pass and keeps any other caller correct.
     ordered: bool,
     max_samples: u64,
+    /// Per call, each point's window as `(floor, at]`, offset applied. Worked out once:
+    /// every sample of every series is placed against them.
+    bounds: Vec<Vec<(u64, u64)>>,
     labels: Vec<Labels>,
     /// Which calls each series belongs to. The read uses only the matchers every
     /// selector shares, so one series can be wanted by `x{code="500"}` and not by the
@@ -410,11 +413,25 @@ impl<'a> FoldState<'a> {
         points: &'a [u64],
         max_samples: u64,
     ) -> Self {
+        let bounds = calls
+            .iter()
+            .map(|(selector, range, _)| {
+                let range_nanos = duration_nanos(*range);
+                points
+                    .iter()
+                    .map(|point| {
+                        let at = selector.offset.apply(*point);
+                        (at.saturating_sub(range_nanos), at)
+                    })
+                    .collect()
+            })
+            .collect();
         Self {
             calls,
             points,
             ordered: points.windows(2).all(|pair| pair[0] <= pair[1]),
             max_samples,
+            bounds,
             labels: Vec::new(),
             wanted: Vec::new(),
             folds: vec![Vec::new(); calls.len()],
@@ -492,6 +509,45 @@ impl<'a> FoldState<'a> {
                 let floor = at.saturating_sub(range_nanos);
                 if at_nanos > floor && at_nanos <= at {
                     cell.add(at_nanos, value);
+                }
+            }
+        }
+    }
+
+    /// Fold one series' samples, in time order, into every point whose window holds each.
+    ///
+    /// The same cells [`Self::add`] fills, found by walking rather than searching: the
+    /// windows a sample belongs to are a contiguous run of points, and as samples move
+    /// forward in time both ends of that run only move forward. So one pass over the
+    /// samples and one over the points place them all — where bisecting the points
+    /// twice for every sample was a third of a chart's time.
+    fn add_run(&mut self, index: usize, timestamps: &[u64], values: &[f64]) {
+        if !self.ordered {
+            for (&at, &value) in timestamps.iter().zip(values) {
+                self.add(index, at, value);
+            }
+            return;
+        }
+        for call in 0..self.calls.len() {
+            if !self.wanted[index][call] {
+                continue;
+            }
+            let bounds = &self.bounds[call];
+            let cells = &mut self.folds[call][index];
+            // `lo`: the first point whose window ends at or after the sample. `hi`: the
+            // first whose window starts at or after it. The sample belongs to `lo..hi`.
+            let (mut lo, mut hi) = (0usize, 0usize);
+            for (&at, &value) in timestamps.iter().zip(values) {
+                while lo < bounds.len() && at > bounds[lo].1 {
+                    lo += 1;
+                }
+                while hi < bounds.len() && at > bounds[hi].0 {
+                    hi += 1;
+                }
+                for (cell, &(floor, end)) in cells[lo..hi].iter_mut().zip(&bounds[lo..hi]) {
+                    if at > floor && at <= end {
+                        cell.add(at, value);
+                    }
                 }
             }
         }
@@ -848,8 +904,8 @@ impl Snapshot {
         Ok(state.finish())
     }
 
-    /// Fold straight from the store's columns. `Ok(false)` when a series' samples came
-    /// out of time order, and `state` is then to be discarded.
+    /// Fold straight from the store, a series at a time. `Ok(false)` when one series'
+    /// runs came out of time order, and `state` is then to be discarded.
     fn fold_columns(
         store: &RecordStore<MetricSchema>,
         state: &mut FoldState<'_>,
@@ -858,72 +914,42 @@ impl Snapshot {
     ) -> Result<bool> {
         use std::ops::ControlFlow;
 
-        let (Some(&(first, _)), Some(&(_, last))) = (windows.first(), windows.last()) else {
-            return Ok(true);
-        };
         let mut by_labels = telemetryd_core::series::SeriesTable::new();
         // Per series: the last sample folded, and which source it came from.
         let mut latest: Vec<(u64, usize)> = Vec::new();
-        // Per stream of the current source: unresolved, not selected, or a series.
-        let mut resolved: Vec<Option<Option<usize>>> = Vec::new();
-        let mut current = usize::MAX;
         let mut refused = None;
 
-        let complete = store.scan_samples(windows, pushdown, &mut |run| {
-            if run.source != current {
-                current = run.source;
-                resolved.clear();
-                resolved.resize(run.streams.len(), None);
-            }
-            for row in 0..run.timestamps.len() {
-                let at = run.timestamps[row];
-                if at < first || at > last {
-                    continue;
+        let complete = store.scan_series(windows, pushdown, &mut |run| {
+            let index = if let Some(index) = by_labels.get(run.series) {
+                index
+            } else {
+                match state.discover(run.series) {
+                    Ok(index) => {
+                        by_labels.insert(run.series);
+                        latest.push((0, usize::MAX));
+                        index
+                    }
+                    Err(error) => {
+                        refused = Some(error);
+                        return ControlFlow::Break(());
+                    }
                 }
-                let stream = run.stream_ids[row] as usize;
-                // A row naming no stream: an old segment without a dictionary. The
-                // sliced read knows what to make of it.
-                let Some(slot) = resolved.get_mut(stream) else {
-                    return ControlFlow::Break(());
-                };
-                let index = if let Some(known) = *slot {
-                    known
-                } else {
-                    let labels = &run.streams[stream];
-                    let found = if !telemetryd_core::matches_all(pushdown, labels) {
-                        None
-                    } else if let Some(index) = by_labels.get(labels) {
-                        Some(index)
-                    } else {
-                        match state.discover(labels) {
-                            Ok(index) => {
-                                by_labels.insert(labels);
-                                latest.push((0, usize::MAX));
-                                Some(index)
-                            }
-                            Err(error) => {
-                                refused = Some(error);
-                                return ControlFlow::Break(());
-                            }
-                        }
-                    };
-                    *slot = Some(found);
-                    found
-                };
-                let Some(index) = index else {
-                    continue;
-                };
-                // Two samples at one instant from two sources are ordered by where
-                // they were stored, and only the sliced read reproduces that order.
-                let (seen_at, seen_in) = latest[index];
-                if seen_in != usize::MAX
-                    && (at < seen_at || (at == seen_at && seen_in != run.source))
-                {
-                    return ControlFlow::Break(());
-                }
-                latest[index] = (at, run.source);
-                state.add(index, at, run.values[row]);
+            };
+            let (Some(&first), Some(&last)) = (run.timestamps.first(), run.timestamps.last())
+            else {
+                return ControlFlow::Continue(());
+            };
+            // A run carries on from the last one only when it starts later. Two samples at
+            // one instant from two sources are ordered by where they were stored, and only
+            // the sliced read reproduces that order.
+            let (seen_at, seen_in) = latest[index];
+            if seen_in != usize::MAX
+                && (first < seen_at || (first == seen_at && seen_in != run.source))
+            {
+                return ControlFlow::Break(());
             }
+            latest[index] = (last, run.source);
+            state.add_run(index, run.timestamps, run.values);
             ControlFlow::Continue(())
         })?;
         if let Some(error) = refused {

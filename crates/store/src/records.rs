@@ -174,11 +174,67 @@ pub(crate) struct Chunk<S: RecordSchema> {
     pub(crate) records: Vec<S::Record>,
     pub(crate) min_nanos: u64,
     pub(crate) max_nanos: u64,
+    /// The records grouped by series, worked out the first time a query asks.
+    by_series: std::sync::OnceLock<SeriesOrder>,
+}
+
+/// A frozen chunk's records, grouped by series and in time order within each.
+///
+/// Buffered records sit in arrival order, every series interleaved with every other, so
+/// a query wanting fifty series of eight hundred had to walk all of them — and a day of
+/// histogram buckets pushed at once is six hundred chunks of it. Grouped, a query looks
+/// at each series once per chunk, decides, and reads only the ones it wants.
+///
+/// Built on first use rather than at freeze, because freezing happens under the lock
+/// ingest appends through, and a chunk no query touches before it is sealed never pays.
+/// Four bytes a record: the positions, not copies.
+#[derive(Debug, Default)]
+pub(crate) struct SeriesOrder {
+    /// Record positions, by the address of their label set and then by time.
+    pub(crate) rows: Vec<u32>,
+    /// `rows[start..end]` for each run of one label set.
+    pub(crate) runs: Vec<(u32, u32)>,
 }
 
 impl<S: RecordSchema> Chunk<S> {
+    pub(crate) fn new(records: Vec<S::Record>, min_nanos: u64, max_nanos: u64) -> Self {
+        Self {
+            records,
+            min_nanos,
+            max_nanos,
+            by_series: std::sync::OnceLock::new(),
+        }
+    }
+
     pub(crate) fn overlaps(&self, start_nanos: u64, end_nanos: u64) -> bool {
         self.min_nanos <= end_nanos && self.max_nanos >= start_nanos
+    }
+
+    /// The records grouped by series. A series whose records do not all share one
+    /// allocation appears as more than one run; each run is still in time order.
+    pub(crate) fn by_series(&self) -> &SeriesOrder {
+        self.by_series.get_or_init(|| {
+            let key = |row: u32| {
+                let record = &self.records[row as usize];
+                (S::index_labels(record).storage_id(), S::timestamp(record))
+            };
+            let mut rows: Vec<u32> =
+                (0..u32::try_from(self.records.len()).unwrap_or(u32::MAX)).collect();
+            // Stable: two records of one series at one instant keep arrival order.
+            rows.sort_by_key(|row| key(*row));
+            let mut runs = Vec::new();
+            let mut start = 0usize;
+            for at in 1..=rows.len() {
+                if at == rows.len() || key(rows[at]).0 != key(rows[start]).0 {
+                    runs.push((
+                        u32::try_from(start).unwrap_or(u32::MAX),
+                        u32::try_from(at).unwrap_or(u32::MAX),
+                    ));
+                    start = at;
+                }
+            }
+            SeriesOrder { rows, runs }
+        })
     }
 }
 
@@ -234,11 +290,11 @@ impl<S: RecordSchema> Buffer<S> {
     fn freeze(&mut self) {
         if !self.active.is_empty() {
             let records = std::mem::replace(&mut self.active, Vec::with_capacity(CHUNK_RECORDS));
-            self.chunks.push(Arc::new(Chunk {
+            self.chunks.push(Arc::new(Chunk::new(
                 records,
-                min_nanos: self.active_min,
-                max_nanos: self.active_max,
-            }));
+                self.active_min,
+                self.active_max,
+            )));
             self.active_min = u64::MAX;
             self.active_max = u64::MIN;
         }
@@ -283,11 +339,7 @@ impl<S: RecordSchema> Buffer<S> {
         self.records = 0;
         self.bytes = 0;
         self.series.clear();
-        Chunk {
-            records,
-            min_nanos,
-            max_nanos,
-        }
+        Chunk::new(records, min_nanos, max_nanos)
     }
 
     /// Put a drained chunk back at the front, preserving order, after a failed seal.
@@ -803,27 +855,6 @@ impl<S: RecordSchema> RecordStore<S> {
     ///
     /// Prefer [`Self::scan`] with a limit wherever the caller has one: this variant
     /// materialises every match.
-    /// Records sitting in the unsealed buffer within `(start, end]`.
-    ///
-    /// The newest and smallest part of the store, and the one part with no segment to
-    /// carry a precomputed summary — so a caller folding a window has to walk it.
-    pub(crate) fn buffered_between(&self, start_nanos: u64, end_nanos: u64) -> Vec<S::Record> {
-        let chunks = Self::buffered_in(&mut lock(&self.writer));
-        let mut out = Vec::new();
-        for chunk in &chunks {
-            if !chunk.overlaps(start_nanos, end_nanos) {
-                continue;
-            }
-            for record in &chunk.records {
-                let at = S::timestamp(record);
-                if at > start_nanos && at <= end_nanos {
-                    out.push(record.clone());
-                }
-            }
-        }
-        out
-    }
-
     pub fn query(
         &self,
         start_nanos: u64,

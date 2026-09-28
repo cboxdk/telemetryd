@@ -19,40 +19,131 @@ use crate::schema::{RecordSchema, Rows, schema_ref};
 #[derive(Debug, Clone, Copy)]
 pub struct MetricSchema;
 
-/// A run of metric samples from one place in the store, as columns.
+/// One series' samples from one place in the store, in time order.
 ///
-/// `streams[stream_ids[i]]` is the series of sample `i`. Stream ids are numbered per
-/// source, so `source` changing is the signal that a consumer's per-stream cache no
-/// longer applies.
+/// `source` numbers the places — a segment, a buffered chunk — oldest first. A series
+/// can appear once per source; its runs from different sources need not follow on from
+/// each other in time, because late data lands in a later segment.
 #[derive(Debug, Clone, Copy)]
-pub struct SampleRun<'a> {
+pub struct SeriesRun<'a> {
     pub source: usize,
-    pub streams: &'a [Labels],
-    pub stream_ids: &'a [u32],
+    pub series: &'a Labels,
     pub timestamps: &'a [u64],
     pub values: &'a [f64],
 }
 
+/// Rows gathered from one segment, before they are grouped into runs. Kept between
+/// segments so a scan allocates once, not once per segment.
+#[derive(Debug, Default)]
+struct Gathered {
+    streams: Vec<u32>,
+    timestamps: Vec<u64>,
+    values: Vec<f64>,
+    /// The same rows grouped by stream, stable, so each stream's stay in time order.
+    grouped_timestamps: Vec<u64>,
+    grouped_values: Vec<f64>,
+    /// `starts[s]..starts[s + 1]` is stream `s` in the grouped columns.
+    starts: Vec<usize>,
+}
+
+impl Gathered {
+    fn clear(&mut self) {
+        self.streams.clear();
+        self.timestamps.clear();
+        self.values.clear();
+    }
+
+    /// Read one segment's rows in `[start, end]` of the streams `allowed` says, replacing
+    /// whatever was gathered before. The flag is `false` when a row names a stream the
+    /// dictionary does not hold, and nothing gathered is to be used.
+    fn gather(
+        &mut self,
+        segment: &crate::segment::Segment,
+        windows: &[(u64, u64)],
+        (start, end): (u64, u64),
+        allowed: &[bool],
+    ) -> (Result<()>, bool) {
+        self.clear();
+        let mut named = true;
+        let outcome = segment.scan_columns(
+            &["timestamp_nanos", "stream_id", "value"],
+            windows,
+            |batch| {
+                let ids = u32_column(batch, "stream_id")?.values();
+                let timestamps = u64_column(batch, "timestamp_nanos")?.values();
+                let values = f64_column(batch, "value")?.values();
+                for ((&id, &at), &value) in ids.iter().zip(timestamps).zip(values) {
+                    if at < start || at > end {
+                        continue;
+                    }
+                    match allowed.get(id as usize) {
+                        Some(true) => {
+                            self.streams.push(id);
+                            self.timestamps.push(at);
+                            self.values.push(value);
+                        }
+                        Some(false) => {}
+                        None => {
+                            named = false;
+                            return Ok(crate::segment::Flow::Stop);
+                        }
+                    }
+                }
+                Ok(crate::segment::Flow::Continue)
+            },
+        );
+        (outcome, named)
+    }
+
+    /// Group the gathered rows by stream: a counting sort, one pass to count and one to
+    /// place, because a comparison sort of a segment's rows cost more than reading them.
+    fn group(&mut self, stream_count: usize) {
+        self.starts.clear();
+        self.starts.resize(stream_count + 1, 0);
+        for &stream in &self.streams {
+            self.starts[stream as usize + 1] += 1;
+        }
+        for at in 1..self.starts.len() {
+            self.starts[at] += self.starts[at - 1];
+        }
+        let rows = self.streams.len();
+        self.grouped_timestamps.resize(rows, 0);
+        self.grouped_values.resize(rows, 0.0);
+        let mut next = self.starts[..stream_count].to_vec();
+        for row in 0..rows {
+            let slot = &mut next[self.streams[row] as usize];
+            self.grouped_timestamps[*slot] = self.timestamps[row];
+            self.grouped_values[*slot] = self.values[row];
+            *slot += 1;
+        }
+    }
+}
+
 impl crate::RecordStore<MetricSchema> {
-    /// Hand `visit` every sample that may fall in `windows` — sorted, disjoint
-    /// `(start, end)` pairs, both ends included — a batch of columns at a time.
+    /// Hand `visit` every series matching `matchers` that has samples in `[start, end]`
+    /// — the ends of `windows`, sorted, disjoint `(start, end)` pairs, both ends included
+    /// — one run per series per source.
     ///
-    /// Only three columns are read and nothing is materialised: no labels are cloned,
-    /// no sample is built, and nothing is held past the batch. A week-long chart that
-    /// used to decode every sample of the week into a record reads the timestamps,
-    /// stream ids and values of the row groups its windows touch.
+    /// # Why by series
     ///
-    /// `matchers` prune segments only; which streams a consumer wants is its decision,
-    /// made once per stream. Sources come oldest first — sealed segments by their
-    /// earliest sample, then the unsealed buffer — and rows within one come in time
-    /// order. Across sources they need not: late data lands in a later segment. A
-    /// consumer that needs order checks it and returns `Break`, and this returns
-    /// `Ok(false)` so it can read another way.
-    pub fn scan_samples(
+    /// Everything that answers `rate` and `increase` works a series at a time: the
+    /// samples of one, in order, against the windows of the evaluation points. The store
+    /// used to hand out its rows as they lie — every series of a segment interleaved —
+    /// and the consumer found each row's series, checked it was wanted, and bisected
+    /// the evaluation points for it, row by row. On a day of one app's request
+    /// histogram, a query about fifty of its eight hundred series walked all of them.
+    /// Here each series is decided once per source, and the rows of the ones not wanted
+    /// are never handed over, and for buffered chunks never looked at.
+    ///
+    /// Sources come oldest first — sealed segments by their earliest sample, then the
+    /// unsealed buffer. A consumer that needs one series' runs to follow on in time
+    /// checks, and returns `Break`; this then returns `Ok(false)` so it can read another
+    /// way. So does a segment with a row naming no stream in its dictionary.
+    pub fn scan_series(
         &self,
         windows: &[(u64, u64)],
         matchers: &[telemetryd_core::LabelMatcher],
-        visit: &mut dyn FnMut(SampleRun<'_>) -> std::ops::ControlFlow<()>,
+        visit: &mut dyn FnMut(SeriesRun<'_>) -> std::ops::ControlFlow<()>,
     ) -> Result<bool> {
         use std::sync::atomic::Ordering;
 
@@ -70,11 +161,26 @@ impl crate::RecordStore<MetricSchema> {
         chunks.sort_by_key(|chunk| chunk.min_nanos);
 
         let mut source = 0;
+        let mut gathered = Gathered::default();
         for segment in &segments {
             let manifest = &segment.manifest;
             if !wanted(manifest.min_time_nanos, manifest.max_time_nanos)
                 || !manifest.might_match(matchers)
             {
+                self.stats.segments_pruned.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let allowed: Vec<bool> = manifest
+                .streams
+                .iter()
+                .map(|labels| telemetryd_core::matches_all(matchers, labels))
+                .collect();
+            if !allowed.iter().any(|ok| *ok) {
+                // Also a segment without a dictionary, whose rows no stream id can name:
+                // the caller's other read handles those.
+                if manifest.streams.is_empty() && manifest.rows > 0 {
+                    return Ok(false);
+                }
                 self.stats.segments_pruned.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -86,71 +192,38 @@ impl crate::RecordStore<MetricSchema> {
             }
             self.stats.segments_scanned.fetch_add(1, Ordering::Relaxed);
             source += 1;
-            let mut abandoned = false;
-            let outcome = segment.scan_columns(
-                &["timestamp_nanos", "stream_id", "value"],
-                windows,
-                |batch| {
-                    let run = SampleRun {
-                        source,
-                        streams: &manifest.streams,
-                        stream_ids: u32_column(batch, "stream_id")?.values(),
-                        timestamps: u64_column(batch, "timestamp_nanos")?.values(),
-                        values: f64_column(batch, "value")?.values(),
-                    };
-                    if visit(run).is_break() {
-                        abandoned = true;
-                        return Ok(crate::segment::Flow::Stop);
-                    }
-                    Ok(crate::segment::Flow::Continue)
-                },
-            );
+
+            let (outcome, named) = gathered.gather(segment, windows, (start, end), &allowed);
             self.settle_scan(segment, outcome)?;
-            if abandoned {
+            if !named {
                 return Ok(false);
+            }
+            gathered.group(manifest.streams.len());
+            for (stream, labels) in manifest.streams.iter().enumerate() {
+                let (from, to) = (gathered.starts[stream], gathered.starts[stream + 1]);
+                if from == to {
+                    continue;
+                }
+                let run = SeriesRun {
+                    source,
+                    series: labels,
+                    timestamps: &gathered.grouped_timestamps[from..to],
+                    values: &gathered.grouped_values[from..to],
+                };
+                if visit(run).is_break() {
+                    return Ok(false);
+                }
             }
         }
 
-        // The buffer holds records, not columns, so each chunk is laid out as one run.
-        // Its label sets are numbered by allocation: the chunk holds every one alive
-        // while the run is built, so an address cannot be reused under it.
-        for chunk in &chunks {
-            if !wanted(chunk.min_nanos, chunk.max_nanos) {
-                continue;
-            }
-            source += 1;
-            let mut numbered: telemetryd_core::series::IdMap<u32> =
-                telemetryd_core::series::IdMap::default();
-            let mut streams: Vec<Labels> = Vec::new();
-            let mut stream_ids = Vec::with_capacity(chunk.records.len());
-            let mut timestamps = Vec::with_capacity(chunk.records.len());
-            let mut values = Vec::with_capacity(chunk.records.len());
-            for record in &chunk.records {
-                if record.timestamp_nanos < start || record.timestamp_nanos > end {
-                    continue;
-                }
-                let id = *numbered
-                    .entry(record.series.storage_id())
-                    .or_insert_with(|| {
-                        streams.push(record.series.clone());
-                        u32::try_from(streams.len() - 1).unwrap_or(u32::MAX)
-                    });
-                stream_ids.push(id);
-                timestamps.push(record.timestamp_nanos);
-                values.push(record.value);
-            }
-            let run = SampleRun {
-                source,
-                streams: &streams,
-                stream_ids: &stream_ids,
-                timestamps: &timestamps,
-                values: &values,
-            };
-            if visit(run).is_break() {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        Ok(visit_buffered(
+            &chunks,
+            (start, end),
+            matchers,
+            &|min, max| wanted(min, max),
+            source,
+            visit,
+        ))
     }
 
     /// Compute and store summaries for segments that have none.
@@ -210,6 +283,45 @@ impl crate::RecordStore<MetricSchema> {
             written += 1;
         }
         Ok(written)
+    }
+
+    /// Fold the buffered samples in `(start, end]` of every series matching `matchers`
+    /// into `folds`, a series at a time. `false` when a series' buffered runs do not
+    /// follow on from each other or from what is folded already — late data — and the
+    /// caller declines the shortcut for the ordinary scan, which sorts.
+    fn fold_buffered(
+        &self,
+        (start_nanos, end_nanos): (u64, u64),
+        matchers: &[telemetryd_core::LabelMatcher],
+        table: &mut telemetryd_core::series::SeriesTable,
+        folds: &mut Vec<crate::folds::StreamFold>,
+    ) -> bool {
+        let (mut chunks, _) = self.view();
+        chunks.sort_by_key(|chunk| chunk.min_nanos);
+        let mut in_order = true;
+        visit_buffered(
+            &chunks,
+            (start_nanos.saturating_add(1), end_nanos),
+            matchers,
+            &|min, max| min <= end_nanos && max > start_nanos,
+            0,
+            &mut |run| {
+                let (index, added) = table.insert(run.series);
+                if added {
+                    folds.push(crate::folds::StreamFold::default());
+                }
+                let entry = &mut folds[index];
+                for (&at, &value) in run.timestamps.iter().zip(run.values) {
+                    if !entry.precedes(at) {
+                        in_order = false;
+                        return std::ops::ControlFlow::Break(());
+                    }
+                    entry.add(at, value);
+                }
+                std::ops::ControlFlow::Continue(())
+            },
+        );
+        in_order
     }
 
     /// Per-stream counter summaries over `(start, end]`.
@@ -340,13 +452,7 @@ impl crate::RecordStore<MetricSchema> {
             }
         }
 
-        if !fold_rows(
-            self.buffered_between(start_nanos, end_nanos).into_iter(),
-            (start_nanos, end_nanos),
-            matchers,
-            &mut table,
-            &mut folds,
-        ) {
+        if !self.fold_buffered((start_nanos, end_nanos), matchers, &mut table, &mut folds) {
             return Ok(None);
         }
 
@@ -359,6 +465,69 @@ impl crate::RecordStore<MetricSchema> {
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(Some(out))
     }
+}
+
+/// Hand `visit` the buffered samples in `[start, end]` of every series matching
+/// `matchers`, one run per series per chunk, numbering chunks as sources after `source`.
+/// `false` when `visit` stopped the scan.
+///
+/// Each chunk is looked at through its records grouped by series, so a series is decided
+/// once per chunk, the samples of one not wanted are never touched, and the ones of one
+/// that is are found by bisection rather than by walking the chunk.
+fn visit_buffered(
+    chunks: &[std::sync::Arc<crate::records::Chunk<MetricSchema>>],
+    (start, end): (u64, u64),
+    matchers: &[telemetryd_core::LabelMatcher],
+    wanted: &dyn Fn(u64, u64) -> bool,
+    mut source: usize,
+    visit: &mut dyn FnMut(SeriesRun<'_>) -> std::ops::ControlFlow<()>,
+) -> bool {
+    // By address: every chunk is held for the length of the scan, so an address cannot be
+    // freed and reused for another set while this map trusts it.
+    let mut decided: telemetryd_core::series::IdMap<bool> =
+        telemetryd_core::series::IdMap::default();
+    let mut timestamps: Vec<u64> = Vec::new();
+    let mut values: Vec<f64> = Vec::new();
+    for chunk in chunks {
+        if !wanted(chunk.min_nanos, chunk.max_nanos) {
+            continue;
+        }
+        source += 1;
+        let order = chunk.by_series();
+        for &(from, to) in &order.runs {
+            let rows = &order.rows[from as usize..to as usize];
+            let series = &chunk.records[rows[0] as usize].series;
+            let matched = *decided
+                .entry(series.storage_id())
+                .or_insert_with(|| telemetryd_core::matches_all(matchers, series));
+            if !matched {
+                continue;
+            }
+            let at = |row: &u32| chunk.records[*row as usize].timestamp_nanos;
+            let first = rows.partition_point(|row| at(row) < start);
+            let last = rows.partition_point(|row| at(row) <= end);
+            if first == last {
+                continue;
+            }
+            timestamps.clear();
+            values.clear();
+            for row in &rows[first..last] {
+                let record = &chunk.records[*row as usize];
+                timestamps.push(record.timestamp_nanos);
+                values.push(record.value);
+            }
+            let run = SeriesRun {
+                source,
+                series,
+                timestamps: &timestamps,
+                values: &values,
+            };
+            if visit(run).is_break() {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// One segment's rows in `(start, end]`, folded per stream straight from its columns.
