@@ -32,6 +32,7 @@ CASES = ROOT / "crates/query/tests/conformance/promql.json"
 # Prometheus, not because a tag moved. This is v3.15.0.
 IMAGE = "prom/prometheus@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e"
 
+EXP = re.compile(r"^\s*exp: (?P<samples>.*)$")
 EXPR = re.compile(r'^\s*expr: "(?P<expr>.*)", time: (?P<time>[^,]+),\s*$')
 GOT = re.compile(r"^\s*got: (?P<samples>.*)$")
 SAMPLE = re.compile(r'(?P<labels>[a-zA-Z_:][a-zA-Z0-9_:]*(?:\{[^}]*\})?|\{[^}]*\}) (?P<value>\S+?)(?:, |$)')
@@ -44,6 +45,36 @@ def promtool(path: pathlib.Path) -> tuple[int, str]:
         capture_output=True, text=True, check=False,
     )
     return result.returncode, result.stdout + result.stderr
+
+
+def parse_samples(text: str) -> list[tuple[str, float]]:
+    if text.strip() == "nil":
+        return []
+    return [(m["labels"], float(m["value"])) for m in SAMPLE.finditer(text)]
+
+
+def only_rounding(output: str) -> bool:
+    """Whether every disagreement promtool reports is in the last bits of a float.
+
+    promtool compares exactly, and Go fuses multiply-add on arm64 but not on amd64: the
+    same Prometheus answered 26.3 on an ARM laptop and 26.299999999999997 on the x86 CI
+    runner. Labels and sample counts still have to match exactly.
+    """
+    expected = None
+    compared = 0
+    for line in output.splitlines():
+        if match := EXP.match(line):
+            expected = parse_samples(match["samples"])
+        elif (match := GOT.match(line)) and expected is not None:
+            got = parse_samples(match["samples"])
+            if [l for l, _ in expected] != [l for l, _ in got]:
+                return False
+            for (_, a), (_, b) in zip(expected, got):
+                if abs(a - b) > 1e-12 * max(abs(a), abs(b), 1.0):
+                    return False
+            compared += 1
+            expected = None
+    return compared > 0
 
 
 def answers(output: str) -> dict[tuple[str, str], list[dict]]:
@@ -83,6 +114,10 @@ def update() -> int:
 
 def check() -> int:
     code, output = promtool(CASES)
+    if code != 0 and only_rounding(output):
+        print("Prometheus differs from the file only in the last bits of some floats "
+              "(this machine's floating point); accepted")
+        code = 0
     if code != 0:
         print(output)
         print(f"Prometheus ({IMAGE}) disagrees with {CASES.relative_to(ROOT)}")
