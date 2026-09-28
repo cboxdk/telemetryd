@@ -403,3 +403,88 @@ fn a_chart_over_late_data_agrees_with_the_ordinary_read() {
         ) > 400
     );
 }
+
+/// Sixty series interleaved as a histogram's buckets arrive, two sealed stretches laid
+/// out series by series and a buffered one across several chunks, with a restart in it.
+/// Every way the fold reads the store — segment row ranges, buffered pieces joined into
+/// one run, a whole run folded into one cell — has to give what walking the rows gives.
+#[test]
+fn a_mixed_store_agrees_with_the_ordinary_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&config(dir.path())).unwrap();
+    let mut rows = Vec::new();
+    for tick in 1..=720u64 {
+        let step: Vec<MetricSample> = (0..60u64)
+            .map(|i| {
+                let mut series = Labels::new();
+                series.insert("__name__", if i % 5 == 0 { "other" } else { "probe" });
+                series.insert("route", format!("/r{i}"));
+                #[allow(clippy::cast_precision_loss)]
+                let raw = (tick * (i + 1)) as f64;
+                MetricSample {
+                    series,
+                    timestamp_nanos: tick * 30 * SECOND,
+                    // A restart two thirds of the way in, inside the buffered stretch.
+                    value: if i == 7 && tick > 600 {
+                        raw - 600.0 * 8.0
+                    } else {
+                        raw
+                    },
+                    kind: MetricKind::Counter,
+                }
+            })
+            .collect();
+        store.metrics().append(&step).unwrap();
+        rows.extend(step);
+        if tick == 240 || tick == 480 {
+            store.metrics().seal_now().unwrap();
+        }
+    }
+    let last = 720 * 30 * SECOND;
+
+    let chart: Vec<u64> = (0..250).map(|i| 30 * SECOND + i * (last / 250)).collect();
+    for (query, points) in [
+        ("sum by (route) (rate(probe[15m]))", chart),
+        ("sum by (route) (increase(probe[5h]))", vec![last]),
+        (r#"rate(probe{route="/r7"}[3h])"#, vec![last]),
+        (
+            r#"rate(probe{route="/r7"}[3h])"#,
+            vec![last - 3_600 * SECOND, last],
+        ),
+        (
+            r#"rate(probe{route="/r7"}[3h])"#,
+            vec![last, last - 3_600 * SECOND],
+        ),
+        ("sum(increase(probe[6h]))", vec![last + 60 * SECOND]),
+    ] {
+        let expr = promql::parse(query).unwrap();
+        let folded = Snapshot::load_at(store.metrics(), &expr, &points, 0).unwrap();
+        let mut walked = Snapshot::from_samples(rows.clone());
+        walked.prepare(&expr, &points);
+        for at in &points {
+            let (Value::Vector(a), Value::Vector(b)) = (
+                folded.eval(&expr, *at).unwrap(),
+                walked.eval(&expr, *at).unwrap(),
+            ) else {
+                panic!("{query} evaluates to a vector");
+            };
+            let (mut a, mut b) = (a.samples, b.samples);
+            a.sort_by(|x, y| x.0.cmp(&y.0));
+            b.sort_by(|x, y| x.0.cmp(&y.0));
+            assert_eq!(
+                a.len(),
+                b.len(),
+                "{query} at {at} points {points:?}: {a:?} vs {b:?}"
+            );
+            for (one, two) in a.iter().zip(&b) {
+                assert_eq!(one.0, two.0, "{query} at {at}");
+                assert!(
+                    (one.1 - two.1).abs() <= 1e-9 * one.1.abs().max(two.1.abs()).max(1.0),
+                    "{query} at {at}: folded {} vs walked {}",
+                    one.1,
+                    two.1
+                );
+            }
+        }
+    }
+}

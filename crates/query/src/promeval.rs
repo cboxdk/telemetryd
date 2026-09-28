@@ -104,6 +104,8 @@ pub struct Snapshot {
     prepared: Vec<PreparedRate>,
     /// The step timestamps `prepared` was built for, so a lookup can find its index.
     prepared_steps: Vec<u64>,
+    /// Whether `prepared_steps` is in ascending order, and so can be bisected.
+    prepared_ordered: bool,
     /// The query's first and last evaluation times, which `@ start()` and `@ end()`
     /// name.
     bounds: (u64, u64),
@@ -771,6 +773,7 @@ impl Snapshot {
             grouped,
             prepared,
             prepared_steps: points.to_vec(),
+            prepared_ordered: points.windows(2).all(|pair| pair[0] <= pair[1]),
             bounds: (0, 0),
         }))
     }
@@ -1142,6 +1145,7 @@ impl Snapshot {
             grouped,
             prepared,
             prepared_steps: points.to_vec(),
+            prepared_ordered: points.windows(2).all(|pair| pair[0] <= pair[1]),
             bounds: (0, 0),
         })
     }
@@ -1265,6 +1269,7 @@ impl Snapshot {
             grouped,
             prepared: Vec::new(),
             prepared_steps: Vec::new(),
+            prepared_ordered: true,
             bounds: (0, 0),
         }
         .bounded(points))
@@ -1301,6 +1306,7 @@ impl Snapshot {
             grouped: Vec::new(),
             prepared: Vec::new(),
             prepared_steps: Vec::new(),
+            prepared_ordered: true,
             bounds: (0, 0),
         }
     }
@@ -1803,6 +1809,12 @@ impl Snapshot {
         if !self.prepared.is_empty() {
             return;
         }
+        // The pass below walks each series with cursors that only move forward, which
+        // steps out of order would carry past samples a later step still needs. Such a
+        // list is evaluated step by step instead.
+        if !steps.windows(2).all(|pair| pair[0] <= pair[1]) {
+            return;
+        }
         for (selector, range, per_second) in rate_calls(expr) {
             let offset = selector.offset;
             if self.prepared.iter().any(|p| {
@@ -1846,6 +1858,7 @@ impl Snapshot {
             });
         }
         self.prepared_steps = steps.to_vec();
+        self.prepared_ordered = true;
     }
 
     /// `rate` and `increase` over a range window: [`rate_over`] on the samples in
@@ -1868,7 +1881,7 @@ impl Snapshot {
                     && p.per_second == per_second
                     && p.offset == selector.offset
             })
-            && let Ok(step) = self.prepared_steps.binary_search(&at_nanos)
+            && let Some(step) = self.prepared_step(at_nanos)
             && let Some(at_step) = prepared.by_step.get(step)
         {
             return InstantVector {
@@ -1896,6 +1909,21 @@ impl Snapshot {
             }
         }
         InstantVector { samples }
+    }
+
+    /// Which prepared step `at_nanos` is, if it is one.
+    ///
+    /// Searched when the steps are in order, which a range query's always are. Otherwise
+    /// looked for: bisecting a list out of order misses steps it holds, and a missed step
+    /// falls through to the samples — which a folded load does not keep, so the answer
+    /// came back empty.
+    fn prepared_step(&self, at_nanos: u64) -> Option<usize> {
+        let steps = &self.prepared_steps;
+        if self.prepared_ordered {
+            steps.binary_search(&at_nanos).ok()
+        } else {
+            steps.iter().position(|step| *step == at_nanos)
+        }
     }
 
     /// Indices of the series a selector matches, resolved at load.
