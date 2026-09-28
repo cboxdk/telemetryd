@@ -52,6 +52,13 @@ pub trait RecordSchema: Send + Sync + 'static {
     /// Which signal this is; decides the on-disk directory.
     const SIGNAL: Signal;
 
+    /// Whether a sealed segment's rows are laid out series by series rather than in
+    /// time order.
+    ///
+    /// For a signal read a series at a time, whose queries name a few series of many.
+    /// See [`crate::segment::SegmentManifest::stream_major`].
+    const STREAM_MAJOR: bool = false;
+
     /// Arrow schema for the sealed Parquet file.
     fn arrow_schema() -> SchemaRef;
 

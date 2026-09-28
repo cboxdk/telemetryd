@@ -100,6 +100,21 @@ pub struct SegmentManifest {
     /// when the budget alarm fires. Empty on segments written before this existed.
     #[serde(default, skip_serializing)]
     pub stream_rows: Vec<u32>,
+    /// Rows lie series by series — streams in label-set order, each one's rows in time
+    /// order — rather than all in time order.
+    ///
+    /// A metric query names a few series of the hundreds a segment holds: fifty request
+    /// counters beside seven hundred histogram buckets. In time order those fifty are
+    /// spread through every page of the file, and reading them decompresses all of it.
+    /// Series by series, a metric name's series are one stretch of rows — label sets
+    /// order by name first — which `stream_rows` locates exactly and the page index lets
+    /// the reader take without touching the rest.
+    ///
+    /// Absent on older segments, which read as time-ordered. A build from before this
+    /// reads these correctly too: nothing that reads a segment relies on its rows being
+    /// in time order across series, only within one.
+    #[serde(default)]
+    pub stream_major: bool,
 }
 
 impl SegmentManifest {
@@ -237,6 +252,9 @@ const MAX_LOAD_THREADS: usize = 8;
 
 /// Rows per Parquet row group in a sealed segment.
 const ROW_GROUP_ROWS: usize = 65_536;
+
+/// Rows per Parquet page in a segment laid out series by series.
+const STREAM_PAGE_ROWS: usize = 2048;
 
 /// Evaluates a selection over a projected batch.
 pub type SelectionMask =
@@ -598,12 +616,104 @@ impl Segment {
         Ok(())
     }
 
+    /// Stream just `columns`, from exactly the rows in `ranges` — sorted, disjoint,
+    /// half-open `[first, end)` row positions.
+    ///
+    /// For a segment laid out series by series, where a series is a known stretch of
+    /// rows. The reader is told which rows, and with the page index it skips every page
+    /// holding none of them: a metric name's fifty series out of eight hundred cost
+    /// their own pages, not the file. Rows come back in storage order.
+    pub fn scan_row_ranges<F>(
+        &self,
+        columns: &[&str],
+        ranges: &[(usize, usize)],
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&RecordBatch) -> Result<Flow>,
+    {
+        use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        let path = self.data_path();
+        let file = File::open(&path)
+            .map_err(|e| Error::io(format!("opening segment {}", path.display()), e))?;
+        let metadata = self.reader_metadata(&file)?;
+
+        // A selection covers only the row groups read, so it is built group by group.
+        let mut groups = Vec::new();
+        let mut selectors = Vec::new();
+        let mut group_start = 0usize;
+        let mut next = 0usize;
+        for (group, row_group) in metadata.metadata().row_groups().iter().enumerate() {
+            let group_end =
+                group_start + usize::try_from(row_group.num_rows()).unwrap_or(usize::MAX);
+            while next < ranges.len() && ranges[next].1 <= group_start {
+                next += 1;
+            }
+            let mut position = group_start;
+            let mut taken = Vec::new();
+            for &(first, end) in &ranges[next..] {
+                if first >= group_end {
+                    break;
+                }
+                let (first, end) = (first.max(group_start), end.min(group_end));
+                if first > position {
+                    taken.push(RowSelector::skip(first - position));
+                }
+                taken.push(RowSelector::select(end - first));
+                position = end;
+            }
+            if !taken.is_empty() {
+                if position < group_end {
+                    taken.push(RowSelector::skip(group_end - position));
+                }
+                groups.push(group);
+                selectors.extend(taken);
+            }
+            group_start = group_end;
+        }
+        if groups.is_empty() {
+            return Ok(());
+        }
+
+        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata)
+            .with_batch_size(SCAN_BATCH_ROWS);
+        let projection = ProjectionMask::columns(builder.parquet_schema(), columns.iter().copied());
+        let reader = builder
+            .with_projection(projection)
+            .with_row_groups(groups)
+            .with_row_selection(RowSelection::from(selectors))
+            .build()
+            .map_err(|e| segment_corrupt(&path, &e))?;
+        for batch in reader {
+            let batch = batch.map_err(|e| segment_corrupt(&path, &e))?;
+            if visit(&batch)? == Flow::Stop {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
     /// The Parquet footer, parsed once per segment and reused by every later read.
+    ///
+    /// With the page index for a segment laid out series by series: that is what lets a
+    /// read of a few series skip the pages of the rest.
     fn reader_metadata(&self, file: &File) -> Result<ArrowReaderMetadata> {
         if let Some(metadata) = self.metadata.get() {
             return Ok(metadata.clone());
         }
-        let loaded = ArrowReaderMetadata::load(file, ArrowReaderOptions::default())
+        // The offset index alone: where each page starts, which is what skipping needs.
+        // The column index would add every page's statistics to what stays resident.
+        let options = if self.manifest.stream_major {
+            ArrowReaderOptions::default()
+                .with_offset_index_policy(parquet::file::metadata::PageIndexPolicy::Optional)
+        } else {
+            ArrowReaderOptions::default()
+        };
+        let loaded = ArrowReaderMetadata::load(file, options)
             .map_err(|e| segment_corrupt(&self.data_path(), &e))?;
         let _ = self.metadata.set(loaded.clone());
         Ok(loaded)
@@ -871,6 +981,11 @@ fn write_staged<S: RecordSchema>(
     (min_time, max_time): (u64, u64),
 ) -> Result<Segment> {
     let (batch, streams) = S::to_batch(records)?;
+    let (batch, streams) = if S::STREAM_MAJOR {
+        stream_major(&batch, &streams)?
+    } else {
+        (batch, streams)
+    };
     // Shared with every other segment holding the same sets, exactly as `load` does.
     //
     // Interning used to happen only when a segment was read back from disk, so a segment
@@ -883,7 +998,7 @@ fn write_staged<S: RecordSchema>(
     let (stream_bounds, stream_rows) = stream_statistics::<S>(records, &streams);
     let folds = stream_folds::<S>(records, &streams);
     let data_path = staging.join(DATA_FILE);
-    let bytes = write_parquet(&data_path, &batch, options.compression)?;
+    let bytes = write_parquet(&data_path, &batch, options.compression, S::STREAM_MAJOR)?;
 
     let manifest = SegmentManifest {
         format_version: SEGMENT_FORMAT_VERSION,
@@ -899,6 +1014,7 @@ fn write_staged<S: RecordSchema>(
         streams,
         stream_bounds,
         stream_rows,
+        stream_major: S::STREAM_MAJOR,
     };
     crate::dictionary::write(
         staging,
@@ -964,7 +1080,66 @@ fn write_staged<S: RecordSchema>(
     })
 }
 
-fn write_parquet(path: &Path, batch: &RecordBatch, compression: Compression) -> Result<u64> {
+/// Reorder a time-ordered batch series by series: streams in label-set order, each
+/// stream's rows keeping the order they had, which is time order.
+///
+/// A counting sort by stream and one `take` per column, so it costs a pass over the rows
+/// rather than a comparison sort of them. The stream ids are renumbered to match, and the
+/// dictionary comes back in the new order.
+fn stream_major(batch: &RecordBatch, streams: &[Labels]) -> Result<(RecordBatch, Vec<Labels>)> {
+    let failed = |e: arrow::error::ArrowError| Error::Config(format!("ordering a segment: {e}"));
+    let ids = crate::schema::arrow_util::u32_column(batch, "stream_id")?.values();
+
+    let mut ordered: Vec<usize> = (0..streams.len()).collect();
+    ordered.sort_by(|a, b| streams[*a].cmp(&streams[*b]));
+    let mut rank = vec![0u32; streams.len()];
+    for (new, old) in ordered.iter().enumerate() {
+        rank[*old] = u32::try_from(new).unwrap_or(u32::MAX);
+    }
+
+    let mut starts = vec![0usize; streams.len() + 1];
+    for id in ids {
+        starts[rank[*id as usize] as usize + 1] += 1;
+    }
+    for at in 1..starts.len() {
+        starts[at] += starts[at - 1];
+    }
+    let mut positions = vec![0u32; ids.len()];
+    let mut renumbered = vec![0u32; ids.len()];
+    for (row, id) in ids.iter().enumerate() {
+        let new = rank[*id as usize];
+        let slot = &mut starts[new as usize];
+        positions[*slot] = u32::try_from(row).unwrap_or(u32::MAX);
+        renumbered[*slot] = new;
+        *slot += 1;
+    }
+
+    let positions = arrow::array::UInt32Array::from(positions);
+    let renumbered: arrow::array::ArrayRef =
+        std::sync::Arc::new(arrow::array::UInt32Array::from(renumbered));
+    let schema = batch.schema();
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        if field.name() == "stream_id" {
+            columns.push(std::sync::Arc::clone(&renumbered));
+        } else {
+            columns.push(arrow::compute::take(column, &positions, None).map_err(failed)?);
+        }
+    }
+    let batch = RecordBatch::try_new(schema, columns).map_err(failed)?;
+    let streams = ordered
+        .into_iter()
+        .map(|old| streams[old].clone())
+        .collect();
+    Ok((batch, streams))
+}
+
+fn write_parquet(
+    path: &Path,
+    batch: &RecordBatch,
+    compression: Compression,
+    stream_major: bool,
+) -> Result<u64> {
     let compression = match compression {
         Compression::Zstd => ParquetCompression::ZSTD(ZstdLevel::default()),
         Compression::Snappy => ParquetCompression::SNAPPY,
@@ -974,10 +1149,29 @@ fn write_parquet(path: &Path, batch: &RecordBatch, compression: Compression) -> 
     // group's timestamp statistics bound a stretch of it, and a chart that needs five
     // minutes in forty reads the groups holding those. Parquet's default of a million
     // rows made every segment one group, and every read of it a read of all of it.
-    let properties = WriterProperties::builder()
+    let mut properties = WriterProperties::builder()
         .set_compression(compression)
-        .set_max_row_group_row_count(Some(ROW_GROUP_ROWS))
-        .build();
+        .set_max_row_group_row_count(Some(ROW_GROUP_ROWS));
+    if stream_major {
+        // Pages small enough that one metric name's series, read out of the middle of
+        // a segment, cost a few pages rather than every page of each column.
+        properties = properties
+            .set_data_page_row_count_limit(STREAM_PAGE_ROWS)
+            .set_write_batch_size(STREAM_PAGE_ROWS)
+            // A series' timestamps step by its scrape interval, which delta encoding
+            // turns into a run of one small number; a dictionary of them is as large as
+            // the column.
+            .set_column_dictionary_enabled("timestamp_nanos".into(), false)
+            .set_column_encoding(
+                "timestamp_nanos".into(),
+                parquet::basic::Encoding::DELTA_BINARY_PACKED,
+            )
+            // A counter rarely repeats a value, so a dictionary only overflows; split into
+            // byte streams, the slowly changing high bytes compress to almost nothing.
+            .set_column_dictionary_enabled("value".into(), false)
+            .set_column_encoding("value".into(), parquet::basic::Encoding::BYTE_STREAM_SPLIT);
+    }
+    let properties = properties.build();
 
     let file =
         File::create(path).map_err(|e| Error::io(format!("creating {}", path.display()), e))?;
@@ -1170,6 +1364,7 @@ mod tests {
             streams: Vec::new(),
             stream_bounds: Vec::new(),
             stream_rows: Vec::new(),
+            stream_major: false,
         }
     }
 

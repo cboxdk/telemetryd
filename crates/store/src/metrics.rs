@@ -65,33 +65,29 @@ impl Gathered {
     ) -> (Result<()>, bool) {
         self.clear();
         let mut named = true;
-        let outcome = segment.scan_columns(
-            &["timestamp_nanos", "stream_id", "value"],
-            windows,
-            |batch| {
-                let ids = u32_column(batch, "stream_id")?.values();
-                let timestamps = u64_column(batch, "timestamp_nanos")?.values();
-                let values = f64_column(batch, "value")?.values();
-                for ((&id, &at), &value) in ids.iter().zip(timestamps).zip(values) {
-                    if at < start || at > end {
-                        continue;
+        let outcome = scan_wanted(segment, windows, allowed, |batch| {
+            let ids = u32_column(batch, "stream_id")?.values();
+            let timestamps = u64_column(batch, "timestamp_nanos")?.values();
+            let values = f64_column(batch, "value")?.values();
+            for ((&id, &at), &value) in ids.iter().zip(timestamps).zip(values) {
+                if at < start || at > end {
+                    continue;
+                }
+                match allowed.get(id as usize) {
+                    Some(true) => {
+                        self.streams.push(id);
+                        self.timestamps.push(at);
+                        self.values.push(value);
                     }
-                    match allowed.get(id as usize) {
-                        Some(true) => {
-                            self.streams.push(id);
-                            self.timestamps.push(at);
-                            self.values.push(value);
-                        }
-                        Some(false) => {}
-                        None => {
-                            named = false;
-                            return Ok(crate::segment::Flow::Stop);
-                        }
+                    Some(false) => {}
+                    None => {
+                        named = false;
+                        return Ok(crate::segment::Flow::Stop);
                     }
                 }
-                Ok(crate::segment::Flow::Continue)
-            },
-        );
+            }
+            Ok(crate::segment::Flow::Continue)
+        });
         (outcome, named)
     }
 
@@ -467,6 +463,72 @@ impl crate::RecordStore<MetricSchema> {
     }
 }
 
+/// Read the columns a fold needs from the rows of `segment` that can matter: the streams
+/// `allowed` names, within `windows`.
+///
+/// A segment laid out series by series is read as exactly those streams' rows, which is
+/// where a query naming a few series of many saves its time. Any other is read by time
+/// range, every stream's rows, and the caller skips the ones it does not want.
+fn scan_wanted<F>(
+    segment: &crate::segment::Segment,
+    windows: &[(u64, u64)],
+    allowed: &[bool],
+    visit: F,
+) -> Result<()>
+where
+    F: FnMut(&RecordBatch) -> Result<crate::segment::Flow>,
+{
+    const COLUMNS: [&str; 3] = ["timestamp_nanos", "stream_id", "value"];
+    match stream_row_ranges(&segment.manifest, allowed, windows) {
+        Some(ranges) => segment.scan_row_ranges(&COLUMNS, &ranges, visit),
+        None => segment.scan_columns(&COLUMNS, windows, visit),
+    }
+}
+
+/// The row ranges of the streams `allowed` names whose samples reach into `windows`, in a
+/// segment laid out series by series. `None` for a segment laid out in time order, or one
+/// whose per-stream row counts do not add up to its rows — read by time range instead.
+fn stream_row_ranges(
+    manifest: &crate::segment::SegmentManifest,
+    allowed: &[bool],
+    windows: &[(u64, u64)],
+) -> Option<Vec<(usize, usize)>> {
+    if !manifest.stream_major
+        || manifest.stream_rows.len() != manifest.streams.len()
+        || allowed.len() != manifest.streams.len()
+        || manifest
+            .stream_rows
+            .iter()
+            .map(|rows| u64::from(*rows))
+            .sum::<u64>()
+            != manifest.rows
+    {
+        return None;
+    }
+    let bounded = manifest.stream_bounds.len() == manifest.streams.len();
+    let reaches = |stream: usize| {
+        if !bounded {
+            return true;
+        }
+        let (min, max) = manifest.stream_bounds[stream];
+        let first = windows.partition_point(|(_, end)| *end < min);
+        windows.get(first).is_some_and(|(start, _)| *start <= max)
+    };
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0usize;
+    for (stream, rows) in manifest.stream_rows.iter().enumerate() {
+        let end = at + *rows as usize;
+        if allowed[stream] && end > at && reaches(stream) {
+            match ranges.last_mut() {
+                Some(last) if last.1 == at => last.1 = end,
+                _ => ranges.push((at, end)),
+            }
+        }
+        at = end;
+    }
+    Some(ranges)
+}
+
 /// Hand `visit` the buffered samples in `[start, end]` of every series matching
 /// `matchers`, one run per series per chunk, numbering chunks as sources after `source`.
 /// `false` when `visit` stopped the scan.
@@ -546,9 +608,10 @@ fn fold_segment_columns(
 ) -> Result<Option<Vec<crate::folds::StreamFold>>> {
     let mut folds = vec![crate::folds::StreamFold::default(); segment.manifest.streams.len()];
     let mut usable = true;
-    let scanned = segment.scan_columns(
-        &["timestamp_nanos", "stream_id", "value"],
+    let scanned = scan_wanted(
+        segment,
         &[(start_nanos.saturating_add(1), end_nanos)],
+        allowed,
         |batch| {
             let ids = u32_column(batch, "stream_id")?.values();
             let timestamps = u64_column(batch, "timestamp_nanos")?.values();
@@ -699,6 +762,8 @@ fn split_sample(payload: &[u8]) -> Option<(u64, &[u8], &[u8])> {
 
 impl RecordSchema for MetricSchema {
     type Record = MetricSample;
+
+    const STREAM_MAJOR: bool = true;
 
     fn replay_decode(
         payload: &[u8],

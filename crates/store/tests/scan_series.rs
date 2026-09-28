@@ -186,3 +186,78 @@ fn late_buffered_samples_decline_the_fold() {
         .unwrap();
     assert!(folded.is_none(), "{folded:?}");
 }
+
+/// A sealed metric segment lies series by series: streams in label-set order, each
+/// stream's rows one stretch in time order, and the per-stream counts locating them.
+#[test]
+fn a_sealed_metric_segment_lies_series_by_series() {
+    let (_dir, store) = filled();
+    let segments = store.metrics().segments();
+    assert_eq!(segments.len(), 2);
+    for segment in segments {
+        let manifest = &segment.manifest;
+        assert!(manifest.stream_major);
+        assert!(manifest.streams.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let rows = segment.read::<telemetryd_store::MetricSchema>().unwrap();
+        let mut at = 0usize;
+        for (stream, count) in manifest.streams.iter().zip(&manifest.stream_rows) {
+            let run = &rows[at..at + *count as usize];
+            assert!(run.iter().all(|sample| &sample.series == stream));
+            assert!(
+                run.windows(2)
+                    .all(|pair| pair[0].timestamp_nanos < pair[1].timestamp_nanos)
+            );
+            at += *count as usize;
+        }
+        assert_eq!(at, rows.len());
+    }
+}
+
+/// Segments sealed before the series-by-series layout carry no flag and are read by time
+/// range. A store holding such segments beside new ones answers exactly the same.
+#[test]
+fn a_segment_without_the_layout_flag_is_read_by_time_range() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = Store::open(&config(dir.path())).unwrap();
+        for at in 1..=100 {
+            store.metrics().append(&step(at * 10)).unwrap();
+            if at == 50 {
+                store.metrics().seal_now().unwrap();
+            }
+        }
+        store.metrics().seal_now().unwrap();
+    }
+    let segments = dir.path().join("segments").join("metrics");
+    let first = std::fs::read_dir(&segments)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .min()
+        .unwrap();
+    let manifest = first.join("manifest.json");
+    let written = std::fs::read_to_string(&manifest).unwrap();
+    let flagged = "\"stream_major\": true";
+    assert!(written.contains(flagged), "{written}");
+    std::fs::write(
+        &manifest,
+        written.replace(flagged, "\"stream_major\": false"),
+    )
+    .unwrap();
+
+    let store = Store::open(&config(dir.path())).unwrap();
+    let flags: Vec<bool> = store
+        .metrics()
+        .segments()
+        .iter()
+        .map(|segment| segment.manifest.stream_major)
+        .collect();
+    assert_eq!(flags.iter().filter(|flag| !**flag).count(), 1, "{flags:?}");
+    let span = (105 * SECOND, 995 * SECOND);
+    for matchers in [vec![], name_is("count")] {
+        assert_eq!(
+            by_scan(&store, &[span], &matchers),
+            by_rows(&store, span, &matchers)
+        );
+    }
+}
