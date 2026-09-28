@@ -381,6 +381,9 @@ pub struct Replay {
     pub truncated: Option<Truncation>,
 }
 
+/// How much of a segment replay reads at a time.
+const REPLAY_BUFFER: usize = 1 << 20;
+
 /// Replay every segment in `dir`, repairing a torn tail if present.
 ///
 /// `visit` is called for each intact record in append order. Records are streamed
@@ -413,13 +416,16 @@ where
     for (index, seq) in sequences.iter().copied().enumerate() {
         let is_last = index + 1 == sequences.len();
         let path = segment_path(dir, seq);
-        let mut file = File::open(&path)
+        let file = File::open(&path)
             .map_err(|e| Error::io(format!("opening WAL segment {}", path.display()), e))?;
         let total = file
             .metadata()
             .map_err(|e| Error::io(format!("stat {}", path.display()), e))?
             .len();
 
+        // Buffered: a record is two reads, a header and a payload, and unbuffered each
+        // was a system call — 1.6 million of them to replay 800,000 metric samples.
+        let mut file = std::io::BufReader::with_capacity(REPLAY_BUFFER, file);
         verify_header(&mut file, &path)?;
         let mut offset = HEADER_LEN_U64;
 
@@ -475,7 +481,7 @@ enum Frame {
     Torn(TruncationReason),
 }
 
-fn read_frame(file: &mut File, path: &Path) -> Result<Frame> {
+fn read_frame(file: &mut impl Read, path: &Path) -> Result<Frame> {
     let mut header = [0u8; FRAME_HEADER_LEN];
     match read_exact_or_eof(file, &mut header, path)? {
         ReadOutcome::Eof => return Ok(Frame::End),
@@ -513,7 +519,7 @@ enum ReadOutcome {
     Eof,
 }
 
-fn read_exact_or_eof(file: &mut File, buf: &mut [u8], path: &Path) -> Result<ReadOutcome> {
+fn read_exact_or_eof(file: &mut impl Read, buf: &mut [u8], path: &Path) -> Result<ReadOutcome> {
     if buf.is_empty() {
         return Ok(ReadOutcome::Full);
     }
@@ -547,7 +553,7 @@ fn repair_tail(path: &Path, valid_bytes: u64) -> Result<()> {
     Ok(())
 }
 
-fn verify_header(file: &mut File, path: &Path) -> Result<()> {
+fn verify_header(file: &mut (impl Read + Seek), path: &Path) -> Result<()> {
     let mut header = [0u8; HEADER_LEN];
     match read_exact_or_eof(file, &mut header, path)? {
         // A zero-length segment is what `open_segment` leaves after creating a file it

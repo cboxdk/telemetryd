@@ -442,8 +442,58 @@ fn fold_rows(
     true
 }
 
+/// A logged sample's timestamp, the bytes of its label set, and what follows them.
+///
+/// Postcard lays a [`MetricSample`] out field by field: the timestamp as a varint, the
+/// labels as a varint count of varint-length-prefixed strings, then the value and kind.
+/// `None` when the bytes do not walk that way, and the caller decodes in full.
+fn split_sample(payload: &[u8]) -> Option<(u64, &[u8], &[u8])> {
+    fn varint(bytes: &[u8], at: &mut usize) -> Option<u64> {
+        let mut value = 0u64;
+        for shift in (0..64).step_by(7) {
+            let byte = *bytes.get(*at)?;
+            *at += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+    let mut at = 0;
+    let timestamp = varint(payload, &mut at)?;
+    let start = at;
+    let pairs = varint(payload, &mut at)?;
+    for _ in 0..pairs.checked_mul(2)? {
+        let len = usize::try_from(varint(payload, &mut at)?).ok()?;
+        at = at.checked_add(len).filter(|end| *end <= payload.len())?;
+    }
+    Some((timestamp, &payload[start..at], &payload[at..]))
+}
+
 impl RecordSchema for MetricSchema {
     type Record = MetricSample;
+
+    fn replay_decode(
+        payload: &[u8],
+        seen: &mut crate::schema::ReplayLabels,
+    ) -> postcard::Result<Self::Record> {
+        let Some((timestamp_nanos, series, rest)) = split_sample(payload) else {
+            return Self::decode_wal(payload);
+        };
+        if let Some(labels) = seen.get(series) {
+            let (value, kind): (f64, MetricKind) = postcard::from_bytes(rest)?;
+            return Ok(MetricSample {
+                timestamp_nanos,
+                series: labels.clone(),
+                value,
+                kind,
+            });
+        }
+        let sample = Self::decode_wal(payload)?;
+        seen.remember(series, &sample.series);
+        Ok(sample)
+    }
 
     const SIGNAL: Signal = Signal::Metrics;
 
@@ -608,6 +658,45 @@ mod tests {
     fn materialize_all(batch: &RecordBatch, streams: &[Labels]) -> Vec<MetricSample> {
         let rows: Rows = (0..u32::try_from(batch.num_rows()).unwrap_or(u32::MAX)).collect();
         MetricSchema::materialize(batch, &rows, streams).unwrap()
+    }
+
+    /// Replay's shortcut must decode exactly what the full decoder does — including
+    /// label values long enough for multi-byte varints, and values that are not finite.
+    #[test]
+    fn replay_decoding_agrees_with_full_decoding() {
+        let long = "x".repeat(300);
+        let mut series = Labels::new();
+        series.insert(METRIC_NAME_LABEL, "m");
+        series.insert("long", long);
+        series.insert("i", "é");
+        let mut seen = crate::schema::ReplayLabels::default();
+        for (i, value) in [0.0, -1.5, f64::INFINITY, 1e300, f64::MIN_POSITIVE]
+            .into_iter()
+            .enumerate()
+        {
+            for kind in [MetricKind::Gauge, MetricKind::Counter, MetricKind::Unknown] {
+                let original = MetricSample {
+                    timestamp_nanos: u64::MAX - i as u64,
+                    series: series.clone(),
+                    value,
+                    kind,
+                };
+                let payload = postcard::to_allocvec(&original).unwrap();
+                // Twice: the first decodes in full and remembers, the second hits.
+                for _ in 0..2 {
+                    let decoded = MetricSchema::replay_decode(&payload, &mut seen).unwrap();
+                    assert_eq!(decoded, original);
+                }
+            }
+        }
+        assert!(
+            split_sample(&[0xff]).is_none(),
+            "a truncated varint is no sample"
+        );
+        assert!(
+            split_sample(&[1, 1, 9, b'a']).is_none(),
+            "nor a string past the end"
+        );
     }
 
     fn sample(i: u64) -> MetricSample {

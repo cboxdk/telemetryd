@@ -465,8 +465,9 @@ impl<S: RecordSchema> RecordStore<S> {
             .unwrap_or(0);
 
         let mut buffer = Buffer::<S>::new();
+        let mut seen = crate::schema::ReplayLabels::default();
         let replayed = wal::replay_from(wal_dir, sealed_through, |payload| {
-            match S::decode_wal(payload) {
+            match S::replay_decode(payload, &mut seen) {
                 Ok(record) => {
                     // `push` counts its size. Counting it here as well charged every
                     // replayed record twice, and a restart sealed early for it.

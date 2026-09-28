@@ -23,6 +23,28 @@ pub type Rows = Vec<u32>;
 /// much work is skipped, never what the answer is. Same contract as the Bloom filter.
 pub type ColumnFilter<'a> = &'a (dyn Fn(&RecordBatch, &mut Rows) -> Result<()> + Sync);
 
+/// Label sets already decoded during one replay, by their encoded bytes.
+#[derive(Debug, Default)]
+pub struct ReplayLabels {
+    seen: std::collections::HashMap<Box<[u8]>, Labels>,
+}
+
+impl ReplayLabels {
+    /// How many label sets one replay remembers; past it, the rest decode as usual.
+    const CAPACITY: usize = 200_000;
+
+    #[must_use]
+    pub fn get(&self, encoded: &[u8]) -> Option<&Labels> {
+        self.seen.get(encoded)
+    }
+
+    pub fn remember(&mut self, encoded: &[u8], labels: &Labels) {
+        if self.seen.len() < Self::CAPACITY {
+            self.seen.insert(encoded.into(), labels.clone());
+        }
+    }
+}
+
 pub trait RecordSchema: Send + Sync + 'static {
     /// The decoded record type, as it exists in memory and in the WAL.
     type Record: Serialize + DeserializeOwned + Clone + Send + Sync + std::fmt::Debug + 'static;
@@ -120,6 +142,16 @@ pub trait RecordSchema: Send + Sync + 'static {
     /// skip records that were acknowledged before it.
     fn decode_wal(payload: &[u8]) -> postcard::Result<Self::Record> {
         postcard::from_bytes(payload)
+    }
+
+    /// Decode one record while replaying the log, where the same label sets recur.
+    ///
+    /// `seen` holds label sets already decoded, keyed by their encoded bytes, for a
+    /// schema that can find those bytes in a record — metrics, whose log is the same few
+    /// thousand series hundreds of times over. Others decode as ever.
+    fn replay_decode(payload: &[u8], seen: &mut ReplayLabels) -> postcard::Result<Self::Record> {
+        let _ = seen;
+        Self::decode_wal(payload)
     }
 
     /// A high-cardinality identifier that queries look up by exact value.
