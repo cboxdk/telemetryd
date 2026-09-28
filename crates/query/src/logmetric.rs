@@ -140,6 +140,21 @@ impl RangeFunction {
         }
     }
 
+    /// Whether Loki accepts `by`/`without` on the aggregation itself.
+    fn groups(self) -> bool {
+        matches!(
+            self,
+            Self::AvgOverTime
+                | Self::MinOverTime
+                | Self::MaxOverTime
+                | Self::StddevOverTime
+                | Self::StdvarOverTime
+                | Self::QuantileOverTime
+                | Self::FirstOverTime
+                | Self::LastOverTime
+        )
+    }
+
     /// Whether summing the function's per-series values equals applying it to the
     /// series' samples merged — the condition for grouping before extraction.
     fn sums(self) -> bool {
@@ -295,9 +310,9 @@ fn range_aggregation(p: &mut Parser, function: RangeFunction) -> Result<RangeAgg
         }
         _ => {}
     }
-    if grouping.is_some() && unwrap.is_none() {
+    if grouping.is_some() && !function.groups() {
         return Err(Error::BadRequest(format!(
-            "grouping belongs to an unwrapped range aggregation; group `{name}` with \
+            "grouping not allowed for {name} aggregation; group it from outside, like \
              sum by (…) ({name}(…))"
         )));
     }
@@ -682,7 +697,19 @@ impl RangeAggregation {
         #[allow(clippy::cast_precision_loss)]
         let value = match &self.unwrap {
             Some(unwrap) => {
-                let value = unwrap.read(&mut labels);
+                let value = match unwrap.read(&mut labels) {
+                    Some(value) => value,
+                    // Loki's `avg_over_time(…) by (…)` is a sum over a count, and the
+                    // count reads no label: a line without it lowers the average, and one
+                    // its pipeline could not parse refuses the query. Loki answers so.
+                    None if self.function == RangeFunction::AvgOverTime
+                        && self.grouping.is_some() =>
+                    {
+                        MISSING
+                    }
+                    // Without the label there is no sample, as in Loki.
+                    None => return None,
+                };
                 if !unwrap.filters.iter().all(|f| f.apply(&mut labels)) {
                     return None;
                 }
@@ -710,8 +737,11 @@ impl RangeAggregation {
             .filter(|(name, value)| !value.is_empty() && is_label_name(name))
             .filter(|(name, _)| match &self.grouping {
                 None => true,
-                Some(_) if failed && name.starts_with("__error") => true,
+                // A `sum` with no labels at all keeps none — not even an error, which is
+                // why Loki answers `sum(count_over_time({…} | json [5m]))` over lines
+                // that did not parse, and refuses the same thing `by` a label.
                 Some(Grouping::All) => false,
+                Some(_) if failed && name.starts_with("__error") => true,
                 Some(Grouping::By(names)) => names.iter().any(|n| n == name),
                 Some(Grouping::Without(names)) => !names.iter().any(|n| n == name),
             })
@@ -794,6 +824,15 @@ impl RangeAggregation {
             RangeFunction::Rate if self.unwrap.is_none() => count / seconds,
             RangeFunction::Rate | RangeFunction::BytesRate => sum() / seconds,
             RangeFunction::BytesOverTime | RangeFunction::SumOverTime => sum(),
+            RangeFunction::AvgOverTime if self.grouping.is_some() => {
+                // Loki's sum over count; see `sample`.
+                let total: f64 = window
+                    .iter()
+                    .filter(|(_, v)| !is_missing(*v))
+                    .map(|(_, v)| v)
+                    .sum();
+                total / count
+            }
             RangeFunction::AvgOverTime => {
                 let mut mean = 0.0;
                 for (n, (_, v)) in window.iter().enumerate() {
@@ -818,26 +857,39 @@ impl RangeAggregation {
 }
 
 impl Unwrap {
-    /// The unwrapped value, taking the label out of the series. A value that does not
-    /// read marks the line `SampleExtractionErr`, as Loki does.
-    fn read(&self, labels: &mut Labels) -> f64 {
-        let raw = labels.remove(&self.label);
-        let parsed = raw.as_deref().and_then(|raw| match self.conversion {
+    /// The unwrapped value, taking the label out of the series: `None` when the line has
+    /// no such label. A value that does not read marks the line `SampleExtractionErr`,
+    /// as Loki does.
+    fn read(&self, labels: &mut Labels) -> Option<f64> {
+        let raw = labels.remove(&self.label)?;
+        let parsed = match self.conversion {
             Conversion::Number => raw.trim().parse::<f64>().ok(),
-            Conversion::Duration => crate::logstage::parse_duration(raw),
-            Conversion::Bytes => crate::logstage::parse_bytes(raw),
-        });
-        parsed.unwrap_or_else(|| {
+            Conversion::Duration => crate::logstage::parse_duration(&raw),
+            Conversion::Bytes => crate::logstage::parse_bytes(&raw),
+        };
+        Some(parsed.unwrap_or_else(|| {
             if labels.get("__error__").is_none_or(str::is_empty) {
                 labels.insert("__error__", "SampleExtractionErr");
+                // Go's words, as Loki reports them.
                 labels.insert(
                     "__error_details__",
-                    format!("{:?} does not unwrap as a value", raw.unwrap_or_default()),
+                    match self.conversion {
+                        Conversion::Duration => format!("time: invalid duration {raw:?}"),
+                        _ => format!("strconv.ParseFloat: parsing {raw:?}: invalid syntax"),
+                    },
                 );
             }
             0.0
-        })
+        }))
     }
+}
+
+/// A line `avg_over_time(…) by (…)` counts without a value; see `sample`. A NaN no
+/// parse produces, so a real NaN in the data stays a value.
+const MISSING: f64 = f64::from_bits(0x7ff8_0000_dead_beef);
+
+fn is_missing(value: f64) -> bool {
+    value.to_bits() == MISSING.to_bits()
 }
 
 /// The samples in `(floor, top]`.

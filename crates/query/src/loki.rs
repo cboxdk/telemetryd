@@ -396,14 +396,12 @@ pub struct StreamResult {
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub enum Entry {
+    /// `[ts, line]`: the flat shape, where a line's metadata is in its stream's labels.
     Plain([String; 2]),
-    WithMetadata(String, String, BTreeMap<String, String>),
     /// Loki's categorised shape: `[ts, line, {"structuredMetadata": {…}, "parsed": {…}}]`.
     ///
     /// Grafana's Loki datasource always asks for it, and its reader for the flat shape
-    /// takes exactly two elements — so any line carrying attributes failed to parse and
-    /// Explore showed nothing. The flat shape stays the default because
-    /// `laravel-telemetry-ui` reads the third element as a flat map.
+    /// takes exactly two elements.
     Categorized(String, String, Categorized),
 }
 
@@ -421,15 +419,6 @@ pub struct Categorized {
 }
 
 impl Entry {
-    pub fn new(timestamp_nanos: u64, line: String, metadata: BTreeMap<String, String>) -> Self {
-        if metadata.is_empty() {
-            // Match Loki, which omits the element entirely rather than sending {}.
-            Self::Plain([timestamp_nanos.to_string(), line])
-        } else {
-            Self::WithMetadata(timestamp_nanos.to_string(), line, metadata)
-        }
-    }
-
     /// A categorised entry: attributes as structured metadata, parser output as parsed.
     pub fn categorized(
         timestamp_nanos: u64,
@@ -453,7 +442,7 @@ impl Entry {
 
     pub fn timestamp(&self) -> &str {
         match self {
-            Self::Plain([ts, _]) | Self::WithMetadata(ts, _, _) | Self::Categorized(ts, _, _) => ts,
+            Self::Plain([ts, _]) | Self::Categorized(ts, _, _) => ts,
         }
     }
 
@@ -461,9 +450,7 @@ impl Entry {
     /// does not have to match on the variant to learn which tuple slot holds what.
     pub fn line(&self) -> &str {
         match self {
-            Self::Plain([_, line])
-            | Self::WithMetadata(_, line, _)
-            | Self::Categorized(_, line, _) => line,
+            Self::Plain([_, line]) | Self::Categorized(_, line, _) => line,
         }
     }
 }
@@ -670,8 +657,16 @@ fn group_into_streams(
         let entry = if categorize {
             Entry::categorized(record.timestamp_nanos, line, metadata, extracted)
         } else {
+            // Loki's flat shape: a line's structured metadata and parsed labels are
+            // labels of its stream, and a line whose differ is in a stream of its own.
+            // Every entry stays `[ts, line]`, which is what a client of this shape reads.
             metadata.extend(extracted);
-            Entry::new(record.timestamp_nanos, line, metadata)
+            for (name, value) in metadata {
+                if stream.get(&name).is_none() {
+                    stream.insert(name, value);
+                }
+            }
+            Entry::Plain([record.timestamp_nanos.to_string(), line])
         };
         grouped.entry(stream).or_default().push(entry);
     }

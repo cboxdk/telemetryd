@@ -266,17 +266,29 @@ the first, deterministically.
 third element is `{"structuredMetadata":{…},"parsed":{…}}`: record attributes in the
 first, fields a `| json` or `| logfmt` stage extracted in the second. Grafana's reader for
 the flat shape takes exactly two elements, so before this any line with attributes
-failed to parse there. Without the header the flat shape below is unchanged.
+failed to parse there.
 
-**Entries carry structured metadata.** Each `values` element is
-`[timestamp, line]` or `[timestamp, line, {…}]`. The third element is where
-per-record OTLP attributes go — `order.id`, `session.id`, `trace_id`. The UI merges it
-over the stream labels. Promoting those attributes to stream labels instead would
-explode cardinality; omitting them entirely would make them invisible in the UI even
-though telemetryd stored them. Timestamps are **strings** of nanoseconds, because a
-JSON number cannot hold them without loss in JavaScript.
+**Without the header, Loki's flat shape.** Each `values` element is `[timestamp, line]`,
+and a line's structured metadata — per-record OTLP attributes such as `order_id` and
+`trace_id`, and `detected_level` — and any labels its pipeline parsed are labels of its
+stream, so lines whose metadata differ are in streams of their own. That is what Loki
+answers; `laravel-telemetry-ui` reads the labels either way. Before 0.69.0 the metadata
+travelled as a third element of the entry instead. They are *response* labels: nothing
+is promoted to the stored stream, whose cardinality stays bounded. Timestamps are
+**strings** of nanoseconds, because a JSON number cannot hold them without loss in
+JavaScript. The live tail answers in the same flat shape.
 
 ### LogQL subset
+
+**Held to Loki.** `crates/server/tests/conformance/logql.json` holds log lines, 62
+queries — log and metric, range and instant — and Loki 3.7.8's answer to each, written by
+Loki through `scripts/loki-conformance.py`. Every answer telemetryd gives must match it:
+each stream's labels, each entry with its structured metadata and parsed labels, each
+series and value. CI asks Loki again on every run, so the file cannot say something Loki
+would not. The rules below that read like Loki's quirks are there because Loki answers so.
+
+Every line carries `detected_level` in its structured metadata — the level telemetryd
+stored it at — as Loki adds it. Grafana's log volume and Logs Drilldown group by it.
 
 Supported:
 
@@ -293,17 +305,21 @@ Supported:
   response showed `_extracted`, and `__error__` was never set.
 - the `regexp` and `pattern` parsers — named groups and `<name>` captures become labels,
   under the same collision rule
-- `line_format` and `label_format` templates: `{{.label}}`, `{{__line__}}`, literals and
-  the functions `ToUpper`/`upper`, `ToLower`/`lower`, `Title`, `TrimSpace`/`trim`,
-  `default`, `replace` and `trunc`. A template using any other Go template feature is
-  refused by name rather than rendered wrong.
+- `line_format` and `label_format` templates: `{{.label}}`, `{{__line__}}`, quoted text
+  and numbers, with `ToUpper`/`upper`, `ToLower`/`lower`, `Title`, `TrimSpace`/`trim`,
+  `default`, `replace`, `trunc`, `trimPrefix` and `trimSuffix` — called, as in
+  `{{ToUpper .path}}` and `{{default "none" .user}}`, or piped, as in
+  `{{.path | trunc 3}}`, with Go's rule that a piped value is the last argument. A
+  template using any other Go template feature is refused by name rather than rendered
+  wrong.
 - `drop` and `keep`, by name or by `name="value"` matcher, and `decolorize`
 - label filters, including `and` / `or` chains — `| status="500" or status="503"` is
   what the UI's compiler emits, so a single bare matcher would not have been enough
 - numeric label filters: `| status >= 500`, `| took > 250ms`, `| size < 20MB`. The
   literal decides how the label is read — a number, a Go duration, a byte size. As in
   Loki, a missing label fails the comparison, and a value that does not read as the
-  literal's kind keeps the line with `__error__="LabelFilterErr"`.
+  literal's kind keeps the line with `__error__="LabelFilterErr"` and Go's own error text
+  in `__error_details__`.
 
 **telemetryd superset:** label filters can read per-record attributes without a parser
 stage. OTLP records are already structured, so requiring `| json` to reach them would
@@ -337,16 +353,25 @@ evaluator — the one held to Prometheus by the conformance suite — answers it
 
 As in Loki:
 
-- a window is `(t - range, t]`, and a series with no line in it is absent at that step
+- a window is `(t - range, t]`, and a series with no line in it is absent at that step;
+  a range query's steps are whole multiples of `step`, the start rounded down and the
+  end up
 - a series carries every label its lines carry, structured metadata included, so
   `count_over_time` over lines that each have a `trace_id` is a series per line.
   `sum by (…)` directly above a summing aggregation groups as the lines are read, so the
   usual form — Grafana's log volume, `sum by (level) (count_over_time(…))` — holds only
   its groups. More than 10,000 series in one aggregation or answer is refused.
-- the unwrapped label leaves the series; a value that does not read marks the line
-  `__error__="SampleExtractionErr"`
+- the unwrapped label leaves the series; a line without it gives no sample, and one
+  whose value does not read is marked `__error__="SampleExtractionErr"`
 - a series carrying `__error__` refuses the query with Loki's `pipeline error: …`
-  message, until a filter like `| __error__=""` or `| drop __error__` handles it
+  message, until a filter like `| __error__=""` or `| drop __error__` handles it. An
+  error survives `by` and `without`, but not a `sum` with no labels at all: Loki answers
+  `sum(count_over_time({…} | json [5m]))` over lines that did not parse
+- `by`/`without` on the range aggregation itself is Loki's list: `avg`, `min`, `max`,
+  `stddev`, `stdvar`, `quantile`, `first` and `last`; on anything else it is refused
+- `avg_over_time(…) by (…)` divides by every line, including those without the
+  unwrapped label — Loki evaluates it as a sum over a count that reads no label
+- `topk` and `bottomk` break ties in their own order; PromQL leaves ties unspecified
 
 A PromQL series name, a subquery, or a function or aggregation LogQL does not have is
 refused by name — ask the Prometheus API for series.

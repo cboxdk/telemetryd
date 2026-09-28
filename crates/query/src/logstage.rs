@@ -7,7 +7,8 @@
 
 use telemetryd_core::{Error, Labels, Result};
 
-/// A `line_format` or `label_format` template: text with `{{ .label | fn … }}` actions.
+/// A `line_format` or `label_format` template: text with Go template actions —
+/// `{{.label}}`, `{{ToUpper .path}}`, `{{.path | trunc 3}}`, `{{default "none" .x}}`.
 #[derive(Debug, Clone)]
 pub struct Template {
     parts: Vec<Part>,
@@ -16,35 +17,118 @@ pub struct Template {
 #[derive(Debug, Clone)]
 enum Part {
     Text(String),
-    Action {
-        source: Source,
-        functions: Vec<Call>,
-    },
+    /// A pipeline: each command's value is the last argument of the next, as in Go.
+    Action(Vec<Command>),
 }
 
 #[derive(Debug, Clone)]
-enum Source {
+struct Command {
+    /// `None` for a bare operand, which only a pipeline's first command may be.
+    function: Option<Function>,
+    args: Vec<Operand>,
+}
+
+#[derive(Debug, Clone)]
+enum Operand {
     Label(String),
     Line,
     Literal(String),
 }
 
-#[derive(Debug, Clone)]
-enum Call {
+#[derive(Debug, Clone, Copy)]
+enum Function {
     Upper,
     Lower,
     Title,
     Trim,
-    Default(String),
-    Replace(String, String),
-    Truncate(usize),
+    Default,
+    Replace,
+    Truncate,
+    TrimPrefix,
+    TrimSuffix,
+}
+
+impl Function {
+    fn named(name: &str) -> Option<Self> {
+        Some(match name {
+            "ToUpper" | "upper" => Self::Upper,
+            "ToLower" | "lower" => Self::Lower,
+            "Title" | "title" => Self::Title,
+            "TrimSpace" | "trim" => Self::Trim,
+            "default" => Self::Default,
+            "replace" => Self::Replace,
+            "trunc" => Self::Truncate,
+            "trimPrefix" | "TrimPrefix" => Self::TrimPrefix,
+            "trimSuffix" | "TrimSuffix" => Self::TrimSuffix,
+            _ => return None,
+        })
+    }
+
+    /// How many arguments it takes, the piped value included.
+    fn arity(self) -> usize {
+        match self {
+            Self::Upper | Self::Lower | Self::Title | Self::Trim => 1,
+            Self::Default | Self::Truncate | Self::TrimPrefix | Self::TrimSuffix => 2,
+            Self::Replace => 3,
+        }
+    }
+
+    /// Apply to its arguments, in Go's order: the value is the last.
+    fn apply(self, args: &[String]) -> String {
+        let value = args.last().cloned().unwrap_or_default();
+        match self {
+            Self::Upper => value.to_uppercase(),
+            Self::Lower => value.to_lowercase(),
+            Self::Title => value
+                .split(' ')
+                .map(|word| {
+                    let mut chars = word.chars();
+                    chars.next().map_or_else(String::new, |first| {
+                        first.to_uppercase().chain(chars).collect()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            Self::Trim => value.trim().to_owned(),
+            Self::Default => {
+                if value.is_empty() {
+                    args[0].clone()
+                } else {
+                    value
+                }
+            }
+            Self::Replace => value.replace(args[0].as_str(), &args[1]),
+            Self::Truncate => {
+                let length = args[0].trim().parse::<i64>().unwrap_or(0);
+                let count = value.chars().count();
+                // Sprig's `trunc`: a negative length keeps the end.
+                if length >= 0 {
+                    value
+                        .chars()
+                        .take(usize::try_from(length).unwrap_or(0))
+                        .collect()
+                } else {
+                    let keep = usize::try_from(-length).unwrap_or(0).min(count);
+                    value.chars().skip(count - keep).collect()
+                }
+            }
+            Self::TrimPrefix => value
+                .strip_prefix(args[0].as_str())
+                .unwrap_or(&value)
+                .to_owned(),
+            Self::TrimSuffix => value
+                .strip_suffix(args[0].as_str())
+                .unwrap_or(&value)
+                .to_owned(),
+        }
+    }
 }
 
 impl Template {
     /// Parse a template.
     ///
     /// # Errors
-    /// An action that is not `.label`, `__line__` or a quoted string, piped through the
+    /// An action outside `.label`, `__line__`, quoted text and numbers, composed with the
     /// supported functions — `if`, `range`, variables and the rest are named.
     pub fn parse(text: &str) -> Result<Self> {
         let mut parts = Vec::new();
@@ -71,20 +155,26 @@ impl Template {
     /// Render against a line's labels and the line itself.
     #[must_use]
     pub fn render(&self, labels: &Labels, line: &str) -> String {
+        let operand = |operand: &Operand| match operand {
+            Operand::Label(name) => labels.get(name).unwrap_or("").to_owned(),
+            Operand::Line => line.to_owned(),
+            Operand::Literal(text) => text.clone(),
+        };
         let mut out = String::new();
         for part in &self.parts {
             match part {
                 Part::Text(text) => out.push_str(text),
-                Part::Action { source, functions } => {
-                    let mut value = match source {
-                        Source::Label(name) => labels.get(name).unwrap_or("").to_owned(),
-                        Source::Line => line.to_owned(),
-                        Source::Literal(text) => text.clone(),
-                    };
-                    for function in functions {
-                        value = function.apply(value);
+                Part::Action(commands) => {
+                    let mut piped: Option<String> = None;
+                    for command in commands {
+                        let mut args: Vec<String> = command.args.iter().map(operand).collect();
+                        args.extend(piped.take());
+                        piped = Some(match command.function {
+                            Some(function) => function.apply(&args),
+                            None => args.pop().unwrap_or_default(),
+                        });
                     }
-                    out.push_str(&value);
+                    out.push_str(&piped.unwrap_or_default());
                 }
             }
         }
@@ -93,84 +183,97 @@ impl Template {
 }
 
 fn parse_action(action: &str) -> Result<Part> {
-    let mut stages = action.split('|').map(str::trim);
-    let head = stages.next().unwrap_or_default();
-    let source = if head == "__line__" {
-        Source::Line
-    } else if let Some(name) = head.strip_prefix('.') {
-        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    let mut commands = Vec::new();
+    for (index, command) in split_pipeline(action).iter().enumerate() {
+        let words = split_words(command);
+        let Some(first) = words.first() else {
             return Err(unsupported_action(action));
-        }
-        Source::Label(name.to_owned())
-    } else if let Some(text) = quoted(head) {
-        Source::Literal(text)
-    } else {
-        return Err(unsupported_action(action));
-    };
-    let functions = stages.map(parse_call).collect::<Result<Vec<_>>>()?;
-    Ok(Part::Action { source, functions })
-}
-
-fn parse_call(call: &str) -> Result<Call> {
-    let mut words = split_words(call).into_iter();
-    let name = words.next().unwrap_or_default();
-    let args: Vec<String> = words.collect();
-    let arg = |i: usize| args.get(i).and_then(|a| quoted(a));
-    Ok(match (name.as_str(), args.len()) {
-        ("ToUpper" | "upper", 0) => Call::Upper,
-        ("ToLower" | "lower", 0) => Call::Lower,
-        ("Title" | "title", 0) => Call::Title,
-        ("TrimSpace" | "trim", 0) => Call::Trim,
-        ("default", 1) => Call::Default(arg(0).ok_or_else(|| unsupported_action(call))?),
-        ("replace", 2) => Call::Replace(
-            arg(0).ok_or_else(|| unsupported_action(call))?,
-            arg(1).ok_or_else(|| unsupported_action(call))?,
-        ),
-        ("trunc", 1) => Call::Truncate(args[0].parse().map_err(|_| unsupported_action(call))?),
-        _ => {
-            return Err(Error::unsupported_with_hint(
-                format!("the template function `{name}`"),
-                "supported: ToUpper, ToLower, Title, TrimSpace, default, replace, trunc",
-            ));
-        }
-    })
-}
-
-impl Call {
-    fn apply(&self, value: String) -> String {
-        match self {
-            Self::Upper => value.to_uppercase(),
-            Self::Lower => value.to_lowercase(),
-            Self::Title => value
-                .split(' ')
-                .map(|word| {
-                    let mut chars = word.chars();
-                    chars.next().map_or_else(String::new, |first| {
-                        first.to_uppercase().chain(chars).collect()
-                    })
-                })
-                .collect::<Vec<_>>()
-                .join(" "),
-            Self::Trim => value.trim().to_owned(),
-            Self::Default(fallback) => {
-                if value.is_empty() {
-                    fallback.clone()
-                } else {
-                    value
-                }
+        };
+        let command = if let Some(function) = Function::named(first) {
+            let args = words[1..]
+                .iter()
+                .map(|word| parse_operand(word).ok_or_else(|| unsupported_action(action)))
+                .collect::<Result<Vec<_>>>()?;
+            let piped = usize::from(index > 0);
+            if args.len() + piped != function.arity() {
+                return Err(Error::BadRequest(format!(
+                    "`{first}` takes {} argument(s) in the template action `{{{{{action}}}}}`",
+                    function.arity()
+                )));
             }
-            // Go's `replace` in Loki's templates: the value is the last argument.
-            Self::Replace(from, to) => value.replace(from.as_str(), to),
-            Self::Truncate(length) => value.chars().take(*length).collect(),
-        }
+            Command {
+                function: Some(function),
+                args,
+            }
+        } else {
+            let operand = parse_operand(first).filter(|_| words.len() == 1 && index == 0);
+            let Some(operand) = operand else {
+                return Err(if first.chars().all(|c| c.is_ascii_alphabetic()) {
+                    Error::unsupported_with_hint(
+                        format!("the template function `{first}`"),
+                        "supported: ToUpper, ToLower, Title, TrimSpace, default, replace, \
+                         trunc, trimPrefix, trimSuffix",
+                    )
+                } else {
+                    unsupported_action(action)
+                });
+            };
+            Command {
+                function: None,
+                args: vec![operand],
+            }
+        };
+        commands.push(command);
     }
+    Ok(Part::Action(commands))
+}
+
+fn parse_operand(word: &str) -> Option<Operand> {
+    if word == "__line__" {
+        return Some(Operand::Line);
+    }
+    if let Some(name) = word.strip_prefix('.') {
+        return (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+            .then(|| Operand::Label(name.to_owned()));
+    }
+    if let Some(text) = quoted(word) {
+        return Some(Operand::Literal(text));
+    }
+    word.parse::<f64>()
+        .is_ok()
+        .then(|| Operand::Literal(word.to_owned()))
+}
+
+/// The commands of a pipeline, split on `|` outside quotes.
+fn split_pipeline(action: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for c in action.chars() {
+        match quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if c == '\\' => escaped = true,
+            Some(q) if c == q => quote = None,
+            None if c == '"' || c == '`' => quote = Some(c),
+            None if c == '|' => {
+                commands.push(std::mem::take(&mut current).trim().to_owned());
+                continue;
+            }
+            Some(_) | None => {}
+        }
+        current.push(c);
+    }
+    commands.push(current.trim().to_owned());
+    commands
 }
 
 fn unsupported_action(action: &str) -> Error {
     Error::unsupported_with_hint(
         format!("the template action `{{{{{action}}}}}`"),
-        "supported: `{{.label}}`, `{{__line__}}` and quoted text, piped through ToUpper, \
-         ToLower, Title, TrimSpace, default, replace or trunc",
+        "supported: `{{.label}}`, `{{__line__}}`, quoted text and numbers, with ToUpper, \
+         ToLower, Title, TrimSpace, default, replace, trunc, trimPrefix and trimSuffix — \
+         called, like `{{ToUpper .path}}`, or piped, like `{{.path | ToUpper}}`",
     )
 }
 
@@ -179,8 +282,17 @@ fn split_words(text: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;
+    let mut escaped = false;
     for c in text.chars() {
         match quote {
+            Some('"') if escaped => {
+                current.push(c);
+                escaped = false;
+            }
+            Some('"') if c == '\\' => {
+                current.push(c);
+                escaped = true;
+            }
             Some(q) if c == q => {
                 current.push(c);
                 quote = None;

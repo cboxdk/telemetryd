@@ -255,12 +255,22 @@ jobs:
       - name: Prometheus agrees with every expectation
         run: python3 scripts/promql-conformance.py --check
 
+  # The same for LogQL: `crates/server/tests/logql_conformance.rs` holds telemetryd to
+  # Loki's answers in `check`; this asks Loki again.
+  logql-conformance:
+    name: LogQL answers match Loki
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Loki agrees with every expectation
+        run: python3 scripts/loki-conformance.py --check
+
   # A single required check, so branch protection does not need updating every time
   # the matrix changes.
   ci:
     name: ci
     if: always()
-    needs: [check, deny, msrv, supply-chain, build, promql-conformance]
+    needs: [check, deny, msrv, supply-chain, build, promql-conformance, logql-conformance]
     runs-on: ubuntu-latest
     steps:
       # Parsed with jq rather than grep. The grep version worked, but only because

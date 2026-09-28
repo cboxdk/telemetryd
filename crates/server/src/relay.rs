@@ -622,8 +622,30 @@ mod tests {
             listener.set_nonblocking(false).unwrap();
             for stream in listener.incoming().take(1) {
                 let mut stream = stream.unwrap();
+                // The whole request before answering: replying and closing while the
+                // client still writes its body failed that write, under load, with
+                // EINVAL instead of the redirect this test is about.
+                let mut request = Vec::new();
                 let mut buffer = [0u8; 4096];
-                let _ = stream.read(&mut buffer);
+                loop {
+                    let n = stream.read(&mut buffer).unwrap_or(0);
+                    request.extend_from_slice(&buffer[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    let complete = text.find("\r\n\r\n").is_some_and(|end| {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        request.len() >= end + 4 + length
+                    });
+                    if n == 0 || complete {
+                        break;
+                    }
+                }
                 requests += 1;
                 stream
                     .write_all(

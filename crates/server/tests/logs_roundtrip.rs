@@ -328,7 +328,8 @@ async fn a_log_line_carries_its_trace_where_loki_puts_it() {
         .get(&range("/loki/api/v1/query_range", r#"{app="checkout"}"#))
         .await;
     assert_eq!(status, StatusCode::OK);
-    let metadata = &response["data"]["result"][0]["values"][0][2];
+    // Loki's flat shape: a line's structured metadata is among its stream's labels.
+    let metadata = &response["data"]["result"][0]["stream"];
     assert_eq!(metadata["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736");
     assert_eq!(metadata["span_id"], "00f067aa0ba902b7");
     assert_eq!(metadata["severity_text"], "ERROR");
@@ -791,7 +792,7 @@ async fn a_protobuf_log_batch_is_stored_and_queryable() {
     assert_eq!(result[0]["values"][0][1], "payment declined");
 
     // The attributes survive both the encoding and the resource/record distinction.
-    let metadata = &result[0]["values"][0][2];
+    let metadata = &result[0]["stream"];
     assert_eq!(metadata["order_id"], "A-99");
     assert_eq!(
         metadata["k8s_pod_name"], "pod-7f",
@@ -851,7 +852,8 @@ async fn a_parser_stage_returns_the_fields_it_extracted() {
     assert_eq!(status, StatusCode::OK, "{response}");
 
     let entry = &response["data"]["result"][0];
-    let metadata = &entry["values"][0][2];
+    // The flat shape carries parsed labels and metadata among the stream's labels.
+    let metadata = &entry["stream"];
 
     // The severity label is untouched: it is a different fact from the body's own idea
     // of level, and overwriting it would lose telemetryd's.
@@ -882,7 +884,7 @@ async fn a_query_without_a_parser_extracts_nothing() {
         NOW + MS
     );
     let (_, response) = harness.get(&path).await;
-    let metadata = &response["data"]["result"][0]["values"][0][2];
+    let metadata = &response["data"]["result"][0]["stream"];
 
     // The body is valid JSON, and nothing asked for it to be parsed.
     assert!(metadata.get("level_extracted").is_none(), "{metadata}");
@@ -1242,9 +1244,9 @@ async fn ingested_logs_survive_a_restart() {
 
 #[tokio::test]
 async fn record_attributes_are_returned_as_structured_metadata() {
-    // The UI reads a third element from each `values` tuple and merges it over the
-    // stream labels. Without it, order.id / trace_id are invisible in the UI even
-    // though telemetryd stored them.
+    // In Loki's flat shape a line's structured metadata is among its stream's labels,
+    // and the entry stays `[ts, line]`; the UI reads labels either way. Without them,
+    // order.id / trace_id are invisible in the UI even though telemetryd stored them.
     let harness = Harness::new();
     harness
         .post_logs(&otlp_logs(&[(0, "error", "payment declined", "1002")]))
@@ -1254,22 +1256,20 @@ async fn record_attributes_are_returned_as_structured_metadata() {
         .get(&range("/loki/api/v1/query_range", r#"{app="checkout"}"#))
         .await;
 
-    let entry = &response["data"]["result"][0]["values"][0];
-    let tuple = entry.as_array().unwrap();
-    assert_eq!(tuple.len(), 3, "expected structured metadata, got {entry}");
+    let stream = &response["data"]["result"][0];
+    assert_eq!(stream["values"][0].as_array().unwrap().len(), 2, "{stream}");
+    let labels = &stream["stream"];
     // Sanitised on the way out, because a Loki structured-metadata key must be a valid
     // label name and a label name cannot contain a dot. The client reads
     // `labels['order_id']`; the dotted form is a key nothing on this API can address.
     // Trace attributes are the other convention and stay dotted — see the Tempo tests.
-    assert_eq!(tuple[2]["order_id"], "1002");
+    assert_eq!(labels["order_id"], "1002");
+    assert_eq!(labels["detected_level"], "error");
     assert!(
-        tuple[2].get("order.id").is_none(),
-        "the dotted spelling must not also be emitted: {}",
-        tuple[2]
+        labels.get("order.id").is_none(),
+        "the dotted spelling must not also be emitted: {labels}"
     );
-
-    // Stream labels stay in `stream`, not duplicated into the metadata.
-    assert!(tuple[2].get("app").is_none());
+    assert_eq!(labels["app"], "checkout");
 }
 
 #[tokio::test]
@@ -1390,7 +1390,16 @@ async fn a_line_that_is_not_json_carries_the_parser_error() {
                 .as_array()
                 .unwrap()
                 .iter()
-                .flat_map(|stream| stream["values"].as_array().unwrap().clone())
+                // Each entry with its stream's labels after it, which in the flat shape
+                // is where its structured metadata and parsed labels are.
+                .flat_map(|stream| {
+                    stream["values"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| json!([v[0], v[1], stream["stream"]]))
+                        .collect::<Vec<Value>>()
+                })
                 .collect::<Vec<Value>>()
         }
     };

@@ -219,15 +219,23 @@ async fn unwrapped_values_aggregate_in_their_units() {
         .await;
     assert_eq!(median, vec![(json!({"app": "x"}), 1.5)]);
 
-    // A value that does not unwrap refuses the query, with Loki's message and fix.
+    // A value that does not unwrap refuses the query, with Loki's message and fix —
+    // unless a `sum` with no labels swallows the error, as Loki's does.
     let (status, body) = h
         .instant(
-            r#"sum(sum_over_time({app="x"} | logfmt | unwrap size [1m]))"#,
+            r#"sum by (app) (sum_over_time({app="x"} | logfmt | unwrap size [1m]))"#,
             30,
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.to_string().contains("SampleExtractionErr"), "{body}");
+    let swallowed = h
+        .vector(
+            r#"sum(sum_over_time({app="x"} | logfmt | unwrap size [1m]))"#,
+            30,
+        )
+        .await;
+    assert_eq!(swallowed, vec![(json!({}), 0.0)]);
     let skipped = h
         .vector(
             r#"sum(sum_over_time({app="x"} | logfmt | unwrap size | __error__="" [1m]))"#,
@@ -241,7 +249,10 @@ async fn unwrapped_values_aggregate_in_their_units() {
 async fn pipeline_errors_refuse_until_filtered() {
     let h = Harness::with_lines().await;
     let (status, body) = h
-        .instant(r#"sum(count_over_time({app="x"} | json [1m]))"#, 30)
+        .instant(
+            r#"sum by (app) (count_over_time({app="x"} | json [1m]))"#,
+            30,
+        )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(
@@ -324,19 +335,20 @@ async fn a_range_query_answers_a_matrix() {
         .iter()
         .find(|s| s["metric"]["level"] == "info")
         .unwrap();
-    // Steps T, T+15, T+30, T+45, T+60 over (t-30s, t]: 1, 2, 1 (T+0 has left), then none.
+    // Loki's grid is whole steps, so T is rounded down to T-10s: steps at T-10, T+5,
+    // T+20, T+35, T+50, T+65 over (t-30s, t] count 1, 2, 1 info lines, then none.
     let points: Vec<(u64, &str)> = info["values"]
         .as_array()
         .unwrap()
         .iter()
         .map(|p| (p[0].as_f64().unwrap() as u64 - T, p[1].as_str().unwrap()))
         .collect();
-    assert_eq!(points, vec![(0, "1"), (15, "2"), (30, "1")], "{body}");
+    assert_eq!(points, vec![(5, "1"), (20, "2"), (35, "1")], "{body}");
     let error = result
         .iter()
         .find(|s| s["metric"]["level"] == "error")
         .unwrap();
-    // The error line at T+20s is in (0, 30] and (15, 45], not (30, 60].
+    // The error line at T+20s is in (-10, 20] and (5, 35], not (20, 50].
     assert_eq!(error["values"].as_array().unwrap().len(), 2, "{body}");
     assert!(body["data"]["stats"]["summary"]["execTime"].is_number());
 }

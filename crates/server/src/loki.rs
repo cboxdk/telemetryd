@@ -72,6 +72,9 @@ async fn metric_range(
             .max(1),
         None => logmetric::default_step_nanos(start, end),
     };
+    // Loki answers on a grid of whole steps: the start rounded down to one, the end up.
+    let start = start - start % step;
+    let end = end.div_ceil(step).saturating_mul(step);
     let steps = prometheus::step_grid(start, end, step)?;
     let store = std::sync::Arc::clone(&state.store);
     crate::auth::spawn_read(move || logmetric::answer_range(store.logs(), &query, &steps))
@@ -232,8 +235,7 @@ struct TailResponse {
 #[derive(Debug, Serialize)]
 struct TailStream {
     stream: std::collections::BTreeMap<String, String>,
-    /// `[ts, line]`, or `[ts, line, {structured metadata}]` when the line has any —
-    /// Loki's shape, and the only place a tailed line's `trace_id` can travel.
+    /// `[ts, line]`, Loki's shape.
     values: Vec<serde_json::Value>,
 }
 
@@ -296,12 +298,11 @@ async fn run_tail(
                         for record in matched {
                             let frame = TailResponse {
                                 streams: vec![TailStream {
-                                    stream: record
-                                        .stream
-                                        .iter()
-                                        .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                                        .collect(),
-                                    values: vec![tail_entry(&record)],
+                                    stream: tail_labels(&record),
+                                    values: vec![serde_json::json!([
+                                        record.timestamp_nanos.to_string(),
+                                        record.body
+                                    ])],
                                 }],
                                 dropped_entries: Vec::new(),
                             };
@@ -348,13 +349,14 @@ async fn report_dropped(socket: &mut WebSocket, state: &AppState, missed: u64) -
     socket.send(Message::Text(json.into())).await.is_ok()
 }
 
-fn tail_entry(record: &LogRecord) -> serde_json::Value {
-    let metadata = record.structured_metadata();
-    if metadata.is_empty() {
-        serde_json::json!([record.timestamp_nanos.to_string(), record.body])
-    } else {
-        serde_json::json!([record.timestamp_nanos.to_string(), record.body, metadata])
+/// A tailed line's stream labels with its structured metadata among them, as Loki's
+/// flat shape carries it — the only place a tailed line's `trace_id` can travel.
+fn tail_labels(record: &LogRecord) -> std::collections::BTreeMap<String, String> {
+    let mut labels = record.structured_metadata();
+    for (name, value) in record.stream.iter() {
+        labels.insert(name.to_owned(), value.to_owned());
     }
+    labels
 }
 
 fn matches_tail(query: &logql::LogQuery, record: &LogRecord) -> bool {

@@ -317,6 +317,9 @@ impl LogRecord {
             ("trace_id", self.trace_id.as_deref()),
             ("span_id", self.span_id.as_deref()),
             ("severity_text", Some(self.severity_text.as_str())),
+            // What Loki adds to every line as `detected_level`, and what Grafana's log
+            // volume and Logs Drilldown group by.
+            ("detected_level", Some(self.severity.as_str())),
         ]
         .into_iter()
         .filter_map(|(name, value)| value.filter(|v| !v.is_empty()).map(|v| (name, v)))

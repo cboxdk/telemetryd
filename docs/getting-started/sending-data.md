@@ -186,8 +186,9 @@ per deploy.
 
 Stored, in this case, means as a **record attribute** under the spelling you sent. A
 resource attribute no stream label claimed — `k8s.pod.name`, `host.name`,
-`cloud.region`, `container.id` — comes back in the third element of each Loki `values`
-entry alongside the record's own attributes, and in `/api/v1/export`:
+`cloud.region`, `container.id` — comes back as structured metadata alongside the
+record's own attributes (under `structuredMetadata` in the shape Grafana asks for, among
+the stream's labels in Loki's flat shape), and in `/api/v1/export`:
 
 ```json
 ["1700000000000000000", "checkout failed", {

@@ -111,10 +111,10 @@ impl LabelPredicate {
 
     /// Whether the labels pass, recording a value that is no number in `__error__`.
     ///
-    /// As in Loki: a missing label fails a comparison; a value that does not read as
-    /// the literal's kind keeps the line and marks it `LabelFilterErr`; and a line that
-    /// already carries an error passes every comparison, so only `__error__` filters
-    /// decide its fate. `or` does not try its right side once the left has passed.
+    /// As Loki 3 answers — checked against it in `logql_conformance.rs`: a missing label
+    /// fails a comparison; a value that does not read as the literal's kind keeps the
+    /// line and marks it `LabelFilterErr`; a line already in error is compared like any
+    /// other. `or` does not try its right side once the left has passed.
     pub fn apply(&self, labels: &mut Labels) -> bool {
         match self {
             Self::Match(matcher) => matcher.matches(labels),
@@ -163,22 +163,20 @@ pub enum Threshold {
 
 impl Comparison {
     fn apply(&self, labels: &mut Labels) -> bool {
-        if labels
-            .get("__error__")
-            .is_some_and(|error| !error.is_empty())
-        {
-            return true;
-        }
         let Some(value) = labels.get(&self.name) else {
             return false;
         };
-        let (read, threshold, kind) = match self.threshold {
-            Threshold::Number(n) => (value.trim().parse::<f64>().ok(), n, "a number"),
-            Threshold::Duration(d) => (crate::logstage::parse_duration(value), d, "a duration"),
-            Threshold::Bytes(b) => (crate::logstage::parse_bytes(value), b, "a byte size"),
+        let read = match self.threshold {
+            Threshold::Number(n) => (value.trim().parse::<f64>().ok(), n),
+            Threshold::Duration(d) => (crate::logstage::parse_duration(value), d),
+            Threshold::Bytes(b) => (crate::logstage::parse_bytes(value), b),
         };
-        let Some(read) = read else {
-            let details = format!("{value:?} is not {kind}");
+        let (Some(read), threshold) = read else {
+            // Go's words, as Loki reports them.
+            let details = match self.threshold {
+                Threshold::Duration(_) => format!("time: invalid duration {value:?}"),
+                _ => format!("strconv.ParseFloat: parsing {value:?}: invalid syntax"),
+            };
             labels.insert("__error__", "LabelFilterErr");
             labels.insert("__error_details__", details);
             return true;
@@ -314,9 +312,10 @@ impl<'a> Parser<'a> {
     /// by name: `query` and `query_range` answer it, this route cannot.
     fn reject_metric_query(&self) -> Result<()> {
         let token = |i: usize| self.tokens.get(i).map(|s| &s.token);
+        // `rate(` or `sum by (` — a name that opens a call, never a selector's label.
         let call = matches!(token(0), Some(Token::Ident(_)))
-            && matches!(token(1), Some(Token::LeftParen))
-            || matches!(token(1), Some(Token::Ident(w)) if w == "by" || w == "without");
+            && (matches!(token(1), Some(Token::LeftParen))
+                || matches!(token(1), Some(Token::Ident(w)) if w == "by" || w == "without"));
         if !call {
             return Ok(());
         }
@@ -849,16 +848,29 @@ fn absorb(labels: &mut Labels, parsed: &Labels, stream: &Labels) {
 /// filter Grafana's query builder adds, and how `| __error__!=""` finds them. It was
 /// never set, so the one kept plain-text lines and the other found nothing.
 fn merge_json(labels: &mut Labels, line: &str) {
-    match serde_json::from_str::<serde_json::Value>(line) {
-        Ok(value @ serde_json::Value::Object(_)) => flatten_json(labels, "", &value),
-        Ok(_) => {
-            labels.insert("__error__", "JSONParserErr");
-            labels.insert("__error_details__", "the line is not a JSON object");
+    let details = match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(value @ serde_json::Value::Object(_)) => return flatten_json(labels, "", &value),
+        Ok(_) => MALFORMED_OBJECT,
+        Err(error) => json_error_details(line, &error),
+    };
+    labels.insert("__error__", "JSONParserErr");
+    labels.insert("__error_details__", details);
+}
+
+// Loki's JSON parser reports in the words of the library it uses; the details are
+// matched on by people who copied them out of Loki, so they are Loki's words here too.
+const MALFORMED_OBJECT: &str = "Value looks like object, but can't find closing '}' symbol";
+
+fn json_error_details(line: &str, error: &serde_json::Error) -> &'static str {
+    if !line.trim_start().starts_with('{') {
+        return MALFORMED_OBJECT;
+    }
+    match error.classify() {
+        serde_json::error::Category::Eof if error.to_string().contains("string") => {
+            "Value is string, but can't find closing '\"' symbol"
         }
-        Err(error) => {
-            labels.insert("__error__", "JSONParserErr");
-            labels.insert("__error_details__", error.to_string());
-        }
+        serde_json::error::Category::Eof => MALFORMED_OBJECT,
+        _ => "Malformed JSON error",
     }
 }
 
@@ -1235,9 +1247,14 @@ mod tests {
             )
             .is_none()
         );
-        // An earlier error passes every comparison: only `__error__` filters decide.
-        let labels = passes(r#"{app="x"} | json | status > 400"#, "not json").unwrap();
-        assert_eq!(labels.get("__error__"), Some("JSONParserErr"));
+        assert_eq!(
+            passes(r#"{app="x"} | logfmt | status > 400"#, "status=oops")
+                .unwrap()
+                .get("__error_details__"),
+            Some(r#"strconv.ParseFloat: parsing "oops": invalid syntax"#)
+        );
+        // An earlier error is no pass: the comparison still decides, as in Loki 3.
+        assert!(passes(r#"{app="x"} | json | status > 400"#, "not json").is_none());
     }
 
     #[test]

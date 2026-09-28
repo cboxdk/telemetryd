@@ -1866,8 +1866,17 @@ async fn log_attributes_come_back_in_the_shape_the_caller_asked_for() {
     let (_, _, body) = harness.request(read(false)).await;
     let json: Value = serde_json::from_str(&body).unwrap();
     assert!(json["data"].get("encodingFlags").is_none(), "{body}");
+    // The flat shape: `[ts, line]`, the metadata among the stream's labels, as Loki.
     assert_eq!(
-        json["data"]["result"][0]["values"][0][2]["order_id"], "42",
+        json["data"]["result"][0]["stream"]["order_id"], "42",
+        "{body}"
+    );
+    assert_eq!(
+        json["data"]["result"][0]["values"][0]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
         "{body}"
     );
 }
