@@ -602,28 +602,6 @@ impl<'a> FoldState<'a> {
     }
 }
 
-/// Series and their folds, reordered by label set.
-fn by_label_order(labels: Vec<Labels>, folds: Vec<Vec<Vec<Fold>>>) -> FoldedSpan {
-    let mut order: Vec<usize> = (0..labels.len()).collect();
-    order.sort_by(|a, b| labels[*a].cmp(&labels[*b]));
-    let folds = folds
-        .into_iter()
-        .map(|per_series| {
-            let mut per_series: Vec<Option<Vec<Fold>>> = per_series.into_iter().map(Some).collect();
-            order
-                .iter()
-                .map(|index| per_series[*index].take().unwrap_or_default())
-                .collect()
-        })
-        .collect();
-    let mut labels: Vec<Option<Labels>> = labels.into_iter().map(Some).collect();
-    let labels = order
-        .iter()
-        .map(|index| labels[*index].take().unwrap_or_default())
-        .collect();
-    (labels, folds)
-}
-
 /// Whether every sample this expression needs can come from a fold.
 ///
 /// A fold carries a window's first and last sample and the increase between them, which
@@ -1171,15 +1149,18 @@ impl Snapshot {
         // In label order, the order Prometheus's storage hands series out in. The series
         // were met in whatever order the store happened to read them, and an aggregation
         // adds its inputs in the order they come: compensated or not, that order decides
-        // the last digit of a sum of fractions.
-        let (labels, folds) = by_label_order(labels, folds);
+        // the last digit of a sum of fractions. Worked out as an order to visit them in:
+        // the folds themselves stay put, since moving them would hold every cell twice.
+        let mut order: Vec<usize> = (0..labels.len()).collect();
+        order.sort_by(|a, b| labels[*a].cmp(&labels[*b]));
+        let labels: Vec<Labels> = order.iter().map(|at| labels[*at].clone()).collect();
 
         let mut prepared = Vec::new();
         for (call, (selector, range, per_second)) in calls.iter().enumerate() {
             let range_nanos = duration_nanos(*range);
             let mut by_step: Vec<Vec<(usize, f64)>> = vec![Vec::new(); points.len()];
-            for (index, per_point) in folds[call].iter().enumerate() {
-                for (point, fold) in per_point.iter().enumerate() {
+            for (index, &met) in order.iter().enumerate() {
+                for (point, fold) in folds[call][met].iter().enumerate() {
                     let window = Window::ending(points[point], range_nanos, selector.offset);
                     if let Some(value) = fold.finish(window, *per_second) {
                         by_step[point].push((index, value));

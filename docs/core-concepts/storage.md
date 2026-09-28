@@ -14,7 +14,7 @@ telemetryd-data/
 ├── LOCK         # advisory lock — one writer per directory, enforced
 ├── wal/{logs,traces,metrics}/NNNNNNNN.wal
 ├── segments/{logs,traces,metrics}/<id>/
-│   ├── data.parquet     # rows, sorted by time, in row groups of 65,536
+│   ├── data.parquet     # rows in row groups of 65,536: by time, or for metrics by series
 │   ├── manifest.json    # id, time bounds, label index
 │   ├── streams.bin      # stream dictionary: each series' labels, bounds and rows
 │   ├── folds.bin        # counter summaries (metrics)
@@ -25,6 +25,13 @@ telemetryd-data/
 
 Deliberately inspectable. You can `ls` your way around it and read a segment with any
 Parquet tool. Deleting an app's data is a directory filter, not a migration.
+
+Metric segments lie series by series: streams in label-set order, each one's rows
+together and in time order. A metric query names a few series of the hundreds a segment
+holds, and laid out this way a metric name's series are one stretch of rows, which the
+dictionary's per-stream row counts locate and the reader takes without decompressing the
+rest. Log and trace segments stay in time order, which is what their newest-first reads
+need. Metric segments written by earlier releases are in time order and are read that way.
 
 ## Durability
 

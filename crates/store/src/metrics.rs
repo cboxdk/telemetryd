@@ -551,77 +551,46 @@ type Grouped<'a> = (
     &'a crate::records::SeriesOrder,
 );
 
-/// A stretch of one series in one chunk: `(series, chunk, first row, end row)`, the rows
-/// being positions in the chunk's grouped order.
-type Piece = (u32, u32, u32, u32);
-
-/// The series matching `matchers` among `chunks`, and every piece of them within
-/// `[start, end]` as `(series, chunk, first row, end row)`, in chunk order.
-fn buffered_pieces<'a>(
+/// Every label set among `chunks` by address, ascending, each with whether `matchers`
+/// select it.
+///
+/// Every chunk lists its runs by address, and nearly always the same addresses as the
+/// chunk before — the same series, a few samples further on — so a chunk whose list is
+/// the last one's again costs one comparison of the two, and only a chunk bringing new
+/// series is walked.
+fn decide<'a>(
     chunks: &[Grouped<'a>],
-    (start, end): (u64, u64),
     matchers: &[telemetryd_core::LabelMatcher],
-) -> (Vec<&'a Labels>, Vec<Piece>) {
-    // Each label set's address, ascending, with the series it is — `u32::MAX` for one not
-    // wanted. Every chunk lists its runs by address too, and nearly always the same ones,
-    // so deciding a chunk's runs is a merge of two sorted lists rather than a lookup each.
-    // The addresses are safe to trust: every chunk is held for the length of the scan.
-    let mut decided: Vec<(usize, u32)> = Vec::new();
-    let mut labels: Vec<&'a Labels> = Vec::new();
-    // `(series, chunk, first, end)` for every piece of a wanted series, in chunk order.
-    let mut pieces: Vec<Piece> = Vec::new();
-    for (index, &(chunk, order)) in chunks.iter().enumerate() {
-        let mut fresh: Vec<(usize, u32)> = Vec::new();
+) -> Vec<(usize, Option<&'a Labels>)> {
+    let mut decided: Vec<(usize, Option<&'a Labels>)> = Vec::new();
+    let mut previous: Option<&[usize]> = None;
+    for &(chunk, order) in chunks {
+        if previous == Some(order.keys.as_slice()) {
+            continue;
+        }
+        previous = Some(order.keys.as_slice());
+        let mut fresh = Vec::new();
         let mut known = 0usize;
-        for (&(from, to), &key) in order.runs.iter().zip(&order.keys) {
+        for (run, &key) in order.keys.iter().enumerate() {
             while known < decided.len() && decided[known].0 < key {
                 known += 1;
             }
-            let series = if known < decided.len() && decided[known].0 == key {
-                decided[known].1
-            } else if let Some(&(_, series)) = fresh.iter().find(|(seen, _)| *seen == key) {
-                series
-            } else {
-                let set = &chunk.records[order.rows[from as usize] as usize].series;
-                let series = if telemetryd_core::matches_all(matchers, set) {
-                    labels.push(set);
-                    u32::try_from(labels.len() - 1).unwrap_or(u32::MAX)
-                } else {
-                    u32::MAX
-                };
-                fresh.push((key, series));
-                series
-            };
-            if series == u32::MAX {
+            if known < decided.len() && decided[known].0 == key {
                 continue;
             }
-            let rows = &order.rows[from as usize..to as usize];
-            let at = |row: &u32| chunk.records[*row as usize].timestamp_nanos;
-            // A chunk wholly inside the span, which for a long window is nearly all of
-            // them, needs no search.
-            let (first, last) = if chunk.min_nanos >= start && chunk.max_nanos <= end {
-                (0, rows.len())
-            } else {
-                (
-                    rows.partition_point(|row| at(row) < start),
-                    rows.partition_point(|row| at(row) <= end),
-                )
-            };
-            if first < last {
-                pieces.push((
-                    series,
-                    u32::try_from(index).unwrap_or(u32::MAX),
-                    from + u32::try_from(first).unwrap_or(u32::MAX),
-                    from + u32::try_from(last).unwrap_or(u32::MAX),
-                ));
-            }
+            let set = &chunk.records[order.row(order.run(run).start)].series;
+            fresh.push((
+                key,
+                telemetryd_core::matches_all(matchers, set).then_some(set),
+            ));
         }
         if !fresh.is_empty() {
             decided.extend(fresh);
-            decided.sort_unstable();
+            decided.sort_unstable_by_key(|(key, _)| *key);
+            decided.dedup_by_key(|(key, _)| *key);
         }
     }
-    (labels, pieces)
+    decided
 }
 
 /// Hand `visit` the buffered samples in `[start, end]` of every series matching
@@ -631,10 +600,11 @@ fn buffered_pieces<'a>(
 /// The buffer is hundreds of small chunks — every query freezes the one being filled, so
 /// on a server being read they hold seconds each — and every chunk holds every series a
 /// few samples deep. Handed out chunk by chunk, a series came in runs of a handful, and
-/// the work per run was the cost of a query. So each chunk is looked at through its
-/// records grouped by series, a series decided by its label set's address alone and
-/// the records of one not wanted never touched; and a wanted series' pieces from every
-/// chunk are joined into one run.
+/// the work per run was the cost of a query. So a wanted series' pieces from every chunk
+/// are joined into one run, series after series in address order, each chunk keeping a
+/// cursor into its own address-ordered runs that only moves forward: nothing is searched
+/// and nothing is held but the run being built. The records of a series not wanted are
+/// never touched.
 ///
 /// Chunks are taken in order of their earliest sample, so a series' pieces normally
 /// join in time order. When late data breaks that the run is sorted, stably: samples at
@@ -647,55 +617,51 @@ fn visit_buffered(
     source: usize,
     visit: &mut dyn FnMut(SeriesRun<'_>) -> std::ops::ControlFlow<()>,
 ) -> bool {
-    let chunks: Vec<(
-        &crate::records::Chunk<MetricSchema>,
-        &crate::records::SeriesOrder,
-    )> = chunks
+    let chunks: Vec<Grouped<'_>> = chunks
         .iter()
         .filter(|chunk| wanted(chunk.min_nanos, chunk.max_nanos))
         .map(|chunk| (&**chunk, chunk.by_series()))
         .collect();
-
-    let (labels, pieces) = buffered_pieces(&chunks, (start, end), matchers);
-
-    // Grouped by series with a counting sort — stable, so each series' pieces stay in
-    // chunk order, and linear, because a histogram's worth of series across a buffer's
-    // chunks is half a million pieces, which a comparison sort took longer to order than
-    // the samples took to read.
-    let mut starts = vec![0usize; labels.len() + 1];
-    for piece in &pieces {
-        starts[piece.0 as usize + 1] += 1;
-    }
-    for at in 1..starts.len() {
-        starts[at] += starts[at - 1];
-    }
-    let mut grouped = vec![(0u32, 0u32, 0u32); pieces.len()];
-    let mut next = starts[..labels.len()].to_vec();
-    for &(series, chunk, first, last) in &pieces {
-        let slot = &mut next[series as usize];
-        grouped[*slot] = (chunk, first, last);
-        *slot += 1;
-    }
-
+    let mut cursors = vec![0usize; chunks.len()];
     let mut timestamps: Vec<u64> = Vec::new();
     let mut values: Vec<f64> = Vec::new();
-    for (series, bounds) in starts.windows(2).enumerate() {
-        if bounds[0] == bounds[1] {
+    for (key, series) in decide(&chunks, matchers) {
+        let Some(series) = series else {
             continue;
-        }
+        };
         timestamps.clear();
         values.clear();
         let mut ordered = true;
-        for &(chunk, first, last) in &grouped[bounds[0]..bounds[1]] {
-            let (chunk, order) = chunks[chunk as usize];
-            for row in &order.rows[first as usize..last as usize] {
-                let record = &chunk.records[*row as usize];
+        for (&(chunk, order), cursor) in chunks.iter().zip(&mut cursors) {
+            while *cursor < order.keys.len() && order.keys[*cursor] < key {
+                *cursor += 1;
+            }
+            if order.keys.get(*cursor) != Some(&key) {
+                continue;
+            }
+            let run = order.run(*cursor);
+            let at = |position: usize| chunk.records[order.row(position)].timestamp_nanos;
+            // A chunk wholly inside the span, which for a long window is nearly all of
+            // them, needs no search.
+            let (first, last) = if chunk.min_nanos >= start && chunk.max_nanos <= end {
+                (run.start, run.end)
+            } else {
+                (
+                    first_where(run.clone(), |position| at(position) >= start),
+                    first_where(run, |position| at(position) > end),
+                )
+            };
+            for position in first..last {
+                let record = &chunk.records[order.row(position)];
                 ordered &= timestamps
                     .last()
                     .is_none_or(|previous| *previous <= record.timestamp_nanos);
                 timestamps.push(record.timestamp_nanos);
                 values.push(record.value);
             }
+        }
+        if timestamps.is_empty() {
+            continue;
         }
         if !ordered {
             let mut paired: Vec<(u64, f64)> = timestamps
@@ -709,7 +675,7 @@ fn visit_buffered(
         }
         let run = SeriesRun {
             source: source + 1,
-            series: labels[series],
+            series,
             timestamps: &timestamps,
             values: &values,
         };
@@ -718,6 +684,21 @@ fn visit_buffered(
         }
     }
     true
+}
+
+/// The first position in `range` where `holds` becomes true, for a predicate that is
+/// false and then true across it; `range.end` when it never does.
+fn first_where(range: std::ops::Range<usize>, holds: impl Fn(usize) -> bool) -> usize {
+    let (mut low, mut high) = (range.start, range.end);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if holds(middle) {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    low
 }
 
 /// One segment's rows in `(start, end]`, folded per stream straight from its columns.

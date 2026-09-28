@@ -187,16 +187,40 @@ pub(crate) struct Chunk<S: RecordSchema> {
 ///
 /// Built on first use rather than at freeze, because freezing happens under the lock
 /// ingest appends through, and a chunk no query touches before it is sealed never pays.
-/// Four bytes a record: the positions, not copies.
-#[derive(Debug, Default)]
+/// Positions, not copies, and as narrow as the chunk allows: two bytes a record for a
+/// buffered chunk, plus twelve per series in it.
+#[derive(Debug)]
 pub(crate) struct SeriesOrder {
     /// Record positions, by the address of their label set and then by time.
-    pub(crate) rows: Vec<u32>,
-    /// `rows[start..end]` for each run of one label set.
-    pub(crate) runs: Vec<(u32, u32)>,
+    rows: Positions,
+    /// Where each run of one label set starts in `rows`, and one more for the end.
+    starts: Vec<u32>,
     /// The address of each run's label set, ascending, so a query can decide on a run
     /// without reaching into the records.
     pub(crate) keys: Vec<usize>,
+}
+
+/// Record positions, in two bytes while a chunk holds few enough records — a buffered
+/// chunk always does — and four for the one chunk a seal drains the whole buffer into.
+#[derive(Debug)]
+enum Positions {
+    Narrow(Vec<u16>),
+    Wide(Vec<u32>),
+}
+
+impl SeriesOrder {
+    /// Where run `run` lies in the grouped order.
+    pub(crate) fn run(&self, run: usize) -> std::ops::Range<usize> {
+        self.starts[run] as usize..self.starts[run + 1] as usize
+    }
+
+    /// The record at position `at` of the grouped order.
+    pub(crate) fn row(&self, at: usize) -> usize {
+        match &self.rows {
+            Positions::Narrow(rows) => usize::from(rows[at]),
+            Positions::Wide(rows) => rows[at] as usize,
+        }
+    }
 }
 
 impl<S: RecordSchema> Chunk<S> {
@@ -225,20 +249,25 @@ impl<S: RecordSchema> Chunk<S> {
                 (0..u32::try_from(self.records.len()).unwrap_or(u32::MAX)).collect();
             // Stable: two records of one series at one instant keep arrival order.
             rows.sort_by_key(|row| key(*row));
-            let mut runs = Vec::new();
+            let mut starts = Vec::new();
             let mut keys = Vec::new();
-            let mut start = 0usize;
-            for at in 1..=rows.len() {
-                if at == rows.len() || key(rows[at]).0 != key(rows[start]).0 {
-                    runs.push((
-                        u32::try_from(start).unwrap_or(u32::MAX),
-                        u32::try_from(at).unwrap_or(u32::MAX),
-                    ));
-                    keys.push(key(rows[start]).0);
-                    start = at;
+            for at in 0..rows.len() {
+                if at == 0 || key(rows[at]).0 != key(rows[at - 1]).0 {
+                    starts.push(u32::try_from(at).unwrap_or(u32::MAX));
+                    keys.push(key(rows[at]).0);
                 }
             }
-            SeriesOrder { rows, runs, keys }
+            starts.push(u32::try_from(rows.len()).unwrap_or(u32::MAX));
+            let rows = if rows.len() <= usize::from(u16::MAX) + 1 {
+                Positions::Narrow(
+                    rows.into_iter()
+                        .map(|row| u16::try_from(row).unwrap_or(u16::MAX))
+                        .collect(),
+                )
+            } else {
+                Positions::Wide(rows)
+            };
+            SeriesOrder { rows, starts, keys }
         })
     }
 }
