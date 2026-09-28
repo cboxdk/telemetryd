@@ -1,0 +1,48 @@
+# Tempo for scripts/tempo-conformance.py: one process, OTLP/HTTP in, local storage.
+stream_over_http_enabled: true
+server:
+  http_listen_port: 3200
+  log_level: warn
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        http:
+          endpoint: 0.0.0.0:4318
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/traces
+    wal:
+      path: /var/tempo/wal
+
+usage_report:
+  reporting_enabled: false
+
+
+ingester:
+  # Short, so a search over a range finds the lines in a block within seconds.
+  max_block_duration: 5s
+  complete_block_timeout: 1h
+
+
+# TraceQL metrics read the generator's local blocks.
+metrics_generator:
+  # The cases' spans end minutes before they are sent; the default slack drops them.
+  metrics_ingestion_time_range_slack: 1h
+  storage:
+    path: /var/tempo/generator/wal
+  traces_storage:
+    path: /var/tempo/generator/traces
+  processor:
+    local_blocks:
+      filter_server_spans: false
+      flush_to_storage: true
+
+overrides:
+  defaults:
+    metrics_generator:
+      processors: [local-blocks]

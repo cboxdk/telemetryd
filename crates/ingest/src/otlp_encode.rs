@@ -203,9 +203,12 @@ pub fn encode_spans(records: &[SpanRecord]) -> Value {
     let with_resource: Vec<(Labels, &SpanRecord)> = records
         .iter()
         .map(|record| {
-            let mut resource = record.stream.clone();
-            for (name, value) in record.kept_resource_attributes() {
-                resource.insert(name, value);
+            // The resource as OTLP described it, plus `app` where it is not simply the
+            // service's name — a relay's stamped identity, which the receiver needs.
+            let mut resource = record.resource_for_display();
+            let app = record.app();
+            if Some(app) != resource.get("service.name") {
+                resource.insert(telemetryd_core::record::APP_LABEL, app);
             }
             (resource, record)
         })
@@ -568,6 +571,7 @@ mod tests {
             attributes: labels(&[
                 ("http.method", "POST"),
                 ("resource.k8s.pod.name", "checkout-7f9"),
+                ("resource.service.name", "checkout"),
             ]),
             events: vec![SpanEvent {
                 time_nanos: 1_760_000_000_050_000_000,

@@ -94,16 +94,18 @@ impl SearchRequest {
             start_nanos,
             end_nanos,
             limit: limit.min(MAX_SEARCH_LIMIT),
+            // Tempo reads them only for a search by `tags`: with a TraceQL `q`, even `{}`,
+            // they change nothing. A bound TraceQL wants is `duration > 1s` in the query.
             min_duration_nanos: params
                 .min_duration
                 .as_deref()
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.is_empty() && params.q.is_none())
                 .map(parse_duration)
                 .transpose()?,
             max_duration_nanos: params
                 .max_duration
                 .as_deref()
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.is_empty() && params.q.is_none())
                 .map(parse_duration)
                 .transpose()?,
         })
@@ -175,8 +177,9 @@ pub struct TraceSummary {
     /// Nanoseconds, as a string — the UI does `intdiv($nano, 1_000_000_000)`.
     #[serde(rename = "startTimeUnixNano")]
     pub start_time_unix_nano: String,
+    /// Whole milliseconds, as Tempo reports them.
     #[serde(rename = "durationMs")]
-    pub duration_ms: f64,
+    pub duration_ms: u64,
     /// The spans the TraceQL expression matched. The UI reads `spanSets` (v2) and
     /// falls back to the singular `spanSet`.
     #[serde(rename = "spanSets")]
@@ -276,15 +279,23 @@ pub struct ScopeSpans {
     pub spans: Vec<SpanJson>,
 }
 
+/// A span in OTLP's JSON as Tempo writes it — protobuf's JSON mapping: ids in base64,
+/// kind and status code by name. Held as hex and numbers, which is what the protobuf
+/// answer needs; the spelling happens on the way out.
 #[derive(Debug, Serialize)]
 pub struct SpanJson {
-    #[serde(rename = "traceId")]
+    #[serde(rename = "traceId", serialize_with = "ids::base64")]
     pub trace_id: String,
-    #[serde(rename = "spanId")]
+    #[serde(rename = "spanId", serialize_with = "ids::base64")]
     pub span_id: String,
-    #[serde(rename = "parentSpanId", skip_serializing_if = "String::is_empty")]
+    #[serde(
+        rename = "parentSpanId",
+        skip_serializing_if = "String::is_empty",
+        serialize_with = "ids::base64"
+    )]
     pub parent_span_id: String,
     pub name: String,
+    #[serde(serialize_with = "ids::kind_name")]
     pub kind: i32,
     #[serde(rename = "startTimeUnixNano")]
     pub start_time_unix_nano: String,
@@ -298,19 +309,26 @@ pub struct SpanJson {
     pub links: Vec<LinkJson>,
 }
 
+/// `{"code":"STATUS_CODE_ERROR","message":…}`, and `{}` for a span nobody gave one.
 #[derive(Debug, Serialize)]
 pub struct StatusJson {
+    #[serde(skip_serializing_if = "is_unset", serialize_with = "ids::status_name")]
     pub code: i32,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub message: String,
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_unset(code: &i32) -> bool {
+    *code == 0
+}
+
 /// A link to another span, in the same id spelling as the span itself.
 #[derive(Debug, Serialize)]
 pub struct LinkJson {
-    #[serde(rename = "traceId")]
+    #[serde(rename = "traceId", serialize_with = "ids::base64")]
     pub trace_id: String,
-    #[serde(rename = "spanId")]
+    #[serde(rename = "spanId", serialize_with = "ids::base64")]
     pub span_id: String,
     #[serde(rename = "traceState", skip_serializing_if = "String::is_empty")]
     pub trace_state: String,
@@ -323,6 +341,89 @@ pub struct EventJson {
     pub time_unix_nano: String,
     pub name: String,
     pub attributes: Vec<TempoKeyValue>,
+}
+
+/// Trace and span ids as Tempo spells them.
+pub mod ids {
+    use std::fmt::Write as _;
+
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    fn bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len() / 2)
+            .filter_map(|i| u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok())
+            .collect()
+    }
+
+    /// A hex id as standard base64, protobuf's JSON spelling of bytes.
+    #[must_use]
+    pub fn to_base64(hex: &str) -> String {
+        let data = bytes(hex);
+        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+        for chunk in data.chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    /// An id in any spelling a client may send back — full hex, hex with its leading
+    /// zeros dropped as Tempo's search writes it, or base64 as its trace JSON does — as
+    /// full lowercase hex. `None` if it is none of them.
+    #[must_use]
+    pub fn normalize(id: &str, hex_len: usize) -> Option<String> {
+        let id = id.trim();
+        if !id.is_empty() && id.len() <= hex_len && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Some(format!("{:0>hex_len$}", id.to_ascii_lowercase()));
+        }
+        let mut bits = 0u32;
+        let mut held = 0;
+        let mut out = String::new();
+        for c in id.trim_end_matches('=').bytes() {
+            let value = ALPHABET.iter().position(|a| *a == c)?;
+            bits = bits << 6 | u32::try_from(value).ok()?;
+            held += 6;
+            if held >= 8 {
+                held -= 8;
+                let _ = write!(out, "{:02x}", (bits >> held) & 0xff);
+            }
+        }
+        (out.len() == hex_len).then_some(out)
+    }
+
+    pub(super) fn base64<S: serde::Serializer>(hex: &str, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&to_base64(hex))
+    }
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub(super) fn kind_name<S: serde::Serializer>(kind: &i32, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match kind {
+            1 => "SPAN_KIND_INTERNAL",
+            2 => "SPAN_KIND_SERVER",
+            3 => "SPAN_KIND_CLIENT",
+            4 => "SPAN_KIND_PRODUCER",
+            5 => "SPAN_KIND_CONSUMER",
+            _ => "SPAN_KIND_UNSPECIFIED",
+        })
+    }
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub(super) fn status_name<S: serde::Serializer>(code: &i32, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match code {
+            1 => "STATUS_CODE_OK",
+            2 => "STATUS_CODE_ERROR",
+            _ => "STATUS_CODE_UNSET",
+        })
+    }
 }
 
 fn key_values<'a>(pairs: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<TempoKeyValue> {
@@ -420,8 +521,7 @@ pub fn search(store: &RecordStore<SpanSchema>, request: &SearchRequest) -> Resul
             // The root when the window holds it; otherwise the earliest span, so the row
             // still names something rather than looking broken.
             let root = all.iter().find(|s| s.is_root()).unwrap_or(&all[0]);
-            #[allow(clippy::cast_precision_loss)]
-            let duration_ms = duration as f64 / 1e6;
+            let duration_ms = duration / 1_000_000;
 
             let summary = TraceSummary {
                 root_service_name: root.service_name().to_owned(),
@@ -437,11 +537,16 @@ pub fn search(store: &RecordStore<SpanSchema>, request: &SearchRequest) -> Resul
                             name: span.name.clone(),
                             start_time_unix_nano: span.start_nanos.to_string(),
                             duration_nanos: span.duration_nanos().to_string(),
-                            attributes: key_values(span.attributes.iter()),
+                            attributes: key_values(span.span_attributes()),
                         })
                         .collect(),
                 }],
-                trace_id,
+                // Tempo's search writes the id without its leading zeros; a trace
+                // lookup takes it back in any spelling.
+                trace_id: match trace_id.trim_start_matches('0') {
+                    "" => "0".to_owned(),
+                    short => short.to_owned(),
+                },
             };
             Some((start, summary))
         })
@@ -469,10 +574,12 @@ pub fn search(store: &RecordStore<SpanSchema>, request: &SearchRequest) -> Resul
 /// retention window is searched rather than a time range: a trace id is exact, and a
 /// client that has one should not also have to know when it happened.
 pub fn trace(store: &RecordStore<SpanSchema>, trace_id: &str) -> Result<TraceResponse> {
-    let wanted = trace_id.trim().to_ascii_lowercase();
-    if wanted.is_empty() {
-        return Err(Error::BadRequest("empty trace id".to_owned()));
-    }
+    let wanted = ids::normalize(trace_id, 32).ok_or_else(|| {
+        Error::BadRequest(format!(
+            "{trace_id:?} is not a trace id: 32 hex digits, fewer with the leading zeros \
+             left off, or base64"
+        ))
+    })?;
 
     // The whole retention window, but not the whole store: `exact_key` lets each
     // segment's Bloom filter answer "this trace is definitely not here" without any
@@ -497,11 +604,10 @@ pub fn trace(store: &RecordStore<SpanSchema>, trace_id: &str) -> Result<TraceRes
     // its stream labels and the resource attributes kept on its spans.
     let mut by_resource: BTreeMap<telemetryd_core::Labels, Vec<SpanRecord>> = BTreeMap::new();
     for span in distinct_spans(spans) {
-        let mut resource = span.stream.clone();
-        for (name, value) in span.kept_resource_attributes() {
-            resource.insert(name, value);
-        }
-        by_resource.entry(resource).or_default().push(span);
+        by_resource
+            .entry(span.resource_for_display())
+            .or_default()
+            .push(span);
     }
 
     let batches = by_resource
@@ -510,18 +616,7 @@ pub fn trace(store: &RecordStore<SpanSchema>, trace_id: &str) -> Result<TraceRes
             spans.sort_by_key(|s| s.start_nanos);
             ResourceSpans {
                 resource: ResourceJson {
-                    // The UI reads `service.name` with a dot, so the dotted spelling is
-                    // restored here even though it is stored sanitised.
-                    attributes: key_values(resource.iter().map(|(k, v)| {
-                        (
-                            if k == "service_name" {
-                                "service.name"
-                            } else {
-                                k
-                            },
-                            v,
-                        )
-                    })),
+                    attributes: key_values(resource.iter()),
                 },
                 scope_spans: vec![ScopeSpans {
                     spans: spans.iter().map(to_span_json).collect(),
@@ -620,18 +715,13 @@ fn scoped_tags(
     start_nanos: u64,
     end_nanos: u64,
 ) -> Result<Vec<(&'static str, BTreeSet<String>)>> {
-    let mut resource: BTreeSet<String> = store
-        .label_names(start_nanos, end_nanos)
-        .into_iter()
-        .collect();
+    // The resource as OTLP named it, from the spans themselves: the stream's label
+    // names are sanitised, and `app` is ours.
+    let mut resource: BTreeSet<String> = BTreeSet::new();
     let mut span: BTreeSet<String> = BTreeSet::new();
     for record in store.scan(newest(start_nanos, end_nanos), &[], &|_| true)? {
         span.extend(record.span_attributes().map(|(name, _)| name.to_owned()));
-        resource.extend(
-            record
-                .kept_resource_attributes()
-                .map(|(name, _)| name.to_owned()),
-        );
+        resource.extend(record.resource_for_display().names().map(str::to_owned));
     }
     // Intrinsics are filterable, so they belong in the tag list a UI offers.
     let intrinsic: BTreeSet<String> = ["name", "status", "duration", "kind"]
@@ -825,7 +915,7 @@ mod tests {
                 root_service_name: "checkout".to_owned(),
                 root_trace_name: "POST /checkout".to_owned(),
                 start_time_unix_nano: NOW.to_string(),
-                duration_ms: 150.0,
+                duration_ms: 150,
                 span_sets: vec![SpanSet {
                     spans: Vec::new(),
                     matched: 0,

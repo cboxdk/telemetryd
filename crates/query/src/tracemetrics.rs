@@ -2,8 +2,9 @@
 //! on `/api/metrics/query_range` and `/api/metrics/query` in Tempo's shapes.
 //!
 //! Computed from the stored spans at query time, as Tempo's own query path computes
-//! them: each matching span counts in the step its start falls in. `rate` is spans per
-//! second of the step, `count_over_time` spans per step, the `*_over_time` family reads
+//! them — checked against Tempo in `tempo_conformance.rs`. Points sit on whole steps, the
+//! start rounded down to one and the end up, and each counts the spans that started in
+//! the step before it. `rate` is spans per second of the step, `count_over_time` spans per step, the `*_over_time` family reads
 //! a field — `duration` in seconds — and `quantile_over_time` answers one series per
 //! quantile under the label `p`. `histogram_over_time` counts spans into power-of-two
 //! buckets under `__bucket`, as Tempo does. Quantiles here are exact rather than read off
@@ -76,20 +77,29 @@ impl MetricsRequest {
             return Err(Error::BadRequest("`start` must be before `end`".to_owned()));
         }
         let range = end_nanos - start_nanos;
-        let step_nanos = if instant {
-            range
-        } else {
-            match params.step.as_deref().filter(|s| !s.trim().is_empty()) {
-                Some(raw) => duration_nanos(raw)?,
-                // A hundred points across the range, at least a second apart.
-                None => (range / 100).max(1_000_000_000),
-            }
+        if instant {
+            return Ok(Self {
+                query,
+                start_nanos,
+                end_nanos,
+                step_nanos: range,
+            });
+        }
+        let step_nanos = match params.step.as_deref().filter(|s| !s.trim().is_empty()) {
+            Some(raw) => duration_nanos(raw)?,
+            // A hundred points across the range, at least a second apart.
+            None => (range / 100).max(1_000_000_000),
         };
         if step_nanos == 0 || range.div_ceil(step_nanos) > MAX_STEPS {
             return Err(Error::BadRequest(format!(
                 "that range and step make more than {MAX_STEPS} points; widen `step`"
             )));
         }
+        // Tempo's grid: whole steps, the start rounded down and the end up, one step
+        // before the first point, which covers the step before it.
+        let first = start_nanos - start_nanos % step_nanos;
+        let last = end_nanos.div_ceil(step_nanos).saturating_mul(step_nanos);
+        let (start_nanos, end_nanos) = (first.saturating_sub(step_nanos), last);
         Ok(Self {
             query,
             start_nanos,
@@ -248,8 +258,17 @@ fn answer(
 ) -> Vec<Series> {
     #[allow(clippy::cast_precision_loss)]
     let step_seconds = request.step_nanos as f64 / 1e9;
-    let at = |i: usize| request.start_nanos + i as u64 * request.step_nanos;
+    // A step's point is at its end: it counts what started in the step before it. An
+    // instant answer is one step whose point is its window's end.
+    let at = |i: usize| request.start_nanos + (i as u64 + 1) * request.step_nanos;
+    // With no `by`, Tempo names the one series after its function.
     let text = |key: &Key| -> Vec<(String, LabelValue)> {
+        if stage.by.is_empty() {
+            return vec![(
+                "__name__".to_owned(),
+                LabelValue::Text(stage.function.name().to_owned()),
+            )];
+        }
         key.iter()
             .map(|(k, v)| (k.clone(), LabelValue::Text(v.clone())))
             .collect()

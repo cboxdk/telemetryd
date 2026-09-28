@@ -149,12 +149,15 @@ pub fn convert_data(data: &TracesData, ctx: DecodeContext<'_>) -> Decoded<SpanRe
     decoded
 }
 
-/// Keep what the stream labels do not already hold: resource attributes under
-/// their prefix, scope attributes as they are, and never over one the span set itself.
+/// Keep every resource attribute under its prefix, as sent — the stream holds some of
+/// them sanitised, and a trace shows the resource OTLP described — and the scope
+/// attributes no stream label holds, never over one the span set itself.
 fn keep_unpromoted_resource(target: &mut Labels, inherited: &Labels, stream: &Labels) {
     for (name, value) in inherited.iter() {
-        let bare = name.strip_prefix(RESOURCE_ATTRIBUTE_PREFIX).unwrap_or(name);
-        if stream.get(&sanitize_label_name(bare)).is_some() || target.get(name).is_some() {
+        let resource = name.starts_with(RESOURCE_ATTRIBUTE_PREFIX);
+        if target.get(name).is_some()
+            || (!resource && stream.get(&sanitize_label_name(name)).is_some())
+        {
             continue;
         }
         target.insert(name.to_owned(), value.to_owned());

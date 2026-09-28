@@ -59,6 +59,21 @@ pub enum MetricsFunction {
 }
 
 impl MetricsFunction {
+    /// The name it is written with.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Rate => "rate",
+            Self::CountOverTime => "count_over_time",
+            Self::SumOverTime => "sum_over_time",
+            Self::AvgOverTime => "avg_over_time",
+            Self::MinOverTime => "min_over_time",
+            Self::MaxOverTime => "max_over_time",
+            Self::QuantileOverTime => "quantile_over_time",
+            Self::HistogramOverTime => "histogram_over_time",
+        }
+    }
+
     fn named(name: &str) -> Option<Self> {
         Some(match name {
             "rate" => Self::Rate,

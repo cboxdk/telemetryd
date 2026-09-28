@@ -248,6 +248,29 @@ impl SpanRecord {
         })
     }
 
+    /// The resource as OTLP sent it: every resource attribute under its own name, as a
+    /// trace view shows it. A span stored before 0.69.0 kept only its unpromoted ones, so
+    /// its stream labels stand in for the rest — `service.name` restored, the derived
+    /// `app` left out when it only repeats the service.
+    pub fn resource_for_display(&self) -> Labels {
+        let kept: Labels = self
+            .kept_resource_attributes()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        if kept.get("service.name").is_some() {
+            return kept;
+        }
+        let mut resource = kept;
+        for (name, value) in self.stream.iter() {
+            match name {
+                "service_name" => resource.insert("service.name", value),
+                crate::record::APP_LABEL if Some(value) == self.stream.get("service_name") => {}
+                _ => resource.insert(name, value),
+            }
+        }
+        resource
+    }
+
     pub fn app(&self) -> &str {
         self.stream
             .get(crate::record::APP_LABEL)

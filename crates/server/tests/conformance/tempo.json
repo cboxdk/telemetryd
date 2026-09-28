@@ -1,0 +1,919 @@
+{
+ "traces": {
+  "resourceSpans": [
+   {
+    "resource": {
+     "attributes": [
+      {
+       "key": "service.name",
+       "value": {
+        "stringValue": "shop"
+       }
+      },
+      {
+       "key": "deployment.environment",
+       "value": {
+        "stringValue": "prod"
+       }
+      },
+      {
+       "key": "k8s.pod.name",
+       "value": {
+        "stringValue": "shop-7f9"
+       }
+      }
+     ]
+    },
+    "scopeSpans": [
+     {
+      "scope": {
+       "name": "shop-tracer"
+      },
+      "spans": [
+       {
+        "traceId": "000000000000000000000000000000a1",
+        "spanId": "00000000000000b1",
+        "name": "POST /checkout",
+        "kind": 2,
+        "startTimeUnixNano": "1790000001000000000",
+        "endTimeUnixNano": "1790000002200000000",
+        "attributes": [
+         {
+          "key": "http.method",
+          "value": {
+           "stringValue": "POST"
+          }
+         },
+         {
+          "key": "http.status_code",
+          "value": {
+           "intValue": "500"
+          }
+         },
+         {
+          "key": "http.route",
+          "value": {
+           "stringValue": "/checkout"
+          }
+         }
+        ],
+        "status": {
+         "code": 2,
+         "message": "payment declined"
+        },
+        "events": [
+         {
+          "timeUnixNano": "1790000001900000000",
+          "name": "exception",
+          "attributes": [
+           {
+            "key": "exception.type",
+            "value": {
+             "stringValue": "PaymentError"
+            }
+           }
+          ]
+         }
+        ]
+       },
+       {
+        "traceId": "000000000000000000000000000000a1",
+        "spanId": "00000000000000b2",
+        "name": "charge",
+        "kind": 3,
+        "startTimeUnixNano": "1790000001100000000",
+        "endTimeUnixNano": "1790000002000000000",
+        "attributes": [
+         {
+          "key": "peer.service",
+          "value": {
+           "stringValue": "payments"
+          }
+         }
+        ],
+        "parentSpanId": "00000000000000b1"
+       },
+       {
+        "traceId": "000000000000000000000000000000a2",
+        "spanId": "00000000000000c1",
+        "name": "GET /products",
+        "kind": 2,
+        "startTimeUnixNano": "1790000020000000000",
+        "endTimeUnixNano": "1790000020040000000",
+        "attributes": [
+         {
+          "key": "http.method",
+          "value": {
+           "stringValue": "GET"
+          }
+         },
+         {
+          "key": "http.status_code",
+          "value": {
+           "intValue": "200"
+          }
+         },
+         {
+          "key": "http.route",
+          "value": {
+           "stringValue": "/products"
+          }
+         }
+        ]
+       },
+       {
+        "traceId": "000000000000000000000000000000a3",
+        "spanId": "00000000000000d1",
+        "name": "GET /products",
+        "kind": 2,
+        "startTimeUnixNano": "1790000080000000000",
+        "endTimeUnixNano": "1790000080060000000",
+        "attributes": [
+         {
+          "key": "http.method",
+          "value": {
+           "stringValue": "GET"
+          }
+         },
+         {
+          "key": "http.status_code",
+          "value": {
+           "intValue": "200"
+          }
+         },
+         {
+          "key": "http.route",
+          "value": {
+           "stringValue": "/products"
+          }
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "resource": {
+     "attributes": [
+      {
+       "key": "service.name",
+       "value": {
+        "stringValue": "db"
+       }
+      }
+     ]
+    },
+    "scopeSpans": [
+     {
+      "scope": {
+       "name": "db-tracer"
+      },
+      "spans": [
+       {
+        "traceId": "000000000000000000000000000000a1",
+        "spanId": "00000000000000b3",
+        "name": "SELECT orders",
+        "kind": 3,
+        "startTimeUnixNano": "1790000001150000000",
+        "endTimeUnixNano": "1790000001450000000",
+        "attributes": [
+         {
+          "key": "db.system",
+          "value": {
+           "stringValue": "mysql"
+          }
+         },
+         {
+          "key": "db.rows",
+          "value": {
+           "intValue": "12"
+          }
+         }
+        ],
+        "parentSpanId": "00000000000000b2"
+       },
+       {
+        "traceId": "000000000000000000000000000000a2",
+        "spanId": "00000000000000c2",
+        "name": "SELECT products",
+        "kind": 3,
+        "startTimeUnixNano": "1790000020005000000",
+        "endTimeUnixNano": "1790000020025000000",
+        "attributes": [
+         {
+          "key": "db.system",
+          "value": {
+           "stringValue": "mysql"
+          }
+         },
+         {
+          "key": "db.rows",
+          "value": {
+           "intValue": "40"
+          }
+         }
+        ],
+        "parentSpanId": "00000000000000c1"
+       },
+       {
+        "traceId": "000000000000000000000000000000a4",
+        "spanId": "00000000000000e1",
+        "name": "vacuum",
+        "kind": 1,
+        "startTimeUnixNano": "1790000150000000000",
+        "endTimeUnixNano": "1790000155000000000",
+        "attributes": [
+         {
+          "key": "db.system",
+          "value": {
+           "stringValue": "postgres"
+          }
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "cases": [
+  {
+   "kind": "trace",
+   "id": "000000000000000000000000000000a1",
+   "expect": {
+    "spans": [
+     {
+      "resource": {
+       "deployment.environment": "prod",
+       "k8s.pod.name": "shop-7f9",
+       "service.name": "shop"
+      },
+      "spanId": "AAAAAAAAALE=",
+      "parentSpanId": "",
+      "name": "POST /checkout",
+      "kind": "SPAN_KIND_SERVER",
+      "start": 1790000001000000000,
+      "end": 1790000002200000000,
+      "status": [
+       "STATUS_CODE_ERROR",
+       "payment declined"
+      ],
+      "attributes": {
+       "http.method": "POST",
+       "http.route": "/checkout",
+       "http.status_code": "500"
+      },
+      "events": [
+       [
+        1790000001900000000,
+        "exception",
+        {
+         "exception.type": "PaymentError"
+        }
+       ]
+      ]
+     },
+     {
+      "resource": {
+       "deployment.environment": "prod",
+       "k8s.pod.name": "shop-7f9",
+       "service.name": "shop"
+      },
+      "spanId": "AAAAAAAAALI=",
+      "parentSpanId": "AAAAAAAAALE=",
+      "name": "charge",
+      "kind": "SPAN_KIND_CLIENT",
+      "start": 1790000001100000000,
+      "end": 1790000002000000000,
+      "status": [
+       0,
+       ""
+      ],
+      "attributes": {
+       "peer.service": "payments"
+      },
+      "events": []
+     },
+     {
+      "resource": {
+       "service.name": "db"
+      },
+      "spanId": "AAAAAAAAALM=",
+      "parentSpanId": "AAAAAAAAALI=",
+      "name": "SELECT orders",
+      "kind": "SPAN_KIND_CLIENT",
+      "start": 1790000001150000000,
+      "end": 1790000001450000000,
+      "status": [
+       0,
+       ""
+      ],
+      "attributes": {
+       "db.rows": "12",
+       "db.system": "mysql"
+      },
+      "events": []
+     }
+    ]
+   }
+  },
+  {
+   "kind": "trace",
+   "id": "000000000000000000000000000000a4",
+   "expect": {
+    "spans": [
+     {
+      "resource": {
+       "service.name": "db"
+      },
+      "spanId": "AAAAAAAAAOE=",
+      "parentSpanId": "",
+      "name": "vacuum",
+      "kind": "SPAN_KIND_INTERNAL",
+      "start": 1790000150000000000,
+      "end": 1790000155000000000,
+      "status": [
+       0,
+       ""
+      ],
+      "attributes": {
+       "db.system": "postgres"
+      },
+      "events": []
+     }
+    ]
+   }
+  },
+  {
+   "kind": "search",
+   "q": "{}",
+   "start": "1789999400",
+   "end": "1790000900",
+   "limit": 20,
+   "expect": {
+    "traces": [
+     {
+      "traceID": "a1",
+      "rootServiceName": "shop",
+      "rootTraceName": "POST /checkout",
+      "start": 1790000001000000000,
+      "durationMs": 1200,
+      "matched": [
+       "00000000000000b1",
+       "00000000000000b2",
+       "00000000000000b3"
+      ]
+     },
+     {
+      "traceID": "a2",
+      "rootServiceName": "shop",
+      "rootTraceName": "GET /products",
+      "start": 1790000020000000000,
+      "durationMs": 40,
+      "matched": [
+       "00000000000000c1",
+       "00000000000000c2"
+      ]
+     },
+     {
+      "traceID": "a3",
+      "rootServiceName": "shop",
+      "rootTraceName": "GET /products",
+      "start": 1790000080000000000,
+      "durationMs": 60,
+      "matched": [
+       "00000000000000d1"
+      ]
+     },
+     {
+      "traceID": "a4",
+      "rootServiceName": "db",
+      "rootTraceName": "vacuum",
+      "start": 1790000150000000000,
+      "durationMs": 5000,
+      "matched": [
+       "00000000000000e1"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "kind": "search",
+   "q": "{ resource.service.name = \"shop\" }",
+   "start": "1789999400",
+   "end": "1790000900",
+   "limit": 20,
+   "expect": {
+    "traces": [
+     {
+      "traceID": "a1",
+      "rootServiceName": "shop",
+      "rootTraceName": "POST /checkout",
+      "start": 1790000001000000000,
+      "durationMs": 1200,
+      "matched": [
+       "00000000000000b1",
+       "00000000000000b2"
+      ]
+     },
+     {
+      "traceID": "a2",
+      "rootServiceName": "shop",
+      "rootTraceName": "GET /products",
+      "start": 1790000020000000000,
+      "durationMs": 40,
+      "matched": [
+       "00000000000000c1"
+      ]
+     },
+     {
+      "traceID": "a3",
+      "rootServiceName": "shop",
+      "rootTraceName": "GET /products",
+      "start": 1790000080000000000,
+      "durationMs": 60,
+      "matched": [
+       "00000000000000d1"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "kind": "search",
+   "q": "{ status = error }",
+   "start": "1789999400",
+   "end": "1790000900",
+   "limit": 20,
+   "expect": {
+    "traces": [
+     {
+      "traceID": "a1",
+      "rootServiceName": "shop",
+      "rootTraceName": "POST /checkout",
+      "start": 1790000001000000000,
+      "durationMs": 1200,
+      "matched": [
+       "00000000000000b1"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "kind": "search",
+   "q": "{ span.http.status_code >= 500 }",
+   "start": "1789999400",
+   "end": "1790000900",
+   "limit": 20,
+   "expect": {
+    "traces": [
+     {
+      "traceID": "a1",
+      "rootServiceName": "shop",
+      "rootTraceName": "POST /checkout",
+      "start": 1790000001000000000,
+      "durationMs": 1200,
+      "matched": [
+       "00000000000000b1"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "kind": "search",
+   "q": "{ .http.method = \"GET\" && duration > 50ms }",
+   "start": "1789999400",
+   "end": "1790000900",
+   "limit": 20,
+   "expect": {
+    "traces": [
+     {
+      "traceID": "a3",
+      "rootServiceName": "shop",
+      "rootTraceName": "GET /products",
+      "start": 1790000080000000000,
+      "durationMs": 60,
+      "matched": [
+       "00000000000000d1"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "kind": "search",
+   "q": "{ name =~ \"SELECT.*\" }",
+   "start": "1789999400",
+   "end": "1790000900",
+   "limit": 20,
+   "expect": {
+    "traces": [
+     {
+      "traceID": "a1",
+      "rootServiceName": "shop",
+      "rootTraceName": "POST /checkout",
+      "start": 1790000001000000000,
+      "durationMs": 1200,
+      "matched": [
+       "00000000000000b3"
+      ]
+     },
+     {
+      "traceID": "a2",
+      "rootServiceName": "shop",
+      "rootTraceName": "GET /products",
+      "start": 1790000020000000000,
+      "durationMs": 40,
+      "matched": [
+       "00000000000000c2"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "kind": "search",
+   "q": "{ resource.k8s.pod.name = \"shop-7f9\" && kind = client }",
+   "start": "1789999400",
+   "end": "1790000900",
+   "limit": 20,
+   "expect": {
+    "traces": [
+     {
+      "traceID": "a1",
+      "rootServiceName": "shop",
+      "rootTraceName": "POST /checkout",
+      "start": 1790000001000000000,
+      "durationMs": 1200,
+      "matched": [
+       "00000000000000b2"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "kind": "search",
+   "q": "{ span.db.rows > 20 }",
+   "start": "1789999400",
+   "end": "1790000900",
+   "limit": 20,
+   "expect": {
+    "traces": [
+     {
+      "traceID": "a2",
+      "rootServiceName": "shop",
+      "rootTraceName": "GET /products",
+      "start": 1790000020000000000,
+      "durationMs": 40,
+      "matched": [
+       "00000000000000c2"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "kind": "search",
+   "q": "{ .db.system != \"mysql\" }",
+   "start": "1789999400",
+   "end": "1790000900",
+   "limit": 20,
+   "expect": {
+    "traces": [
+     {
+      "traceID": "a4",
+      "rootServiceName": "db",
+      "rootTraceName": "vacuum",
+      "start": 1790000150000000000,
+      "durationMs": 5000,
+      "matched": [
+       "00000000000000e1"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "kind": "search",
+   "q": "{}",
+   "start": "1789999400",
+   "end": "1790000900",
+   "limit": 20,
+   "minDuration": "1s",
+   "expect": {
+    "traces": [
+     {
+      "traceID": "a1",
+      "rootServiceName": "shop",
+      "rootTraceName": "POST /checkout",
+      "start": 1790000001000000000,
+      "durationMs": 1200,
+      "matched": [
+       "00000000000000b1",
+       "00000000000000b2",
+       "00000000000000b3"
+      ]
+     },
+     {
+      "traceID": "a2",
+      "rootServiceName": "shop",
+      "rootTraceName": "GET /products",
+      "start": 1790000020000000000,
+      "durationMs": 40,
+      "matched": [
+       "00000000000000c1",
+       "00000000000000c2"
+      ]
+     },
+     {
+      "traceID": "a3",
+      "rootServiceName": "shop",
+      "rootTraceName": "GET /products",
+      "start": 1790000080000000000,
+      "durationMs": 60,
+      "matched": [
+       "00000000000000d1"
+      ]
+     },
+     {
+      "traceID": "a4",
+      "rootServiceName": "db",
+      "rootTraceName": "vacuum",
+      "start": 1790000150000000000,
+      "durationMs": 5000,
+      "matched": [
+       "00000000000000e1"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "kind": "tags",
+   "scope": "resource",
+   "start": "1789999400",
+   "end": "1790000900",
+   "expect": {
+    "tags": [
+     "deployment.environment",
+     "k8s.pod.name",
+     "service.name"
+    ]
+   }
+  },
+  {
+   "kind": "tags",
+   "scope": "span",
+   "start": "1789999400",
+   "end": "1790000900",
+   "expect": {
+    "tags": [
+     "db.rows",
+     "db.system",
+     "http.method",
+     "http.route",
+     "http.status_code",
+     "peer.service"
+    ]
+   }
+  },
+  {
+   "kind": "values",
+   "tag": "resource.service.name",
+   "start": "1789999400",
+   "end": "1790000900",
+   "expect": {
+    "values": [
+     "db",
+     "shop"
+    ]
+   }
+  },
+  {
+   "kind": "values",
+   "tag": "span.http.route",
+   "start": "1789999400",
+   "end": "1790000900",
+   "expect": {
+    "values": [
+     "/checkout",
+     "/products"
+    ]
+   }
+  },
+  {
+   "kind": "metrics",
+   "q": "{} | count_over_time() by (resource.service.name)",
+   "start": "1790000000",
+   "end": "1790000300",
+   "step": "60s",
+   "expect": {
+    "series": [
+     {
+      "labels": {
+       "resource.service.name": "db"
+      },
+      "points": [
+       [
+        1789999980,
+        0.0
+       ],
+       [
+        1790000040,
+        2.0
+       ],
+       [
+        1790000100,
+        0.0
+       ],
+       [
+        1790000160,
+        1.0
+       ],
+       [
+        1790000220,
+        0.0
+       ],
+       [
+        1790000280,
+        0.0
+       ],
+       [
+        1790000340,
+        0.0
+       ]
+      ]
+     },
+     {
+      "labels": {
+       "resource.service.name": "shop"
+      },
+      "points": [
+       [
+        1789999980,
+        0.0
+       ],
+       [
+        1790000040,
+        3.0
+       ],
+       [
+        1790000100,
+        1.0
+       ],
+       [
+        1790000160,
+        0.0
+       ],
+       [
+        1790000220,
+        0.0
+       ],
+       [
+        1790000280,
+        0.0
+       ],
+       [
+        1790000340,
+        0.0
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "kind": "metrics",
+   "q": "{ status = error } | rate()",
+   "start": "1790000000",
+   "end": "1790000300",
+   "step": "60s",
+   "expect": {
+    "series": [
+     {
+      "labels": {
+       "__name__": "rate"
+      },
+      "points": [
+       [
+        1789999980,
+        0.0
+       ],
+       [
+        1790000040,
+        0.016666666666666666
+       ],
+       [
+        1790000100,
+        0.0
+       ],
+       [
+        1790000160,
+        0.0
+       ],
+       [
+        1790000220,
+        0.0
+       ],
+       [
+        1790000280,
+        0.0
+       ],
+       [
+        1790000340,
+        0.0
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "kind": "metrics",
+   "q": "{} | max_over_time(duration) by (name)",
+   "start": "1790000000",
+   "end": "1790000300",
+   "step": "60s",
+   "expect": {
+    "series": [
+     {
+      "labels": {
+       "name": "GET /products"
+      },
+      "points": [
+       [
+        1790000040,
+        0.04
+       ],
+       [
+        1790000100,
+        0.06
+       ]
+      ]
+     },
+     {
+      "labels": {
+       "name": "POST /checkout"
+      },
+      "points": [
+       [
+        1790000040,
+        1.2
+       ]
+      ]
+     },
+     {
+      "labels": {
+       "name": "SELECT orders"
+      },
+      "points": [
+       [
+        1790000040,
+        0.3
+       ]
+      ]
+     },
+     {
+      "labels": {
+       "name": "SELECT products"
+      },
+      "points": [
+       [
+        1790000040,
+        0.02
+       ]
+      ]
+     },
+     {
+      "labels": {
+       "name": "charge"
+      },
+      "points": [
+       [
+        1790000040,
+        0.9
+       ]
+      ]
+     },
+     {
+      "labels": {
+       "name": "vacuum"
+      },
+      "points": [
+       [
+        1790000160,
+        5.0
+       ]
+      ]
+     }
+    ]
+   }
+  }
+ ]
+}

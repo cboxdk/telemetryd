@@ -174,12 +174,13 @@ async fn otlp_traces_in_tempo_trace_out() {
     let spans = batches[0]["scopeSpans"][0]["spans"].as_array().unwrap();
     assert_eq!(spans.len(), 2);
 
+    // Protobuf's JSON, as Tempo writes it: ids in base64, kind and status by name.
     let root = &spans[0];
-    assert_eq!(root["traceId"], TRACE);
-    assert_eq!(root["spanId"], ROOT_SPAN);
+    assert_eq!(root["traceId"], "S/kvNXezTaajzpKdDg5HNg==");
+    assert_eq!(root["spanId"], "APBnqgupArc=");
     assert_eq!(root["name"], "POST /checkout");
-    assert_eq!(root["kind"], 2);
-    assert_eq!(root["status"]["code"], 2);
+    assert_eq!(root["kind"], "SPAN_KIND_SERVER");
+    assert_eq!(root["status"]["code"], "STATUS_CODE_ERROR");
     assert_eq!(root["status"]["message"], "payment declined");
     // Nanosecond timestamps as strings, as in OTLP.
     assert_eq!(root["startTimeUnixNano"], NOW_NANOS.to_string());
@@ -189,8 +190,15 @@ async fn otlp_traces_in_tempo_trace_out() {
     );
 
     let child = &spans[1];
-    assert_eq!(child["parentSpanId"], ROOT_SPAN);
-    assert_eq!(child["kind"], 3);
+    assert_eq!(child["parentSpanId"], "APBnqgupArc=");
+    assert_eq!(child["kind"], "SPAN_KIND_CLIENT");
+
+    // Every spelling of the id a client might hand back finds the trace: the hex it
+    // sent, Tempo's search spelling without leading zeros, and base64.
+    for id in [TRACE, "S/kvNXezTaajzpKdDg5HNg=="] {
+        let (status, _) = harness.get(&format!("/api/traces/{}", urlencode(id))).await;
+        assert_eq!(status, StatusCode::OK, "{id}");
+    }
 }
 
 #[tokio::test]
@@ -380,11 +388,10 @@ async fn tags_include_resource_labels_span_attributes_and_intrinsics() {
         .map(|v| v.as_str().unwrap())
         .collect();
 
-    // Resource-derived stream labels are sanitised (they are label names); span
-    // attributes keep the producer's spelling (they are data).
+    // Every name as OTLP spelled it, resource and span alike, as Tempo lists them.
     for expected in [
-        "app",
-        "service_name",
+        "service.name",
+        "deployment.environment",
         "http.method",
         "db.system",
         "name",
@@ -631,7 +638,8 @@ async fn search_duration_bounds_apply_to_the_trace() {
         .await;
 
     let found = |bounds: &str| {
-        let path = format!("/api/search?q={}&{}&{bounds}", urlencode("{}"), window());
+        // No `q`: a search by tags, the one Tempo applies the bounds to.
+        let path = format!("/api/search?{}&{bounds}", window());
         let harness = &harness;
         async move {
             let (status, response) = harness.get(&path).await;
@@ -642,6 +650,19 @@ async fn search_duration_bounds_apply_to_the_trace() {
     assert_eq!(found("minDuration=100ms").await, 1);
     assert_eq!(found("maxDuration=50ms").await, 0);
     assert_eq!(found("minDuration=150ms&maxDuration=250ms").await, 1);
+
+    // With a TraceQL `q`, Tempo does not read them at all: the bound goes in the query.
+    let path = format!(
+        "/api/search?q={}&{}&maxDuration=50ms",
+        urlencode("{}"),
+        window()
+    );
+    let (_, response) = harness.get(&path).await;
+    assert_eq!(
+        response["traces"].as_array().unwrap().len(),
+        1,
+        "{response}"
+    );
 }
 
 /// An exporter that retries a batch it was not sure had landed sends every span twice.
@@ -774,21 +795,41 @@ async fn traceql_metrics_answer_in_tempo_s_shape() {
         .find(|s| s["labels"][0]["value"]["stringValue"] == "POST /checkout")
         .unwrap();
     assert_eq!(checkout["labels"][0]["key"], "name");
-    // Two steps; the spans start in the second, the first is a counted zero.
+    // Tempo's grid: from the start rounded down to a whole minute to the end rounded
+    // up, each point counting the minute before it — so the span at NOW counts at the
+    // next whole minute, and the other points are counted zeros.
     let samples = checkout["samples"].as_array().unwrap();
-    assert_eq!(samples.len(), 2, "{body}");
-    assert_eq!(samples[0]["value"], 0.0);
-    assert_eq!(samples[1]["value"], 1.0);
+    let points: Vec<(String, f64)> = samples
+        .iter()
+        .map(|p| {
+            (
+                p["timestampMs"].as_str().unwrap().to_owned(),
+                p["value"].as_f64().unwrap(),
+            )
+        })
+        .collect();
+    let next_minute = NOW_SECONDS.div_ceil(60) * 60;
     assert_eq!(
-        samples[1]["timestampMs"],
-        (NOW_SECONDS * 1000).to_string(),
+        points,
+        vec![
+            (((next_minute - 120) * 1000).to_string(), 0.0),
+            (((next_minute - 60) * 1000).to_string(), 0.0),
+            ((next_minute * 1000).to_string(), 1.0),
+            (((next_minute + 60) * 1000).to_string(), 0.0),
+        ],
         "{body}"
     );
 
     let (_, body) = harness.get(&range("{ status = error } | rate()")).await;
+    // With no `by`, Tempo names the series after its function.
+    assert_eq!(body["series"][0]["labels"][0]["key"], "__name__", "{body}");
+    assert_eq!(
+        body["series"][0]["labels"][0]["value"]["stringValue"],
+        "rate"
+    );
     let samples = body["series"][0]["samples"].as_array().unwrap();
     assert!(
-        (samples[1]["value"].as_f64().unwrap() - 1.0 / 60.0).abs() < 1e-12,
+        (samples[2]["value"].as_f64().unwrap() - 1.0 / 60.0).abs() < 1e-12,
         "{body}"
     );
 

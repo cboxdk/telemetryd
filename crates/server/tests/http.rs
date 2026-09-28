@@ -1988,7 +1988,7 @@ async fn a_trace_comes_back_as_the_protobuf_grafana_decodes() {
     let (_, _, json) = harness.get(&format!("/api/traces/{trace_id}")).await;
     assert!(json.contains("\"batches\""), "{json}");
     assert!(
-        json.contains(r#""links":[{"traceId":"0af7651916cd43dd8448eb211c80319c""#),
+        json.contains(r#""links":[{"traceId":"CvdlGRbNQ92ESOshHIAxnA==""#),
         "{json}"
     );
 }

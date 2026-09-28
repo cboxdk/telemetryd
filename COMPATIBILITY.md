@@ -401,6 +401,26 @@ Two corrections our first plan got wrong, both found by reading the connector:
   subset is therefore required, not optional.
 - Tag values come from the **v2** path. The v1 path is not called.
 
+**Held to Tempo.** `crates/server/tests/conformance/tempo.json` holds OTLP traces, 19
+queries — trace by id, TraceQL search, tag listings and values, TraceQL metrics — and
+Tempo 2.10.1's answer to each, written by Tempo through `scripts/tempo-conformance.py`
+and asked of Tempo again in CI. What that pinned down, now as Tempo answers:
+
+- a trace's JSON is protobuf's JSON mapping, as Tempo writes it: trace and span ids in
+  base64, `kind` and the status code by name (`SPAN_KIND_SERVER`,
+  `STATUS_CODE_ERROR`), `{}` for an unset status; its resource is every resource
+  attribute under the name OTLP sent, not telemetryd's stream labels
+- a search row's `traceID` drops its leading zeros and `durationMs` is whole
+  milliseconds; `/api/traces/{id}` takes an id in any of those spellings
+- `minDuration`/`maxDuration` apply to a search by `tags`; with a TraceQL `q` — even
+  `{}` — they change nothing, and the bound goes in the query as `duration > 1s`
+- the resource scope of the tag listing names attributes as OTLP spelled them
+
+Two differences remain, on purpose: attribute values come back as strings, since
+telemetryd stores them as text (`"500"` where Tempo types an `intValue`), and `= nil` is
+not compared — Tempo 2.10 answers it for some spans without the attribute and not others,
+by how its storage lays that attribute out; telemetryd matches every span without it.
+
 ### TraceQL subset
 
 The UI's `TraceqlCompiler` emits a single spanset of `&&`-joined conditions, optionally
@@ -424,7 +444,7 @@ attribute, so a typo is an error instead of an empty result.
 
 A search row describes the whole trace — its root span's name and service, its start
 and its duration — while its span set lists the spans that matched. `minDuration` and
-`maxDuration` bound the trace's duration, as in Tempo. A span stored twice, as an
+`maxDuration`, where they apply, bound the trace's duration, as in Tempo. A span stored twice, as an
 exporter's retry can leave it, is returned once. Before 0.61.0 each of these differed.
 
 `resource.X` reaches every resource attribute, not only the ones promoted to stream
@@ -445,8 +465,10 @@ spelling, `.service.name` still reaches the `service_name` label.
 `min_over_time(f)`, `max_over_time(f)`, `quantile_over_time(f, q, …)` and
 `histogram_over_time(f)`, each optionally `by (field, …)` and followed by `| topk(n)` or
 `| bottomk(n)`. `f` is `duration` — in seconds, as Tempo reports it — or a numeric
-attribute. A span counts in the step its start falls in; `rate` is spans per second of
-the step, and `rate` and `count_over_time` answer zero for an empty step. Quantiles are
+attribute. Points sit on whole steps, the start rounded down and the end up, and each
+counts the spans that started in the step before it; `rate` is spans per second of the
+step, and `rate` and `count_over_time` answer zero for an empty step. With no `by`, the
+one series is named after its function, `{__name__="rate"}`, as Tempo names it. Quantiles are
 one series each under the label `p`, histogram buckets under `__bucket` (powers of two,
 as Tempo's). Computed from the stored spans at query time, with exact quantiles where
 Tempo reads them off a log-2 histogram, so the two can differ by up to a bucket's
