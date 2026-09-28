@@ -367,6 +367,8 @@ refused by name — ask the Prometheus API for series.
 | `GET /api/v2/traces/{traceID}` | Grafana's trace view | `tempopb.TraceByIDResponse` with `Accept: application/protobuf` — what Grafana asks for and decodes whatever the content type — else `{"trace":{"resourceSpans":[…]}}` |
 | `GET /api/v2/search/tags` | Grafana's query builder | `{"scopes":[{"name":"resource"|"span"|"intrinsic","tags":[…]}]}`; `scope` narrows to one |
 | `GET /api/v2/search/tag/{name}/values` | `TempoSource::tagValues()` | **v2**, with an optional `q` filter. Returns `{"tagValues":[{"type","value"}]}` |
+| `GET /api/metrics/query_range` | Grafana's TraceQL metrics, Traces Drilldown | `q` ending in a metrics function; `start`/`end` (seconds, nanoseconds or RFC 3339), `step`. `{"series":[{"labels","promLabels","samples":[{"timestampMs","value"}]}]}` |
+| `GET /api/metrics/query` | Grafana's instant TraceQL metrics | The same over the whole window, one `value` per series |
 
 Two corrections our first plan got wrong, both found by reading the connector:
 
@@ -412,8 +414,22 @@ span's name, `.name` is an attribute a producer happened to call `name`. Because
 ingest sanitizes stream labels but leaves attribute keys in the producer's own
 spelling, `.service.name` still reaches the `service_name` label.
 
+### TraceQL metrics
+
+`{ … } | rate()`, `count_over_time()`, `sum_over_time(f)`, `avg_over_time(f)`,
+`min_over_time(f)`, `max_over_time(f)`, `quantile_over_time(f, q, …)` and
+`histogram_over_time(f)`, each optionally `by (field, …)` and followed by `| topk(n)` or
+`| bottomk(n)`. `f` is `duration` — in seconds, as Tempo reports it — or a numeric
+attribute. A span counts in the step its start falls in; `rate` is spans per second of
+the step, and `rate` and `count_over_time` answer zero for an empty step. Quantiles are
+one series each under the label `p`, histogram buckets under `__bucket` (powers of two,
+as Tempo's). Computed from the stored spans at query time, with exact quantiles where
+Tempo reads them off a log-2 histogram, so the two can differ by up to a bucket's
+width. More than 1,000 series is refused.
+
 *Not supported:* multiple spansets, `||` between conditions, structural operators
-(`>>`, `~`), aggregates (`count()`, `avg()`), and `by()`.
+(`>>`, `~`), spanset aggregates (`count() > 2`), `compare()`, and the service graph and
+span metrics, which Tempo's metrics generator writes to a Prometheus.
 
 ---
 

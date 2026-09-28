@@ -5,6 +5,7 @@ use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
 use telemetryd_core::Error;
 use telemetryd_query::tempo::{self, SearchParams, SearchRequest};
+use telemetryd_query::tracemetrics::{self, MetricsParams, MetricsRequest};
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -22,6 +23,43 @@ pub async fn search(
         .map_err(|e| Error::Config(format!("search task panicked: {e}")))??;
 
     Ok(Json(response).into_response())
+}
+
+/// `GET /api/metrics/query_range` — TraceQL metrics over a range, in Tempo's shape.
+pub async fn metrics_range(
+    State(state): State<AppState>,
+    Query(params): Query<MetricsParams>,
+) -> Result<Response, ApiError> {
+    metrics(&state, &params, false).await
+}
+
+/// `GET /api/metrics/query` — TraceQL metrics as one value per series.
+pub async fn metrics_instant(
+    State(state): State<AppState>,
+    Query(params): Query<MetricsParams>,
+) -> Result<Response, ApiError> {
+    metrics(&state, &params, true).await
+}
+
+async fn metrics(
+    state: &AppState,
+    params: &MetricsParams,
+    instant: bool,
+) -> Result<Response, ApiError> {
+    let expression = params.q.clone().unwrap_or_default();
+    let request = MetricsRequest::from_params(params, telemetryd_store::now_nanos(), instant)
+        .inspect_err(|error| state.refused_query("traceql", &expression, error))?;
+    let store = std::sync::Arc::clone(&state.store);
+    let series = crate::auth::spawn_read(move || tracemetrics::evaluate(store.traces(), &request))
+        .await
+        .map_err(|e| Error::Config(format!("metrics task panicked: {e}")))?
+        .inspect_err(|error| state.refused_query("traceql", &expression, error))?;
+    let body = if instant {
+        tracemetrics::instant_json(&series)
+    } else {
+        tracemetrics::range_json(&series)
+    };
+    Ok(Json(body).into_response())
 }
 
 /// `GET /api/traces/{trace_id}`

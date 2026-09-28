@@ -53,6 +53,13 @@ pub struct SearchRequest {
 impl SearchRequest {
     pub fn from_params(params: &SearchParams, now_nanos: u64) -> Result<Self> {
         let query = traceql::parse(params.q.as_deref().unwrap_or_default())?;
+        if query.metrics.is_some() {
+            return Err(Error::BadRequest(
+                "a query ending in a metrics function is answered by \
+                 /api/metrics/query_range, not by search"
+                    .to_owned(),
+            ));
+        }
 
         let end_nanos = match params.end.as_deref().filter(|s| !s.is_empty()) {
             Some(raw) => parse_seconds(raw)?,

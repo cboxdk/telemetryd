@@ -24,6 +24,54 @@ pub struct TraceQuery {
     /// `&&`-joined; all must hold for a span to match. Empty means "every span",
     /// which is what `{}` means and what the UI sends for an unfiltered search.
     pub conditions: Vec<Condition>,
+    /// `| rate() by (resource.service.name)`: what makes this a metrics query, answered
+    /// by `/api/metrics/query_range` rather than by search.
+    pub metrics: Option<MetricsStage>,
+}
+
+/// A TraceQL metrics function over the matching spans, its grouping, and an optional
+/// `topk`/`bottomk` after it.
+#[derive(Debug, Clone)]
+pub struct MetricsStage {
+    pub function: MetricsFunction,
+    /// The field `sum_over_time(span.bytes)` and its kin read; `None` for `rate` and
+    /// `count_over_time`, which count spans.
+    pub field: Option<Field>,
+    /// The quantiles `quantile_over_time` answers, each its own series.
+    pub quantiles: Vec<f64>,
+    /// `by (resource.service.name, name)`: each field with the spelling it was written in,
+    /// which is the series label's key.
+    pub by: Vec<(String, Field)>,
+    /// `| topk(5)` (`true`) or `| bottomk(5)`, per step.
+    pub rank: Option<(bool, usize)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsFunction {
+    Rate,
+    CountOverTime,
+    SumOverTime,
+    AvgOverTime,
+    MinOverTime,
+    MaxOverTime,
+    QuantileOverTime,
+    HistogramOverTime,
+}
+
+impl MetricsFunction {
+    fn named(name: &str) -> Option<Self> {
+        Some(match name {
+            "rate" => Self::Rate,
+            "count_over_time" => Self::CountOverTime,
+            "sum_over_time" => Self::SumOverTime,
+            "avg_over_time" => Self::AvgOverTime,
+            "min_over_time" => Self::MinOverTime,
+            "max_over_time" => Self::MaxOverTime,
+            "quantile_over_time" => Self::QuantileOverTime,
+            "histogram_over_time" => Self::HistogramOverTime,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -132,15 +180,36 @@ impl Parser<'_> {
             }
         }
 
-        // `| select(a, b)` is accepted and ignored: telemetryd always returns the
-        // matched spans in full, so a projection changes nothing about the result.
-        if self.peek() == Some(&Token::Pipe) {
+        let mut metrics: Option<MetricsStage> = None;
+        while self.peek() == Some(&Token::Pipe) {
             self.pos += 1;
-            let name = self.expect_ident("`select` after `|`")?;
-            if name != "select" {
-                return Err(Error::unsupported(format!("TraceQL `| {name}`")));
+            let name = self.expect_ident("`select` or a metrics function after `|`")?;
+            if let Some(function) = MetricsFunction::named(&name) {
+                if metrics.is_some() {
+                    return Err(Error::BadRequest(
+                        "a TraceQL query takes one metrics function".to_owned(),
+                    ));
+                }
+                metrics = Some(self.parse_metrics(function)?);
+                continue;
             }
-            self.skip_balanced_parens()?;
+            match (name.as_str(), metrics.as_mut()) {
+                // `| select(a, b)` is accepted and ignored: telemetryd always returns
+                // the matched spans in full, so a projection changes nothing.
+                ("select", None) => self.skip_balanced_parens()?,
+                ("topk" | "bottomk", Some(stage)) if stage.rank.is_none() => {
+                    self.expect(&Token::LeftParen, "`(` after topk")?;
+                    let Some(Token::Number(k)) = self.peek().cloned() else {
+                        return Err(self.unexpected("how many series to keep"));
+                    };
+                    self.pos += 1;
+                    self.expect(&Token::RightParen, "`)`")?;
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let k = k.max(0.0) as usize;
+                    stage.rank = Some((name == "topk", k));
+                }
+                _ => return Err(Error::unsupported(format!("TraceQL `| {name}`"))),
+            }
         }
 
         if self.pos < self.tokens.len() {
@@ -152,7 +221,71 @@ impl Parser<'_> {
             ));
         }
 
-        Ok(TraceQuery { conditions })
+        Ok(TraceQuery {
+            conditions,
+            metrics,
+        })
+    }
+
+    /// `rate()`, `quantile_over_time(duration, .99, .5)`, … and any `by (…)` after it.
+    fn parse_metrics(&mut self, function: MetricsFunction) -> Result<MetricsStage> {
+        self.expect(&Token::LeftParen, "`(` after the metrics function")?;
+        let reads = !matches!(
+            function,
+            MetricsFunction::Rate | MetricsFunction::CountOverTime
+        );
+        let field = if reads {
+            Some(self.parse_field()?)
+        } else {
+            None
+        };
+        let mut quantiles = Vec::new();
+        if function == MetricsFunction::QuantileOverTime {
+            while self.peek() == Some(&Token::Comma) {
+                self.pos += 1;
+                let Some(Token::Number(q)) = self.peek().cloned() else {
+                    return Err(self.unexpected("a quantile between 0 and 1"));
+                };
+                self.pos += 1;
+                quantiles.push(q);
+            }
+            if quantiles.is_empty() {
+                return Err(Error::BadRequest(
+                    "quantile_over_time needs at least one quantile, like \
+                     quantile_over_time(duration, .99)"
+                        .to_owned(),
+                ));
+            }
+        }
+        self.expect(&Token::RightParen, "`)` closing the metrics function")?;
+
+        let mut by = Vec::new();
+        if matches!(self.peek(), Some(Token::Ident(word)) if word == "by") {
+            self.pos += 1;
+            self.expect(&Token::LeftParen, "`(` after by")?;
+            loop {
+                let written = match self.peek() {
+                    Some(Token::Ident(name)) => name.clone(),
+                    _ => return Err(self.unexpected("a field to group by")),
+                };
+                by.push((written, self.parse_field()?));
+                match self.peek() {
+                    Some(Token::Comma) => self.pos += 1,
+                    Some(Token::RightParen) => {
+                        self.pos += 1;
+                        break;
+                    }
+                    _ => return Err(self.unexpected("`,` or `)`")),
+                }
+            }
+        }
+        Ok(MetricsStage {
+            function,
+            field,
+            quantiles,
+            by,
+            rank: None,
+        })
     }
 
     fn parse_condition(&mut self) -> Result<Condition> {
@@ -360,6 +493,38 @@ impl TraceQuery {
 
     pub fn is_empty(&self) -> bool {
         self.conditions.is_empty()
+    }
+}
+
+impl Field {
+    /// The field's value on a span as text, for a series label; `None` when the span
+    /// does not have it.
+    pub fn text(&self, span: &SpanRecord) -> Option<String> {
+        Some(match self {
+            Self::Intrinsic(Intrinsic::Name) => span.name.clone(),
+            Self::Intrinsic(Intrinsic::Status) => span.status.as_str().to_owned(),
+            Self::Intrinsic(Intrinsic::StatusMessage) => span.status_message.clone(),
+            Self::Intrinsic(Intrinsic::Kind) => span.kind.as_str().to_owned(),
+            Self::Intrinsic(Intrinsic::Duration) => self.number(span)?.to_string(),
+            Self::Resource(name) => span.resource_attribute(name)?.to_owned(),
+            Self::Span(name) => span.attributes.get_relaxed(name)?.to_owned(),
+            Self::Unscoped(name) => span
+                .attributes
+                .get_relaxed(name)
+                .or_else(|| span.resource_attribute(name))
+                .or_else(|| span.stream.get_relaxed(name))?
+                .to_owned(),
+        })
+    }
+
+    /// The field's value as a number — `duration` in seconds, as Tempo's metrics give it.
+    pub fn number(&self, span: &SpanRecord) -> Option<f64> {
+        match self {
+            #[allow(clippy::cast_precision_loss)]
+            Self::Intrinsic(Intrinsic::Duration) => Some(span.duration_nanos() as f64 / 1e9),
+            Self::Intrinsic(_) => None,
+            _ => self.text(span)?.trim().parse().ok(),
+        }
     }
 }
 

@@ -747,3 +747,96 @@ async fn resource_attributes_beyond_the_stream_are_the_resource_s() {
         .await;
     assert_eq!(values["tagValues"][0]["value"], "checkout-7f9", "{values}");
 }
+
+/// TraceQL metrics, in Tempo's response shape: Grafana's metrics queries and the
+/// Traces Drilldown read `series[].labels`, `samples[].timestampMs` and `value`.
+#[tokio::test]
+async fn traceql_metrics_answer_in_tempo_s_shape() {
+    let harness = Harness::new();
+    harness.post_traces(&trace_payload()).await;
+    let range = |q: &str| {
+        format!(
+            "/api/metrics/query_range?q={}&start={}&end={}&step=60s",
+            urlencode(q),
+            NOW_SECONDS - 60,
+            NOW_SECONDS + 60
+        )
+    };
+
+    let (status, body) = harness
+        .get(&range("{} | count_over_time() by (name)"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let series = body["series"].as_array().unwrap();
+    assert_eq!(series.len(), 2, "{body}");
+    let checkout = series
+        .iter()
+        .find(|s| s["labels"][0]["value"]["stringValue"] == "POST /checkout")
+        .unwrap();
+    assert_eq!(checkout["labels"][0]["key"], "name");
+    // Two steps; the spans start in the second, the first is a counted zero.
+    let samples = checkout["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 2, "{body}");
+    assert_eq!(samples[0]["value"], 0.0);
+    assert_eq!(samples[1]["value"], 1.0);
+    assert_eq!(
+        samples[1]["timestampMs"],
+        (NOW_SECONDS * 1000).to_string(),
+        "{body}"
+    );
+
+    let (_, body) = harness.get(&range("{ status = error } | rate()")).await;
+    let samples = body["series"][0]["samples"].as_array().unwrap();
+    assert!(
+        (samples[1]["value"].as_f64().unwrap() - 1.0 / 60.0).abs() < 1e-12,
+        "{body}"
+    );
+
+    let (_, body) = harness
+        .get(&range(
+            "{} | quantile_over_time(duration, .5, 1) by (resource.service.name)",
+        ))
+        .await;
+    let series = body["series"].as_array().unwrap();
+    assert_eq!(series.len(), 2, "one series per quantile: {body}");
+    let max = series
+        .iter()
+        .find(|s| s["labels"][1]["value"]["doubleValue"] == 1.0)
+        .unwrap();
+    assert_eq!(max["labels"][0]["key"], "resource.service.name");
+    assert!(
+        (max["samples"][0]["value"].as_f64().unwrap() - 0.15).abs() < 1e-9,
+        "{body}"
+    );
+
+    let (_, body) = harness
+        .get(&range("{} | histogram_over_time(duration)"))
+        .await;
+    assert!(body.to_string().contains("__bucket"), "{body}");
+
+    let (status, body) = harness
+        .get(&format!(
+            "/api/metrics/query?q={}&start={}&end={}",
+            urlencode("{} | max_over_time(duration)"),
+            NOW_SECONDS - 60,
+            NOW_SECONDS + 60
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        (body["series"][0]["value"].as_f64().unwrap() - 0.15).abs() < 1e-9,
+        "{body}"
+    );
+
+    // A metrics query is not a search, and a search is not a metrics query.
+    let (status, _) = harness
+        .get(&format!(
+            "/api/search?q={}&{}",
+            urlencode("{} | rate()"),
+            window()
+        ))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = harness.get(&range("{ status = error }")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

@@ -29,6 +29,7 @@ pub mod promeval;
 pub mod promfn;
 pub mod promql;
 pub mod tempo;
+pub mod tracemetrics;
 pub mod traceql;
 
 pub use logql::{LogQuery, Stage};

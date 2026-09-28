@@ -102,6 +102,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/traces/{trace_id}", get(tempo::trace))
         .route("/api/v2/traces/{trace_id}", get(tempo::trace_v2))
         .route("/api/search", get(tempo::search))
+        .route("/api/metrics/query_range", get(tempo::metrics_range))
+        .route("/api/metrics/query", get(tempo::metrics_instant))
         .route("/api/search/tags", get(tempo::tags))
         .route("/api/v2/search/tags", get(tempo::tags_v2))
         // The UI calls the v2 path; v1 is kept for older clients.
