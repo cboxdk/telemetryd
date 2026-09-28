@@ -443,10 +443,7 @@ async fn an_unsupported_promql_function_is_named_with_a_400() {
     assert_eq!(response["errorType"], "bad_data");
     assert_eq!(response["code"], "unsupported_feature");
     assert!(
-        response["error"]
-            .as_str()
-            .unwrap()
-            .contains("holt_winters"),
+        response["error"].as_str().unwrap().contains("holt_winters"),
         "{response}"
     );
     assert!(
