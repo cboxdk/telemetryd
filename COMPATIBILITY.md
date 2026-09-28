@@ -118,6 +118,15 @@ labels; every other resource and scope attribute is stored as a record attribute
 the spelling it was sent with. So `k8s.pod.name`, `host.name` and `cloud.region` are
 queryable and appear in `/api/v1/export`, without adding to stream cardinality.
 
+**Metric series carry `job` and `instance`**, set as Prometheus's own OTLP receiver sets
+them: `job` is `service.name`, prefixed with `service.namespace/` when there is one, and
+`instance` is `service.instance.id`. Both are set over a data-point attribute of the same
+name. One difference: when a producer sends no `service.instance.id`, `instance` is
+`host.name`. Prometheus sets none then, and two hosts exporting the same counter become
+one series whose value jumps between their totals — every jump a counter reset. Series
+written before this carried neither label, so a query spanning the upgrade sees each
+series end and its successor begin.
+
 One fidelity note for round trips: an attribute that arrived in `resource` comes back out
 of `/api/v1/export` on the record rather than nested under `resource`. The attribute and
 its value are preserved; its OTLP nesting is not.

@@ -142,6 +142,10 @@ Promoting every attribute would be the friendly-looking default and a trap: `hos
 `process.pid` and `container.id` change per deploy or per process, and would multiply
 streams without bound. See [`ingest.stream_labels`](../configuration/reference.md).
 
+Metric series also carry `job` and `instance`, as Prometheus's OTLP receiver sets them:
+`job` from `service.namespace` and `service.name`, `instance` from `service.instance.id` —
+or from `host.name` when there is no instance id, so two hosts of one app stay two series.
+
 Per-record attributes keep the producer's own key spelling — `exception.type` stays
 `exception.type`, because a trace view should show what was sent. Queries reach them by
 either spelling.

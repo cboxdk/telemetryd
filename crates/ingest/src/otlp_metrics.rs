@@ -374,6 +374,7 @@ fn push_number(
 
     let mut series = base_series(name, resource, app, ctx);
     add_attributes(&mut series, &point.attributes);
+    identify(&mut series, resource);
 
     if let Err(rejection) = check_limits(&series, ctx) {
         decoded.refuse(rejection);
@@ -402,6 +403,7 @@ fn push_histogram(
 
     let mut base = base_series(name, resource, app, ctx);
     add_attributes(&mut base, &point.attributes);
+    identify(&mut base, resource);
     if let Err(rejection) = check_limits(&base, ctx) {
         decoded.refuse(rejection);
         return;
@@ -476,6 +478,38 @@ fn base_series(name: &str, resource: &Labels, app: &str, ctx: MetricContext<'_>)
         }
     }
     series
+}
+
+/// `job` and `instance`, as Prometheus's own OTLP receiver sets them: `job` from
+/// `service.namespace` and `service.name`, `instance` from `service.instance.id`.
+/// Set last, over any data-point attribute of the same name, as Prometheus sets them.
+///
+/// # Why
+///
+/// A series was its name, its app and the promoted resource labels — none of which tell
+/// two hosts of one app apart. cbox.dk runs on two servers exporting the same counters,
+/// and their samples became one series whose value jumped between the two totals every
+/// minute: each jump read as a counter reset, and `increase()` reported seven thousand
+/// cache warms an hour where there were none.
+///
+/// `instance` falls back to `host.name` when a producer sends no `service.instance.id`,
+/// which laravel-telemetry does not. Prometheus sets no `instance` then, and merges the
+/// hosts into one series exactly as this did; the one label more is the difference
+/// between two counters and a number that means nothing.
+fn identify(series: &mut Labels, resource: &Labels) {
+    if let Some(service) = resource.get("service_name") {
+        let job = match resource.get("service_namespace") {
+            Some(namespace) => format!("{namespace}/{service}"),
+            None => service.to_owned(),
+        };
+        series.insert("job", job);
+    }
+    if let Some(instance) = resource
+        .get("service_instance_id")
+        .or_else(|| resource.get("host_name"))
+    {
+        series.insert("instance", instance);
+    }
 }
 
 fn add_attributes(series: &mut Labels, attributes: &[KeyValue]) {
@@ -680,6 +714,65 @@ mod tests {
         );
         assert_eq!(decoded.records.len(), 2);
         assert_ne!(decoded.records[0].series, decoded.records[1].series);
+    }
+
+    fn with_resource(resource: &str) -> Decoded<MetricSample> {
+        decode_str(&format!(
+            r#"{{"resourceMetrics":[{{"resource":{{"attributes":[{resource}]}},
+                "scopeMetrics":[{{"metrics":[{{"name":"warms","unit":"1","sum":{{
+                    "isMonotonic":true,"aggregationTemporality":2,"dataPoints":[{{
+                    "timeUnixNano":"1750000000000000000","asInt":"124",
+                    "attributes":[{{"key":"job","value":{{"stringValue":"ignored"}}}}]
+                }}]}}}}]}}]}}]}}"#
+        ))
+    }
+
+    fn attribute(key: &str, value: &str) -> String {
+        format!(r#"{{"key":"{key}","value":{{"stringValue":"{value}"}}}}"#)
+    }
+
+    /// Two hosts of one app exporting the same counter are two series, told apart by
+    /// `instance` as Prometheus's OTLP receiver tells them apart. They were one series,
+    /// whose value jumped between the hosts' totals and read as a reset every minute.
+    #[test]
+    fn two_hosts_of_one_app_are_two_series() {
+        let series = |host: &str| {
+            let decoded = with_resource(
+                &[
+                    attribute("service.name", "cbox-web"),
+                    attribute("host.name", host),
+                ]
+                .join(","),
+            );
+            decoded.records[0].series.clone()
+        };
+        let (one, two) = (series("web01"), series("web02"));
+        assert_ne!(one, two);
+        assert_eq!(one.get("instance"), Some("web01"));
+        // Set over the data point's own `job`, as Prometheus sets it.
+        assert_eq!(one.get("job"), Some("cbox-web"));
+    }
+
+    #[test]
+    fn job_and_instance_follow_prometheus() {
+        let decoded = with_resource(
+            &[
+                attribute("service.name", "api"),
+                attribute("service.namespace", "shop"),
+                attribute("service.instance.id", "7f3a"),
+                attribute("host.name", "web01"),
+            ]
+            .join(","),
+        );
+        let series = &decoded.records[0].series;
+        assert_eq!(series.get("job"), Some("shop/api"));
+        // The instance id outranks the host.
+        assert_eq!(series.get("instance"), Some("7f3a"));
+
+        // Nothing to name them from, nothing named.
+        let decoded = with_resource("");
+        assert_eq!(decoded.records[0].series.get("job"), Some("ignored"));
+        assert_eq!(decoded.records[0].series.get("instance"), None);
     }
 
     #[test]
