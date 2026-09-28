@@ -276,3 +276,65 @@ fn one_series_from_the_middle_of_a_segment() {
         assert_eq!(scanned, by_rows(&store, span, &matchers), "route {route}");
     }
 }
+
+/// Three series, each longer than a read batch and together longer than a row group,
+/// sealed as one segment: every series' rows cross the reader's batch boundaries, and one
+/// crosses a row group's.
+fn long_series() -> (tempfile::TempDir, Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&config(dir.path())).unwrap();
+    for from in (0..40_000u64).step_by(1_000) {
+        let batch: Vec<MetricSample> = (from..from + 1_000)
+            .flat_map(|at| {
+                (0..3).map(move |route| MetricSample {
+                    series: series("bucket", route),
+                    timestamp_nanos: (at + 1) * SECOND,
+                    #[allow(clippy::cast_precision_loss)]
+                    value: (at * (route as u64 + 1)) as f64,
+                    kind: MetricKind::Counter,
+                })
+            })
+            .collect();
+        store.metrics().append(&batch).unwrap();
+    }
+    store.metrics().seal_now().unwrap();
+    (dir, store)
+}
+
+/// A segment's series are handed out as they are read, not gathered first, so a series
+/// whose rows cross a batch or a row group must still come out whole — one run per series
+/// per segment, holding exactly its rows.
+#[test]
+fn a_series_longer_than_a_read_batch_is_one_whole_run() {
+    let (_dir, store) = long_series();
+    assert_eq!(store.metrics().segments().len(), 1);
+    for span in [(1, 40_000 * SECOND), (8_000 * SECOND, 30_123 * SECOND)] {
+        let mut runs = Vec::new();
+        let complete = store
+            .metrics()
+            .scan_series(&[span], &[], &mut |run| {
+                runs.push((run.source, run.series.clone(), run.timestamps.len()));
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert!(complete);
+        assert_eq!(runs.len(), 3, "one run per series: {runs:?}");
+        assert_eq!(by_scan(&store, &[span], &[]), by_rows(&store, span, &[]));
+    }
+}
+
+/// A consumer that stops is not handed anything more, and the scan says it did not finish.
+#[test]
+fn a_consumer_that_stops_is_handed_nothing_more() {
+    let (_dir, store) = long_series();
+    let mut handed = 0;
+    let complete = store
+        .metrics()
+        .scan_series(&[(1, 40_000 * SECOND)], &[], &mut |_| {
+            handed += 1;
+            std::ops::ControlFlow::Break(())
+        })
+        .unwrap();
+    assert!(!complete);
+    assert_eq!(handed, 1);
+}

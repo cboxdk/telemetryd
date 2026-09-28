@@ -119,6 +119,103 @@ impl Gathered {
     }
 }
 
+/// One series' rows at a time, read from a segment laid out series by series. Kept
+/// between segments, like [`Gathered`], so a scan allocates once.
+#[derive(Debug, Default)]
+struct Streamed {
+    /// Rows the reader decoded for the last segment read, wanted or not.
+    decoded: usize,
+    /// The stream the rows below belong to.
+    stream: Option<u32>,
+    timestamps: Vec<u64>,
+    values: Vec<f64>,
+    ended: Ended,
+}
+
+/// How reading a segment a series at a time ended.
+#[derive(Debug, Default, Clone, Copy)]
+enum Ended {
+    #[default]
+    Complete,
+    /// The consumer broke off.
+    Stopped,
+    /// A row named a stream the dictionary does not hold, or the streams came out of
+    /// order; the rows are to be read another way.
+    Unnamed,
+}
+
+impl Streamed {
+    /// Read `ranges` of one segment, handing `visit` each stream's rows in `[start, end]`
+    /// as soon as the next stream's begin. The last stream's are left for [`Self::flush`],
+    /// once the caller has settled how the read ended.
+    fn read(
+        &mut self,
+        segment: &crate::segment::Segment,
+        ranges: &[(usize, usize)],
+        (start, end): (u64, u64),
+        allowed: &[bool],
+        source: usize,
+        visit: &mut dyn FnMut(SeriesRun<'_>) -> std::ops::ControlFlow<()>,
+    ) -> Result<()> {
+        const COLUMNS: [&str; 3] = ["timestamp_nanos", "stream_id", "value"];
+        self.decoded = 0;
+        self.stream = None;
+        self.timestamps.clear();
+        self.values.clear();
+        self.ended = Ended::Complete;
+        segment.scan_row_ranges(&COLUMNS, ranges, |batch| {
+            self.decoded += batch.num_rows();
+            let ids = u32_column(batch, "stream_id")?.values();
+            let timestamps = u64_column(batch, "timestamp_nanos")?.values();
+            let values = f64_column(batch, "value")?.values();
+            for ((&id, &at), &value) in ids.iter().zip(timestamps).zip(values) {
+                if self.stream != Some(id) {
+                    // Streams ascend through a segment laid out by them; one that does not
+                    // is read the other way rather than handed out as two runs.
+                    if self.stream.is_some_and(|stream| id < stream)
+                        || allowed.get(id as usize).is_none()
+                    {
+                        self.ended = Ended::Unnamed;
+                        return Ok(crate::segment::Flow::Stop);
+                    }
+                    if self.flush(&segment.manifest, source, visit).is_break() {
+                        self.ended = Ended::Stopped;
+                        return Ok(crate::segment::Flow::Stop);
+                    }
+                    self.stream = Some(id);
+                }
+                if at < start || at > end || !allowed[id as usize] {
+                    continue;
+                }
+                self.timestamps.push(at);
+                self.values.push(value);
+            }
+            Ok(crate::segment::Flow::Continue)
+        })
+    }
+
+    /// Hand over the rows held for the current stream, if there are any.
+    fn flush(
+        &mut self,
+        manifest: &crate::segment::SegmentManifest,
+        source: usize,
+        visit: &mut dyn FnMut(SeriesRun<'_>) -> std::ops::ControlFlow<()>,
+    ) -> std::ops::ControlFlow<()> {
+        let flow = match self.stream {
+            Some(stream) if !self.timestamps.is_empty() => visit(SeriesRun {
+                source,
+                series: &manifest.streams[stream as usize],
+                timestamps: &self.timestamps,
+                values: &self.values,
+            }),
+            _ => std::ops::ControlFlow::Continue(()),
+        };
+        self.timestamps.clear();
+        self.values.clear();
+        flow
+    }
+}
+
 impl crate::RecordStore<MetricSchema> {
     /// Hand `visit` every series matching `matchers` that has samples in `[start, end]`
     /// — the ends of `windows`, sorted, disjoint `(start, end)` pairs, both ends included
@@ -162,6 +259,7 @@ impl crate::RecordStore<MetricSchema> {
 
         let mut source = 0;
         let mut gathered = Gathered::default();
+        let mut streamed = Streamed::default();
         for segment in &segments {
             let manifest = &segment.manifest;
             if !wanted(manifest.min_time_nanos, manifest.max_time_nanos)
@@ -192,6 +290,28 @@ impl crate::RecordStore<MetricSchema> {
             }
             self.stats.segments_scanned.fetch_add(1, Ordering::Relaxed);
             source += 1;
+
+            // Laid out series by series, a segment's rows come out a series at a time, and
+            // each run is handed over as soon as it ends. Gathering the whole segment
+            // first held every row it read three times over — a week of one histogram
+            // was four hundred megabytes for a query that folds as it goes.
+            if let Some(ranges) = stream_row_ranges(manifest, &allowed, windows) {
+                let outcome =
+                    streamed.read(segment, &ranges, (start, end), &allowed, source, visit);
+                self.stats
+                    .rows_read
+                    .fetch_add(streamed.decoded as u64, Ordering::Relaxed);
+                if matches!(streamed.ended, Ended::Stopped) {
+                    return Ok(false);
+                }
+                self.settle_scan(segment, outcome)?;
+                if matches!(streamed.ended, Ended::Unnamed)
+                    || streamed.flush(manifest, source, visit).is_break()
+                {
+                    return Ok(false);
+                }
+                continue;
+            }
 
             let (outcome, named) = gathered.gather(segment, windows, (start, end), &allowed);
             self.stats
