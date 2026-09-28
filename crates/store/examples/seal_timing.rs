@@ -48,13 +48,13 @@ fn main() {
         );
         drop(batch);
         let at = Instant::now();
-        let (batch, _) = MetricSchema::to_batch_by_stream(&samples).unwrap();
-        println!(
-            "to_batch_by_stream     {:?}  {} rows",
-            at.elapsed(),
-            batch.num_rows()
-        );
-        drop(batch);
+        let mut rows = 0;
+        MetricSchema::write_by_stream(&[&samples], 65_536, &mut |batch| {
+            rows += batch.num_rows();
+            Ok(())
+        })
+        .unwrap();
+        println!("write_by_stream        {:?}  {rows} rows", at.elapsed());
     }
 
     let dir = tempfile::tempdir().unwrap();

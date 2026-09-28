@@ -74,11 +74,29 @@ pub trait RecordSchema: Send + Sync + 'static {
     /// label-set order and the rows grouped by stream, each stream's in the order the
     /// records came — time order, as a seal hands them over.
     ///
-    /// Built in that order rather than built and then reordered: reordering copies every
-    /// column, and at a seal of a quarter of a gigabyte of records that copy was the
-    /// largest thing the process held.
-    fn to_batch_by_stream(records: &[Self::Record]) -> Result<(RecordBatch, Vec<Labels>)> {
-        Self::to_batch(records)
+    /// Handed to `write` at most `rows_per_batch` rows at a time, each batch built only
+    /// when the one before it has been written. A seal of a quarter of a gigabyte of
+    /// records built as one batch was a gigabyte more — every column of every row at
+    /// once, the metric name spelled out on each — and the allocator kept most of it
+    /// long after the seal had finished. A row group's worth is all a Parquet writer
+    /// holds anyway.
+    ///
+    /// `parts` are the records in order, in the slices the buffer held them in.
+    fn write_by_stream(
+        parts: &[&[Self::Record]],
+        rows_per_batch: usize,
+        write: &mut dyn FnMut(&RecordBatch) -> Result<()>,
+    ) -> Result<Vec<Labels>> {
+        let _ = rows_per_batch;
+        let (batch, streams) = if let [records] = parts {
+            Self::to_batch(records)?
+        } else {
+            let records: Vec<Self::Record> =
+                parts.iter().flat_map(|part| part.iter()).cloned().collect();
+            Self::to_batch(&records)?
+        };
+        write(&batch)?;
+        Ok(streams)
     }
 
     fn from_batch(batch: &RecordBatch) -> Result<Vec<Self::Record>>;

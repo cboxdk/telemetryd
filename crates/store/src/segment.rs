@@ -780,23 +780,19 @@ fn segment_corrupt(path: &Path, error: &dyn std::fmt::Display) -> Error {
     }
 }
 
-/// Event-time bounds and row count for each interned stream, in stream-id order.
+/// Each interned stream's event-time bounds and row count, in stream-id order, and its
+/// counter summary for a signal that has counter values — in one pass over the records.
 ///
-/// One pass over the records with a hash lookup each. Sealing already encodes every
-/// record into Arrow and compresses it, so this is not the expensive part.
-/// Per-stream counter summaries, for signals that have a counter value.
-///
-/// Records are sorted by time before folding: a summary is built by walking samples
-/// forward, and the seal path receives them in whatever order the buffer held. Folding
-/// them unsorted would take an arbitrary sample as the window's first and read a
-/// legitimate step as a counter reset — producing a number that is wrong and plausible.
-fn stream_folds<S: RecordSchema>(
-    records: &[S::Record],
+/// `records` must be in time order, as [`seal`] hands them over: a summary is built by
+/// walking a stream's samples forward, and folded out of order it would take an
+/// arbitrary sample as the window's first and read a legitimate step as a counter reset
+/// — a number that is wrong and plausible. In time order, each stream's samples already
+/// reach its summary in order, so nothing is sorted: the pass that did sort held a copy
+/// of every counter sample, 24 bytes a row, beside the whole segment's columns.
+fn stream_summaries<S: RecordSchema>(
+    parts: &[&[S::Record]],
     streams: &[Labels],
-) -> Option<crate::folds::StreamFolds> {
-    // One probe: a signal either has counter values or it does not.
-    S::counter_value(records.first()?)?;
-
+) -> (Vec<(u64, u64)>, Vec<u32>, Option<crate::folds::StreamFolds>) {
     // Keyed by the label set itself: a fingerprint is a hash, and two streams sharing
     // one would have had their counters folded into one summary.
     let index: std::collections::HashMap<&Labels, usize> = streams
@@ -804,45 +800,39 @@ fn stream_folds<S: RecordSchema>(
         .enumerate()
         .map(|(id, labels)| (labels, id))
         .collect();
+    // Buffered records share one allocation per label set, so a set's address finds its
+    // stream without hashing every label of every record; an address not seen yet is
+    // looked up by value once.
+    let mut by_address: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
 
-    let mut ordered: Vec<(usize, u64, f64)> = Vec::with_capacity(records.len());
-    for record in records {
-        if let Some(&id) = index.get(S::index_labels(record))
-            && let Some(value) = S::counter_value(record)
-        {
-            ordered.push((id, S::timestamp(record), value));
-        }
-    }
-    ordered.sort_unstable_by_key(|(id, at, _)| (*id, *at));
-
-    let mut folds = vec![crate::folds::StreamFold::default(); streams.len()];
-    for (id, at, value) in ordered {
-        folds[id].add(at, value);
-    }
-    Some(crate::folds::StreamFolds(folds))
-}
-
-fn stream_statistics<S: RecordSchema>(
-    records: &[S::Record],
-    streams: &[Labels],
-) -> (Vec<(u64, u64)>, Vec<u32>) {
-    let index: std::collections::HashMap<&Labels, usize> = streams
-        .iter()
-        .enumerate()
-        .map(|(id, labels)| (labels, id))
-        .collect();
-
+    // One probe: a signal either has counter values or it does not.
+    let records = || parts.iter().flat_map(|part| part.iter());
+    let counters = records().next().and_then(S::counter_value).is_some();
+    let mut folds = counters.then(|| vec![crate::folds::StreamFold::default(); streams.len()]);
     let mut bounds = vec![(u64::MAX, u64::MIN); streams.len()];
     let mut rows = vec![0u32; streams.len()];
-    for record in records {
-        if let Some(&id) = index.get(S::index_labels(record)) {
-            let at = S::timestamp(record);
-            bounds[id].0 = bounds[id].0.min(at);
-            bounds[id].1 = bounds[id].1.max(at);
-            rows[id] = rows[id].saturating_add(1);
+    for record in records() {
+        let labels = S::index_labels(record);
+        let id = match by_address.get(&labels.storage_id()) {
+            Some(id) => Some(*id),
+            None => index.get(labels).copied().inspect(|id| {
+                by_address.insert(labels.storage_id(), *id);
+            }),
+        };
+        let Some(id) = id else { continue };
+        let at = S::timestamp(record);
+        debug_assert!(
+            at >= bounds[id].1 || rows[id] == 0,
+            "records out of time order"
+        );
+        bounds[id].0 = bounds[id].0.min(at);
+        bounds[id].1 = bounds[id].1.max(at);
+        rows[id] = rows[id].saturating_add(1);
+        if let (Some(folds), Some(value)) = (folds.as_mut(), S::counter_value(record)) {
+            folds[id].add(at, value);
         }
     }
-    (bounds, rows)
+    (bounds, rows, folds.map(crate::folds::StreamFolds))
 }
 
 /// Assigns a dense id to each distinct stream label set.
@@ -890,12 +880,16 @@ pub struct SealOptions<'a> {
 /// A schema opts into each by returning `Some` from `exact_key` or `searchable_text`;
 /// a signal that returns `None` pays nothing and gets no sidecar file.
 fn build_sidecars<S: RecordSchema>(
-    records: &[S::Record],
+    parts: &[&[S::Record]],
 ) -> (LabelIndexBuilder, Option<Bloom>, Option<TrigramIndex>) {
+    let records = || parts.iter().flat_map(|part| part.iter());
     let mut index = LabelIndexBuilder::default();
-    let mut bloom = S::exact_key(&records[0]).map(|_| Bloom::with_capacity(records.len()));
+    let mut bloom = records()
+        .next()
+        .and_then(S::exact_key)
+        .map(|_| Bloom::with_capacity(records().count()));
 
-    for record in records {
+    for record in records() {
         index.observe(S::index_labels(record));
         if let (Some(bloom), Some(key)) = (bloom.as_mut(), S::exact_key(record)) {
             bloom.insert(key);
@@ -905,12 +899,15 @@ fn build_sidecars<S: RecordSchema>(
     // Built separately because its size depends on what the text turns out to contain,
     // which is not known until every record has been seen. `build` returns `None` when
     // there is nothing to index or when a filter could not prune anyway.
-    let text = TrigramIndex::build(records.iter().filter_map(S::searchable_text));
+    let text = TrigramIndex::build(records().filter_map(S::searchable_text));
     (index, bloom, text)
 }
 
-pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) -> Result<Segment> {
-    if records.is_empty() {
+/// `parts` are the records in order, in as many slices as the buffer held them: a
+/// signal laid out series by series is sealed from them as they lie, and the rest from
+/// one — [`crate::records`] hands those over in one.
+pub fn seal<S: RecordSchema>(parts: &[&[S::Record]], options: SealOptions<'_>) -> Result<Segment> {
+    if parts.iter().all(|part| part.is_empty()) {
         return Err(Error::Config(
             "refusing to seal an empty segment".to_owned(),
         ));
@@ -922,26 +919,39 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
     // the whole segment.
     //
     // Checked first rather than sorted unconditionally: records normally arrive in
-    // order, and `to_vec()` on a full buffer is a real cost (it measured at ~20% of
-    // seal). Paying it only when the data is actually out of order keeps the common
-    // case free.
+    // order, and copying a full buffer is a real cost (it measured at ~20% of seal).
+    // Paying it only when the data is actually out of order keeps the common case free.
+    let mut last = u64::MIN;
+    let in_order = parts.iter().flat_map(|part| part.iter()).all(|record| {
+        let at = S::timestamp(record);
+        let ordered = at >= last;
+        last = at;
+        ordered
+    });
     let sorted_storage: Vec<S::Record>;
-    let records = if records
-        .windows(2)
-        .all(|w| S::timestamp(&w[0]) <= S::timestamp(&w[1]))
-    {
-        records
+    let single: [&[S::Record]; 1];
+    let parts = if in_order && (S::STREAM_MAJOR || parts.len() <= 1) {
+        parts
     } else {
-        let mut owned = records.to_vec();
+        let mut owned: Vec<S::Record> =
+            parts.iter().flat_map(|part| part.iter()).cloned().collect();
         owned.sort_by_key(|record| S::timestamp(record));
         sorted_storage = owned;
-        &sorted_storage[..]
+        single = [&sorted_storage[..]];
+        &single[..]
     };
 
-    let (index, bloom, text) = build_sidecars::<S>(records);
+    let (index, bloom, text) = build_sidecars::<S>(parts);
     // Sorted, so the bounds are simply the endpoints.
-    let min_time = S::timestamp(&records[0]);
-    let max_time = S::timestamp(&records[records.len() - 1]);
+    let min_time = parts
+        .iter()
+        .find_map(|part| part.first())
+        .map_or(0, |record| S::timestamp(record));
+    let max_time = parts
+        .iter()
+        .rev()
+        .find_map(|part| part.last())
+        .map_or(0, |record| S::timestamp(record));
 
     let id = format!("{min_time:020}-{:08}", options.sequence);
     let staging = options.tmp_dir.join(format!("{}-{id}", S::SIGNAL.as_str()));
@@ -958,7 +968,7 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
     // `tmp/` with them until the disk budget counted them and retention deleted sealed
     // segments to make room.
     let written = write_staged::<S>(
-        records,
+        parts,
         &options,
         &id,
         &staging,
@@ -973,18 +983,24 @@ pub fn seal<S: RecordSchema>(records: &[S::Record], options: SealOptions<'_>) ->
 
 /// Everything a seal writes once its staging directory exists, through to publishing it.
 fn write_staged<S: RecordSchema>(
-    records: &[S::Record],
+    parts: &[&[S::Record]],
     options: &SealOptions<'_>,
     id: &str,
     staging: &Path,
     (index, bloom, text): (LabelIndexBuilder, Option<Bloom>, Option<TrigramIndex>),
     (min_time, max_time): (u64, u64),
 ) -> Result<Segment> {
-    let (batch, streams) = if S::STREAM_MAJOR {
-        S::to_batch_by_stream(records)?
-    } else {
-        S::to_batch(records)?
-    };
+    let data_path = staging.join(DATA_FILE);
+    let (bytes, streams) = write_parquet::<S>(&data_path, options.compression, |write| {
+        if S::STREAM_MAJOR {
+            S::write_by_stream(parts, ROW_GROUP_ROWS, write)
+        } else {
+            // One slice, as `seal` hands a signal not laid out by stream over.
+            let (batch, streams) = S::to_batch(parts.first().copied().unwrap_or_default())?;
+            write(&batch)?;
+            Ok(streams)
+        }
+    })?;
     // Shared with every other segment holding the same sets, exactly as `load` does.
     //
     // Interning used to happen only when a segment was read back from disk, so a segment
@@ -994,10 +1010,7 @@ fn write_staged<S: RecordSchema>(
     // segment instead of one per stream, which reads as a rate multiplied by the number
     // of segments in the window.
     let streams: Vec<Labels> = streams.into_iter().map(crate::intern::shared).collect();
-    let (stream_bounds, stream_rows) = stream_statistics::<S>(records, &streams);
-    let folds = stream_folds::<S>(records, &streams);
-    let data_path = staging.join(DATA_FILE);
-    let bytes = write_parquet(&data_path, &batch, options.compression, S::STREAM_MAJOR)?;
+    let (stream_bounds, stream_rows, folds) = stream_summaries::<S>(parts, &streams);
 
     let manifest = SegmentManifest {
         format_version: SEGMENT_FORMAT_VERSION,
@@ -1005,7 +1018,7 @@ fn write_staged<S: RecordSchema>(
         id: id.to_owned(),
         min_time_nanos: min_time,
         max_time_nanos: max_time,
-        rows: records.len() as u64,
+        rows: parts.iter().map(|part| part.len() as u64).sum(),
         bytes,
         created_at_nanos: options.now_nanos,
         wal_sequence: options.wal_sequence,
@@ -1079,12 +1092,13 @@ fn write_staged<S: RecordSchema>(
     })
 }
 
-fn write_parquet(
+/// Write what `batches` hands over as one Parquet file, returning its size and
+/// whatever `batches` returns.
+fn write_parquet<S: RecordSchema>(
     path: &Path,
-    batch: &RecordBatch,
     compression: Compression,
-    stream_major: bool,
-) -> Result<u64> {
+    batches: impl FnOnce(&mut dyn FnMut(&RecordBatch) -> Result<()>) -> Result<Vec<Labels>>,
+) -> Result<(u64, Vec<Labels>)> {
     let compression = match compression {
         Compression::Zstd => ParquetCompression::ZSTD(ZstdLevel::default()),
         Compression::Snappy => ParquetCompression::SNAPPY,
@@ -1097,7 +1111,7 @@ fn write_parquet(
     let mut properties = WriterProperties::builder()
         .set_compression(compression)
         .set_max_row_group_row_count(Some(ROW_GROUP_ROWS));
-    if stream_major {
+    if S::STREAM_MAJOR {
         // Pages small enough that one metric name's series, read out of the middle of
         // a segment, cost a few pages rather than every page of each column.
         properties = properties
@@ -1120,20 +1134,23 @@ fn write_parquet(
 
     let file =
         File::create(path).map_err(|e| Error::io(format!("creating {}", path.display()), e))?;
-    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(properties))
+    let mut writer = ArrowWriter::try_new(file, S::arrow_schema(), Some(properties))
         .map_err(|e| Error::Config(format!("opening a Parquet writer: {e}")))?;
-    writer
-        .write(batch)
-        .map_err(|e| Error::Config(format!("writing Parquet: {e}")))?;
+    let streams = batches(&mut |batch| {
+        writer
+            .write(batch)
+            .map_err(|e| Error::Config(format!("writing Parquet: {e}")))
+    })?;
     let file = writer
         .into_inner()
         .map_err(|e| Error::Config(format!("finishing Parquet: {e}")))?;
     file.sync_all()
         .map_err(|e| Error::io(format!("syncing {}", path.display()), e))?;
 
-    Ok(fs::metadata(path)
+    let bytes = fs::metadata(path)
         .map_err(|e| Error::io(format!("stat {}", path.display()), e))?
-        .len())
+        .len();
+    Ok((bytes, streams))
 }
 
 fn write_manifest(path: &Path, manifest: &SegmentManifest) -> Result<()> {
@@ -1334,7 +1351,7 @@ mod tests {
             })
             .collect();
         let sealed = seal::<crate::MetricSchema>(
-            &records,
+            &[&records],
             SealOptions {
                 segments_dir: &segments_dir,
                 tmp_dir: &tmp_dir,
@@ -1397,7 +1414,7 @@ mod tests {
             })
             .collect();
         let segment = seal::<crate::MetricSchema>(
-            &records,
+            &[&records],
             SealOptions {
                 segments_dir: &segments_dir,
                 tmp_dir: &tmp_dir,
@@ -1431,6 +1448,85 @@ mod tests {
             read(&[(5, 6), (rows - 2, rows - 1)]).len(),
             2 * ROW_GROUP_ROWS
         );
+    }
+
+    /// A seal takes the records in the slices the buffer held them in, and what it writes
+    /// is exactly what sealing them as one slice writes: the same bytes in every file, in
+    /// or out of time order, across row groups, whatever the slices' lengths.
+    #[test]
+    fn sealing_from_slices_writes_what_sealing_from_one_does() {
+        use telemetryd_core::{MetricKind, MetricSample};
+        let rows = ROW_GROUP_ROWS + 5_003;
+        let series: Vec<Labels> = (0..37)
+            .map(|i| {
+                labels(&[
+                    ("__name__", if i % 3 == 0 { "up" } else { "x_total" }),
+                    ("pod", &format!("p{i}")),
+                ])
+            })
+            .collect();
+        for in_order in [true, false] {
+            let records: Vec<MetricSample> = (0..rows)
+                .map(|i| MetricSample {
+                    series: series[(i * 7) % series.len()].clone(),
+                    timestamp_nanos: if in_order {
+                        (i / series.len()) as u64
+                    } else {
+                        ((i * 7919) % 5000) as u64
+                    },
+                    #[allow(clippy::cast_precision_loss)]
+                    value: ((i * 31) % 1000) as f64,
+                    kind: if i % 3 == 0 {
+                        MetricKind::Gauge
+                    } else {
+                        MetricKind::Counter
+                    },
+                })
+                .collect();
+            let (a, b) = records.split_at(4096);
+            let (b, c) = b.split_at(9);
+            let parts: [&[MetricSample]; 4] = [a, b, &[], c];
+            let written = |parts: &[&[MetricSample]]| {
+                let dir = tempfile::tempdir().unwrap();
+                let (segments_dir, tmp_dir) = (dir.path().join("segments"), dir.path().join("tmp"));
+                fs::create_dir_all(&segments_dir).unwrap();
+                fs::create_dir_all(&tmp_dir).unwrap();
+                let segment = seal::<crate::MetricSchema>(
+                    parts,
+                    SealOptions {
+                        segments_dir: &segments_dir,
+                        tmp_dir: &tmp_dir,
+                        compression: Compression::Zstd,
+                        now_nanos: 1,
+                        sequence: 1,
+                        wal_sequence: 0,
+                    },
+                )
+                .unwrap();
+                let mut files: Vec<(String, Vec<u8>)> = fs::read_dir(&segment.dir)
+                    .unwrap()
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+                        (
+                            entry.file_name().to_string_lossy().into_owned(),
+                            fs::read(entry.path()).unwrap(),
+                        )
+                    })
+                    .collect();
+                files.sort();
+                (dir, files)
+            };
+            let (_one_dir, one) = written(&[&records]);
+            let (_many_dir, many) = written(&parts);
+            assert!(one.iter().any(|(name, _)| name == DATA_FILE));
+            assert_eq!(
+                one.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+                many.iter().map(|(name, _)| name).collect::<Vec<_>>()
+            );
+            for ((name, one), (_, many)) in one.iter().zip(&many) {
+                assert!(one == many, "{name} differs, in order: {in_order}");
+            }
+        }
     }
 
     #[test]

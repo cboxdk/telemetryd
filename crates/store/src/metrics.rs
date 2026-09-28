@@ -874,6 +874,68 @@ fn split_sample(payload: &[u8]) -> Option<(u64, &[u8], &[u8])> {
     Some((timestamp, &payload[start..at], &payload[at..]))
 }
 
+/// A seal's records, in the slices the buffer held them in, read by position.
+struct Parts<'a> {
+    slices: &'a [&'a [MetricSample]],
+    /// Where each slice starts, and one more for the end.
+    starts: Vec<usize>,
+    len: usize,
+}
+
+impl<'a> Parts<'a> {
+    fn new(parts: &'a [&'a [MetricSample]]) -> Self {
+        let mut starts = Vec::with_capacity(parts.len() + 1);
+        let mut at = 0;
+        for part in parts {
+            starts.push(at);
+            at += part.len();
+        }
+        starts.push(at);
+        Self {
+            slices: parts,
+            starts,
+            len: at,
+        }
+    }
+
+    fn cursor(&self) -> Cursor<'_, 'a> {
+        Cursor {
+            records: self,
+            part: 0,
+        }
+    }
+}
+
+/// Reads [`Parts`] by position, remembering which slice it was last in: a series'
+/// records are read in ascending position, a stride apart that is shorter than a slice,
+/// so the next one is nearly always in the same slice or the one after.
+struct Cursor<'r, 'a> {
+    records: &'r Parts<'a>,
+    part: usize,
+}
+
+impl<'a> Cursor<'_, 'a> {
+    fn get(&mut self, row: usize) -> &'a MetricSample {
+        let starts = &self.records.starts;
+        if row < starts[self.part] {
+            self.part = starts.partition_point(|start| *start <= row) - 1;
+        }
+        // Forward past the slices that end before it, empty ones included; a long way
+        // forward is found by bisection rather than walked.
+        if row >= starts[self.part + 1] {
+            self.part = if row < starts[(self.part + 2).min(starts.len() - 1)] {
+                self.part + 1
+            } else {
+                starts.partition_point(|start| *start <= row) - 1
+            };
+            while row >= starts[self.part + 1] {
+                self.part += 1;
+            }
+        }
+        &self.records.slices[self.part][row - starts[self.part]]
+    }
+}
+
 impl RecordSchema for MetricSchema {
     type Record = MetricSample;
 
@@ -939,9 +1001,18 @@ impl RecordSchema for MetricSchema {
         Ok((batch, interner.into_streams()))
     }
 
-    fn to_batch_by_stream(records: &[Self::Record]) -> Result<(RecordBatch, Vec<Labels>)> {
+    fn write_by_stream(
+        parts: &[&[Self::Record]],
+        rows_per_batch: usize,
+        write: &mut dyn FnMut(&RecordBatch) -> Result<()>,
+    ) -> Result<Vec<Labels>> {
+        let records = Parts::new(parts);
         let mut interner = crate::segment::StreamInterner::default();
-        let mut ranked: Vec<u32> = records.iter().map(|s| interner.intern(&s.series)).collect();
+        let ids: Vec<u32> = parts
+            .iter()
+            .flat_map(|part| part.iter())
+            .map(|s| interner.intern(&s.series))
+            .collect();
         let streams = interner.into_streams();
 
         // Each stream's place in label-set order, which the ids are rewritten to.
@@ -951,69 +1022,86 @@ impl RecordSchema for MetricSchema {
         for (new, old) in ordered.iter().enumerate() {
             rank[*old] = u32::try_from(new).unwrap_or(u32::MAX);
         }
-        for id in &mut ranked {
-            *id = rank[*id as usize];
+
+        // Where each stream's rows begin once grouped, and one more for the end.
+        let mut starts = vec![0usize; streams.len() + 1];
+        for id in &ids {
+            starts[rank[*id as usize] as usize + 1] += 1;
+        }
+        for at in 1..starts.len() {
+            starts[at] += starts[at - 1];
         }
 
-        // Where each stream's rows begin once grouped.
-        let mut counts = vec![0usize; streams.len()];
-        for id in &ranked {
-            counts[*id as usize] += 1;
-        }
-        let mut next = Vec::with_capacity(streams.len());
-        let mut at = 0usize;
-        for count in &counts {
-            next.push(at);
-            at += count;
-        }
-
-        // Scattered, not gathered: the records are read once, in the order they lie, and
-        // each written to its stream's next slot. Every stream writes forward through its
-        // own stretch, so the writes stay in cache where reading the records out of order
-        // — once per column — missed it on nearly every row.
-        let mut timestamps = vec![0u64; records.len()];
-        let mut values = vec![0f64; records.len()];
-        let mut kinds = vec![MetricKind::Unknown; records.len()];
-        for (record, id) in records.iter().zip(&ranked) {
-            let slot = &mut next[*id as usize];
-            timestamps[*slot] = record.timestamp_nanos;
-            values[*slot] = record.value;
-            kinds[*slot] = record.kind;
+        // The records' positions in grouped order — four bytes a row, where the columns
+        // themselves were seventeen, and the names and kinds spelled out on every row
+        // more than sixty. Scattered in one pass over the records as they lie, so each
+        // stream's stretch fills front to back in the order its records came.
+        let mut order = vec![0u32; records.len];
+        let mut next = starts.clone();
+        for (row, id) in ids.iter().enumerate() {
+            let slot = &mut next[rank[*id as usize] as usize];
+            order[*slot] = u32::try_from(row).unwrap_or(u32::MAX);
             *slot += 1;
         }
-        drop(ranked);
+        drop((ids, next));
 
         let sorted: Vec<Labels> = ordered
             .into_iter()
             .map(|old| streams[old].clone())
             .collect();
-        // `counts` is by new id, so the grouped ids and names are each stream's, repeated
-        // for its rows, in order.
-        let ids =
-            UInt32Array::from_iter_values(counts.iter().enumerate().flat_map(|(id, count)| {
-                std::iter::repeat_n(u32::try_from(id).unwrap_or(u32::MAX), *count)
-            }));
-        let mut names =
-            arrow::array::StringBuilder::with_capacity(records.len(), records.len() * 16);
-        for (series, count) in sorted.iter().zip(&counts) {
-            let name = series.get(METRIC_NAME_LABEL).unwrap_or("");
-            for _ in 0..*count {
-                names.append_value(name);
+        drop(streams);
+
+        let mut stream = 0usize;
+        let mut cursor = records.cursor();
+        for first in (0..records.len).step_by(rows_per_batch.max(1)) {
+            let rows = &order[first..records.len.min(first + rows_per_batch.max(1))];
+            // One pass over the records a batch takes, reading each once for all three
+            // columns: in grouped order they lie a stream's stride apart, and reading
+            // them once per column missed the cache three times a row.
+            let mut timestamps = Vec::with_capacity(rows.len());
+            let mut values = Vec::with_capacity(rows.len());
+            let mut kinds = Vec::with_capacity(rows.len());
+            for row in rows {
+                let record = cursor.get(*row as usize);
+                timestamps.push(record.timestamp_nanos);
+                values.push(record.value);
+                kinds.push(record.kind);
             }
+            // The streams this batch's rows belong to, each for as many of its rows as
+            // fall inside it.
+            let end = first + rows.len();
+            let mut stream_ids = Vec::with_capacity(rows.len());
+            let mut names = arrow::array::StringBuilder::with_capacity(rows.len(), rows.len() * 16);
+            while starts[stream + 1] <= first {
+                stream += 1;
+            }
+            let mut at = first;
+            while at < end {
+                let until = starts[stream + 1].min(end);
+                let name = sorted[stream].get(METRIC_NAME_LABEL).unwrap_or("");
+                for _ in at..until {
+                    stream_ids.push(u32::try_from(stream).unwrap_or(u32::MAX));
+                    names.append_value(name);
+                }
+                at = until;
+                if at == starts[stream + 1] {
+                    stream += 1;
+                }
+            }
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(UInt64Array::from(timestamps)),
+                Arc::new(UInt32Array::from(stream_ids)),
+                Arc::new(Float64Array::from(values)),
+                Arc::new(names.finish()),
+                Arc::new(StringArray::from_iter_values(
+                    kinds.iter().map(|k| k.as_str()),
+                )),
+            ];
+            let batch = RecordBatch::try_new(Self::arrow_schema(), columns)
+                .map_err(|e| Error::Config(format!("building a metric record batch: {e}")))?;
+            write(&batch)?;
         }
-        let names = names.finish();
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(UInt64Array::from(timestamps)),
-            Arc::new(ids),
-            Arc::new(Float64Array::from(values)),
-            Arc::new(names),
-            Arc::new(StringArray::from_iter_values(
-                kinds.iter().map(|k| k.as_str()),
-            )),
-        ];
-        let batch = RecordBatch::try_new(Self::arrow_schema(), columns)
-            .map_err(|e| Error::Config(format!("building a metric record batch: {e}")))?;
-        Ok((batch, sorted))
+        Ok(sorted)
     }
 
     fn from_batch(batch: &RecordBatch) -> Result<Vec<Self::Record>> {
@@ -1194,6 +1282,32 @@ mod tests {
             value: i as f64 * 1.5,
             kind: MetricKind::Counter,
         }
+    }
+
+    /// A seal hands the Parquet writer a row group's worth at a time, never the segment:
+    /// the batches together are the rows grouped by stream, streams in label-set order and
+    /// each stream's rows in the order they came, whatever slices they came in.
+    #[test]
+    fn a_seal_is_written_a_batch_at_a_time_grouped_by_stream() {
+        let records: Vec<MetricSample> = (0..1_001).map(sample).collect();
+        let (a, b) = records.split_at(333);
+        let mut batches = Vec::new();
+        let streams = MetricSchema::write_by_stream(&[a, &[], b], 100, &mut |batch| {
+            batches.push(batch.clone());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(batches.len(), 11);
+        assert!(batches.iter().all(|batch| batch.num_rows() <= 100));
+        assert!(streams.windows(2).all(|pair| pair[0] < pair[1]));
+        let rows: Vec<MetricSample> = batches
+            .iter()
+            .flat_map(|batch| materialize_all(batch, &streams))
+            .collect();
+        let mut expected = records.clone();
+        expected.sort_by(|x, y| x.series.cmp(&y.series));
+        assert_eq!(rows, expected);
     }
 
     #[test]
