@@ -38,9 +38,25 @@ use telemetryd_core::Labels;
 /// than trading one unbounded table for another.
 const CAPACITY: usize = 250_000;
 
-fn table() -> &'static Mutex<HashMap<u64, Labels>> {
-    static TABLE: OnceLock<Mutex<HashMap<u64, Labels>>> = OnceLock::new();
-    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+/// How many independently locked parts the table is in.
+///
+/// One lock was what a restart waited on: segments load on several threads, every one of
+/// the millions of label sets they hold is looked up here, and the sampler found the
+/// threads spending most of their time in the mutex rather than in the lookup. Split by
+/// fingerprint, the threads rarely meet.
+const SHARDS: usize = 64;
+
+fn shards() -> &'static [Mutex<HashMap<u64, Labels>>; SHARDS] {
+    static TABLE: OnceLock<[Mutex<HashMap<u64, Labels>>; SHARDS]> = OnceLock::new();
+    TABLE.get_or_init(|| std::array::from_fn(|_| Mutex::new(HashMap::new())))
+}
+
+fn table(fingerprint: u64) -> std::sync::MutexGuard<'static, HashMap<u64, Labels>> {
+    #[allow(clippy::cast_possible_truncation)]
+    let shard = (fingerprint >> 58) as usize % SHARDS;
+    shards()[shard]
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Return a `Labels` that shares its map with every equal set already seen.
@@ -51,9 +67,7 @@ fn table() -> &'static Mutex<HashMap<u64, Labels>> {
 #[must_use]
 pub fn shared(labels: Labels) -> Labels {
     let fingerprint = labels.fingerprint();
-    let mut table = table()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut table = table(fingerprint);
 
     if let Some(canonical) = table.get(&fingerprint) {
         if *canonical == labels {
@@ -61,7 +75,7 @@ pub fn shared(labels: Labels) -> Labels {
         }
         return labels;
     }
-    if table.len() >= CAPACITY {
+    if table.len() >= CAPACITY / SHARDS {
         return labels;
     }
     table.insert(fingerprint, labels.shared_with());
@@ -77,9 +91,7 @@ pub fn shared(labels: Labels) -> Labels {
 pub fn shared_pairs(pairs: &[(&str, &str)]) -> Labels {
     let fingerprint = Labels::fingerprint_of(pairs.iter().copied());
     {
-        let table = table()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let table = table(fingerprint);
         if let Some(canonical) = table.get(&fingerprint)
             && canonical.iter().eq(pairs.iter().copied())
         {
@@ -99,22 +111,32 @@ pub fn shared_pairs(pairs: &[(&str, &str)]) -> Labels {
 /// An entry is handed out only under the table's lock, which this holds, so one found
 /// held by nothing else cannot be claimed between the check and its removal.
 pub fn prune() -> usize {
-    let mut table = table()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let before = table.len();
-    table.retain(|_, labels| !labels.is_only_holder());
-    table.shrink_to_fit();
-    before - table.len()
+    shards()
+        .iter()
+        .map(|shard| {
+            let mut table = shard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let before = table.len();
+            table.retain(|_, labels| !labels.is_only_holder());
+            table.shrink_to_fit();
+            before - table.len()
+        })
+        .sum()
 }
 
 /// How many distinct label sets are being shared. For `/status` and for tests.
 #[must_use]
 pub fn distinct() -> usize {
-    table()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .len()
+    shards()
+        .iter()
+        .map(|shard| {
+            shard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+        })
+        .sum()
 }
 
 #[cfg(test)]
