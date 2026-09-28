@@ -38,23 +38,32 @@ deliberate subset — writing a valid PromQL or LogQL expression is not enough f
 run here.
 
 Anything outside the subset is refused with HTTP 400 and a structured body naming the
-construct: `{"error":{"code":"unsupported_feature","feature":"PromQL function `quantile`"}}`.
+construct: `{"error":{"code":"unsupported_feature","feature":"PromQL function `holt_winters`"}}`.
 The languages are parsed in full and then lowered, which is why the error can name the
 function rather than reporting a syntax error.
 
-Verified against a running instance:
+Answers are held to the upstream engines' own, in CI: 151 PromQL expressions against
+Prometheus 3.15, 62 LogQL queries against Loki 3.7.8, 19 Tempo queries against Tempo 2.10.
 
-- **PromQL works** for selectors and label matchers, `rate`, `increase`,
-  `histogram_quantile`, `sum`, `avg`, `min`, `max`, `count`, `by (...)`, `without (...)`,
-  `offset`, and arithmetic on a series.
-- **PromQL is refused** for `quantile`, `count_values`, `stddev`, `irate`, `delta`,
-  `absent`, and comparison operators such as `> 5`.
-- **LogQL works** for stream selectors, `|=`, `!=`, `|~`, `| json` and `| logfmt`.
-- **LogQL is refused** for `| line_format` and for every metric query over log streams —
-  `rate`, `count_over_time`, `sum`. Use the Prometheus API for pre-aggregated metrics.
-- **TraceQL works** for `{}`, attribute equality, `duration > 100ms`, `status = error`,
-  `name = "..."`, and `&&` between conditions.
-- **TraceQL is refused** for `||` between conditions and for `| count() > 2`.
+- **PromQL works** for every function Prometheus enables by default except those over
+  native histograms (`histogram_count`, `histogram_sum`, …; `histogram_quantile` over
+  classic buckets works), every aggregation, comparison and set operators with
+  `on`/`ignoring`/`group_left`, subqueries and `@`. Prometheus's experimental functions
+  — `sort_by_label`, `limitk`, `mad_over_time`, `double_exponential_smoothing` and the
+  like, behind a feature flag in Prometheus too — are refused by name.
+- **LogQL works** for stream selectors, line filters, every parser (`json`, `logfmt`,
+  `regexp`, `pattern`), label filters including `status >= 500` and `took > 250ms`,
+  `line_format`, `label_format`, `drop`, `keep`, `decolorize`, and metric queries:
+  `count_over_time`, `rate`, `bytes_*`, `| unwrap` with the `*_over_time` family, and
+  `sum`/`topk`/binary operators above them.
+- **LogQL is refused** for `| distinct`, `| ip` and Go template features beyond the
+  common functions.
+- **TraceQL works** for `{}`, attribute comparisons in the `resource.`, `span.` and
+  unscoped forms, `duration > 100ms`, `status = error`, `&&`, and the metrics functions
+  on `/api/metrics/query_range` — `rate()`, `count_over_time()`, `quantile_over_time()`
+  and the rest, `by (...)`.
+- **TraceQL is refused** for `||` between conditions, structural operators and
+  `| count() > 2`.
 
 One request does not return everything. `GET /loki/api/v1/query_range` clamps `limit`
 to 5,000 and `GET /api/search` clamps it to 1,000 — **silently**, so asking for a
@@ -71,9 +80,12 @@ common — a numeric order id, say — cannot be, and the time bound is what sav
 ## Sending data
 
 OTLP over HTTP in **either encoding** — JSON or protobuf. The `Content-Type` picks the
-parser and changes nothing else. There is no gRPC endpoint.
+parser and changes nothing else. OTLP over gRPC is served too, on a port of its own once
+`server.grpc_listen` is set (conventionally `127.0.0.1:4317`).
 
 - `POST /v1/logs`, `POST /v1/traces`, `POST /v1/metrics` — OTLP/HTTP, JSON or protobuf
+- `POST /loki/api/v1/push` — Loki's push API, what promtail, Alloy, Fluent Bit and
+  Vector send
 - `POST /api/v1/write` — Prometheus `remote_write` (snappy + protobuf)
 
 `gzip`, `deflate` and `zstd` request bodies are decompressed. Records are rejected

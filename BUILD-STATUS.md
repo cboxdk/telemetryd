@@ -234,9 +234,22 @@ is marked so later queries skip it cheaply, and the loss is reported in `/status
 as `telemetryd_segments_unreadable_total` rather than being inferred. Verified by
 damaging a real data directory five different ways.
 
-**Query.** LogQL, TraceQL and PromQL subsets, each parsed in full and lowered so an
-unsupported construct reports itself by name. Live tail over WebSocket. Label and series
-queries answered from metadata with no file I/O.
+**Query.** LogQL, TraceQL and PromQL, each parsed in full and lowered so an unsupported
+construct reports itself by name. Live tail over WebSocket. Label and series queries
+answered from metadata with no file I/O.
+
+**Held to the upstream engines, in CI.** 151 PromQL expressions against Prometheus 3.15
+(`promtool`), 62 LogQL queries against Loki 3.7.8, 19 Tempo queries against Tempo 2.10 —
+each suite's expectations written by the upstream itself and re-asked of it on every CI
+run, and telemetryd required to give the same answers. The Loki and Tempo suites found
+what reading had not: `detected_level` on every line, Loki's flat response shape, the
+step grids of both, Tempo's base64 ids, and a dozen smaller rules — each now answered as
+upstream answers it.
+
+**As a drop-in, all three ways in.** Loki's push API for log shippers, metric LogQL for
+Grafana's log volume and alerting, OTLP over gRPC on `server.grpc_listen`, TraceQL
+metrics on `/api/metrics/query_range`, and `[metrics_generator]` for the service graph and
+span metrics Grafana reads — what Tempo's metrics generator writes, derived at ingest.
 
 **Authentication.** Three surfaces — ingest, query, admin — each guarded by its own
 static bearer token, with rotation via a list and indirection through a file or
@@ -556,7 +569,6 @@ Not gaps. These are decisions:
 - **Clustering, replication, object-store tiering** — single node is the design
 - **Plugins, relabelling rules, write-path transformations** — shape data in the
   instrumentation
-- **OTLP/gRPC** — JSON is first-class because that is what the client emits
 - **A separate "events" signal** — OpenTelemetry has no such signal. An event is a log
   record carrying `event.name`, so events already arrive on `/v1/logs` and are queryable
   through the Loki API. telemetryd used to carry a fourth `Signal::Events` that nothing
