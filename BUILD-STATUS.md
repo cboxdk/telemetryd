@@ -93,15 +93,17 @@ from the five minutes in front of each point. Measured on a sealed week of one a
 | bare gauge chart, 250 points | 167 ms | 17 ms |
 | `avg_over_time(x[15m])` chart | 164 ms | 15 ms |
 | counter-increase panel (`x - x offset 15m`) | 192 ms | 42 ms |
-| `max_over_time` over the week | 167 ms | 3.5 ms |
-| `avg_over_time` over the week | 167 ms | 3.5 ms |
+| `max_over_time` over the week, instant | 167 ms | 3.5 ms |
+| `avg_over_time` over the week, instant | 167 ms | 3.5 ms |
 | counter and histogram queries (11) | unchanged | unchanged |
 
-Every answer identical to the release before, to the bit, on that data. Two changes:
+Every answer the same as the release before's on that data. In general the count, least
+and greatest from summaries are exact, and the sum and mean agree to the last bits — the
+same compensated additions, joined per segment. Two changes:
 summaries now carry the compensated sum, least and greatest per stream (format 2,
 80 bytes, about 7% on a metric segment), so `sum`/`count`/`avg`/`min`/`max_over_time` take
 them as `rate` does; and a range query keeps only the samples in its points' windows.
-Older summaries keep answering `rate` and are rewritten in the background. Held by 13 new
+Older summaries keep answering `rate` and are rewritten in the background. Held by 21 new
 expressions in the Prometheus suite, now also asked of a store sealed into two-minute
 segments, and a property test of both paths against every sample on generated data —
 NaN, staleness markers, gaps, late data. Which functions are summarised, and when each
@@ -264,7 +266,7 @@ damaging a real data directory five different ways.
 construct reports itself by name. Live tail over WebSocket. Label and series queries
 answered from metadata with no file I/O.
 
-**Held to the upstream engines, in CI.** 164 PromQL expressions against Prometheus 3.15
+**Held to the upstream engines, in CI.** 172 PromQL expressions against Prometheus 3.15
 (`promtool`), 62 LogQL queries against Loki 3.7.8, 22 Tempo queries against Tempo 2.10 —
 each suite's expectations written by the upstream itself and re-asked of it on every CI
 run, and telemetryd required to give the same answers. The Loki and Tempo suites found

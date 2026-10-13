@@ -46,6 +46,9 @@ enum Draw {
     Value(i16),
     Nan,
     Stale,
+    /// `±1e308`: two of the same sign overflow, which is where adding a window up in
+    /// segment order and in time order part ways.
+    Huge(bool),
 }
 
 fn draw() -> impl Strategy<Value = Draw> {
@@ -54,6 +57,7 @@ fn draw() -> impl Strategy<Value = Draw> {
         30 => any::<i16>().prop_map(Draw::Value),
         1 => Just(Draw::Nan),
         1 => Just(Draw::Stale),
+        1 => any::<bool>().prop_map(Draw::Huge),
     ]
 }
 
@@ -89,6 +93,13 @@ fn sample(series: usize, tick: u64, draw: Draw, offset_nanos: u64) -> Option<Met
         Draw::Value(v) => f64::from(v) / 8.0,
         Draw::Nan => f64::NAN,
         Draw::Stale => f64::from_bits(STALE_MARKER_BITS),
+        Draw::Huge(positive) => {
+            if positive {
+                1e308
+            } else {
+                -1e308
+            }
+        }
     };
     Some(MetricSample {
         series: labels("gauge", series),
@@ -288,4 +299,140 @@ fn a_summary_from_before_gauges_is_not_trusted_and_is_rewritten() {
     for query in ["max_over_time(gauge[7h])", "avg_over_time(gauge[7h])"] {
         agree(query, &[at(TICKS)], &store, &all).unwrap();
     }
+}
+
+/// The case that a finite join of finite segment sums got wrong: in time order the
+/// window's sum overflows and stays infinite, as Prometheus's does; segment by segment
+/// each part is finite, and so was their join.
+#[test]
+fn a_sum_that_overflows_in_time_order_is_not_taken_from_summaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.storage.data_dir = Some(dir.path().to_path_buf());
+    let store = Store::open(&config).unwrap();
+    let point = |tick: u64, value: f64| MetricSample {
+        series: labels("gauge", 0),
+        timestamp_nanos: at(tick),
+        value,
+        kind: MetricKind::Gauge,
+    };
+    let all = vec![
+        point(1, 1e308),
+        point(2, 1e308),
+        point(3, -1e308),
+        point(4, 1.0),
+    ];
+    store.metrics().append(&all[..1]).unwrap();
+    store.metrics().seal_now().unwrap();
+    store.metrics().append(&all[1..3]).unwrap();
+    store.metrics().seal_now().unwrap();
+    store.metrics().append(&all[3..]).unwrap();
+
+    for query in ["sum_over_time(gauge[3h])", "avg_over_time(gauge[3h])"] {
+        agree(query, &[at(10)], &store, &all).unwrap();
+    }
+    let expr = promql::parse("sum_over_time(gauge[3h])").unwrap();
+    let snapshot = Snapshot::load_at(store.metrics(), &expr, &[at(10)], 0).unwrap();
+    let got = answer(snapshot.eval(&expr, at(10)).unwrap());
+    assert!(got[0].1.is_infinite() && got[0].1 > 0.0, "{got:?}");
+}
+
+fn rows_read(store: &Store, query: impl FnOnce()) -> u64 {
+    let before = store.metrics().status().rows_read;
+    query();
+    store.metrics().status().rows_read - before
+}
+
+/// A gauge that ever held a NaN — momentarily undefined, not ended — still takes its
+/// segments' summaries for the count, least and greatest. The check against NaN in a
+/// summary is for counter summaries written before staleness markers were skipped.
+#[test]
+fn a_gauge_that_held_a_nan_still_takes_its_summaries() {
+    let case = Case {
+        series: vec![
+            (0..TICKS)
+                .map(|t| {
+                    if t % 7 == 3 {
+                        Draw::Nan
+                    } else {
+                        Draw::Value((t % 50) as i16 - 20)
+                    }
+                })
+                .collect(),
+        ],
+        seals: (1..12).map(|i| i * 30).collect(),
+        late: Vec::new(),
+    };
+    let (_dir, store, all) = filled(&case);
+    for function in ["max_over_time", "min_over_time", "count_over_time"] {
+        let query = format!("{function}(gauge[7h])");
+        let read = rows_read(&store, || {
+            agree(&query, &[at(TICKS)], &store, &all).unwrap();
+        });
+        // `agree` loads once from the store; reading every row would be all 360.
+        assert!(read < TICKS / 4, "{query} read {read} of {TICKS} rows");
+    }
+}
+
+/// A chart keeps only the samples in front of its points. Held to the query sample
+/// allowance, which counts what a read keeps: a bare gauge chart whose span holds three
+/// times the allowance and whose lookback windows hold half of it is answered — and is
+/// refused, as it used to be, if the whole span is read again.
+#[test]
+fn a_chart_holds_only_the_samples_its_points_look_at() {
+    let case = Case {
+        series: (0..3)
+            .map(|s| {
+                (0..TICKS)
+                    .map(|t| Draw::Value((t * (s + 1)) as i16))
+                    .collect()
+            })
+            .collect(),
+        seals: vec![120, 240],
+        late: Vec::new(),
+    };
+    let (_dir, store, all) = filled(&case);
+    // 3 series × 360 samples in the span; a point every twelve minutes looks back five,
+    // which holds 3 × 5 × 30 = 450 of them.
+    let points: Vec<u64> = (1..=30).map(|i| at(i * 12)).collect();
+    let allowance = 600;
+    assert!(all.len() as u64 > allowance);
+    for query in ["gauge", "max_over_time(gauge[4m])"] {
+        let expr = promql::parse(query).unwrap();
+        let mut stored = Snapshot::load_at(store.metrics(), &expr, &points, allowance)
+            .unwrap_or_else(|error| panic!("{query}: {error}"));
+        stored.prepare(&expr, &points);
+        agree(query, &points, &store, &all).unwrap();
+    }
+}
+
+/// A current-format summary that fails its checksum is forgotten when a query finds it,
+/// so the backfill writes it again instead of every query paying for the miss.
+#[test]
+fn a_damaged_summary_is_forgotten_and_rewritten() {
+    let case = Case {
+        series: vec![(0..TICKS).map(|t| Draw::Value((t % 50) as i16)).collect()],
+        seals: vec![60, 120, 180, 240, 300],
+        late: Vec::new(),
+    };
+    let (dir, store, all) = filled(&case);
+    let mut damaged = 0;
+    for entry in std::fs::read_dir(dir.path().join("segments").join("metrics")).unwrap() {
+        let path = entry.unwrap().path().join("folds.bin");
+        if let Ok(mut raw) = std::fs::read(&path) {
+            // Past the header, which still says "format 2"; the checksum catches it.
+            raw[20] ^= 0xff;
+            std::fs::write(&path, &raw).unwrap();
+            damaged += 1;
+        }
+    }
+    assert!(damaged >= 5);
+    drop(store);
+    let mut config = Config::default();
+    config.storage.data_dir = Some(dir.path().to_path_buf());
+    let store = Store::open(&config).unwrap();
+    agree("max_over_time(gauge[7h])", &[at(TICKS)], &store, &all).unwrap();
+    let written = store.metrics().backfill_folds(100).unwrap();
+    assert!(written >= 5, "rewrote {written} of {damaged}");
+    agree("max_over_time(gauge[7h])", &[at(TICKS)], &store, &all).unwrap();
 }

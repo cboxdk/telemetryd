@@ -227,3 +227,72 @@ fn a_segment_deleted_under_the_shortcut_declines_it() {
             .fold_window(90 * 1_000_000_000, 13 * 60 * 1_000_000_000, &[], 4, false);
     assert!(matches!(answer, Ok(None)), "{answer:?}");
 }
+
+/// A segment from before stream dictionaries numbers no streams, so a summary beside it
+/// — the backfill used to write an empty one — has nothing to say about any series. It
+/// was taken anyway, and the segment's rows vanished from every window holding it.
+#[test]
+fn a_segment_without_a_dictionary_is_read_not_summarised() {
+    let dir = tempfile::tempdir().unwrap();
+    let named = |at_secs: u64, value: f64| {
+        let mut series = Labels::new();
+        series.insert("__name__", "probe");
+        MetricSample {
+            series,
+            timestamp_nanos: at_secs * 1_000_000_000,
+            value,
+            kind: MetricKind::Counter,
+        }
+    };
+    let store = Store::open(&config(dir.path())).unwrap();
+    for minute in 1..=30u64 {
+        #[allow(clippy::cast_precision_loss)]
+        let value = minute as f64;
+        store
+            .metrics()
+            .append(&[named(minute * 60, value)])
+            .unwrap();
+        if minute % 10 == 0 {
+            store.metrics().seal_now().unwrap();
+        }
+    }
+    let middle = store
+        .metrics()
+        .segments()
+        .into_iter()
+        .find(|segment| segment.manifest.min_time_nanos == 11 * 60 * 1_000_000_000)
+        .unwrap()
+        .dir
+        .clone();
+    drop(store);
+
+    // As a build from before dictionaries wrote it: format 2, no streams, no per-stream
+    // bounds or rows, time order — and an empty summary, as the backfill wrote for it.
+    let manifest_path = middle.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest["format_version"] = 2.into();
+    manifest["streams"] = serde_json::json!([]);
+    manifest["stream_bounds"] = serde_json::json!([]);
+    manifest["stream_rows"] = serde_json::json!([]);
+    manifest["stream_major"] = false.into();
+    std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+    let _ = std::fs::remove_file(middle.join("streams.bin"));
+    let mut empty = Vec::new();
+    empty.extend_from_slice(b"TFLD");
+    empty.extend_from_slice(&2u32.to_le_bytes());
+    empty.extend_from_slice(&0u64.to_le_bytes());
+    std::fs::write(middle.join("folds.bin"), &empty).unwrap();
+
+    let store = Store::open(&config(dir.path())).unwrap();
+    for gauges in [false, true] {
+        let folded = store
+            .metrics()
+            .fold_window(0, 31 * 60 * 1_000_000_000, &[], 4, gauges)
+            .unwrap()
+            .expect("three segments are within the read-whole limit");
+        let seen: u64 = folded.iter().map(|(_, fold)| fold.seen).sum();
+        assert_eq!(seen, 30, "every sample, the old segment's too: {folded:?}");
+    }
+    assert_eq!(store.metrics().backfill_folds(10).unwrap(), 0);
+}

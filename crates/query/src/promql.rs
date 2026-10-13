@@ -1309,7 +1309,15 @@ impl Expr {
                     arg.collect_selectors(out);
                 }
             }
-            Self::Aggregation { inner, .. } | Self::Negate(inner) => inner.collect_selectors(out),
+            // The parameter too: `topk(scalar(k), x)` reads `k`, and a selector left out
+            // here is never loaded, so it evaluated to nothing and the answer was empty.
+            Self::Aggregation { param, inner, .. } => {
+                if let Some(param) = param {
+                    param.collect_selectors(out);
+                }
+                inner.collect_selectors(out);
+            }
+            Self::Negate(inner) => inner.collect_selectors(out),
             Self::Subquery(subquery) => subquery.inner.collect_selectors(out),
             Self::Binary { left, right, .. } => {
                 left.collect_selectors(out);

@@ -42,7 +42,7 @@ construct: `{"error":{"code":"unsupported_feature","feature":"PromQL function `h
 The languages are parsed in full and then lowered, which is why the error can name the
 function rather than reporting a syntax error.
 
-Answers are held to the upstream engines' own, in CI: 164 PromQL expressions against
+Answers are held to the upstream engines' own, in CI: 172 PromQL expressions against
 Prometheus 3.15, 62 LogQL queries against Loki 3.7.8, 22 Tempo queries against Tempo 2.10.
 
 - **PromQL works** for every function Prometheus enables by default except those over

@@ -82,7 +82,8 @@ Sealing also writes `folds.bin` next to the Parquet file: one 80-byte record per
 holding the sample count, the first and last timestamp and value, the increase over the
 segment with counter resets applied, and the compensated sum, least and greatest value.
 It is what lets a `rate` or a `max_over_time` over a long window skip the segment
-entirely — see [Query performance](performance.md). It adds about 7% to a metric
+entirely — see [Query performance](performance.md). The count, least and greatest it
+gives are exact; a sum or mean joined from it agrees with the rows to the last bits. It adds about 7% to a metric
 segment: 2.9 MB beside 38 MB of samples for a week of 850 series at thirty seconds.
 
 The file carries a format number. Format 1, written by earlier releases, has the counter
@@ -91,7 +92,8 @@ the background task rewrites it as format 2 — a week of segments took under se
 minutes. An earlier telemetryd finds a format it does not know in a format 2 file and
 reads the segment's rows instead, so moving back costs speed, not answers. The file is
 written to a temporary name, fsynced and renamed into place like every sidecar, so a
-crash leaves the old file, the new one, or none.
+crash leaves the old file, the new one, or none. One that fails its checksum when a query
+reads it is forgotten, and the background task writes it again.
 
 The file is additive and optional. Segments written before it exists have none, an older
 telemetryd ignores it, and deleting it costs speed rather than correctness: a background

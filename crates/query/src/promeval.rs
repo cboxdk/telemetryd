@@ -718,17 +718,22 @@ fn collect_range_calls<'a>(
 ///
 /// The count, the least and the greatest are exact. The sum and the mean are the
 /// compensated sum Prometheus takes, joined across segments — the same additions in a
-/// different order, so they agree to the last few bits. A sum that is not finite is
-/// declined rather than joined: past overflow Prometheus averages incrementally, and a
-/// NaN or infinity summed in segment order is not the same NaN or infinity summed in
-/// time order. The rows answer those.
+/// different order, so they agree to the last few bits. That holds only while no
+/// ordering of the additions can overflow: `[1e308]` then `[1e308, -1e308]` sums to
+/// infinity in time order and stays there, while each segment's own sum is finite and
+/// their join is `1e308`. So the sum is taken from a summary only when every partial
+/// sum, in any order, is bounded — the count times the largest magnitude, with room to
+/// spare for rounding — and is finite; past that Prometheus's own arithmetic depends on
+/// the order, and the rows answer.
 fn finish_gauge(fold: &telemetryd_store::folds::StreamFold, function: Function) -> Option<f64> {
     if !fold.gauges || fold.seen == 0 {
         return None;
     }
     #[allow(clippy::cast_precision_loss)]
     let count = fold.seen as f64;
-    let finite = fold.sum.is_finite() && fold.compensation.is_finite();
+    // Doubled for headroom: rounding can carry a partial sum a hair past its exact bound.
+    let bounded = (fold.min.abs().max(fold.max.abs()) * count * 2.0).is_finite();
+    let finite = bounded && fold.sum.is_finite() && fold.compensation.is_finite();
     match function {
         Function::CountOverTime => Some(count),
         Function::MinOverTime => Some(fold.min),

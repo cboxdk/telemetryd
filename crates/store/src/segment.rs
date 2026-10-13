@@ -412,6 +412,13 @@ impl Segment {
         self.gauge_folds.load(Ordering::Relaxed)
     }
 
+    /// Record that the summary beside this segment cannot be used — it failed its
+    /// checksum, or is gone — so the backfill writes it again.
+    pub(crate) fn forget_folds(&self) {
+        self.has_folds.store(false, Ordering::Relaxed);
+        self.gauge_folds.store(false, Ordering::Relaxed);
+    }
+
     /// Record that a current-format summary now sits next to this segment.
     pub(crate) fn mark_folds_written(&self) {
         self.has_folds.store(true, Ordering::Relaxed);

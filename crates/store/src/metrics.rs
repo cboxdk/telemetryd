@@ -375,7 +375,12 @@ impl crate::RecordStore<MetricSchema> {
             if written >= limit {
                 break;
             }
-            if segment.has_gauge_folds() || segment.is_unreadable() {
+            // A segment without a stream dictionary has nothing to number a summary by,
+            // and is read row by row whatever is beside it.
+            if segment.has_gauge_folds()
+                || segment.is_unreadable()
+                || segment.manifest.streams.is_empty()
+            {
                 continue;
             }
             let Ok(records) = segment.read::<MetricSchema>() else {
@@ -532,10 +537,16 @@ impl crate::RecordStore<MetricSchema> {
             let per_stream = if let Some(precomputed) = precomputed {
                 // A summary sealed before staleness markers were skipped may have folded
                 // one in, and its NaN cannot be taken back out. The rows can: decline, and
-                // the ordinary scan leaves the marker out.
-                if precomputed.0.iter().zip(&allowed).any(|(fold, ok)| {
-                    *ok && fold.seen > 0 && (fold.increase.is_nan() || fold.last_value.is_nan())
-                }) {
+                // the ordinary scan leaves the marker out. Only a counter summary can be
+                // one of those — a gauge summary is format 2, written after markers were
+                // skipped — and a gauge may hold a NaN that is simply a value: its count,
+                // least and greatest are still right, and a sum it poisons is declined
+                // where the answer is worked out.
+                if !gauges
+                    && precomputed.0.iter().zip(&allowed).any(|(fold, ok)| {
+                        *ok && fold.seen > 0 && (fold.increase.is_nan() || fold.last_value.is_nan())
+                    })
+                {
                     return Ok(None);
                 }
                 precomputed.0
@@ -902,12 +913,24 @@ fn whole_summary(
     wholly_inside: bool,
     gauges: bool,
 ) -> Option<crate::folds::StreamFolds> {
-    if !wholly_inside || !answers_from_summary(segment, gauges) {
+    // A segment from before stream dictionaries numbers no streams, so a summary of it
+    // has nothing to say about any series — and taking it would drop the segment's rows
+    // from the answer without a trace. Its rows are read, labels and all.
+    if !wholly_inside
+        || !answers_from_summary(segment, gauges)
+        || segment.manifest.streams.is_empty()
+    {
         return None;
     }
-    segment
-        .folds()
-        .filter(|folds| !gauges || folds.0.iter().all(|fold| fold.gauges))
+    let Some(folds) = segment.folds() else {
+        // Flagged as summarised but unreadable: damaged, or removed under us. Forget it,
+        // so the backfill writes it again rather than every query paying for the miss.
+        segment.forget_folds();
+        return None;
+    };
+    (folds.0.len() == segment.manifest.streams.len()
+        && (!gauges || folds.0.iter().all(|fold| fold.gauges)))
+    .then_some(folds)
 }
 
 /// Whether answering a window from summaries costs less than reading it.
