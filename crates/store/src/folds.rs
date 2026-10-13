@@ -28,6 +28,23 @@
 //! would repeat it at a smaller scale. These are read when a query wants them and dropped
 //! when it is done.
 //!
+//! # Gauges too, from format 2
+//!
+//! Format 2 adds four numbers per stream — the compensated sum of the values, its Kahan
+//! compensation, the least and the greatest — which is what `sum_over_time`,
+//! `count_over_time`, `avg_over_time`, `min_over_time` and `max_over_time` need over a
+//! window, and what they need is again the same for a segment whatever the query. These
+//! are exact in the same sense as the counter summary: the least of the parts is the
+//! least of the whole, and a sum of compensated sums differs from one pass only in the
+//! order of the additions. A sum that is not finite is not joined at all — Prometheus
+//! switches to another way of averaging there — and the query reads the rows instead.
+//!
+//! A format 1 file still answers `rate` and `increase`; it is read with
+//! [`StreamFold::gauges`] unset, so a gauge function never trusts the four numbers it
+//! lacks, and the background backfill rewrites it as format 2. An older telemetryd reading
+//! a format 2 file finds a version it does not know and reads the rows, so the change
+//! costs it speed and never an answer.
+//!
 //! # Binary, not JSON
 //!
 //! A segment holding three thousand streams is a hundred and forty kilobytes here. A query
@@ -42,9 +59,11 @@ use telemetryd_core::Result;
 pub const FOLDS_FILE: &str = "folds.bin";
 
 const MAGIC: &[u8; 4] = b"TFLD";
-const VERSION: u32 = 1;
-/// `seen` plus five 8-byte fields.
-const BYTES_PER_STREAM: usize = 8 * 5 + 8;
+const VERSION: u32 = 2;
+/// Format 1: `seen` plus five 8-byte fields — the counter summary alone.
+const V1_BYTES_PER_STREAM: usize = 8 * 5 + 8;
+/// Format 2: format 1 plus the sum, its compensation, the least and the greatest.
+const BYTES_PER_STREAM: usize = V1_BYTES_PER_STREAM + 8 * 4;
 
 /// One stream's counter summary over one segment.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -60,6 +79,17 @@ pub struct StreamFold {
     /// The step from the previous segment's last value is deliberately not included: it
     /// belongs to whoever joins the two, and only they know what came before.
     pub increase: f64,
+    /// The values added up, Kahan–Neumaier compensated as Prometheus adds a window up;
+    /// `compensation` is the running correction, added at the end.
+    pub sum: f64,
+    pub compensation: f64,
+    /// The least and the greatest value, chosen as `min_over_time` and `max_over_time`
+    /// choose: a NaN is kept only until any number arrives.
+    pub min: f64,
+    pub max: f64,
+    /// Whether `sum`, `compensation`, `min` and `max` were computed. Unset for a summary
+    /// read from a format 1 file, which predates them, and for any join that took one in.
+    pub gauges: bool,
 }
 
 impl Default for StreamFold {
@@ -71,8 +101,23 @@ impl Default for StreamFold {
             first_value: 0.0,
             last_value: 0.0,
             increase: 0.0,
+            sum: 0.0,
+            compensation: 0.0,
+            min: 0.0,
+            max: 0.0,
+            gauges: true,
         }
     }
+}
+
+/// `candidate` replaces `current` as the least, the way `min_over_time` decides.
+fn less(candidate: f64, current: f64) -> bool {
+    candidate < current || current.is_nan()
+}
+
+/// `candidate` replaces `current` as the greatest, the way `max_over_time` decides.
+fn greater(candidate: f64, current: f64) -> bool {
+    candidate > current || current.is_nan()
 }
 
 impl StreamFold {
@@ -86,6 +131,8 @@ impl StreamFold {
         if self.seen == 0 {
             self.first_nanos = timestamp;
             self.first_value = value;
+            self.min = value;
+            self.max = value;
         } else {
             // A drop means the counter restarted, so the new value *is* the increase.
             self.increase += if value < self.last_value {
@@ -93,7 +140,15 @@ impl StreamFold {
             } else {
                 value - self.last_value
             };
+            if less(value, self.min) {
+                self.min = value;
+            }
+            if greater(value, self.max) {
+                self.max = value;
+            }
         }
+        (self.sum, self.compensation) =
+            telemetryd_core::metric::kahan_add(value, self.sum, self.compensation);
         self.seen = self.seen.saturating_add(1);
         self.last_nanos = timestamp;
         self.last_value = value;
@@ -131,6 +186,16 @@ impl StreamFold {
             later.first_value - self.last_value
         };
         self.increase += later.increase;
+        if less(later.min, self.min) {
+            self.min = later.min;
+        }
+        if greater(later.max, self.max) {
+            self.max = later.max;
+        }
+        (self.sum, self.compensation) =
+            telemetryd_core::metric::kahan_add(later.sum, self.sum, self.compensation);
+        self.compensation += later.compensation;
+        self.gauges &= later.gauges;
         self.seen = self.seen.saturating_add(later.seen);
         self.last_nanos = later.last_nanos;
         self.last_value = later.last_value;
@@ -160,8 +225,29 @@ impl StreamFolds {
             out.extend_from_slice(&fold.first_value.to_le_bytes());
             out.extend_from_slice(&fold.last_value.to_le_bytes());
             out.extend_from_slice(&fold.increase.to_le_bytes());
+            out.extend_from_slice(&fold.sum.to_le_bytes());
+            out.extend_from_slice(&fold.compensation.to_le_bytes());
+            out.extend_from_slice(&fold.min.to_le_bytes());
+            out.extend_from_slice(&fold.max.to_le_bytes());
         }
         crate::sidecar::write(&path, &out)
+    }
+
+    /// Whether the file in `dir` is the current format, from its first eight bytes alone.
+    ///
+    /// Asked once per segment when the store opens, so that a query can tell a segment
+    /// whose summary answers gauge functions from one whose summary predates them without
+    /// reading either. Anything unreadable is `false`: the summary is then rewritten or
+    /// ignored, never trusted.
+    #[must_use]
+    pub fn is_current(dir: &Path) -> bool {
+        use std::io::Read;
+        let mut header = [0u8; 8];
+        std::fs::File::open(dir.join(FOLDS_FILE))
+            .and_then(|mut file| file.read_exact(&mut header))
+            .is_ok()
+            && &header[0..4] == MAGIC
+            && header[4..8] == VERSION.to_le_bytes()
     }
 
     /// Read a segment's summaries, or `None` when it has none.
@@ -175,25 +261,37 @@ impl StreamFolds {
         if raw.len() < 16 || &raw[0..4] != MAGIC {
             return None;
         }
-        if u32::from_le_bytes(raw[4..8].try_into().ok()?) != VERSION {
-            return None;
-        }
+        let version = u32::from_le_bytes(raw[4..8].try_into().ok()?);
+        let width = match version {
+            1 => V1_BYTES_PER_STREAM,
+            VERSION => BYTES_PER_STREAM,
+            // From a newer telemetryd: whatever it holds, it is not known to mean what
+            // this build would take it to mean. The rows are still there.
+            _ => return None,
+        };
         let count = usize::try_from(u64::from_le_bytes(raw[8..16].try_into().ok()?)).ok()?;
-        if raw.len() != 16 + count * BYTES_PER_STREAM {
+        if raw.len() != 16 + count.checked_mul(width)? {
             // Truncated, which a crash mid-write looks like. The rows are still there.
             return None;
         }
         let number = |at: usize| u64::from_le_bytes(raw[at..at + 8].try_into().unwrap_or([0; 8]));
+        let float = |at: usize| f64::from_bits(number(at));
         let mut folds = Vec::with_capacity(count);
         for stream in 0..count {
-            let at = 16 + stream * BYTES_PER_STREAM;
+            let at = 16 + stream * width;
+            let gauges = version == VERSION;
             folds.push(StreamFold {
                 seen: number(at),
                 first_nanos: number(at + 8),
                 last_nanos: number(at + 16),
-                first_value: f64::from_bits(number(at + 24)),
-                last_value: f64::from_bits(number(at + 32)),
-                increase: f64::from_bits(number(at + 40)),
+                first_value: float(at + 24),
+                last_value: float(at + 32),
+                increase: float(at + 40),
+                sum: if gauges { float(at + 48) } else { 0.0 },
+                compensation: if gauges { float(at + 56) } else { 0.0 },
+                min: if gauges { float(at + 64) } else { 0.0 },
+                max: if gauges { float(at + 72) } else { 0.0 },
+                gauges,
             });
         }
         Some(Self(folds))
@@ -298,5 +396,83 @@ mod tests {
 
         std::fs::write(&path, b"not a folds file at all").unwrap();
         assert!(StreamFolds::read(dir.path()).is_none());
+    }
+
+    /// The gauge numbers join like the counter ones: the least of the parts is the least
+    /// of the whole, and so on — including a NaN, which a number displaces from either
+    /// side of the join as it would mid-stream.
+    #[test]
+    fn gauge_numbers_join_like_one_pass() {
+        let all: Vec<(u64, f64)> = vec![
+            (60, f64::NAN),
+            (120, 4.5),
+            (180, -2.0),
+            (240, 9.25),
+            (300, f64::NAN),
+            (360, 0.125),
+        ];
+        let whole = folded(&all);
+        for split in 0..=all.len() {
+            let mut joined = folded(&all[..split]);
+            joined.merge_later(&folded(&all[split..]));
+            assert_eq!(joined.seen, whole.seen, "split at {split}");
+            assert_eq!(
+                joined.min.to_bits(),
+                whole.min.to_bits(),
+                "min, split at {split}"
+            );
+            assert_eq!(
+                joined.max.to_bits(),
+                whole.max.to_bits(),
+                "max, split at {split}"
+            );
+            assert!(joined.gauges);
+        }
+        assert!((whole.min - -2.0).abs() < f64::EPSILON);
+        assert!((whole.max - 9.25).abs() < f64::EPSILON);
+
+        let finite: Vec<(u64, f64)> = (1..=40u32)
+            .map(|i| (u64::from(i) * 60, f64::from(i) * 0.1))
+            .collect();
+        let whole = folded(&finite);
+        let mut joined = folded(&finite[..17]);
+        joined.merge_later(&folded(&finite[17..]));
+        let total = |f: &StreamFold| f.sum + f.compensation;
+        assert!((total(&joined) - total(&whole)).abs() <= 1e-12 * total(&whole).abs());
+    }
+
+    /// A format 1 file — what every store held before format 2 — still answers `rate`,
+    /// and says it cannot answer the gauge functions.
+    #[test]
+    fn a_format_1_file_reads_without_gauges() {
+        let dir = tempfile::tempdir().unwrap();
+        let fold = folded(&[(60, 1.0), (120, 7.5), (180, 3.0)]);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(MAGIC);
+        raw.extend_from_slice(&1u32.to_le_bytes());
+        raw.extend_from_slice(&1u64.to_le_bytes());
+        for number in [fold.seen, fold.first_nanos, fold.last_nanos] {
+            raw.extend_from_slice(&number.to_le_bytes());
+        }
+        for number in [fold.first_value, fold.last_value, fold.increase] {
+            raw.extend_from_slice(&number.to_le_bytes());
+        }
+        crate::sidecar::write(&dir.path().join(FOLDS_FILE), &raw).unwrap();
+
+        assert!(!StreamFolds::is_current(dir.path()));
+        let back = StreamFolds::read(dir.path()).unwrap();
+        assert_eq!(back.0.len(), 1);
+        assert!(!back.0[0].gauges);
+        assert_eq!(back.0[0].seen, 3);
+        assert!((back.0[0].increase - fold.increase).abs() < f64::EPSILON);
+
+        // Joined into anything, it takes the "no gauges" with it.
+        let mut joined = StreamFold::default();
+        joined.merge_later(&back.0[0]);
+        assert!(!joined.gauges);
+
+        StreamFolds(vec![fold]).write(dir.path()).unwrap();
+        assert!(StreamFolds::is_current(dir.path()));
+        assert!(StreamFolds::read(dir.path()).unwrap().0[0].gauges);
     }
 }

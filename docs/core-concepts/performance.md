@@ -42,8 +42,9 @@ while a `limit=100` log search cost milliseconds.
 
 So a segment carries the answer next to it. When a segment is sealed, telemetryd folds
 each stream's samples once and writes a small `folds.bin` beside the Parquet file: how
-many samples, the first and last timestamp and value, and the accumulated increase with
-counter resets already applied. Forty-eight bytes per stream.
+many samples, the first and last timestamp and value, the accumulated increase with
+counter resets already applied, and — since format 2 — the compensated sum of the values,
+the least and the greatest. Eighty bytes per stream.
 
 A window that wholly contains a segment can then take that stream's total without opening
 the segment at all. Only the two segments straddling the window's edges are read, plus
@@ -68,6 +69,61 @@ store on startup. A maintenance task folds a few segments at a time, so an upgra
 instance reaches full speed within the hour while staying answerable throughout. Nothing
 about the on-disk format changed: `folds.bin` is additive, and an older telemetryd
 ignores it.
+
+## Which functions a summary answers
+
+A window that wholly contains a segment takes that segment's summary for these, and
+reads rows only for the segments at its edges and the unsealed tail:
+
+| Function | From a summary | Agrees with the rows |
+|---|---|---|
+| `rate`, `increase` (counters, classic histogram buckets) | yes | to the last bits — additions in another order |
+| `count_over_time`, `min_over_time`, `max_over_time` | yes | exactly |
+| `sum_over_time`, `avg_over_time` | yes, while no order of adding the window up can overflow | to the last bits — the same compensated sum, joined per segment |
+| everything else — a bare selector, `last_over_time`, `quantile_over_time`, `stddev_over_time`, `irate`, `delta`, `deriv`, `changes`, `resets`, … | no, always rows | — |
+
+Every one of them reads rows instead, with the same answer it always had, when:
+
+- the expression has a selector outside such a call — `max_over_time(x[7d]) / x` reads
+  `x`'s rows, so the whole expression is read from rows;
+- it contains a subquery or `@`, which evaluate at times of their own;
+- the window is two hours or narrower, too narrow to hold a whole segment;
+- the window does not wholly contain a segment, or holds more segments it must read
+  whole than it can afford: four for a single point, shared between the points. A range
+  query of more than four points can afford none, so a chart takes summaries only where
+  every window it draws is made of whole segments and the unsealed tail — rarely, in
+  practice; charts are what the windowed read below is for;
+- the window holds a segment without a summary, or with one in the format before gauges
+  were summarised, or with one that fails its checksum — a background task rewrites
+  those, eight every thirty seconds;
+- late data puts a stream's samples out of time order across two segments;
+- for `rate` and `increase`, a NaN in a counter summary — written before staleness
+  markers were left out of summaries;
+- for `sum_over_time` and `avg_over_time`, a sum that could overflow in some order of
+  adding it up — the count times the largest magnitude, doubled for rounding, past the
+  largest float — or that is not finite. `[1e308]` then `[1e308, -1e308]` is infinite in
+  time order and finite segment by segment, and Prometheus's answer is the time-order
+  one. A NaN value makes the sum NaN and is read from rows too; the count, least and
+  greatest of a gauge that held a NaN still come from summaries.
+
+There is no second resolution and no step alignment: a summary is the exact fold of the
+segment it sits beside, so the answer does not depend on where the query's points fall.
+Over a sealed week of 850 series, `max_over_time` and `avg_over_time` over the whole week
+— instant queries, one point each — went from 167 ms to 3.5 ms; the summaries cost 2.9 MB
+beside 38 MB of samples.
+
+## Range queries read only where they look
+
+A range query evaluates its expression at every point, and at each one a selector looks
+only a little way back: five minutes for a bare selector, the range for `x[15m]`. A week
+at 250 points is a point every forty minutes, so most of the span is never looked at —
+and it used to be read anyway, every sample of it held, grouped and sorted. Now only the
+windows in front of the points are kept, read a series at a time from the store's
+columns. The answer cannot change, because nothing outside those windows is ever
+evaluated; an expression with a subquery or `@`, whose times are its own, still reads
+its span whole. Over the same week, a bare gauge chart went from 167 ms to 17 ms, an
+`avg_over_time(x[15m])` chart from 164 ms to 15 ms, and the counter-increase panel the UI
+draws (`x - x offset 15m`) from 192 ms to 42 ms.
 
 ## Queries that touch no data at all
 

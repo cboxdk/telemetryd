@@ -42,8 +42,8 @@ construct: `{"error":{"code":"unsupported_feature","feature":"PromQL function `h
 The languages are parsed in full and then lowered, which is why the error can name the
 function rather than reporting a syntax error.
 
-Answers are held to the upstream engines' own, in CI: 151 PromQL expressions against
-Prometheus 3.15, 62 LogQL queries against Loki 3.7.8, 19 Tempo queries against Tempo 2.10.
+Answers are held to the upstream engines' own, in CI: 172 PromQL expressions against
+Prometheus 3.15, 62 LogQL queries against Loki 3.7.8, 22 Tempo queries against Tempo 2.10.
 
 - **PromQL works** for every function Prometheus enables by default except those over
   native histograms (`histogram_count`, `histogram_sum`, …; `histogram_quantile` over
@@ -59,11 +59,13 @@ Prometheus 3.15, 62 LogQL queries against Loki 3.7.8, 19 Tempo queries against T
 - **LogQL is refused** for `| distinct`, `| ip` and Go template features beyond the
   common functions.
 - **TraceQL works** for `{}`, attribute comparisons in the `resource.`, `span.` and
-  unscoped forms, `duration > 100ms`, `status = error`, `&&`, and the metrics functions
+  unscoped forms, `duration > 100ms`, `status = error`, `nestedSetParent < 0` (root
+  spans), `&&`, and the metrics functions
   on `/api/metrics/query_range` — `rate()`, `count_over_time()`, `quantile_over_time()`
   and the rest, `by (...)`.
-- **TraceQL is refused** for `||` between conditions, structural operators and
-  `| count() > 2`.
+- **TraceQL is refused** for `||` between conditions, structural operators,
+  `| count() > 2`, and `nestedSetParent` comparisons that depend on Tempo's span
+  numbering (`= 3`).
 
 One request does not return everything. `GET /loki/api/v1/query_range` clamps `limit`
 to 5,000 and `GET /api/search` clamps it to 1,000 — **silently**, so asking for a

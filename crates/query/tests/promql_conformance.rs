@@ -5,10 +5,12 @@
 //! written by Prometheus — `scripts/promql-conformance.py --update` asks it — and CI asks
 //! it again on every run, so they cannot drift from what Prometheus says.
 //!
-//! Every expression is answered here three ways, because telemetryd has three roads to
+//! Every expression is answered here five ways, because telemetryd has several roads to
 //! an answer and a bug on any one of them is a wrong chart: the in-memory evaluator, the
 //! store read for one instant, and the store read for a range of points — the chart
-//! path, which folds instead of loading when the expression allows.
+//! path, which folds instead of loading when the expression allows — and those two
+//! store reads again over a store sealed into two-minute segments, where a window
+//! holding whole segments is answered from their summaries.
 
 #![allow(clippy::unwrap_used)]
 
@@ -52,6 +54,21 @@ fn every_expression_answers_as_prometheus_does() {
     let store = Store::open(&config).unwrap();
     store.metrics().append(&samples).unwrap();
 
+    // The same samples sealed a couple of minutes at a time, in time order, as a live
+    // server holds them — so a wide window contains whole segments and their summaries.
+    let sealed_dir = tempfile::tempdir().unwrap();
+    let mut sealed_config = Config::default();
+    sealed_config.storage.data_dir = Some(sealed_dir.path().to_path_buf());
+    let sealed = Store::open(&sealed_config).unwrap();
+    let mut in_time = samples.clone();
+    in_time.sort_by_key(|sample| sample.timestamp_nanos);
+    for chunk in in_time.chunk_by(|a, b| {
+        (a.timestamp_nanos - BASE) / (120 * SECOND) == (b.timestamp_nanos - BASE) / (120 * SECOND)
+    }) {
+        sealed.metrics().append(chunk).unwrap();
+        sealed.metrics().seal_now().unwrap();
+    }
+
     let mut failures = Vec::new();
     let cases = test["promql_expr_test"].as_array().unwrap();
     for case in cases {
@@ -65,11 +82,15 @@ fn every_expression_answers_as_prometheus_does() {
         let instant = Snapshot::load_at(store.metrics(), &expr, &[at], 0).unwrap();
         let points: Vec<u64> = (0..20).map(|i| at - (19 - i) * interval).collect();
         let ranged = Snapshot::load_at(store.metrics(), &expr, &points, 0).unwrap();
+        let sealed_instant = Snapshot::load_at(sealed.metrics(), &expr, &[at], 0).unwrap();
+        let sealed_ranged = Snapshot::load_at(sealed.metrics(), &expr, &points, 0).unwrap();
 
         for (road, snapshot) in [
             ("in memory", &in_memory),
             ("one instant", &instant),
             ("a range", &ranged),
+            ("one instant, sealed", &sealed_instant),
+            ("a range, sealed", &sealed_ranged),
         ] {
             let got = answer(snapshot.eval(&expr, at).unwrap());
             if let Some(difference) = differs(&expected, &got) {
@@ -84,7 +105,7 @@ fn every_expression_answers_as_prometheus_does() {
         failures.is_empty(),
         "{} of {} answers differ from Prometheus:\n{}",
         failures.len(),
-        cases.len() * 3,
+        cases.len() * 5,
         failures.join("\n")
     );
 }

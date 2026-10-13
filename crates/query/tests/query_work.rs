@@ -157,3 +157,23 @@ fn a_quantile_chart_reads_the_buckets_and_nothing_else() {
         "read {read} rows for {buckets} buckets, of {ALL_ROWS} in the store"
     );
 }
+
+#[test]
+fn a_gauge_function_over_the_whole_window_reads_little_more_than_its_edges() {
+    let (_dir, store) = filled();
+    // The same shape as the total above, for the functions a gauge panel asks: five
+    // sealed hours answer from their summaries, and only the edges are read.
+    for query in [
+        "max(max_over_time(latency_count[5h30m]))",
+        "min(min_over_time(latency_count[5h30m]))",
+        "sum(avg_over_time(latency_count[5h30m]))",
+        "sum(sum_over_time(latency_count[5h30m]))",
+        "sum(count_over_time(latency_count[5h30m]))",
+    ] {
+        let read = rows_read(&store, || at_end(&store, query));
+        assert!(
+            read <= COUNT_ROWS / 3,
+            "{query} read {read} rows; the counts are {COUNT_ROWS}, the store {ALL_ROWS}"
+        );
+    }
+}

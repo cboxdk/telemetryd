@@ -117,7 +117,26 @@ pub enum Intrinsic {
     StatusMessage,
     Duration,
     Kind,
+    /// `nestedSetParent`: whether the span has a parent. See `NESTED_SET_PARENT` in this module.
+    NestedSetParent,
 }
+
+/// What `nestedSetParent` means, and the part of it telemetryd answers.
+///
+/// Tempo numbers each trace's spans as a nested set when it writes a block
+/// (`assignNestedSetModelBoundsAndServiceStats`, `tempodb/encoding/vparquet4/
+/// nested_set_model.go`): a depth-first walk gives every span a `nestedSetLeft` and
+/// `nestedSetRight`, a root span's `nestedSetParent` is `-1` (`nestedSetRootParent`), and
+/// every other span's is its parent's `nestedSetLeft` — a positive number — or `0` when
+/// the parent is not in the trace. Clients use it for one thing: `nestedSetParent < 0`
+/// means "root spans only", which is how laravel-telemetry-ui lists traces.
+///
+/// telemetryd does not number spans, so a non-root span's value is known only to be some
+/// integer of at least zero. A root is `-1`, exactly as in Tempo. A comparison is
+/// answered when its result is the same for every value a non-root span could hold —
+/// `< 0`, `= -1`, `!= -1`, `>= 0`, `> -1` — and refused when it would depend on the
+/// numbering, rather than answered from a number we made up.
+const NESTED_SET_PARENT: &str = "nestedSetParent";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompareOp {
@@ -250,7 +269,7 @@ impl Parser<'_> {
             MetricsFunction::Rate | MetricsFunction::CountOverTime
         );
         let field = if reads {
-            Some(self.parse_field()?)
+            Some(refuse_nested_set_parent(self.parse_field()?)?)
         } else {
             None
         };
@@ -288,7 +307,7 @@ impl Parser<'_> {
                     Some(Token::Ident(name)) => name.clone(),
                     _ => return Err(self.unexpected("a field to group by")),
                 };
-                by.push((written, self.parse_field()?));
+                by.push((written, refuse_nested_set_parent(self.parse_field()?)?));
                 match self.peek() {
                     Some(Token::Comma) => self.pos += 1,
                     Some(Token::RightParen) => {
@@ -312,6 +331,9 @@ impl Parser<'_> {
         let field = self.parse_field()?;
         let op = self.parse_op()?;
         let value = self.parse_value(&field)?;
+        if field == Field::Intrinsic(Intrinsic::NestedSetParent) {
+            nested_set_parent_answerable(op, &value)?;
+        }
 
         let regex = if matches!(op, CompareOp::Regex | CompareOp::NotRegex) {
             let Value::Str(pattern) = &value else {
@@ -366,6 +388,15 @@ impl Parser<'_> {
                 }
                 "duration" | "span:duration" => Field::Intrinsic(Intrinsic::Duration),
                 "kind" | "span:kind" => Field::Intrinsic(Intrinsic::Kind),
+                // Tempo spells it only bare; there is no scoped form.
+                NESTED_SET_PARENT => Field::Intrinsic(Intrinsic::NestedSetParent),
+                "nestedSetLeft" | "nestedSetRight" => {
+                    return Err(Error::unsupported_with_hint(
+                        format!("TraceQL intrinsic `{path}`"),
+                        "telemetryd does not number spans as a nested set; use \
+                         `nestedSetParent < 0` to select root spans",
+                    ));
+                }
                 // `rootName` / `rootServiceName` are trace-level, not span-level, and
                 // reporting them as unknown attributes would silently match nothing.
                 "rootName" | "rootServiceName" | "traceDuration" | "trace:rootName"
@@ -378,7 +409,8 @@ impl Parser<'_> {
                 scoped if scoped.contains(':') => {
                     return Err(Error::unsupported_with_hint(
                         format!("TraceQL intrinsic `{scoped}`"),
-                        "the supported intrinsics are name, status, statusMessage, duration and kind",
+                        "the supported intrinsics are name, status, statusMessage, duration, kind and \
+                         nestedSetParent",
                     ));
                 }
                 // A dotted path can only be an attribute, and is read as an unscoped one
@@ -419,6 +451,14 @@ impl Parser<'_> {
             Some(Token::String(text)) => Value::Str(text),
             Some(Token::Number(number)) => Value::Number(number),
             Some(Token::Duration(nanos)) => Value::Duration(nanos),
+            // `-1`: the lexer hands the sign over as its own token.
+            Some(Token::Minus) => match self.tokens.get(self.pos + 1).map(|s| &s.token) {
+                Some(Token::Number(number)) => {
+                    self.pos += 1;
+                    Value::Number(-number)
+                }
+                _ => return Err(self.unexpected("a value")),
+            },
             Some(Token::Ident(word)) => match word.as_str() {
                 "nil" => Value::Nil,
                 // Bare enum words: `status = error`, `kind = server`.
@@ -501,6 +541,57 @@ impl Parser<'_> {
     }
 }
 
+/// Refuse a `nestedSetParent` comparison whose answer for a non-root span would depend
+/// on Tempo's numbering, which telemetryd does not compute. See `NESTED_SET_PARENT` in this module.
+fn nested_set_parent_answerable(op: CompareOp, value: &Value) -> Result<()> {
+    let Value::Number(threshold) = *value else {
+        return Err(Error::BadRequest(format!(
+            "`{NESTED_SET_PARENT}` is a number; compare it with one, as in \
+             `{NESTED_SET_PARENT} < 0`"
+        )));
+    };
+    let holds = |n: f64| match op {
+        CompareOp::Greater => n > threshold,
+        CompareOp::GreaterEqual => n >= threshold,
+        CompareOp::Less => n < threshold,
+        CompareOp::LessEqual => n <= threshold,
+        CompareOp::Equal | CompareOp::NotEqual | CompareOp::Regex | CompareOp::NotRegex => false,
+    };
+    let answerable = match op {
+        // An ordering is monotonic in the value, so it agrees on every integer from zero
+        // up exactly when it agrees at zero and at the far end.
+        CompareOp::Greater | CompareOp::GreaterEqual | CompareOp::Less | CompareOp::LessEqual => {
+            holds(0.0) == holds(f64::MAX)
+        }
+        // No non-root span can equal a negative number or a fraction.
+        CompareOp::Equal | CompareOp::NotEqual => threshold < 0.0 || threshold.fract() != 0.0,
+        CompareOp::Regex | CompareOp::NotRegex => false,
+    };
+    if answerable {
+        Ok(())
+    } else {
+        Err(Error::unsupported_with_hint(
+            format!(
+                "TraceQL `{NESTED_SET_PARENT}` compared in a way that depends on Tempo's span numbering"
+            ),
+            format!(
+                "`{NESTED_SET_PARENT} < 0` selects root spans; `{NESTED_SET_PARENT} >= 0` the rest"
+            ),
+        ))
+    }
+}
+
+/// `nestedSetParent` can be compared, not read: only a root span's value is known.
+fn refuse_nested_set_parent(field: Field) -> Result<Field> {
+    if field == Field::Intrinsic(Intrinsic::NestedSetParent) {
+        return Err(Error::unsupported_with_hint(
+            format!("TraceQL `{NESTED_SET_PARENT}` as a value to aggregate or group by"),
+            format!("filter with `{{ {NESTED_SET_PARENT} < 0 }}` to keep root spans"),
+        ));
+    }
+    Ok(field)
+}
+
 // ---------------------------------------------------------------------------
 // Evaluation
 // ---------------------------------------------------------------------------
@@ -526,6 +617,11 @@ impl Field {
             Self::Intrinsic(Intrinsic::StatusMessage) => span.status_message.clone(),
             Self::Intrinsic(Intrinsic::Kind) => span.kind.as_str().to_owned(),
             Self::Intrinsic(Intrinsic::Duration) => self.number(span)?.to_string(),
+            // Refused where a value is read rather than compared; see
+            // `refuse_nested_set_parent`. Only a root's is known.
+            Self::Intrinsic(Intrinsic::NestedSetParent) => {
+                return span.is_root().then(|| "-1".to_owned());
+            }
             Self::Resource(name) => span.resource_attribute(name)?.to_owned(),
             Self::Span(name) => span.attributes.get_relaxed(name)?.to_owned(),
             Self::Unscoped(name) => span
@@ -579,6 +675,13 @@ impl Condition {
                 }
             }
             Field::Intrinsic(Intrinsic::Name) => self.compare_text(Some(span.name.as_str())),
+            // A root is -1, as Tempo numbers it. Any other span is some integer of at
+            // least zero, and the parser admitted only comparisons that answer the same
+            // for all of them, so zero stands for every one.
+            Field::Intrinsic(Intrinsic::NestedSetParent) => self.compare_number(
+                if span.is_root() { -1.0 } else { 0.0 },
+                self.value_as_number(),
+            ),
             Field::Intrinsic(Intrinsic::StatusMessage) => {
                 self.compare_text(Some(span.status_message.as_str()))
             }
@@ -982,6 +1085,61 @@ mod tests {
                 "{query} produced {err:?}"
             );
         }
+    }
+
+    /// `nestedSetParent < 0` is how a Tempo client asks for root spans: Tempo gives a root
+    /// `-1` and every other span a number of zero or more.
+    #[test]
+    fn nested_set_parent_below_zero_selects_root_spans() {
+        let root = span();
+        let mut child = span();
+        child.parent_span_id = Some("aaaaaaaaaaaaaaaa".to_owned());
+
+        let roots =
+            parse(r#"{ nestedSetParent < 0 && resource.service.name = "checkout" }"#).unwrap();
+        assert!(roots.matches(&root));
+        assert!(!roots.matches(&child));
+
+        for (query, on_root, on_child) in [
+            ("{ nestedSetParent = -1 }", true, false),
+            ("{ nestedSetParent != -1 }", false, true),
+            ("{ nestedSetParent <= -1 }", true, false),
+            ("{ nestedSetParent < 0 }", true, false),
+            ("{ nestedSetParent >= 0 }", false, true),
+            ("{ nestedSetParent > -1 }", false, true),
+            ("{ nestedSetParent = -2 }", false, false),
+            ("{ nestedSetParent > -5 }", true, true),
+        ] {
+            let parsed = parse(query).unwrap();
+            assert_eq!(parsed.matches(&root), on_root, "{query} on a root");
+            assert_eq!(parsed.matches(&child), on_child, "{query} on a child");
+        }
+    }
+
+    /// A comparison whose answer for a non-root span would depend on Tempo's numbering
+    /// is refused rather than answered from a number telemetryd does not have.
+    #[test]
+    fn nested_set_comparisons_that_need_the_numbering_are_refused() {
+        for query in [
+            "{ nestedSetParent = 5 }",
+            "{ nestedSetParent > 3 }",
+            "{ nestedSetParent < 1 }",
+            "{ nestedSetParent = 0 }",
+            "{ nestedSetLeft > 0 }",
+            "{ nestedSetRight > 0 }",
+            "{ } | count_over_time() by (nestedSetParent)",
+        ] {
+            let err = parse(query).unwrap_err();
+            assert!(
+                matches!(err, Error::Unsupported { .. }),
+                "{query} should be Unsupported, got {err:?}"
+            );
+            assert!(err.to_string().contains("nestedSet"), "{query}: {err}");
+        }
+        assert!(matches!(
+            parse(r#"{ nestedSetParent = "root" }"#).unwrap_err(),
+            Error::BadRequest(_)
+        ));
     }
 
     #[test]

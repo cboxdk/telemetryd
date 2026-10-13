@@ -125,6 +125,10 @@ QUERIES = [
     search('{ resource.k8s.pod.name = "shop-7f9" && kind = client }'),
     search('{ span.db.rows > 20 }'),
     search('{ .db.system != "mysql" }'),
+    # Root spans, as laravel-telemetry-ui lists traces: Tempo numbers a root -1.
+    search("{ nestedSetParent < 0 }"),
+    search('{ nestedSetParent < 0 && resource.service.name = "shop" }'),
+    search("{ nestedSetParent >= 0 }"),
     # Not `= nil`: Tempo 2.10 answers it for some of the spans that lack the attribute
     # and not others, by how its storage lays the attribute out.
     search("{}", minDuration="1s"),
