@@ -29,19 +29,7 @@ pub(crate) fn group_sum(values: &[f64]) -> f64 {
     sum + compensation
 }
 
-/// Kahan–Neumaier summation, one term at a time, as Prometheus's `kahanSumInc`.
-#[must_use]
-pub fn kahan_add(increment: f64, sum: f64, compensation: f64) -> (f64, f64) {
-    let total = sum + increment;
-    let compensation = if total.is_infinite() {
-        0.0
-    } else if sum.abs() >= increment.abs() {
-        compensation + ((sum - total) + increment)
-    } else {
-        compensation + ((increment - total) + sum)
-    };
-    (total, compensation)
-}
+pub use telemetryd_core::metric::kahan_add;
 
 /// A range function other than `rate`/`increase` over one series' samples in its
 /// window, staleness markers already left out. `None` when it has no answer there.

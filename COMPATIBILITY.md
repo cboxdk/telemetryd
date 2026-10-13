@@ -414,7 +414,7 @@ Two corrections our first plan got wrong, both found by reading the connector:
   subset is therefore required, not optional.
 - Tag values come from the **v2** path. The v1 path is not called.
 
-**Held to Tempo.** `crates/server/tests/conformance/tempo.json` holds OTLP traces, 19
+**Held to Tempo.** `crates/server/tests/conformance/tempo.json` holds OTLP traces, 22
 queries — trace by id, TraceQL search, tag listings and values, TraceQL metrics — and
 Tempo 2.10.1's answer to each, written by Tempo through `scripts/tempo-conformance.py`
 and asked of Tempo again in CI. What that pinned down, now as Tempo answers:
@@ -450,6 +450,15 @@ Supported: one spanset; `&&`-joined conditions; the operators `=`, `!=`, `=~`, `
 (`name`, `status`, `statusMessage`, `duration`, `kind`, also spelled `span:name` and so
 on); string, number, duration and `nil` literals; `| select(...)` is accepted and ignored
 (telemetryd always returns the matched spans).
+
+`nestedSetParent` is supported for what clients use it for: `{ nestedSetParent < 0 }`
+selects root spans, which is how the UI lists traces. Tempo numbers each trace's spans as
+a nested set when it writes a block — a root's `nestedSetParent` is `-1`, any other
+span's is its parent's `nestedSetLeft`, or `0` when the parent is missing. telemetryd does
+not number spans, so a root is `-1` exactly and any other span is only known to be zero
+or more: a comparison is answered when every such value gives the same result (`< 0`,
+`= -1`, `!= -1`, `>= 0`) and refused, naming the construct, when it would depend on the
+numbering (`= 3`, `> 2`). `nestedSetLeft` and `nestedSetRight` are refused.
 
 Comparisons follow Tempo's rules. Regular expressions are anchored at both ends, so
 `name =~ "GET"` matches `GET` and not `GET /health`. An attribute a span lacks matches

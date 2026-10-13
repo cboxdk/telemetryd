@@ -2285,6 +2285,228 @@
        "value": 18.0
       }
      ]
+    },
+    {
+     "expr": "sum_over_time(temperature[3h])",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 1172.0
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 723.0
+      }
+     ]
+    },
+    {
+     "expr": "count_over_time(up[3h])",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{instance=\"a\", job=\"api\"}",
+       "value": 41.0
+      },
+      {
+       "labels": "{instance=\"b\", job=\"api\"}",
+       "value": 11.0
+      },
+      {
+       "labels": "{instance=\"c\", job=\"web\"}",
+       "value": 41.0
+      }
+     ]
+    },
+    {
+     "expr": "avg_over_time(queue_depth[3h])",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{instance=\"a\", job=\"api\"}",
+       "value": 4.097560975609756
+      },
+      {
+       "labels": "{instance=\"b\", job=\"api\"}",
+       "value": 20.0
+      },
+      {
+       "labels": "{instance=\"c\", job=\"web\"}",
+       "value": 7.0
+      }
+     ]
+    },
+    {
+     "expr": "min_over_time(queue_depth[3h])",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{instance=\"a\", job=\"api\"}",
+       "value": 1.0
+      },
+      {
+       "labels": "{instance=\"b\", job=\"api\"}",
+       "value": 0.0
+      },
+      {
+       "labels": "{instance=\"c\", job=\"web\"}",
+       "value": -3.0
+      }
+     ]
+    },
+    {
+     "expr": "max_over_time(queue_depth[3h])",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{instance=\"a\", job=\"api\"}",
+       "value": 9.0
+      },
+      {
+       "labels": "{instance=\"b\", job=\"api\"}",
+       "value": 40.0
+      },
+      {
+       "labels": "{instance=\"c\", job=\"web\"}",
+       "value": 17.0
+      }
+     ]
+    },
+    {
+     "expr": "sum by (job) (avg_over_time(queue_depth[3h]))",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{job=\"api\"}",
+       "value": 24.097560975609756
+      },
+      {
+       "labels": "{job=\"web\"}",
+       "value": 7.0
+      }
+     ]
+    },
+    {
+     "expr": "count_over_time(sparse_total[3h])",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{job=\"batch\"}",
+       "value": 9.0
+      }
+     ]
+    },
+    {
+     "expr": "max_over_time(temperature[3h]) - min_over_time(temperature[3h])",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{room=\"a\"}",
+       "value": 10.0
+      },
+      {
+       "labels": "{room=\"b\"}",
+       "value": 3.0
+      }
+     ]
+    },
+    {
+     "expr": "increase(http_requests_total[3h]) / count_over_time(http_requests_total[3h])",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{code=\"200\", instance=\"a\", job=\"api\"}",
+       "value": 9.75609756097561
+      },
+      {
+       "labels": "{code=\"200\", instance=\"b\", job=\"api\"}",
+       "value": 19.097560975609756
+      },
+      {
+       "labels": "{code=\"200\", instance=\"c\", job=\"web\"}",
+       "value": 4.939024390243903
+      },
+      {
+       "labels": "{code=\"500\", instance=\"a\", job=\"api\"}",
+       "value": 0.975609756097561
+      },
+      {
+       "labels": "{code=\"500\", instance=\"c\", job=\"web\"}",
+       "value": 0.12195121951219512
+      }
+     ]
+    },
+    {
+     "expr": "max_over_time(queue_depth[3h] offset 2m)",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{instance=\"a\", job=\"api\"}",
+       "value": 9.0
+      },
+      {
+       "labels": "{instance=\"b\", job=\"api\"}",
+       "value": 40.0
+      },
+      {
+       "labels": "{instance=\"c\", job=\"web\"}",
+       "value": 13.0
+      }
+     ]
+    },
+    {
+     "expr": "sum_over_time(queue_depth[3h])",
+     "eval_time": "9m",
+     "exp_samples": [
+      {
+       "labels": "{instance=\"a\", job=\"api\"}",
+       "value": 152.0
+      },
+      {
+       "labels": "{instance=\"b\", job=\"api\"}",
+       "value": 814.0
+      },
+      {
+       "labels": "{instance=\"c\", job=\"web\"}",
+       "value": 222.0
+      }
+     ]
+    },
+    {
+     "expr": "avg_over_time(node_cpu[3h]) * on (instance, cpu) node_cpu",
+     "eval_time": "10m",
+     "exp_samples": [
+      {
+       "labels": "{cpu=\"0\", instance=\"a\"}",
+       "value": 0.25
+      },
+      {
+       "labels": "{cpu=\"0\", instance=\"b\"}",
+       "value": 0.5625
+      },
+      {
+       "labels": "{cpu=\"1\", instance=\"a\"}",
+       "value": 0.0625
+      }
+     ]
+    },
+    {
+     "expr": "queue_depth - queue_depth offset 3m",
+     "eval_time": "8m",
+     "exp_samples": [
+      {
+       "labels": "{instance=\"a\", job=\"api\"}",
+       "value": 0.0
+      },
+      {
+       "labels": "{instance=\"b\", job=\"api\"}",
+       "value": -12.0
+      },
+      {
+       "labels": "{instance=\"c\", job=\"web\"}",
+       "value": 6.0
+      }
+     ]
     }
    ]
   }

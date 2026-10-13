@@ -68,7 +68,7 @@ fn summaries_agree_with_walking_every_row() {
 
     let folded = store
         .metrics()
-        .fold_window(0, 31 * 60 * 1_000_000_000, &[], 4)
+        .fold_window(0, 31 * 60 * 1_000_000_000, &[], 4, false)
         .unwrap()
         .expect("six segments is within the read-whole limit, so summaries answer this");
     assert_eq!(folded.len(), 1, "one stream: {folded:?}");
@@ -123,7 +123,7 @@ fn the_shortcut_is_taken_only_when_it_saves_work() {
     let (narrow_from, narrow_to) = (11 * 60 * 1_000_000_000, 14 * 60 * 1_000_000_000);
     assert!(
         folds
-            .fold_window(narrow_from, narrow_to, &[], 4)
+            .fold_window(narrow_from, narrow_to, &[], 4, false)
             .unwrap()
             .is_none(),
         "a window narrower than a segment has nothing to take from summaries"
@@ -133,14 +133,14 @@ fn the_shortcut_is_taken_only_when_it_saves_work() {
     let (wide_from, wide_to) = (150 * 1_000_000_000, 28 * 60 * 1_000_000_000);
     assert!(
         folds
-            .fold_window(wide_from, wide_to, &[], 4)
+            .fold_window(wide_from, wide_to, &[], 4, false)
             .unwrap()
             .is_some(),
         "one evaluation point can afford to read the two edge segments"
     );
     assert!(
         folds
-            .fold_window(wide_from, wide_to, &[], 0)
+            .fold_window(wide_from, wide_to, &[], 0, false)
             .unwrap()
             .is_none(),
         "a chart pays for each edge segment at every point, so it can afford none"
@@ -185,7 +185,7 @@ fn a_staleness_marker_survives_sealing_and_stays_out_of_the_summary() {
 
     let folded = store
         .metrics()
-        .fold_window(0, 10 * 60 * 1_000_000_000, &[], 4)
+        .fold_window(0, 10 * 60 * 1_000_000_000, &[], 4, false)
         .unwrap()
         .expect("one summarised segment");
     let (_, fold) = &folded[0];
@@ -221,8 +221,9 @@ fn a_segment_deleted_under_the_shortcut_declines_it() {
         .min_by_key(|s| s.manifest.min_time_nanos)
         .unwrap();
     std::fs::remove_dir_all(&straddled.dir).unwrap();
-    let answer = store
-        .metrics()
-        .fold_window(90 * 1_000_000_000, 13 * 60 * 1_000_000_000, &[], 4);
+    let answer =
+        store
+            .metrics()
+            .fold_window(90 * 1_000_000_000, 13 * 60 * 1_000_000_000, &[], 4, false);
     assert!(matches!(answer, Ok(None)), "{answer:?}");
 }

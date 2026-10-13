@@ -149,7 +149,7 @@ fn folding_a_window_agrees_with_folding_its_rows() {
         let (start, end) = (start * SECOND, end * SECOND);
         let folded = store
             .metrics()
-            .fold_window(start, end, &name_is("count"), 4)
+            .fold_window(start, end, &name_is("count"), 4, false)
             .unwrap();
         let Some(folded) = folded else {
             // Declined is allowed; a different answer is not.
@@ -182,7 +182,7 @@ fn late_buffered_samples_decline_the_fold() {
     store.metrics().append(&step(600)).unwrap();
     let folded = store
         .metrics()
-        .fold_window(0, 2_000 * SECOND, &name_is("count"), 4)
+        .fold_window(0, 2_000 * SECOND, &name_is("count"), 4, false)
         .unwrap();
     assert!(folded.is_none(), "{folded:?}");
 }

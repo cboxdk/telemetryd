@@ -332,6 +332,63 @@ async fn traceql_can_filter_on_duration_and_span_attributes() {
     }
 }
 
+/// `nestedSetParent < 0` is how laravel-telemetry-ui lists traces against Tempo: root
+/// spans only. A trace whose root never arrived is not listed — Tempo gives such a span
+/// `0`, not `-1` — and a matched trace's span set is its root alone.
+#[tokio::test]
+async fn nested_set_parent_below_zero_lists_traces_by_their_root() {
+    let harness = Harness::new();
+    harness.post_traces(&trace_payload()).await;
+    let orphan = json!({
+        "resourceSpans": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "checkout"}}
+            ]},
+            "scopeSpans": [{"spans": [{
+                "traceId": "11111111111111111111111111111111",
+                "spanId": "bbbbbbbbbbbbbbbb",
+                "parentSpanId": "cccccccccccccccc",
+                "name": "orphaned child",
+                "kind": 1,
+                "startTimeUnixNano": NOW_NANOS.to_string(),
+                "endTimeUnixNano": (NOW_NANOS + 5 * MS).to_string()
+            }]}]
+        }]
+    });
+    let (status, _) = harness.post_traces(&orphan).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let query = urlencode(r#"{ nestedSetParent < 0 && resource.service.name = "checkout" }"#);
+    let (status, response) = harness
+        .get(&format!("/api/search?q={query}&{}", window()))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let traces = response["traces"].as_array().unwrap();
+    assert_eq!(traces.len(), 1, "{response}");
+    assert_eq!(traces[0]["traceID"], TRACE);
+    assert_eq!(traces[0]["spanSets"][0]["matched"], 1);
+    assert_eq!(traces[0]["spanSets"][0]["spans"][0]["spanID"], ROOT_SPAN);
+
+    // Every span but the root: both the database span and the orphan.
+    let query = urlencode("{ nestedSetParent >= 0 }");
+    let (_, response) = harness
+        .get(&format!("/api/search?q={query}&{}", window()))
+        .await;
+    assert_eq!(
+        response["traces"].as_array().unwrap().len(),
+        2,
+        "{response}"
+    );
+
+    // A comparison that needs Tempo's numbering is named, not guessed.
+    let query = urlencode("{ nestedSetParent = 3 }");
+    let (status, response) = harness
+        .get(&format!("/api/search?q={query}&{}", window()))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(response["error"]["code"], "unsupported_feature");
+}
+
 #[tokio::test]
 async fn the_select_projection_is_accepted() {
     // telemetryd always returns matched spans in full, but refusing the clause would

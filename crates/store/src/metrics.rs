@@ -366,13 +366,16 @@ impl crate::RecordStore<MetricSchema> {
     ///
     /// Returns how many it wrote. A segment that cannot be read is left alone and counted
     /// as done, so one damaged file does not make this retry forever.
+    ///
+    /// A summary in the format before gauges were summarised is rewritten too: it still
+    /// answers `rate`, but `max_over_time` over the same week would read every row.
     pub fn backfill_folds(&self, limit: usize) -> Result<usize> {
         let mut written = 0;
         for segment in &self.segments() {
             if written >= limit {
                 break;
             }
-            if segment.has_folds() || segment.is_unreadable() {
+            if segment.has_gauge_folds() || segment.is_unreadable() {
                 continue;
             }
             let Ok(records) = segment.read::<MetricSchema>() else {
@@ -468,12 +471,17 @@ impl crate::RecordStore<MetricSchema> {
     /// Segments are visited oldest first, and the unsealed tail last, because the merge
     /// requires it: joined out of order, a later value would be taken as the window's
     /// first and the step back to it read as a counter reset.
+    ///
+    /// `gauges` asks for summaries that also carry the sum, least and greatest — what the
+    /// `*_over_time` functions need. A segment whose summary predates those is then
+    /// counted as one without a summary, so it is read rather than half-trusted.
     pub fn fold_window(
         &self,
         start_nanos: u64,
         end_nanos: u64,
         matchers: &[telemetryd_core::LabelMatcher],
         whole_reads_allowed: usize,
+        gauges: bool,
     ) -> Result<Option<Vec<(Labels, crate::folds::StreamFold)>>> {
         use crate::folds::StreamFold;
 
@@ -491,11 +499,10 @@ impl crate::RecordStore<MetricSchema> {
         // Nothing is summarised yet, which is every store's first half hour after an
         // upgrade. Say so before sorting or inspecting anything: the answer is the same
         // either way, and this is the one case where the shortcut is pure overhead.
-        if !segments.iter().any(|segment| segment.has_folds()) {
-            return Ok(None);
-        }
-
-        if !shortcut_pays(&segments, start_nanos, end_nanos, whole_reads_allowed) {
+        let window = (start_nanos, end_nanos);
+        if !segments.iter().any(|s| answers_from_summary(s, gauges))
+            || !shortcut_pays(&segments, window, whole_reads_allowed, gauges)
+        {
             return Ok(None);
         }
 
@@ -521,7 +528,7 @@ impl crate::RecordStore<MetricSchema> {
 
             let wholly_inside =
                 manifest.min_time_nanos > start_nanos && manifest.max_time_nanos <= end_nanos;
-            let precomputed = if wholly_inside { segment.folds() } else { None };
+            let precomputed = whole_summary(segment, wholly_inside, gauges);
             let per_stream = if let Some(precomputed) = precomputed {
                 // A summary sealed before staleness markers were skipped may have folded
                 // one in, and its NaN cannot be taken back out. The rows can: decline, and
@@ -881,15 +888,37 @@ fn fold_segment_columns(
     }
 }
 
+/// Whether `segment` carries a summary that answers what is asked: any summary for
+/// `rate` and `increase`, a current-format one for the gauge functions.
+fn answers_from_summary(segment: &crate::segment::Segment, gauges: bool) -> bool {
+    segment.has_folds() && (!gauges || segment.has_gauge_folds())
+}
+
+/// The summary a window wholly containing `segment` can take instead of its rows, if it
+/// has one that answers what is asked — for `gauges`, one in which every stream carries
+/// the sum, least and greatest.
+fn whole_summary(
+    segment: &crate::segment::Segment,
+    wholly_inside: bool,
+    gauges: bool,
+) -> Option<crate::folds::StreamFolds> {
+    if !wholly_inside || !answers_from_summary(segment, gauges) {
+        return None;
+    }
+    segment
+        .folds()
+        .filter(|folds| !gauges || folds.0.iter().all(|fold| fold.gauges))
+}
+
 /// Whether answering a window from summaries costs less than reading it.
 ///
 /// Decided from manifests alone — time bounds and whether a summary exists — so asking
 /// is cheap even when the answer is no.
 fn shortcut_pays(
     segments: &[std::sync::Arc<crate::segment::Segment>],
-    start_nanos: u64,
-    end_nanos: u64,
+    (start_nanos, end_nanos): (u64, u64),
     whole_reads_allowed: usize,
+    gauges: bool,
 ) -> bool {
     let mut needs_rows = 0usize;
     let mut summarised = 0usize;
@@ -898,7 +927,10 @@ fn shortcut_pays(
         if m.min_time_nanos > end_nanos || m.max_time_nanos <= start_nanos {
             continue;
         }
-        if m.min_time_nanos > start_nanos && m.max_time_nanos <= end_nanos && segment.has_folds() {
+        if m.min_time_nanos > start_nanos
+            && m.max_time_nanos <= end_nanos
+            && answers_from_summary(segment, gauges)
+        {
             summarised += 1;
         } else {
             needs_rows += 1;

@@ -5,8 +5,9 @@
 //! Storage is read **once** for the whole query, not once per step. A one-hour range at
 //! a 15-second step is 240 evaluations; re-reading segments for each would make a chart
 //! cost 240 scans instead of one. Samples are loaded for the union of every selector's
-//! matchers over `[start - lookback, end]`, grouped into series, and every step is then
-//! evaluated from memory.
+//! matchers, within the windows the points look back over — see
+//! `Snapshot::lookback_windows` — grouped into series, and every step is then evaluated
+//! from memory.
 //!
 //! Timestamps and counts convert to `f64` throughout: PromQL is defined over floats,
 //! and the values involved — nanosecond durations within a query window, sample counts
@@ -117,6 +118,16 @@ pub struct Snapshot {
     /// that comparing values was answering a million times over. Profiling a six-hour
     /// panel put `memcmp` at the top, and this is what it was.
     grouped: Vec<GroupIndex>,
+}
+
+/// The refusal for a read past `limits.max_query_samples`.
+fn too_many_samples(max_samples: u64) -> Error {
+    Error::BadRequest(format!(
+        "this query would load more than {max_samples} samples into memory at \
+         once. PromQL is evaluated from a single read of the whole window, so the \
+         cost is every sample of every matching series — narrow the time range, \
+         add label matchers, or raise limits.max_query_samples"
+    ))
 }
 
 /// Turn scanned samples into series, sorted by label set and by time.
@@ -619,38 +630,112 @@ fn fully_foldable(expr: &Expr) -> bool {
 }
 
 fn rate_calls(expr: &Expr) -> Vec<(&Selector, Duration, bool)> {
+    range_calls(expr, &|function| {
+        matches!(function, Function::Rate | Function::Increase)
+    })
+    .into_iter()
+    .map(|(selector, range, function)| (selector, range, function == Function::Rate))
+    .collect()
+}
+
+/// `rate` is `increase` per second; which one a prepared value is.
+fn rate_function(per_second: bool) -> Function {
+    if per_second {
+        Function::Rate
+    } else {
+        Function::Increase
+    }
+}
+
+/// The `*_over_time` functions a segment's summary answers: each needs only the count,
+/// the compensated sum, the least or the greatest of a window's values.
+fn summarises_gauge(function: Function) -> bool {
+    matches!(
+        function,
+        Function::SumOverTime
+            | Function::CountOverTime
+            | Function::AvgOverTime
+            | Function::MinOverTime
+            | Function::MaxOverTime
+    )
+}
+
+/// Every call a segment's summary can answer: `rate`, `increase`, and the gauge
+/// functions of [`summarises_gauge`].
+fn summary_calls(expr: &Expr) -> Vec<(&Selector, Duration, Function)> {
+    range_calls(expr, &|function| {
+        matches!(function, Function::Rate | Function::Increase) || summarises_gauge(function)
+    })
+}
+
+/// Every call of a function `accepts` whose first argument is a plain range selector —
+/// no `@`, which a precomputed value for the query's own points cannot follow.
+fn range_calls<'a>(
+    expr: &'a Expr,
+    accepts: &dyn Fn(Function) -> bool,
+) -> Vec<(&'a Selector, Duration, Function)> {
     let mut out = Vec::new();
-    collect_rate_calls(expr, &mut out);
+    collect_range_calls(expr, accepts, &mut out);
     out
 }
 
-fn collect_rate_calls<'a>(expr: &'a Expr, out: &mut Vec<(&'a Selector, Duration, bool)>) {
+fn collect_range_calls<'a>(
+    expr: &'a Expr,
+    accepts: &dyn Fn(Function) -> bool,
+    out: &mut Vec<(&'a Selector, Duration, Function)>,
+) {
     match expr {
         Expr::Call { function, args } => {
-            if matches!(function, Function::Rate | Function::Increase)
+            if accepts(*function)
                 && let Some(Expr::Selector(selector)) = args.first()
                 && selector.at.is_none()
                 && let Some(range) = selector.range
             {
-                out.push((selector, range, *function == Function::Rate));
+                out.push((selector, range, *function));
             }
             for arg in args {
-                collect_rate_calls(arg, out);
+                collect_range_calls(arg, accepts, out);
             }
         }
         Expr::Aggregation { param, inner, .. } => {
             if let Some(param) = param {
-                collect_rate_calls(param, out);
+                collect_range_calls(param, accepts, out);
             }
-            collect_rate_calls(inner, out);
+            collect_range_calls(inner, accepts, out);
         }
         Expr::Binary { left, right, .. } => {
-            collect_rate_calls(left, out);
-            collect_rate_calls(right, out);
+            collect_range_calls(left, accepts, out);
+            collect_range_calls(right, accepts, out);
         }
-        Expr::Negate(inner) => collect_rate_calls(inner, out),
-        Expr::Subquery(subquery) => collect_rate_calls(&subquery.inner, out),
+        Expr::Negate(inner) => collect_range_calls(inner, accepts, out),
+        Expr::Subquery(subquery) => collect_range_calls(&subquery.inner, accepts, out),
         Expr::Selector(_) | Expr::Number(_) | Expr::String(_) => {}
+    }
+}
+
+/// A gauge function's answer from a window's summary, or `None` when the summary cannot
+/// give the answer the rows would.
+///
+/// The count, the least and the greatest are exact. The sum and the mean are the
+/// compensated sum Prometheus takes, joined across segments — the same additions in a
+/// different order, so they agree to the last few bits. A sum that is not finite is
+/// declined rather than joined: past overflow Prometheus averages incrementally, and a
+/// NaN or infinity summed in segment order is not the same NaN or infinity summed in
+/// time order. The rows answer those.
+fn finish_gauge(fold: &telemetryd_store::folds::StreamFold, function: Function) -> Option<f64> {
+    if !fold.gauges || fold.seen == 0 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let count = fold.seen as f64;
+    let finite = fold.sum.is_finite() && fold.compensation.is_finite();
+    match function {
+        Function::CountOverTime => Some(count),
+        Function::MinOverTime => Some(fold.min),
+        Function::MaxOverTime => Some(fold.max),
+        Function::SumOverTime if finite => Some(fold.sum + fold.compensation),
+        Function::AvgOverTime if finite => Some(fold.sum / count + fold.compensation / count),
+        _ => None,
     }
 }
 
@@ -671,7 +756,10 @@ struct PreparedRate {
     matchers: Vec<telemetryd_core::LabelMatcher>,
     range: Duration,
     offset: Offset,
-    per_second: bool,
+    /// `rate` or `increase`, or — from a segment's summaries — one of the gauge functions
+    /// they answer. Part of the key: `increase(x[1d])` and `max_over_time(x[1d])` share
+    /// everything else.
+    function: Function,
     /// `by_step[s]` holds `(series index, value)` for every series with a value at step
     /// `s`. Indices, not labels: the label set is attached when the vector is handed to
     /// the evaluator.
@@ -740,6 +828,160 @@ impl Snapshot {
                 .any(|(_, range, _)| *range > Self::FOLD_ABOVE)
     }
 
+    /// Whether a gauge function's window is wide enough that segment summaries may answer
+    /// it.
+    ///
+    /// Every selector has to sit in a call a summary answers — `rate`, `increase`, or a
+    /// gauge function of [`summarises_gauge`] — because a summarised load holds no
+    /// samples, and a bare selector beside one would come back empty. Time must not move
+    /// either: a subquery and `@` evaluate at times of their own, and a summary is worked
+    /// out for the query's points alone. And at least one window has to be wider than
+    /// [`Self::FOLD_ABOVE`]: narrower, it holds no whole segment, and asking costs more
+    /// than the windowed read it would fall back to. Expressions of `rate` and `increase`
+    /// alone are left to [`Self::should_fold`], which reads them as before.
+    fn should_summarise(expr: &Expr) -> bool {
+        if expr.shifts_time() {
+            return false;
+        }
+        let calls = summary_calls(expr);
+        let all_summarised = expr.selectors().iter().all(|selector| {
+            calls
+                .iter()
+                .any(|(inside, _, _)| std::ptr::eq(*inside, *selector))
+        });
+        all_summarised
+            && calls
+                .iter()
+                .any(|(_, _, function)| summarises_gauge(*function))
+            && calls.iter().any(|(_, range, _)| *range > Self::FOLD_ABOVE)
+    }
+
+    /// The stretches of time an expression's selectors read at `points`, merged.
+    ///
+    /// # Why the whole span is not read
+    ///
+    /// A bare selector at a point wants the newest sample in the five minutes before it,
+    /// and `avg_over_time(x[15m])` the samples in the fifteen. A week at 250 points is a
+    /// point every forty minutes, so each reads an eighth or a third of the span — and the
+    /// span used to be read whole, every sample of it held, grouped and sorted, to answer
+    /// from the slivers in front of each point. Nothing outside these windows can change
+    /// an answer: every selector is evaluated in `(at - range, at]`, or the lookback for
+    /// one without a range, offset applied.
+    ///
+    /// Closed at both ends, which takes in a sample sitting exactly on a floor that the
+    /// evaluator then leaves out — reading more than needed is safe, and less never is.
+    /// An expression that moves time — a subquery, `@` — reads `[from, end]` whole, as one
+    /// window, because the times it reads at are not the query's points.
+    fn lookback_windows(expr: &Expr, points: &[u64], from: u64, end: u64) -> Vec<(u64, u64)> {
+        if expr.shifts_time() {
+            return vec![(from, end)];
+        }
+        let mut windows: Vec<(u64, u64)> = expr
+            .selectors()
+            .into_iter()
+            .flat_map(|selector| {
+                let reach =
+                    duration_nanos(selector.range.unwrap_or(crate::promql::DEFAULT_LOOKBACK));
+                points.iter().map(move |point| {
+                    let at = selector.offset.apply(*point);
+                    (at.saturating_sub(reach).max(from), at.min(end))
+                })
+            })
+            .filter(|(start, stop)| start <= stop)
+            .collect();
+        windows.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(windows.len());
+        for (start, stop) in windows {
+            match merged.last_mut() {
+                Some(previous) if start <= previous.1.saturating_add(1) => {
+                    previous.1 = previous.1.max(stop);
+                }
+                _ => merged.push((start, stop)),
+            }
+        }
+        merged
+    }
+
+    /// Every sample of the series `pushdown` selects inside `windows`, as series.
+    ///
+    /// The same series [`group_samples`] builds from a whole-span read, restricted to the
+    /// windows: each series' samples in time order, the series in label order. Read a
+    /// series at a time from the store's columns, so the samples outside the windows are
+    /// stepped over in the run rather than materialised as records first.
+    ///
+    /// `Ok(None)` when the store cannot read this way — a segment from before stream
+    /// dictionaries — and the caller reads the span whole instead.
+    fn load_windows(
+        store: &RecordStore<MetricSchema>,
+        pushdown: &[LabelMatcher],
+        windows: &[(u64, u64)],
+        max_samples: u64,
+    ) -> Result<Option<Vec<Series>>> {
+        use std::ops::ControlFlow;
+
+        let mut table = telemetryd_core::series::SeriesTable::new();
+        let mut samples: Vec<Vec<(u64, f64)>> = Vec::new();
+        let mut held: u64 = 0;
+        let mut over = false;
+        let complete = store.scan_series(windows, pushdown, &mut |run| {
+            // The first window that ends at or after the run's first sample; from there
+            // both the samples and the windows only move forward.
+            let Some(&first) = run.timestamps.first() else {
+                return ControlFlow::Continue(());
+            };
+            let mut window = windows.partition_point(|(_, stop)| *stop < first);
+            let mut kept: Vec<(u64, f64)> = Vec::new();
+            for (&at, &value) in run.timestamps.iter().zip(run.values) {
+                while window < windows.len() && windows[window].1 < at {
+                    window += 1;
+                }
+                let Some(&(start, _)) = windows.get(window) else {
+                    break;
+                };
+                if at >= start {
+                    kept.push((at, value));
+                }
+            }
+            if kept.is_empty() {
+                return ControlFlow::Continue(());
+            }
+            held = held.saturating_add(kept.len() as u64);
+            if max_samples != 0 && held > max_samples {
+                over = true;
+                return ControlFlow::Break(());
+            }
+            let (index, added) = table.insert(run.series);
+            if added {
+                samples.push(kept);
+            } else {
+                samples[index].extend(kept);
+            }
+            ControlFlow::Continue(())
+        })?;
+        if over {
+            return Err(too_many_samples(max_samples));
+        }
+        if !complete {
+            return Ok(None);
+        }
+        let mut series: Vec<Series> = table
+            .into_series()
+            .into_iter()
+            .zip(samples)
+            .map(|(labels, mut samples)| {
+                // Runs come oldest source first, and late data puts a later segment's run
+                // before an earlier one's in time. Stable, so two samples at one instant
+                // keep the order they were stored in.
+                if !samples.windows(2).all(|pair| pair[0].0 <= pair[1].0) {
+                    samples.sort_by_key(|(at, _)| *at);
+                }
+                Series { labels, samples }
+            })
+            .collect();
+        series.sort_by(|a, b| a.labels.cmp(&b.labels));
+        Ok(Some(series))
+    }
+
     /// Answer every window from the store's per-segment counter summaries, if it can.
     ///
     /// `None` means the store declined: enough segments in some window carry no summary
@@ -748,7 +990,7 @@ impl Snapshot {
     fn fold_from_summaries(
         store: &RecordStore<MetricSchema>,
         expr: &Expr,
-        calls: &[(&Selector, Duration, bool)],
+        calls: &[(&Selector, Duration, Function)],
         points: &[u64],
     ) -> Result<Option<Self>> {
         // What the shortcut may spend on segments the window does not contain whole. One
@@ -761,9 +1003,10 @@ impl Snapshot {
         let mut table = telemetryd_core::series::SeriesTable::new();
         let mut prepared = Vec::with_capacity(calls.len());
 
-        for (selector, range, per_second) in calls {
+        for (selector, range, function) in calls {
             let offset = selector.offset;
             let range_nanos = duration_nanos(*range);
+            let gauges = summarises_gauge(*function);
             let mut by_step: Vec<Vec<(usize, f64)>> = vec![Vec::new(); points.len()];
 
             for (point, at_nanos) in points.iter().enumerate() {
@@ -774,14 +1017,28 @@ impl Snapshot {
                 // divided by `x` would otherwise fold every code into both sides and read
                 // as exactly 1. The selector's matchers include the pushdown, so this only
                 // ever prunes more.
-                let Some(folded) = store.fold_window(floor, at, &selector.matchers, whole_reads)?
+                let Some(folded) =
+                    store.fold_window(floor, at, &selector.matchers, whole_reads, gauges)?
                 else {
                     return Ok(None);
                 };
                 for (series, summary) in folded {
-                    let window = Window::ending(*at_nanos, range_nanos, offset);
-                    let Some(value) = finish_fold(&summary, window, *per_second) else {
-                        continue;
+                    let value = if gauges {
+                        // Every series here has samples in the window, so each of these
+                        // functions has an answer; a summary that cannot give it sends the
+                        // whole query to the rows rather than leaving the series out.
+                        let Some(value) = finish_gauge(&summary, *function) else {
+                            return Ok(None);
+                        };
+                        value
+                    } else {
+                        let window = Window::ending(*at_nanos, range_nanos, offset);
+                        let Some(value) =
+                            finish_fold(&summary, window, *function == Function::Rate)
+                        else {
+                            continue;
+                        };
+                        value
                     };
                     let (at_index, _) = table.insert(&series);
                     by_step[point].push((at_index, value));
@@ -791,7 +1048,7 @@ impl Snapshot {
                 matchers: selector.matchers.clone(),
                 range: *range,
                 offset,
-                per_second: *per_second,
+                function: *function,
                 by_step,
             });
         }
@@ -1134,7 +1391,11 @@ impl Snapshot {
         // enough segments lack one that reading them whole would cost more than the scan
         // below — which is the same scan the store has always used, left untouched so the
         // shortcut can only ever add speed, never take it away.
-        if let Some(snapshot) = Self::fold_from_summaries(store, expr, &calls, points)? {
+        let summarised: Vec<(&Selector, Duration, Function)> = calls
+            .iter()
+            .map(|(selector, range, per_second)| (*selector, *range, rate_function(*per_second)))
+            .collect();
+        if let Some(snapshot) = Self::fold_from_summaries(store, expr, &summarised, points)? {
             return Ok(snapshot);
         }
 
@@ -1171,7 +1432,7 @@ impl Snapshot {
                 matchers: selector.matchers.clone(),
                 range: *range,
                 offset: selector.offset,
-                per_second: *per_second,
+                function: rate_function(*per_second),
                 by_step,
             });
         }
@@ -1276,26 +1537,36 @@ impl Snapshot {
                 .map(|snapshot| snapshot.bounded(points));
         }
 
-        // One more than allowed, so a full collector is unambiguously an overflow rather
-        // than a query that happened to fit exactly.
-        let ceiling = usize::try_from(max_samples.saturating_add(1)).unwrap_or(usize::MAX);
-        let samples = store.query_bounded(
-            from,
-            end_nanos,
-            &pushdown,
-            &|_| true,
-            if max_samples == 0 { 0 } else { ceiling },
-        )?;
-        if max_samples != 0 && samples.len() as u64 > max_samples {
-            return Err(Error::BadRequest(format!(
-                "this query would load more than {max_samples} samples into memory at \
-                 once. PromQL is evaluated from a single read of the whole window, so the \
-                 cost is every sample of every matching series — narrow the time range, \
-                 add label matchers, or raise limits.max_query_samples"
-            )));
+        // A gauge function over a window wide enough to hold whole segments takes their
+        // summaries, as `rate` does. Declined — a segment without a current summary, late
+        // data, a sum that is not finite — it is read the ordinary way below.
+        if Self::should_summarise(expr) {
+            let calls = summary_calls(expr);
+            if let Some(snapshot) = Self::fold_from_summaries(store, expr, &calls, points)? {
+                return Ok(snapshot.bounded(points));
+            }
         }
 
-        let series = group_samples(samples);
+        let windows = Self::lookback_windows(expr, points, from, end_nanos);
+        let series =
+            if let Some(series) = Self::load_windows(store, &pushdown, &windows, max_samples)? {
+                series
+            } else {
+                // One more than allowed, so a full collector is unambiguously an overflow
+                // rather than a query that happened to fit exactly.
+                let ceiling = usize::try_from(max_samples.saturating_add(1)).unwrap_or(usize::MAX);
+                let samples = store.query_bounded(
+                    from,
+                    end_nanos,
+                    &pushdown,
+                    &|_| true,
+                    if max_samples == 0 { 0 } else { ceiling },
+                )?;
+                if max_samples != 0 && samples.len() as u64 > max_samples {
+                    return Err(too_many_samples(max_samples));
+                }
+                group_samples(samples)
+            };
 
         // Resolve every selector against the loaded series once. A query has a handful
         // of selectors; the loop inside `eval` has hundreds of steps.
@@ -1674,6 +1945,12 @@ impl Snapshot {
                 function == Function::Rate,
             )));
         }
+        // Answered from segment summaries at load, when the window allowed it.
+        if summarises_gauge(function)
+            && let Some(vector) = self.prepared_vector(selector, range, function, at_nanos)
+        {
+            return Ok(Value::Vector(vector));
+        }
         let parameter = match function {
             Function::QuantileOverTime => self.scalar_argument(function, &args[0], at_nanos)?,
             Function::PredictLinear => self.scalar_argument(function, &args[1], at_nanos)?,
@@ -1913,7 +2190,7 @@ impl Snapshot {
                 p.matchers == selector.matchers
                     && p.range == range
                     && p.offset == offset
-                    && p.per_second == per_second
+                    && p.function == rate_function(per_second)
             }) {
                 continue;
             }
@@ -1945,7 +2222,7 @@ impl Snapshot {
                 matchers: selector.matchers.clone(),
                 range,
                 offset,
-                per_second,
+                function: rate_function(per_second),
                 by_step,
             });
         }
@@ -1966,22 +2243,10 @@ impl Snapshot {
         // Prepared for this exact step? Then the work is already done and this is a
         // lookup. Falls through otherwise — an instant query, or a call the preparation
         // pass did not see.
-        if selector.at.is_none()
-            && let Some(prepared) = self.prepared.iter().find(|p| {
-                p.matchers == selector.matchers
-                    && p.range == range
-                    && p.per_second == per_second
-                    && p.offset == selector.offset
-            })
-            && let Some(step) = self.prepared_step(at_nanos)
-            && let Some(at_step) = prepared.by_step.get(step)
+        if let Some(vector) =
+            self.prepared_vector(selector, range, rate_function(per_second), at_nanos)
         {
-            return InstantVector {
-                samples: at_step
-                    .iter()
-                    .map(|(index, value)| (self.stripped[*index].clone(), *value))
-                    .collect(),
-            };
+            return vector;
         }
 
         let at = self.time_of(selector, at_nanos);
@@ -2001,6 +2266,33 @@ impl Snapshot {
             }
         }
         InstantVector { samples }
+    }
+
+    /// The prepared answer of `function` over `selector[range]` at `at_nanos`, if the
+    /// load or the preparation pass worked one out for exactly this call and step.
+    fn prepared_vector(
+        &self,
+        selector: &Selector,
+        range: Duration,
+        function: Function,
+        at_nanos: u64,
+    ) -> Option<InstantVector> {
+        if selector.at.is_some() {
+            return None;
+        }
+        let prepared = self.prepared.iter().find(|p| {
+            p.matchers == selector.matchers
+                && p.range == range
+                && p.function == function
+                && p.offset == selector.offset
+        })?;
+        let at_step = prepared.by_step.get(self.prepared_step(at_nanos)?)?;
+        Some(InstantVector {
+            samples: at_step
+                .iter()
+                .map(|(index, value)| (self.stripped[*index].clone(), *value))
+                .collect(),
+        })
     }
 
     /// Which prepared step `at_nanos` is, if it is one.

@@ -312,6 +312,10 @@ pub struct Segment {
     /// evaluation point per segment. Only two things create the file — sealing and the
     /// backfill — and both set this, so it cannot go stale under us.
     has_folds: Arc<AtomicBool>,
+    /// Whether that summary is the current format, which also answers the gauge
+    /// functions. A summary written before format 2 answers `rate` and `increase` only,
+    /// and the backfill rewrites it. Read from the file's header when the segment opens.
+    gauge_folds: Arc<AtomicBool>,
     /// Set once [`Self::upgrade`] has rewritten, or is rewriting, this segment's files.
     upgraded: Arc<AtomicBool>,
     /// Parquet footer, parsed once and reused.
@@ -402,9 +406,16 @@ impl Segment {
         self.has_folds.load(Ordering::Relaxed)
     }
 
-    /// Record that a summary now sits next to this segment.
+    /// Whether this segment's summary also answers the `*_over_time` functions.
+    #[must_use]
+    pub fn has_gauge_folds(&self) -> bool {
+        self.gauge_folds.load(Ordering::Relaxed)
+    }
+
+    /// Record that a current-format summary now sits next to this segment.
     pub(crate) fn mark_folds_written(&self) {
         self.has_folds.store(true, Ordering::Relaxed);
+        self.gauge_folds.store(true, Ordering::Relaxed);
     }
 
     pub fn load(dir: &Path) -> Result<Option<Self>> {
@@ -486,6 +497,7 @@ impl Segment {
             has_folds: Arc::new(AtomicBool::new(
                 dir.join(crate::folds::FOLDS_FILE).is_file(),
             )),
+            gauge_folds: Arc::new(AtomicBool::new(crate::folds::StreamFolds::is_current(dir))),
             upgraded: Arc::new(AtomicBool::new(false)),
             metadata: Arc::new(OnceLock::new()),
         }))
@@ -1087,6 +1099,7 @@ fn write_staged<S: RecordSchema>(
         text,
         unreadable: Arc::new(AtomicBool::new(false)),
         has_folds: Arc::new(AtomicBool::new(wrote_folds)),
+        gauge_folds: Arc::new(AtomicBool::new(wrote_folds)),
         upgraded: Arc::new(AtomicBool::new(false)),
         metadata: Arc::new(OnceLock::new()),
     })

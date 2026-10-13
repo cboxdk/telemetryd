@@ -27,6 +27,24 @@ pub fn is_stale_marker(value: f64) -> bool {
     value.to_bits() == STALE_MARKER_BITS
 }
 
+/// Kahan–Neumaier summation, one term at a time, as Prometheus's `kahanSumInc`.
+///
+/// Here rather than beside the PromQL functions because two places add the same samples
+/// up and must do it the same way: the evaluator, over a window's rows, and a sealed
+/// segment's summary, over the segment's. `(sum, compensation)` in, the same out.
+#[must_use]
+pub fn kahan_add(increment: f64, sum: f64, compensation: f64) -> (f64, f64) {
+    let total = sum + increment;
+    let compensation = if total.is_infinite() {
+        0.0
+    } else if sum.abs() >= increment.abs() {
+        compensation + ((sum - total) + increment)
+    } else {
+        compensation + ((increment - total) + sum)
+    };
+    (total, compensation)
+}
+
 /// What kind of series this is.
 ///
 /// Kept because it changes how a value should be *read*, not how it is stored: a

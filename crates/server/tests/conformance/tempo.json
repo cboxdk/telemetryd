@@ -601,6 +601,130 @@
   },
   {
    "kind": "search",
+   "q": "{ nestedSetParent < 0 }",
+   "start": "1789999400",
+   "end": "1790000900",
+   "limit": 20,
+   "expect": {
+    "traces": [
+     {
+      "traceID": "a1",
+      "rootServiceName": "shop",
+      "rootTraceName": "POST /checkout",
+      "start": 1790000001000000000,
+      "durationMs": 1200,
+      "matched": [
+       "00000000000000b1"
+      ]
+     },
+     {
+      "traceID": "a2",
+      "rootServiceName": "shop",
+      "rootTraceName": "GET /products",
+      "start": 1790000020000000000,
+      "durationMs": 40,
+      "matched": [
+       "00000000000000c1"
+      ]
+     },
+     {
+      "traceID": "a3",
+      "rootServiceName": "shop",
+      "rootTraceName": "GET /products",
+      "start": 1790000080000000000,
+      "durationMs": 60,
+      "matched": [
+       "00000000000000d1"
+      ]
+     },
+     {
+      "traceID": "a4",
+      "rootServiceName": "db",
+      "rootTraceName": "vacuum",
+      "start": 1790000150000000000,
+      "durationMs": 5000,
+      "matched": [
+       "00000000000000e1"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "kind": "search",
+   "q": "{ nestedSetParent < 0 && resource.service.name = \"shop\" }",
+   "start": "1789999400",
+   "end": "1790000900",
+   "limit": 20,
+   "expect": {
+    "traces": [
+     {
+      "traceID": "a1",
+      "rootServiceName": "shop",
+      "rootTraceName": "POST /checkout",
+      "start": 1790000001000000000,
+      "durationMs": 1200,
+      "matched": [
+       "00000000000000b1"
+      ]
+     },
+     {
+      "traceID": "a2",
+      "rootServiceName": "shop",
+      "rootTraceName": "GET /products",
+      "start": 1790000020000000000,
+      "durationMs": 40,
+      "matched": [
+       "00000000000000c1"
+      ]
+     },
+     {
+      "traceID": "a3",
+      "rootServiceName": "shop",
+      "rootTraceName": "GET /products",
+      "start": 1790000080000000000,
+      "durationMs": 60,
+      "matched": [
+       "00000000000000d1"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "kind": "search",
+   "q": "{ nestedSetParent >= 0 }",
+   "start": "1789999400",
+   "end": "1790000900",
+   "limit": 20,
+   "expect": {
+    "traces": [
+     {
+      "traceID": "a1",
+      "rootServiceName": "shop",
+      "rootTraceName": "POST /checkout",
+      "start": 1790000001000000000,
+      "durationMs": 1200,
+      "matched": [
+       "00000000000000b2",
+       "00000000000000b3"
+      ]
+     },
+     {
+      "traceID": "a2",
+      "rootServiceName": "shop",
+      "rootTraceName": "GET /products",
+      "start": 1790000020000000000,
+      "durationMs": 40,
+      "matched": [
+       "00000000000000c2"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "kind": "search",
    "q": "{}",
    "start": "1789999400",
    "end": "1790000900",
