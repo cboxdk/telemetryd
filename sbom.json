@@ -1,7 +1,7 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
-  "serialNumber": "urn:uuid:937e5e2b-d759-5615-8af5-e701bfbd922d",
+  "serialNumber": "urn:uuid:d426e1f7-ccf3-5c7f-b20c-f6ae1524eb38",
   "version": 1,
   "metadata": {
     "component": {
@@ -4595,10 +4595,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/rustls@0.23.45",
+      "bom-ref": "pkg:cargo/rustls@0.23.46",
       "name": "rustls",
-      "version": "0.23.45",
-      "purl": "pkg:cargo/rustls@0.23.45",
+      "version": "0.23.46",
+      "purl": "pkg:cargo/rustls@0.23.46",
       "description": "Rustls is a modern TLS library written in Rust.",
       "licenses": [
         {
