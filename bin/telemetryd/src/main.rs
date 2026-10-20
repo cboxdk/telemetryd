@@ -37,6 +37,11 @@ mod reload;
 /// It helps on macOS too (72 ms to 57 ms), so this is set for every target rather
 /// than only for musl — one allocator everywhere means the benchmarks, the tests and
 /// the shipped binary are all measuring the same program.
+///
+/// It is built with `no_thp`, so on Linux it never asks for transparent huge pages.
+/// With them, a buffer charged 42 MiB held 128–149 MB resident, because a 2 MiB page
+/// stays resident for a few live records. Without them it held 76–88 MB, which is what
+/// `requirements.md` promises.
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
