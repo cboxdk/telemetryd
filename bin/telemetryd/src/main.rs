@@ -38,10 +38,7 @@ mod reload;
 /// than only for musl — one allocator everywhere means the benchmarks, the tests and
 /// the shipped binary are all measuring the same program.
 ///
-/// It is built with `no_thp`, so on Linux it never asks for transparent huge pages.
-/// With them, a buffer charged 42 MiB held 128–149 MB resident, because a 2 MiB page
-/// stays resident for a few live records. Without them it held 76–88 MB, which is what
-/// `requirements.md` promises.
+/// On Linux the process also runs without transparent huge pages: see [`main`].
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -161,6 +158,16 @@ impl ServeArgs {
 }
 
 fn main() -> std::process::ExitCode {
+    // Transparent huge pages make resident memory outgrow `max_segment_bytes`: a 2 MiB
+    // page stays resident for the few live records on it. The soak's buffer, charged
+    // 48 MiB, held 187–223 MB with them and 117–121 MB without — the difference
+    // between the sizing rule in `requirements.md` holding and not. mimalloc is built
+    // with `no_thp`, so it never asks for them, but a kernel set to `always` hands them
+    // out regardless; this turns them off for the process, whatever the kernel says.
+    // Failing to is not fatal, only bigger.
+    #[cfg(target_os = "linux")]
+    let _ = rustix::thread::disable_transparent_huge_pages(true);
+
     let cli = Cli::parse();
 
     match run(cli) {

@@ -21,7 +21,7 @@ authors = ["Cbox"]
 
 [workspace.dependencies]
 # `no_thp`: transparent huge pages make resident memory outgrow `max_segment_bytes` on
-# Linux; see the allocator in bin/telemetryd/src/main.rs
+# Linux; see `main` in bin/telemetryd/src/main.rs
 mimalloc = { version = "0.1", features = ["no_thp"] }
 # internal — versioned as well as pathed so the workspace stays publishable and
 # `cargo deny` can tell a deliberate internal edge from an unpinned third-party one
@@ -103,6 +103,7 @@ regex = "1"
 
 # dev
 tempfile = "3"
+rustix = { version = "1", default-features = false, features = ["std", "thread"] }
 toml = "0.8"
 proptest = "1"
 tokio-tungstenite = "0.29"
