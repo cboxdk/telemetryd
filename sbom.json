@@ -1,7 +1,7 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
-  "serialNumber": "urn:uuid:d426e1f7-ccf3-5c7f-b20c-f6ae1524eb38",
+  "serialNumber": "urn:uuid:c1d65029-9081-5e9e-b79f-67d4d67606b2",
   "version": 1,
   "metadata": {
     "component": {
@@ -4652,10 +4652,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/rustls-webpki@0.103.15",
+      "bom-ref": "pkg:cargo/rustls-webpki@0.103.16",
       "name": "rustls-webpki",
-      "version": "0.103.15",
-      "purl": "pkg:cargo/rustls-webpki@0.103.15",
+      "version": "0.103.16",
+      "purl": "pkg:cargo/rustls-webpki@0.103.16",
       "description": "Web PKI X.509 Certificate Verification.",
       "licenses": [
         {
@@ -6497,10 +6497,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/webpki-roots@1.0.9",
+      "bom-ref": "pkg:cargo/webpki-roots@1.0.10",
       "name": "webpki-roots",
-      "version": "1.0.9",
-      "purl": "pkg:cargo/webpki-roots@1.0.9",
+      "version": "1.0.10",
+      "purl": "pkg:cargo/webpki-roots@1.0.10",
       "description": "Mozilla's CA root certificates for use with webpki",
       "licenses": [
         {
