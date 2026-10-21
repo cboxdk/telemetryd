@@ -2473,6 +2473,7 @@ dependencies = [
  "clap",
  "humantime",
  "mimalloc",
+ "rustix",
  "serde_json",
  "snap",
  "telemetryd-core",

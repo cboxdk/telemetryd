@@ -38,6 +38,9 @@ time.workspace = true
 ureq.workspace = true
 snap.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 toml.workspace = true
