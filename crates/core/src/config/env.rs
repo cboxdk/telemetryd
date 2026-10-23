@@ -149,6 +149,29 @@ pub(super) const ENV_KEYS: &[(&str, &str)] = &[
         "relay.max_request_bytes",
     ),
     ("TELEMETRYD_RELAY_MAX_QUEUE_SHARE", "relay.max_queue_share"),
+    ("TELEMETRYD_CLICKHOUSE_URL", "clickhouse.url"),
+    ("TELEMETRYD_CLICKHOUSE_DATABASE", "clickhouse.database"),
+    ("TELEMETRYD_CLICKHOUSE_USER", "clickhouse.user"),
+    ("TELEMETRYD_CLICKHOUSE_PASSWORD", "clickhouse.password"),
+    ("TELEMETRYD_CLICKHOUSE_CLUSTER", "clickhouse.cluster"),
+    (
+        "TELEMETRYD_CLICKHOUSE_CREATE_SCHEMA",
+        "clickhouse.create_schema",
+    ),
+    (
+        "TELEMETRYD_CLICKHOUSE_STORAGE_POLICY",
+        "clickhouse.storage_policy",
+    ),
+    ("TELEMETRYD_CLICKHOUSE_COLD_AFTER", "clickhouse.cold_after"),
+    (
+        "TELEMETRYD_CLICKHOUSE_COLD_VOLUME",
+        "clickhouse.cold_volume",
+    ),
+    (
+        "TELEMETRYD_CLICKHOUSE_ALLOW_PLAINTEXT",
+        "clickhouse.allow_plaintext",
+    ),
+    ("TELEMETRYD_CLICKHOUSE_TIMEOUT", "clickhouse.timeout"),
     (
         "TELEMETRYD_SERVER_TLS_SELF_SIGNED",
         "server.tls.self_signed",

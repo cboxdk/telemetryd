@@ -64,6 +64,7 @@ fn record(i: u64) -> LogRecord {
         attributes,
         trace_id: Some(format!("{i:032x}")),
         span_id: Some(format!("{i:016x}")),
+        resource: telemetryd_core::Labels::default(),
     }
 }
 
@@ -224,6 +225,7 @@ fn bench_query(c: &mut Criterion) {
                         exact_key: None,
                         columns: None,
                         required_text: None,
+                        body_filters: &[],
                     },
                     &[LabelMatcher::equal("app", "checkout")],
                     &|_| true,
@@ -247,6 +249,7 @@ fn bench_query(c: &mut Criterion) {
                         exact_key: None,
                         columns: None,
                         required_text: None,
+                        body_filters: &[],
                     },
                     &[],
                     &|r: &LogRecord| r.body.contains("status 200"),
@@ -296,6 +299,7 @@ fn bench_query(c: &mut Criterion) {
                         exact_key: None,
                         columns: None,
                         required_text: None,
+                        body_filters: &[],
                     },
                     &[LabelMatcher::equal("app", "checkout")],
                     &|_| true,

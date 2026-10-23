@@ -52,11 +52,12 @@ use telemetryd_core::config::Overrides;
     name = "telemetryd",
     version,
     about = "Single-binary observability backend — OTLP in, Loki/Tempo/Prometheus APIs out",
-    long_about = "telemetryd stores logs, traces and metrics in one directory \
-                  and serves the Loki, Tempo and Prometheus query APIs that \
-                  laravel-telemetry-ui speaks.\n\n\
+    long_about = "telemetryd stores logs, traces and metrics in one directory, \
+                  or in ClickHouse shared by several instances, and serves the \
+                  Loki, Tempo and Prometheus query APIs that laravel-telemetry-ui \
+                  speaks.\n\n\
                   Your telemetry never leaves your infrastructure: one binary, one \
-                  port, one data directory, no sidecars.",
+                  port, no sidecars.",
     propagate_version = true
 )]
 struct Cli {
@@ -83,6 +84,13 @@ enum Command {
 
     /// Check a configuration and show where every value came from.
     Validate(ConfigArgs),
+
+    /// With ClickHouse as the store: print its schema, or check the account can use it.
+    #[command(name = "clickhouse")]
+    ClickHouse {
+        #[command(subcommand)]
+        action: commands::clickhouse::ClickHouseAction,
+    },
 
     /// Write a configuration with generated tokens, ready for `service install`.
     Init(commands::init::InitArgs),
@@ -133,15 +141,15 @@ struct ServeArgs {
 }
 
 #[derive(Debug, Args, Clone)]
-struct ConfigArgs {
+pub(crate) struct ConfigArgs {
     /// Path to telemetryd.toml. Discovered automatically when omitted.
     #[arg(long, short, value_name = "PATH")]
-    config: Option<PathBuf>,
+    pub(crate) config: Option<PathBuf>,
 
     /// Where to store data. Defaults to ./telemetryd-data if it exists, else the
     /// platform data directory.
     #[arg(long, value_name = "DIR")]
-    data_dir: Option<PathBuf>,
+    pub(crate) data_dir: Option<PathBuf>,
 }
 
 impl ServeArgs {
@@ -197,6 +205,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Validate(args) => {
             commands::validate::run(args.config.as_deref(), args.data_dir.as_deref())
         }
+        Command::ClickHouse { action } => commands::clickhouse::run(&action),
         Command::Init(args) => commands::init::run(&args),
         Command::Service { action } => commands::service::run(&action),
         Command::Version { check } => {

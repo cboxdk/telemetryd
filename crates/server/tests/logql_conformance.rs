@@ -22,17 +22,47 @@ use telemetryd_server::{AppState, router};
 use telemetryd_store::Store;
 use tower::ServiceExt;
 
+mod common;
+use common::clickhouse_under_test;
+
 #[tokio::test]
 async fn every_query_answers_as_loki_does() {
-    let doc: Value = serde_json::from_str(include_str!("conformance/logql.json")).unwrap();
     let tmp = tempfile::tempdir().unwrap();
-    let config = Config {
+    conforms(Config {
         storage: StorageConfig {
             data_dir: Some(tmp.path().join("data")),
             ..StorageConfig::default()
         },
         ..Config::default()
+    })
+    .await;
+}
+
+/// The same answers with ClickHouse as the store, when there is one to test against:
+/// `TELEMETRYD_TEST_CLICKHOUSE_URL=http://user:password@host:8123`. Each run writes to
+/// a database of its own, dropped by the next run of the same name only, so runs never
+/// read each other's lines.
+#[tokio::test]
+async fn every_query_answers_as_loki_does_on_clickhouse() {
+    let Some(clickhouse) = clickhouse_under_test("logql") else {
+        common::skip("TELEMETRYD_TEST_CLICKHOUSE_URL");
+        return;
     };
+    let tmp = tempfile::tempdir().unwrap();
+    conforms(Config {
+        storage: StorageConfig {
+            data_dir: Some(tmp.path().join("data")),
+            ..StorageConfig::default()
+        },
+        clickhouse,
+        retention: common::long_retention(),
+        ..Config::default()
+    })
+    .await;
+}
+
+async fn conforms(config: Config) {
+    let doc: Value = serde_json::from_str(include_str!("conformance/logql.json")).unwrap();
     config.validate().unwrap();
     let store = Arc::new(Store::open(&config).unwrap());
     let app = router(AppState::new(Arc::new(config), store).unwrap());

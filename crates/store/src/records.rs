@@ -459,6 +459,10 @@ pub struct Scan<'a> {
     /// negated one — because it is used to skip segments unread via the trigram index.
     /// A wrong value here silently drops results, so the rule is: if in doubt, `None`.
     pub required_text: Option<&'a str>,
+    /// The query's `|=` and `!=` line filters, as data rather than as an Arrow
+    /// closure, for a backend that is not the local store. See
+    /// [`crate::backend::BodyFilter`].
+    pub body_filters: &'a [crate::backend::BodyFilter],
 }
 
 impl std::fmt::Debug for Scan<'_> {
@@ -487,6 +491,7 @@ impl<'a> Scan<'a> {
             exact_key: None,
             columns: None,
             required_text: None,
+            body_filters: &[],
         }
     }
 
@@ -512,6 +517,12 @@ impl<'a> Scan<'a> {
     #[must_use]
     pub fn exact_key(mut self, key: &'a str) -> Self {
         self.exact_key = Some(key);
+        self
+    }
+
+    #[must_use]
+    pub fn body_filters(mut self, filters: &'a [crate::backend::BodyFilter]) -> Self {
+        self.body_filters = filters;
         self
     }
 
@@ -942,6 +953,7 @@ impl<S: RecordSchema> RecordStore<S> {
                 exact_key: None,
                 columns: None,
                 required_text: None,
+                body_filters: &[],
             },
             matchers,
             extra,
@@ -1582,6 +1594,7 @@ mod tests {
             attributes: Labels::new(),
             trace_id: None,
             span_id: None,
+            resource: telemetryd_core::Labels::default(),
         }
     }
 

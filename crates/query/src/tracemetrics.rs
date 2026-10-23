@@ -15,8 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use serde::Deserialize;
 use telemetryd_core::span::SpanRecord;
 use telemetryd_core::{Error, Result};
-use telemetryd_store::RecordStore;
-use telemetryd_store::spans::SpanSchema;
+use telemetryd_store::SpanStore;
 
 use crate::traceql::{self, MetricsFunction, MetricsStage, TraceQuery};
 
@@ -140,6 +139,8 @@ struct Bucket {
     min: f64,
     max: f64,
     values: Vec<f64>,
+    /// Quantiles a store computed, in the stage's order, instead of `values`.
+    quantiles: Vec<f64>,
     histogram: BTreeMap<u64, u64>,
 }
 
@@ -164,7 +165,7 @@ pub enum LabelValue {
 ///
 /// # Errors
 /// A `400` for more than [`MAX_SERIES`] series; storage errors as they come.
-pub fn evaluate(store: &RecordStore<SpanSchema>, request: &MetricsRequest) -> Result<Vec<Series>> {
+pub fn evaluate(store: &dyn SpanStore, request: &MetricsRequest) -> Result<Vec<Series>> {
     let stage = request.stage();
     let steps = request.steps();
     let per_series = steps.saturating_mul(stage.quantiles.len().max(1));
@@ -225,8 +226,40 @@ pub fn evaluate(store: &RecordStore<SpanSchema>, request: &MetricsRequest) -> Re
         }
         false
     };
-    let scan = telemetryd_store::Scan::range(request.start_nanos, request.end_nanos - 1);
-    store.scan(scan, &[], &visit)?;
+    if let Some(aggregated) = aggregated_in_store(store, request, stage, steps)? {
+        for row in aggregated.rows {
+            let key: Key = stage
+                .by
+                .iter()
+                .zip(&row.key)
+                .filter_map(|((written, _), value)| value.clone().map(|v| (written.clone(), v)))
+                .collect();
+            let mut guard = gathered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (series, refused, _) = &mut *guard;
+            if !series.contains_key(&key)
+                && (series.len() >= MAX_SERIES
+                    || (series.len() + 1).saturating_mul(per_series) > MAX_POINTS)
+            {
+                **refused = Some(Error::BadRequest(format!(
+                    "this would be more than {MAX_SERIES} series or {MAX_POINTS} points; widen \
+                     `step`, group by fewer fields, or filter the spans"
+                )));
+                break;
+            }
+            let bucket = &mut series
+                .entry(key)
+                .or_insert_with(|| vec![Bucket::default(); steps])[row.step.min(steps - 1)];
+            bucket.merge(&row);
+        }
+        for span in &aggregated.individual {
+            visit(span);
+        }
+    } else {
+        let scan = telemetryd_store::Scan::range(request.start_nanos, request.end_nanos - 1);
+        store.scan(scan, &request.query.pushdown(), &visit)?;
+    }
     // Given back, not dropped: `Mutex` has no `Drop` on Linux, so clippy there calls a
     // drop pointless, while on macOS the borrow would outlive it without one.
     let _ = gathered.into_inner();
@@ -236,7 +269,81 @@ pub fn evaluate(store: &RecordStore<SpanSchema>, request: &MetricsRequest) -> Re
     Ok(answer(stage, request, series))
 }
 
+/// The request aggregated by the store, when every condition, `by` field and value has
+/// a stored form; `None` to scan.
+fn aggregated_in_store(
+    store: &dyn SpanStore,
+    request: &MetricsRequest,
+    stage: &MetricsStage,
+    steps: usize,
+) -> Result<Option<telemetryd_store::SpanAggregates>> {
+    use telemetryd_store::{SpanAggregateRequest, SpanAggregation, SpanField};
+    let conditions = request.query.pushdown();
+    // A condition with no stored form is one the store's count could not apply.
+    if conditions.len() != request.query.conditions.len() {
+        return Ok(None);
+    }
+    let Some(group_by) = stage
+        .by
+        .iter()
+        .map(|(_, field)| field.stored())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    let duration =
+        stage.field.as_ref().and_then(crate::traceql::Field::stored) == Some(SpanField::Duration);
+    let aggregation = match stage.function {
+        MetricsFunction::Rate | MetricsFunction::CountOverTime if stage.field.is_none() => {
+            SpanAggregation::Count
+        }
+        MetricsFunction::SumOverTime
+        | MetricsFunction::AvgOverTime
+        | MetricsFunction::MinOverTime
+        | MetricsFunction::MaxOverTime
+            if duration =>
+        {
+            SpanAggregation::Duration
+        }
+        MetricsFunction::QuantileOverTime if duration => {
+            SpanAggregation::Quantiles(stage.quantiles.clone())
+        }
+        MetricsFunction::HistogramOverTime if duration => SpanAggregation::Histogram,
+        _ => return Ok(None),
+    };
+    store.aggregate(&SpanAggregateRequest {
+        start_nanos: request.start_nanos,
+        end_nanos: request.end_nanos,
+        step_nanos: request.step_nanos,
+        steps,
+        conditions: &conditions,
+        group_by: &group_by,
+        aggregation: &aggregation,
+    })
+}
+
 impl Bucket {
+    /// A store's aggregate for this step and series, added to what is here.
+    fn merge(&mut self, row: &telemetryd_store::SpanAggregateRow) {
+        if row.count == 0 {
+            return;
+        }
+        if !row.quantiles.is_empty() {
+            self.quantiles.clone_from(&row.quantiles);
+        }
+        if self.count == 0 || row.min < self.min {
+            self.min = row.min;
+        }
+        if self.count == 0 || row.max > self.max {
+            self.max = row.max;
+        }
+        self.count += row.count;
+        self.sum += row.sum;
+        for &(bound, count) in &row.histogram {
+            *self.histogram.entry(bound).or_default() += count;
+        }
+    }
+
     fn add(&mut self, function: MetricsFunction, value: f64) {
         if self.count == 0 || value < self.min {
             self.min = value;
@@ -300,12 +407,15 @@ fn answer(
     for (key, buckets) in series {
         match stage.function {
             MetricsFunction::QuantileOverTime => {
-                for &q in &stage.quantiles {
+                for (level, &q) in stage.quantiles.iter().enumerate() {
                     let points = buckets
                         .iter()
                         .enumerate()
-                        .filter(|(_, b)| !b.values.is_empty())
+                        .filter(|(_, b)| !b.values.is_empty() || !b.quantiles.is_empty())
                         .map(|(i, b)| {
+                            if let Some(&value) = b.quantiles.get(level) {
+                                return (at(i), value);
+                            }
                             let mut values = b.values.clone();
                             (at(i), crate::promfn::quantile(q, &mut values))
                         })

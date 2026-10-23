@@ -107,7 +107,34 @@ fn spawn_reload_listener(
 
 fn open_store(config: &Config) -> anyhow::Result<Store> {
     let data_dir = config.storage.resolve_data_dir();
-    Store::open(config).with_context(|| {
+    let opened = Store::open(config);
+    // A ClickHouse that refused is not a data directory that is locked: say which it is.
+    if config.clickhouse.is_enabled()
+        && let Err(telemetryd_core::Error::Unavailable(_)) = &opened
+    {
+        return opened.with_context(|| {
+            format!(
+                "connecting to ClickHouse at {} as {:?}, database {:?}\n\
+                 \n\
+                 Check clickhouse.url, clickhouse.user and clickhouse.password, and that the \
+                 account may create the database and its tables (see the cookbook page \
+                 \"Scale out on ClickHouse\") — or set clickhouse.create_schema = false for \
+                 a schema someone else manages.",
+                telemetryd_core::http::redact_url(&config.clickhouse.url),
+                config.clickhouse.user,
+                config.clickhouse.database,
+            )
+        });
+    }
+    if opened.is_ok() && config.clickhouse.is_enabled() {
+        tracing::info!(
+            url = %telemetryd_core::http::redact_url(&config.clickhouse.url),
+            database = %config.clickhouse.database,
+            cluster = %config.clickhouse.cluster,
+            "storing logs, traces and metrics in ClickHouse"
+        );
+    }
+    opened.with_context(|| {
         format!(
             "opening the data directory at {}\n\
              \n\

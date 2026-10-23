@@ -1,0 +1,16 @@
+<clickhouse>
+  <logger><level>warning</level><console>1</console></logger>
+  <listen_host>0.0.0.0</listen_host>
+  <zookeeper><node><host>keeper</host><port>9181</port></node></zookeeper>
+  <macros><shard>01</shard><replica>ch2</replica></macros>
+  <remote_servers>
+    <td>
+      <shard>
+        <internal_replication>true</internal_replication>
+        <replica><host>ch1</host><port>9000</port><user>td</user><password>td</password></replica>
+        <replica><host>ch2</host><port>9000</port><user>td</user><password>td</password></replica>
+      </shard>
+    </td>
+  </remote_servers>
+  <distributed_ddl><path>/clickhouse/task_queue/ddl</path></distributed_ddl>
+</clickhouse>

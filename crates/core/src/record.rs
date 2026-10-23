@@ -301,6 +301,16 @@ pub struct LogRecord {
     pub attributes: Labels,
     pub trace_id: Option<String>,
     pub span_id: Option<String>,
+    /// The producer's resource and scope attributes, verbatim — what OTLP calls
+    /// `ResourceAttributes`, before any were promoted into `stream` and sanitised.
+    ///
+    /// Only the ClickHouse backend keeps it: it stores the OTel Collector's table
+    /// layout, where `ResourceAttributes['service.version']` is a column other tools
+    /// read, and the sanitised `service_version` in `stream` cannot be turned back into
+    /// it. The local store has no use for it, so ingest leaves it empty there, and it is
+    /// never part of the write-ahead log: skipping it keeps that format unchanged.
+    #[serde(skip)]
+    pub resource: Labels,
 }
 
 impl LogRecord {
@@ -492,6 +502,7 @@ mod tests {
             attributes: Labels::new(),
             trace_id: None,
             span_id: None,
+            resource: Labels::default(),
         };
         assert_eq!(record.app(), UNKNOWN_APP);
         assert!(record.size_estimate() >= 5);

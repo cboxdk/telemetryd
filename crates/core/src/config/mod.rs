@@ -146,6 +146,92 @@ impl Config {
         })
     }
 
+    /// `[clickhouse]`'s own checks: a URL that keeps the password and the telemetry off
+    /// the wire in clear, a retention the TTL can express, tiers that can move rows.
+    fn validate_clickhouse(&self) -> Result<()> {
+        const TEN_YEARS: std::time::Duration = std::time::Duration::from_secs(3650 * 86_400);
+        if !self.clickhouse.is_enabled() {
+            return Ok(());
+        }
+        let url = self.clickhouse.url.trim();
+        let shown = crate::http::redact_url(url);
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(Error::Config(format!(
+                "clickhouse.url must be the HTTP interface, http:// or https:// (got {shown:?})"
+            )));
+        }
+        // Credentials go in their own keys: in the URL they would be shown wherever the
+        // URL is, and ClickHouse refuses a request that carries them twice.
+        let authority = url.split_once("://").map_or("", |(_, rest)| {
+            rest.split(['/', '?', '#']).next().unwrap_or("")
+        });
+        if authority.contains('@') || url.contains('?') {
+            return Err(Error::Config(format!(
+                "clickhouse.url carries credentials or parameters ({shown:?}); give the \
+                 server only, and the account as clickhouse.user and clickhouse.password"
+            )));
+        }
+        // The same rule as relay.upstream: every request carries the password, and every
+        // write the telemetry, so off this machine they go encrypted unless an operator
+        // says otherwise.
+        if url.starts_with("http://")
+            && !crate::http::is_loopback_url(url)
+            && !self.clickhouse.allow_plaintext
+        {
+            return Err(Error::Config(format!(
+                "clickhouse.url is plain http to another machine ({shown:?}), which sends the \
+                 password and every record in cleartext. Use https://, or set \
+                 clickhouse.allow_plaintext = true for a network you trust"
+            )));
+        }
+        // The TTL is `toDateTime(Timestamp) + INTERVAL n SECOND`, and `DateTime` ends in
+        // 2106: past that the sum wraps to a date already gone, and ClickHouse drops
+        // every row as it arrives. Ten years is far inside it.
+        for (name, keep) in self.retention.each() {
+            if keep > TEN_YEARS {
+                return Err(Error::Config(format!(
+                    "{name} can be at most 3650d with ClickHouse as the store (got {})",
+                    humantime::format_duration(keep)
+                )));
+            }
+        }
+        let cold = self.clickhouse.cold_after;
+        if !cold.is_zero() {
+            if self.clickhouse.storage_policy.trim().is_empty() {
+                return Err(Error::Config(
+                    "clickhouse.cold_after needs clickhouse.storage_policy: the policy is \
+                     what names the volume rows move to"
+                        .to_owned(),
+                ));
+            }
+            if self.clickhouse.cold_volume.trim().is_empty() {
+                return Err(Error::Config(
+                    "clickhouse.cold_after needs clickhouse.cold_volume".to_owned(),
+                ));
+            }
+            for (name, keep) in self.retention.each() {
+                if cold >= keep {
+                    return Err(Error::Config(format!(
+                        "clickhouse.cold_after ({}) is not shorter than {name} ({}), so \
+                         nothing would ever move; shorten it or set it to 0",
+                        humantime::format_duration(cold),
+                        humantime::format_duration(keep)
+                    )));
+                }
+            }
+        }
+        if self.relay.is_enabled() {
+            return Err(Error::Config(
+                "relay.upstream and [clickhouse] are both set. A relay forwards what it \
+                 stores on its own disk; with ClickHouse as the store there is nothing \
+                 local to forward. Send to the instances in front of ClickHouse directly, \
+                 or run the relay without [clickhouse]"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Relay mode's own checks, kept out of `validate` so neither grows past reading.
     fn validate_relay(&self) -> Result<()> {
         if !self.relay.is_enabled() {
@@ -241,6 +327,10 @@ impl Config {
     /// the latter from an hour to five minutes multiplied the bill by twelve.
     #[must_use]
     pub fn memory_notes(&self) -> Vec<String> {
+        // With ClickHouse as the store there are no local segments to hold open.
+        if self.clickhouse.is_enabled() {
+            return Vec::new();
+        }
         let (implied, budget) = crate::config::manifest_memory(self);
         if implied <= budget {
             return Vec::new();
@@ -427,6 +517,7 @@ impl Config {
         }
 
         self.validate_relay()?;
+        self.validate_clickhouse()?;
 
         if self.limits.ingest_queue_depth == 0 {
             return Err(Error::Config(

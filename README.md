@@ -31,14 +31,14 @@ read APIs are three standards rather than ours. If this stops being the right to
 the UI at Loki and Prometheus and run one export command. The exit is designed in, not
 discovered later.
 
-telemetryd is scoped deliberately: one team, a handful of apps, one VPS or a dev
-laptop. It targets that case completely rather than scaling to a large fleet.
+telemetryd starts where most teams are: one team, a handful of apps, one VPS or a dev
+laptop, and it serves that case completely on its own.
 
-**Single-node is a design choice, not a limitation we plan to remove.** It is what
-lets us delete sharding, consensus, object-store tiering and a query scheduler — and
-ship one static binary — about 15 MB — instead of a stack of services to operate. If you outgrow one
-node, you have outgrown telemetryd, and we would rather say so than pretend
-otherwise.
+**One node is the default, and needs nothing else.** No database, no consensus, no
+query scheduler: one static binary — about 15 MB — instead of a stack of services to
+operate. When one machine stops being enough, the same binary runs as many instances as
+you like in front of one ClickHouse, with the same APIs and the same answers; see
+[Scale out on ClickHouse](docs/cookbook/scale-out-on-clickhouse.md).
 
 > **Status: feature complete.** All three signals go in as OTLP/HTTP JSON (plus
 > Prometheus `remote_write`), land in Parquet segments, and come back out through the
@@ -263,6 +263,22 @@ python3 scripts/check-docs.py             # docs structure, frontmatter, links
 cargo bench -p telemetryd-store                         # measures the constants
 cargo test -p telemetryd-store --test scale --release   # asserts the asymptotics
 ```
+
+The tests that run against ClickHouse skip unless they are given one. A replicated
+cluster of two replicas, as CI runs, is in `scripts/clickhouse/compose.yml`:
+
+```bash
+docker compose -f scripts/clickhouse/compose.yml up -d --wait
+TELEMETRYD_TEST_CLICKHOUSE_URL=http://td:td@127.0.0.1:18124 \
+TELEMETRYD_TEST_CLICKHOUSE_CLUSTER=td \
+TELEMETRYD_TEST_CLICKHOUSE_REPLICAS=http://td:td@127.0.0.1:18124,http://td:td@127.0.0.1:18125 \
+TELEMETRYD_TEST_CLICKHOUSE_REQUIRED=1 \
+  cargo test -p telemetryd-server -p telemetryd-query
+```
+
+`TELEMETRYD_TEST_CLICKHOUSE_REQUIRED=1` turns a skip into a failure. Each test writes
+to a database of its own, `td_test_*`, and leaves it behind for inspection;
+`docker compose … down -v` removes them all.
 
 Performance is held in place from two directions: benchmarks measure the constants,
 and `tests/scale.rs` asserts the asymptotics as *segment-open counts* rather than

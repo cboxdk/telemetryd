@@ -1,7 +1,7 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
-  "serialNumber": "urn:uuid:c1d65029-9081-5e9e-b79f-67d4d67606b2",
+  "serialNumber": "urn:uuid:c835b354-6ff7-5918-aacf-5d53f9e9fbcd",
   "version": 1,
   "metadata": {
     "component": {
@@ -5605,10 +5605,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/tokio@1.53.1",
+      "bom-ref": "pkg:cargo/tokio@1.54.1",
       "name": "tokio",
-      "version": "1.53.1",
-      "purl": "pkg:cargo/tokio@1.53.1",
+      "version": "1.54.1",
+      "purl": "pkg:cargo/tokio@1.54.1",
       "description": "An event-driven, non-blocking I/O platform for writing asynchronous I/O backed applications.",
       "licenses": [
         {

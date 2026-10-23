@@ -255,6 +255,31 @@ jobs:
       - name: Prometheus agrees with every expectation
         run: python3 scripts/promql-conformance.py --check
 
+  # ClickHouse as the store: the Loki and Tempo corpora answered from it, its answers
+  # held to the local store's, a live tail across instances, and two instances in front
+  # of different replicas of one replicated cluster agreeing.
+  clickhouse:
+    name: ClickHouse as the store
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: a replicated ClickHouse cluster
+        run: docker compose -f scripts/clickhouse/compose.yml up -d --wait
+      - name: every test that runs against ClickHouse
+        env:
+          TELEMETRYD_TEST_CLICKHOUSE_URL: http://td:td@127.0.0.1:18124
+          TELEMETRYD_TEST_CLICKHOUSE_CLUSTER: td
+          TELEMETRYD_TEST_CLICKHOUSE_REPLICAS: http://td:td@127.0.0.1:18124,http://td:td@127.0.0.1:18125
+          TELEMETRYD_TEST_CLICKHOUSE_REQUIRED: "1"
+        run: cargo test --locked -p telemetryd-server -p telemetryd-query
+      - name: what ClickHouse said, if it refused
+        if: failure()
+        run: docker compose -f scripts/clickhouse/compose.yml logs --tail 200
+
   # The same for LogQL: `crates/server/tests/logql_conformance.rs` holds telemetryd to
   # Loki's answers in `check`; this asks Loki again.
   logql-conformance:
@@ -279,7 +304,7 @@ jobs:
   ci:
     name: ci
     if: always()
-    needs: [check, deny, msrv, supply-chain, build, promql-conformance, logql-conformance, tempo-conformance]
+    needs: [check, deny, msrv, supply-chain, build, promql-conformance, logql-conformance, tempo-conformance, clickhouse]
     runs-on: ubuntu-latest
     steps:
       # Parsed with jq rather than grep. The grep version worked, but only because

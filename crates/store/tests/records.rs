@@ -76,6 +76,7 @@ fn record(i: u64, app: &str, level: Severity, body: &str) -> LogRecord {
         attributes,
         trace_id: None,
         span_id: None,
+        resource: telemetryd_core::Labels::default(),
     }
 }
 

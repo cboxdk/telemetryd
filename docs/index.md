@@ -52,10 +52,10 @@ Anything outside the subset returns a structured error naming the feature.
 
 ## Scope
 
-telemetryd is scoped deliberately: one team, a handful of apps, one VPS or a dev
-laptop. It targets that case completely rather than scaling to a large fleet.
+telemetryd starts where most teams are: one team, a handful of apps, one VPS or a dev
+laptop, and it serves that case completely on its own.
 
-Single-node is a design choice, not a limitation waiting to be removed. It is what lets
-us delete sharding, consensus, object-store tiering and a query scheduler. If you
-outgrow one node you have outgrown telemetryd, and we would rather say so than pretend
-otherwise.
+One node is the default and needs nothing else: no database, no consensus, no query
+scheduler. When one machine stops being enough, the same binary runs as many instances
+as you like in front of one ClickHouse, with the same APIs and the same answers — see
+[Scale out on ClickHouse](cookbook/scale-out-on-clickhouse.md).

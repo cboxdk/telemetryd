@@ -329,6 +329,26 @@ pub const DESCRIPTORS: &[Descriptor] = &[
         kind: Kind::Counter,
         help: "Torn write-ahead log tails repaired at startup; non-zero means a crash cost records",
     },
+    Descriptor {
+        name: "telemetryd_clickhouse_requests_total",
+        kind: Kind::Counter,
+        help: "Requests to ClickHouse since start, by operation and outcome",
+    },
+    Descriptor {
+        name: "telemetryd_clickhouse_request_seconds_total",
+        kind: Kind::Counter,
+        help: "Seconds spent waiting on ClickHouse since start, by operation",
+    },
+    Descriptor {
+        name: "telemetryd_clickhouse_rows_written_total",
+        kind: Kind::Counter,
+        help: "Rows ClickHouse acknowledged since start",
+    },
+    Descriptor {
+        name: "telemetryd_clickhouse_bytes_sent_total",
+        kind: Kind::Counter,
+        help: "Bytes of rows sent to ClickHouse since start",
+    },
 ];
 
 /// Process-lifetime counters.

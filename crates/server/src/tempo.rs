@@ -18,7 +18,7 @@ pub async fn search(
     let request = SearchRequest::from_params(&params, telemetryd_store::now_nanos())?;
 
     let store = std::sync::Arc::clone(&state.store);
-    let response = crate::auth::spawn_read(move || tempo::search(store.traces(), &request))
+    let response = crate::auth::spawn_read(move || tempo::search(store.span_store(), &request))
         .await
         .map_err(|e| Error::Config(format!("search task panicked: {e}")))??;
 
@@ -50,10 +50,11 @@ async fn metrics(
     let request = MetricsRequest::from_params(params, telemetryd_store::now_nanos(), instant)
         .inspect_err(|error| state.refused_query("traceql", &expression, error))?;
     let store = std::sync::Arc::clone(&state.store);
-    let series = crate::auth::spawn_read(move || tracemetrics::evaluate(store.traces(), &request))
-        .await
-        .map_err(|e| Error::Config(format!("metrics task panicked: {e}")))?
-        .inspect_err(|error| state.refused_query("traceql", &expression, error))?;
+    let series =
+        crate::auth::spawn_read(move || tracemetrics::evaluate(store.span_store(), &request))
+            .await
+            .map_err(|e| Error::Config(format!("metrics task panicked: {e}")))?
+            .inspect_err(|error| state.refused_query("traceql", &expression, error))?;
     let body = if instant {
         tracemetrics::instant_json(&series)
     } else {
@@ -93,7 +94,7 @@ pub async fn trace_v2(
 
 async fn find_trace(state: &AppState, trace_id: String) -> Result<tempo::TraceResponse, ApiError> {
     let store = std::sync::Arc::clone(&state.store);
-    let response = crate::auth::spawn_read(move || tempo::trace(store.traces(), &trace_id))
+    let response = crate::auth::spawn_read(move || tempo::trace(store.span_store(), &trace_id))
         .await
         .map_err(|e| Error::Config(format!("trace task panicked: {e}")))??;
 
@@ -139,7 +140,7 @@ pub async fn tags_v2(
     let store = std::sync::Arc::clone(&state.store);
     let response = crate::auth::spawn_read(move || {
         tempo::tags_v2(
-            store.traces(),
+            store.span_store(),
             request.start_nanos,
             request.end_nanos,
             scope.as_deref(),
@@ -160,7 +161,7 @@ pub async fn tags(
 
     let store = std::sync::Arc::clone(&state.store);
     let response = crate::auth::spawn_read(move || {
-        tempo::tags(store.traces(), request.start_nanos, request.end_nanos)
+        tempo::tags(store.span_store(), request.start_nanos, request.end_nanos)
     })
     .await
     .map_err(|e| Error::Config(format!("tags task panicked: {e}")))??;
@@ -178,7 +179,7 @@ pub async fn tag_values(
 
     let store = std::sync::Arc::clone(&state.store);
     let response =
-        crate::auth::spawn_read(move || tempo::tag_values(store.traces(), &name, &request))
+        crate::auth::spawn_read(move || tempo::tag_values(store.span_store(), &name, &request))
             .await
             .map_err(|e| Error::Config(format!("tag values task panicked: {e}")))??;
 

@@ -126,6 +126,7 @@ pub fn run(args: &BenchArgs) -> anyhow::Result<()> {
                         exact_key: None,
                         columns: None,
                         required_text: None,
+                        body_filters: &[],
                     },
                     &matchers,
                     &|_| true,
@@ -256,6 +257,7 @@ fn record(writer: usize, timestamp_nanos: u64) -> LogRecord {
         attributes,
         trace_id: None,
         span_id: None,
+        resource: telemetryd_core::Labels::default(),
     }
 }
 

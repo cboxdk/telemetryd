@@ -606,7 +606,7 @@ fn logs(
         {
             let parsed = telemetryd_query::logql::parse(query)?;
             let response = telemetryd_query::loki::query_range(
-                store.logs(),
+                store.log_store(),
                 &telemetryd_query::loki::QueryRangeRequest {
                     query: parsed,
                     start_nanos: start,
@@ -635,7 +635,7 @@ fn logs(
                     });
                 }
             }
-            let apps = store.logs().label_values("app", start, end)?;
+            let apps = store.log_store().label_values("app", start, end)?;
             let mut suggestions: Vec<String> = apps
                 .iter()
                 .map(|app| format!(r#"{{app="{app}"}}"#))
@@ -660,7 +660,7 @@ fn traces(
         {
             let parsed = telemetryd_query::traceql::parse(query)?;
             let response = telemetryd_query::tempo::search(
-                store.traces(),
+                store.span_store(),
                 &telemetryd_query::tempo::SearchRequest {
                     query: parsed,
                     start_nanos: start,
@@ -705,7 +705,7 @@ fn metrics(
             // Not a chart and not a range query: the names that exist, and the newest
             // sample of each. That is the whole "is it arriving" question for a metric,
             // and a graph is `laravel-telemetry-ui`'s job.
-            let names = store.metrics().label_values(
+            let names = store.metric_store().label_values(
                 telemetryd_core::metric::METRIC_NAME_LABEL,
                 start,
                 end,
@@ -716,7 +716,7 @@ fn metrics(
                     continue;
                 }
                 let response = telemetryd_query::prometheus::instant(
-                    store.metrics(),
+                    store.metric_store(),
                     &telemetryd_query::prometheus::InstantParams {
                         query: Some(name.clone()),
                         time: None,

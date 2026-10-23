@@ -34,6 +34,76 @@ pub struct Config {
     /// Span metrics and service graphs from incoming spans. Off unless asked for.
     #[serde(default)]
     pub metrics_generator: MetricsGeneratorConfig,
+    /// ClickHouse as the database, shared by every telemetryd in front of it. Off
+    /// unless `url` is set.
+    #[serde(default)]
+    pub clickhouse: ClickHouseConfig,
+}
+
+/// ClickHouse as the store, instead of files in `storage.data_dir`.
+///
+/// Set, telemetryd keeps no telemetry of its own: every instance writes to and reads
+/// from the same database, so they can sit behind one load balancer and any of them
+/// answers for all the data. The tables are the OpenTelemetry Collector's ClickHouse
+/// layout, which `cboxdk/laravel-telemetry-store` and Grafana's ClickHouse plugin read
+/// as well, plus the columns telemetryd needs to answer its own APIs exactly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ClickHouseConfig {
+    /// The HTTP interface, `http://host:8123` or `https://…`. Empty = off.
+    pub url: String,
+    pub database: String,
+    pub user: String,
+    pub password: Secret,
+    /// Create the tables on `ON CLUSTER` this cluster, with `ReplicatedMergeTree`.
+    /// Empty = one server, plain `MergeTree`.
+    pub cluster: String,
+    /// Create the tables and columns that are missing at startup, and bring their TTLs
+    /// to `retention.*`. Off for a database whose schema someone else manages.
+    pub create_schema: bool,
+    /// The storage policy new tables are created with. Empty = the server's default.
+    /// Needed for `cold_after`: it names the volumes rows move between. Applies when a
+    /// table is created. An existing table keeps its policy: ClickHouse moves one only
+    /// to a policy holding all the old one's disks, by `ALTER TABLE … MODIFY SETTING`.
+    pub storage_policy: String,
+    /// Move logs, spans and metric samples this old to `cold_volume` — object storage or slower disks,
+    /// still queryable — and keep them there until `retention.*` deletes them. Zero =
+    /// never: everything stays on the policy's first volume.
+    #[serde(with = "humantime_serde")]
+    pub cold_after: Duration,
+    /// The volume of `storage_policy` that `cold_after` moves rows to.
+    pub cold_volume: String,
+    /// Allow `http://` to a ClickHouse on another machine, sending the password and every
+    /// record unencrypted. For a network you trust; `https://` otherwise.
+    pub allow_plaintext: bool,
+    /// How long one request to ClickHouse may take.
+    #[serde(with = "humantime_serde")]
+    pub timeout: Duration,
+}
+
+impl Default for ClickHouseConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            database: "default".to_owned(),
+            user: "default".to_owned(),
+            password: Secret::default(),
+            cluster: String::new(),
+            create_schema: true,
+            storage_policy: String::new(),
+            cold_after: Duration::ZERO,
+            cold_volume: "cold".to_owned(),
+            allow_plaintext: false,
+            timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl ClickHouseConfig {
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        !self.url.trim().is_empty()
+    }
 }
 
 /// What Tempo's metrics generator does, done at ingest: series derived from spans,

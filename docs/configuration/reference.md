@@ -163,6 +163,22 @@ max_request_bytes     = "4MiB"       # segments are split into requests this siz
 # app   = "mobile-ios"
 # token = "file:/run/secrets/mobile-ios"
 
+[clickhouse]
+# ClickHouse as the store, shared by every instance in front of it — give them all the
+# same [clickhouse] and [retention]. Unset = files in storage.data_dir, one instance.
+# See docs/cookbook/scale-out-on-clickhouse.md.
+# url           = "https://clickhouse.internal:8443"  # the HTTP interface; empty = off
+database        = "default"
+user            = "default"
+# password      = "file:/run/secrets/clickhouse"
+cluster         = ""         # ON CLUSTER this, with Replicated engines; empty = one server
+create_schema   = true       # create what is missing and bring TTLs to retention.* at startup
+storage_policy  = ""         # set on tables telemetryd creates; needed by cold_after
+cold_after      = "0s"       # move logs, spans and metric samples this old to cold_volume; 0 = never
+cold_volume     = "cold"     # the volume of storage_policy they move to
+allow_plaintext = false      # allow http:// to a non-loopback host, password and data in clear
+timeout         = "30s"      # one request; also each read's max_execution_time
+
 [ingest]
 # Resource attributes that become stream labels, beside `app` and `level`. The
 # cardinality contract: anything not listed is still stored and filterable, it just
