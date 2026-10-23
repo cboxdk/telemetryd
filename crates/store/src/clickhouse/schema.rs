@@ -573,10 +573,39 @@ pub fn ensure(
     // From the server's default database: the configured one may not exist yet, and a
     // request naming a database that does not exist is refused before it runs.
     let on = Layout { config, retention }.on_cluster();
-    client.in_database("default").execute(&format!(
+    let server = client.in_database("default");
+    server.execute(&format!(
         "CREATE DATABASE IF NOT EXISTS {}{on}",
         identifier(client.database())
     ))?;
+    // On a cluster the statement can return before this replica has run it — another
+    // instance's identical statement, queued first, is the one this replica ran — and a
+    // table created in a database not there yet is refused. Wait until it is there.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let mut there = false;
+        server.query_lines(
+            &format!(
+                "SELECT 1 AS one FROM system.databases WHERE name = {}",
+                quote(client.database())
+            ),
+            |_| {
+                there = true;
+                Ok(std::ops::ControlFlow::Break(()))
+            },
+        )?;
+        if there {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(telemetryd_core::Error::Unavailable(format!(
+                "database {:?} was created on the cluster but has not appeared on this \
+                 replica within a minute; check the cluster's distributed DDL queue",
+                client.database()
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
     for statement in statements(config, retention) {
         client.execute(&statement)?;
     }
