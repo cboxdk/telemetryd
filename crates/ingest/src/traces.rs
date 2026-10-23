@@ -359,6 +359,7 @@ pub fn context<'a>(
     now_nanos: u64,
 ) -> DecodeContext<'a> {
     DecodeContext {
+        keep_resource: false,
         pool: None,
         limits,
         ingest,

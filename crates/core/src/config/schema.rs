@@ -34,6 +34,61 @@ pub struct Config {
     /// Span metrics and service graphs from incoming spans. Off unless asked for.
     #[serde(default)]
     pub metrics_generator: MetricsGeneratorConfig,
+    /// ClickHouse as the database, shared by every telemetryd in front of it. Off
+    /// unless `url` is set.
+    #[serde(default)]
+    pub clickhouse: ClickHouseConfig,
+}
+
+/// ClickHouse as the store, instead of files in `storage.data_dir`.
+///
+/// Set, telemetryd keeps no telemetry of its own: every instance writes to and reads
+/// from the same database, so they can sit behind one load balancer and any of them
+/// answers for all the data. The tables are the OpenTelemetry Collector's ClickHouse
+/// layout, which `cboxdk/laravel-telemetry-store` and Grafana's ClickHouse plugin read
+/// as well, plus the columns telemetryd needs to answer its own APIs exactly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ClickHouseConfig {
+    /// The HTTP interface, `http://host:8123` or `https://…`. Empty = off.
+    pub url: String,
+    pub database: String,
+    pub user: String,
+    pub password: Secret,
+    /// Create the tables on `ON CLUSTER` this cluster, with `ReplicatedMergeTree`.
+    /// Empty = one server, plain `MergeTree`.
+    pub cluster: String,
+    /// Create the tables and columns that are missing at startup. Off for a database
+    /// whose schema someone else manages.
+    pub create_schema: bool,
+    /// Days ClickHouse keeps a row, as the table's TTL. Applies when the tables are
+    /// created; an existing table keeps the TTL it has.
+    pub retention_days: u32,
+    /// How long one request to ClickHouse may take.
+    #[serde(with = "humantime_serde")]
+    pub timeout: Duration,
+}
+
+impl Default for ClickHouseConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            database: "default".to_owned(),
+            user: "default".to_owned(),
+            password: Secret::default(),
+            cluster: String::new(),
+            create_schema: true,
+            retention_days: 30,
+            timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl ClickHouseConfig {
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        !self.url.trim().is_empty()
+    }
 }
 
 /// What Tempo's metrics generator does, done at ingest: series derived from spans,

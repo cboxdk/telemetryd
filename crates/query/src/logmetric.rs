@@ -15,8 +15,7 @@ use std::sync::{Mutex, PoisonError};
 
 use telemetryd_core::{Error, LabelMatcher, Labels, LogRecord, MatchOp, MetricKind, Result};
 use telemetryd_core::{MetricSample, metric::STALE_MARKER_BITS};
-use telemetryd_store::RecordStore;
-use telemetryd_store::logs::LogSchema;
+use telemetryd_store::LogStore;
 
 use crate::lexer::{Token, tokenize};
 use crate::logql::{LabelPredicate, LogQuery, Parser, Stage};
@@ -592,7 +591,7 @@ fn too_many_series() -> Error {
 /// # Errors
 /// A `400` for a pipeline error in a series, or a query over the series or sample limits.
 pub fn evaluate(
-    store: &RecordStore<LogSchema>,
+    store: &dyn LogStore,
     query: &MetricQuery,
     steps: &[u64],
     deadline: Deadline,
@@ -668,7 +667,7 @@ impl RangeAggregation {
     /// Read every line any step's window covers, once, into series.
     fn extract(
         &self,
-        store: &RecordStore<LogSchema>,
+        store: &dyn LogStore,
         steps: &[u64],
         deadline: Deadline,
     ) -> Result<(Extracted, u64)> {
@@ -699,7 +698,9 @@ impl RangeAggregation {
             false
         };
         let prefilter = crate::loki::build_line_prefilter(&self.query);
-        let mut scan = telemetryd_store::Scan::range(floor.saturating_add(1), top);
+        let body = crate::loki::body_filters(&self.query);
+        let mut scan =
+            telemetryd_store::Scan::range(floor.saturating_add(1), top).body_filters(&body);
         if let Some(prefilter) = prefilter.as_ref() {
             scan = scan.columns(prefilter);
         }
@@ -1011,7 +1012,7 @@ fn is_label_name(name: &str) -> bool {
 /// # Errors
 /// As [`evaluate`], and for an answer over [`MAX_SERIES`].
 pub fn answer_range(
-    store: &RecordStore<LogSchema>,
+    store: &dyn LogStore,
     query: &MetricQuery,
     steps: &[u64],
     deadline: Deadline,
@@ -1056,7 +1057,7 @@ pub fn answer_range(
 /// # Errors
 /// As [`evaluate`].
 pub fn answer_instant(
-    store: &RecordStore<LogSchema>,
+    store: &dyn LogStore,
     query: &MetricQuery,
     at: u64,
     deadline: Deadline,

@@ -91,6 +91,7 @@ fn log(ts: u64, app: &str, body: &str) -> LogRecord {
         attributes: Labels::new(),
         trace_id: None,
         span_id: None,
+        resource: telemetryd_core::Labels::default(),
     }
 }
 
@@ -151,6 +152,7 @@ fn a_limited_query_does_not_open_every_segment() {
                 exact_key: None,
                 columns: None,
                 required_text: None,
+                body_filters: &[],
             },
             &[],
             &|_| true,
@@ -183,6 +185,7 @@ fn a_limited_query_still_returns_the_correct_records() {
                 exact_key: None,
                 columns: None,
                 required_text: None,
+                body_filters: &[],
             },
             &[],
             &|_| true,
@@ -218,6 +221,7 @@ fn an_ascending_limited_query_takes_the_oldest_and_prunes_from_the_other_end() {
                 exact_key: None,
                 columns: None,
                 required_text: None,
+                body_filters: &[],
             },
             &[],
             &|_| true,
@@ -334,6 +338,7 @@ fn a_trace_lookup_does_not_read_the_whole_retention_window() {
                 exact_key: Some("4bf92f3577b34da6a3ce929d0e0e4736"),
                 columns: None,
                 required_text: None,
+                body_filters: &[],
             },
             &[],
             &|s: &SpanRecord| s.trace_id == "4bf92f3577b34da6a3ce929d0e0e4736",
@@ -378,6 +383,7 @@ fn the_bloom_filter_never_hides_a_trace_that_exists() {
                     exact_key: Some(id),
                     columns: None,
                     required_text: None,
+                    body_filters: &[],
                 },
                 &[],
                 &|s: &SpanRecord| &s.trace_id == id,
@@ -412,6 +418,7 @@ fn a_limited_query_over_a_large_store_stays_bounded() {
                 exact_key: None,
                 columns: None,
                 required_text: None,
+                body_filters: &[],
             },
             &[],
             &|_| true,
@@ -483,6 +490,7 @@ fn parallel_scanning_returns_exactly_the_sequential_answer() {
             exact_key: None,
             columns: None,
             required_text: None,
+            body_filters: &[],
         };
         let expected = sequential.scan(request(), &matchers, &|_| true).unwrap();
         let actual = parallel.scan(request(), &matchers, &|_| true).unwrap();
@@ -536,6 +544,7 @@ fn a_parallel_query_is_deterministic_across_runs() {
         exact_key: None,
         columns: None,
         required_text: None,
+        body_filters: &[],
     };
 
     let first: Vec<_> = store
@@ -606,6 +615,7 @@ fn a_stream_is_pruned_on_its_own_time_range_not_the_segments() {
                     exact_key: None,
                     columns: None,
                     required_text: None,
+                    body_filters: &[],
                 },
                 &[LabelMatcher::equal("app", app)],
                 &|_| true,
@@ -694,6 +704,7 @@ fn trigram_pruning_never_changes_the_answer() {
                 exact_key: None,
                 columns: None,
                 required_text: None,
+                body_filters: &[],
             };
             if with_index {
                 request.required_text = Some(pattern);
@@ -762,6 +773,7 @@ fn a_pattern_that_appears_nowhere_reads_no_segments() {
                 exact_key: None,
                 columns: None,
                 required_text: Some("zzzzz-no-such-term"),
+                body_filters: &[],
             },
             &[LabelMatcher::equal("app", "checkout")],
             &|record: &LogRecord| record.body.contains("zzzzz-no-such-term"),

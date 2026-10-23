@@ -147,6 +147,28 @@ impl Config {
     }
 
     /// Relay mode's own checks, kept out of `validate` so neither grows past reading.
+    fn validate_clickhouse(&self) -> Result<()> {
+        if !self.clickhouse.is_enabled() {
+            return Ok(());
+        }
+        let url = self.clickhouse.url.trim();
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(Error::Config(format!(
+                "clickhouse.url must be the HTTP interface, http:// or https:// (got {url:?})"
+            )));
+        }
+        // The TTL is `toDateTime(Timestamp) + INTERVAL n DAY`, and `DateTime` ends in
+        // 2106: past that the sum wraps to a date already gone, and ClickHouse drops
+        // every row as it arrives. Ten years is far inside it and far past any need.
+        if !(1..=3650).contains(&self.clickhouse.retention_days) {
+            return Err(Error::Config(format!(
+                "clickhouse.retention_days must be between 1 and 3650 (got {})",
+                self.clickhouse.retention_days
+            )));
+        }
+        Ok(())
+    }
+
     fn validate_relay(&self) -> Result<()> {
         if !self.relay.is_enabled() {
             return Ok(());
@@ -427,6 +449,7 @@ impl Config {
         }
 
         self.validate_relay()?;
+        self.validate_clickhouse()?;
 
         if self.limits.ingest_queue_depth == 0 {
             return Err(Error::Config(

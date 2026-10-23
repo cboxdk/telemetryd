@@ -368,6 +368,7 @@ mod tests {
             attributes: labels(&[("order.id", "42")]),
             trace_id: Some("5b8efff798038103d269b633813fc60c".into()),
             span_id: Some("eee19b7ec3c1b174".into()),
+            resource: telemetryd_core::Labels::default(),
         }
     }
 
@@ -529,6 +530,7 @@ mod tests {
         let decoded = crate::logs::decode(
             &body,
             crate::logs::DecodeContext {
+                keep_resource: false,
                 pool: None,
                 limits: &limits,
                 ingest: &ingest,
@@ -592,6 +594,7 @@ mod tests {
         let decoded = crate::traces::decode(
             &body,
             crate::logs::DecodeContext {
+                keep_resource: false,
                 pool: None,
                 limits: &limits,
                 ingest: &ingest,

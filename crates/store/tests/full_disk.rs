@@ -43,6 +43,7 @@ fn record(batch: usize, i: usize) -> LogRecord {
         attributes: Labels::new(),
         trace_id: None,
         span_id: None,
+        resource: telemetryd_core::Labels::default(),
     }
 }
 

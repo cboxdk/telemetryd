@@ -24,15 +24,62 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn every_query_answers_as_loki_does() {
-    let doc: Value = serde_json::from_str(include_str!("conformance/logql.json")).unwrap();
     let tmp = tempfile::tempdir().unwrap();
-    let config = Config {
+    conforms(Config {
         storage: StorageConfig {
             data_dir: Some(tmp.path().join("data")),
             ..StorageConfig::default()
         },
         ..Config::default()
+    })
+    .await;
+}
+
+/// The same answers with ClickHouse as the store, when there is one to test against:
+/// `TELEMETRYD_TEST_CLICKHOUSE_URL=http://user:password@host:8123`. Each run writes to
+/// a database of its own, dropped by the next run of the same name only, so runs never
+/// read each other's lines.
+#[tokio::test]
+async fn every_query_answers_as_loki_does_on_clickhouse() {
+    let Some(clickhouse) = clickhouse_under_test("logql") else {
+        eprintln!("TELEMETRYD_TEST_CLICKHOUSE_URL is not set; skipped");
+        return;
     };
+    let tmp = tempfile::tempdir().unwrap();
+    conforms(Config {
+        storage: StorageConfig {
+            data_dir: Some(tmp.path().join("data")),
+            ..StorageConfig::default()
+        },
+        clickhouse,
+        ..Config::default()
+    })
+    .await;
+}
+
+/// A `[clickhouse]` section for a test, on a fresh database, or `None` without one.
+fn clickhouse_under_test(name: &str) -> Option<telemetryd_core::config::ClickHouseConfig> {
+    let raw = std::env::var("TELEMETRYD_TEST_CLICKHOUSE_URL").ok()?;
+    let (scheme, rest) = raw.split_once("://").unwrap();
+    let (credentials, host) = rest.rsplit_once('@').unwrap_or(("default:", rest));
+    let (user, password) = credentials.split_once(':').unwrap_or((credentials, ""));
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    Some(telemetryd_core::config::ClickHouseConfig {
+        url: format!("{scheme}://{host}"),
+        database: format!("td_test_{name}_{unique}"),
+        user: user.to_owned(),
+        password: telemetryd_core::Secret::new(password),
+        // The corpus is dated; a month's TTL would have ClickHouse drop it on insert.
+        retention_days: 3_650,
+        ..telemetryd_core::config::ClickHouseConfig::default()
+    })
+}
+
+async fn conforms(config: Config) {
+    let doc: Value = serde_json::from_str(include_str!("conformance/logql.json")).unwrap();
     config.validate().unwrap();
     let store = Arc::new(Store::open(&config).unwrap());
     let app = router(AppState::new(Arc::new(config), store).unwrap());

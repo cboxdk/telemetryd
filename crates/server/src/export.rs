@@ -130,6 +130,7 @@ pub async fn export(
             order: Order::Ascending,
             exact_key: None,
             required_text: None,
+            body_filters: &[],
             // No narrowing: an export wants every column of every row, and a
             // projection here would silently drop whatever it left out.
             columns: None,
@@ -137,7 +138,7 @@ pub async fn export(
 
         Ok(match signal {
             telemetryd_core::Signal::Logs => {
-                Scanned::Logs(store.logs().scan(scan, &[], &|_| true)?)
+                Scanned::Logs(store.log_store().scan(scan, &[], &|_| true)?)
             }
             telemetryd_core::Signal::Traces => {
                 Scanned::Traces(store.traces().scan(scan, &[], &|_| true)?)

@@ -700,6 +700,7 @@ mod tests {
                     attributes: telemetryd_core::Labels::new(),
                     trace_id: None,
                     span_id: None,
+                    resource: telemetryd_core::Labels::default(),
                 }])
                 .unwrap();
             store.seal_all().unwrap();

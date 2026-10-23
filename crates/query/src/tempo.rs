@@ -574,6 +574,7 @@ pub fn trace(store: &RecordStore<SpanSchema>, trace_id: &str) -> Result<TraceRes
                 exact_key: Some(candidate),
                 columns: None,
                 required_text: None,
+                body_filters: &[],
             },
             &[],
             &|span: &SpanRecord| span.trace_id == *candidate,

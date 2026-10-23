@@ -2592,6 +2592,7 @@ dependencies = [
  "telemetryd-core",
  "tempfile",
  "tracing",
+ "ureq",
  "zstd",
 ]
 

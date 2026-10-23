@@ -45,7 +45,7 @@ pub async fn query_range(
 
     // Reading segments is blocking file I/O; keep it off the async runtime.
     let store = std::sync::Arc::clone(&state.store);
-    let response = crate::auth::spawn_read(move || loki::query_range(store.logs(), &request))
+    let response = crate::auth::spawn_read(move || loki::query_range(store.log_store(), &request))
         .await
         .map_err(|e| Error::Config(format!("query task panicked: {e}")))?
         .inspect_err(|error| state.refused_query("logql", &expression, error))?;
@@ -80,9 +80,11 @@ async fn metric_range(
     let deadline = logmetric::Deadline(Some(
         std::time::Instant::now() + state.config.server.request_timeout,
     ));
-    crate::auth::spawn_read(move || logmetric::answer_range(store.logs(), &query, &steps, deadline))
-        .await
-        .map_err(|e| Error::Config(format!("query task panicked: {e}")))?
+    crate::auth::spawn_read(move || {
+        logmetric::answer_range(store.log_store(), &query, &steps, deadline)
+    })
+    .await
+    .map_err(|e| Error::Config(format!("query task panicked: {e}")))?
 }
 
 /// `GET /loki/api/v1/query` — an instant query.
@@ -106,7 +108,7 @@ pub async fn instant(
         let store = std::sync::Arc::clone(&state.store);
         let answer = crate::auth::spawn_read(move || {
             let deadline = logmetric::Deadline(Some(std::time::Instant::now() + timeout));
-            logmetric::answer_instant(store.logs(), &query, at, deadline)
+            logmetric::answer_instant(store.log_store(), &query, at, deadline)
         })
         .await
         .map_err(|e| Error::Config(format!("query task panicked: {e}")))?
@@ -118,7 +120,7 @@ pub async fn instant(
         .inspect_err(|error| state.refused_query("logql", &expression, error))?;
     request.categorize = wants_categorized(&headers);
     let store = std::sync::Arc::clone(&state.store);
-    let response = crate::auth::spawn_read(move || loki::query_range(store.logs(), &request))
+    let response = crate::auth::spawn_read(move || loki::query_range(store.log_store(), &request))
         .await
         .map_err(|e| Error::Config(format!("query task panicked: {e}")))?
         .inspect_err(|error| state.refused_query("logql", &expression, error))?;
@@ -133,10 +135,11 @@ pub async fn labels(
     let (start, end) = range_of(&pairs)?;
     let selectors = pairs.all(&["query"]);
     let store = std::sync::Arc::clone(&state.store);
-    let response =
-        crate::auth::spawn_read(move || loki::label_names(store.logs(), &selectors, start, end))
-            .await
-            .map_err(|e| Error::Config(format!("query task panicked: {e}")))??;
+    let response = crate::auth::spawn_read(move || {
+        loki::label_names(store.log_store(), &selectors, start, end)
+    })
+    .await
+    .map_err(|e| Error::Config(format!("query task panicked: {e}")))??;
     Ok(Json(response).into_response())
 }
 
@@ -150,7 +153,7 @@ pub async fn label_values(
     let selectors = pairs.all(&["query"]);
     let store = std::sync::Arc::clone(&state.store);
     let response = crate::auth::spawn_read(move || {
-        loki::label_values(store.logs(), &name, &selectors, start, end)
+        loki::label_values(store.log_store(), &name, &selectors, start, end)
     })
     .await
     .map_err(|e| Error::Config(format!("query task panicked: {e}")))??;
@@ -168,7 +171,7 @@ pub async fn series(
     let selectors = pairs.all(&["match[]", "match", "query"]);
     let store = std::sync::Arc::clone(&state.store);
     let response =
-        crate::auth::spawn_read(move || loki::series(store.logs(), &selectors, start, end))
+        crate::auth::spawn_read(move || loki::series(store.log_store(), &selectors, start, end))
             .await
             .map_err(|e| Error::Config(format!("query task panicked: {e}")))??;
     Ok(Json(response).into_response())
@@ -391,6 +394,7 @@ mod tests {
             attributes: Labels::new(),
             trace_id: None,
             span_id: None,
+            resource: telemetryd_core::Labels::default(),
         }
     }
 

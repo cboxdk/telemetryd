@@ -5,8 +5,10 @@
 //! store in M3. Both register in one retention pass, so the disk budget means the same
 //! thing everywhere.
 
+pub mod backend;
 pub mod bloom;
 pub mod cardinality;
+pub mod clickhouse;
 pub mod datadir;
 mod dictionary;
 pub mod folds;
@@ -36,6 +38,7 @@ use telemetryd_core::span::SpanRecord;
 use crate::schema::RecordSchema;
 use telemetryd_core::{Labels, LogRecord, Result, Signal};
 
+pub use backend::{BodyFilter, LogStore, RecordFilter};
 pub use cardinality::{Admission, Admitted, Cardinality};
 pub use datadir::{DataDir, DiskUsage};
 pub use logs::LogSchema;
@@ -76,6 +79,8 @@ pub struct Store {
     /// has not forwarded yet, with `relay.when_full = "reject"`; cleared by the next pass
     /// that finds room. While set, every append is refused.
     refusing: std::sync::atomic::AtomicBool,
+    /// Logs in ClickHouse instead of in `logs`, when `[clickhouse]` is configured.
+    clickhouse_logs: Option<clickhouse::ClickHouseLogs>,
 }
 
 /// What one app holds in the store.
@@ -110,6 +115,18 @@ impl Store {
         let root = config.storage.resolve_data_dir();
         let data_dir = DataDir::open(&root)?;
         data_dir.clean_tmp()?;
+
+        // Before anything is opened: a ClickHouse that cannot be reached or refuses the
+        // schema is a startup error, not a first failed request.
+        let clickhouse_logs = if config.clickhouse.is_enabled() {
+            let client = clickhouse::Client::new(&config.clickhouse)?;
+            if config.clickhouse.create_schema {
+                clickhouse::schema::ensure(&client, &config.clickhouse)?;
+            }
+            Some(clickhouse::ClickHouseLogs::new(client))
+        } else {
+            None
+        };
 
         let settings = StoreSettings::from(&config.storage);
         let logs = RecordStore::<LogSchema>::open(
@@ -163,7 +180,21 @@ impl Store {
             reaper: Mutex::new(ReaperReport::default()),
             wal_truncations: RwLock::new(truncations),
             refusing: std::sync::atomic::AtomicBool::new(false),
+            clickhouse_logs,
         })
+    }
+
+    /// Logs, wherever they are kept: what the query engines read.
+    pub fn log_store(&self) -> &dyn LogStore {
+        match &self.clickhouse_logs {
+            Some(clickhouse) => clickhouse,
+            None => &self.logs,
+        }
+    }
+
+    /// Whether logs are kept in ClickHouse rather than on this machine.
+    pub fn logs_in_clickhouse(&self) -> bool {
+        self.clickhouse_logs.is_some()
     }
 
     pub fn logs(&self) -> &RecordStore<LogSchema> {
@@ -199,7 +230,10 @@ impl Store {
     /// Append log records. Durable before this returns.
     pub fn append_logs(&self, records: &[LogRecord]) -> Result<Admitted> {
         self.append_within_limits(records, LogSchema::index_labels, |kept| {
-            self.logs.append(kept)
+            match &self.clickhouse_logs {
+                Some(clickhouse) => clickhouse.append(kept),
+                None => self.logs.append(kept),
+            }
         })
     }
 
@@ -832,6 +866,7 @@ mod tests {
             attributes: Labels::new(),
             trace_id: None,
             span_id: None,
+            resource: telemetryd_core::Labels::default(),
         }
     }
 

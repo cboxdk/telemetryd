@@ -139,6 +139,11 @@ pub struct DecodeContext<'a> {
     /// The memory requests in flight share, which decoding draws from. `None` decodes
     /// against this request's own budget alone.
     pub pool: Option<&'a std::sync::Arc<crate::pool::MemoryPool>>,
+    /// Keep each record's resource attributes verbatim, in `LogRecord::resource`.
+    ///
+    /// Only the ClickHouse backend stores them; the local store would hold a map per
+    /// record it never reads, so there this is `false`.
+    pub keep_resource: bool,
 }
 
 /// Decode an `ExportLogsServiceRequest`.
@@ -288,6 +293,12 @@ fn convert(
         attributes,
         trace_id: normalize_trace_id(&raw.trace_id),
         span_id: normalize_span_id(&raw.span_id),
+        // Shared, not copied: every record of one scope holds the same map.
+        resource: if ctx.keep_resource {
+            inherited_attributes.clone()
+        } else {
+            Labels::new()
+        },
     })
 }
 
@@ -376,6 +387,7 @@ mod tests {
 
     fn ctx<'a>(limits: &'a LimitsConfig, ingest: &'a IngestConfig) -> DecodeContext<'a> {
         DecodeContext {
+            keep_resource: false,
             pool: None,
             limits,
             ingest,

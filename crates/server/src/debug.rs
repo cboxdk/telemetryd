@@ -606,7 +606,7 @@ fn logs(
         {
             let parsed = telemetryd_query::logql::parse(query)?;
             let response = telemetryd_query::loki::query_range(
-                store.logs(),
+                store.log_store(),
                 &telemetryd_query::loki::QueryRangeRequest {
                     query: parsed,
                     start_nanos: start,
@@ -635,7 +635,7 @@ fn logs(
                     });
                 }
             }
-            let apps = store.logs().label_values("app", start, end)?;
+            let apps = store.log_store().label_values("app", start, end)?;
             let mut suggestions: Vec<String> = apps
                 .iter()
                 .map(|app| format!(r#"{{app="{app}"}}"#))
