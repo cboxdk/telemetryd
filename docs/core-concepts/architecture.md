@@ -66,5 +66,6 @@ Each of these is a thing telemetryd does not have, and the reason:
 - **No background compaction.** Segments are sealed once and never rewritten. That is
   most of the single-host ingest advantage: no merge amplification.
 - **No query planner.** The query shapes are known at compile time.
-- **No C dependencies at all.** Which is what makes the static musl builds a
-  straightforward link rather than a source of surprises.
+- **No system libraries.** The three C dependencies — zstd, `ring` and mimalloc — are
+  built from source and linked statically, so nothing is linked from the machine that
+  runs the binary and the static musl builds stay a straightforward link.
