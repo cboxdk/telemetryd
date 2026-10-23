@@ -43,6 +43,9 @@ pub struct BucketRequest<'a> {
     pub body_filters: &'a [BodyFilter],
     /// Stream labels to group by; empty for one group of everything.
     pub group_by: &'a [String],
+    /// Whether bytes are wanted as well as lines; reading the bodies is most of the
+    /// cost of counting them.
+    pub bytes: bool,
 }
 
 /// One group's `(bucket, lines, bytes)`, in no particular order.

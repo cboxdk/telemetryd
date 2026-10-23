@@ -23,7 +23,7 @@
 //! matchers are checked again on those rows, so a condition ClickHouse evaluates
 //! slightly more loosely can only ever cost a row read, never a row lost.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
 use serde::{Deserialize, Serialize};
@@ -110,180 +110,27 @@ impl ClickHouseLogs {
         })
     }
 
-    fn rows(&self, conditions: &str, order: Order, limit: Option<usize>) -> Result<Vec<Row>> {
-        let mut rows = Vec::new();
-        self.read(conditions, order, limit, |row| {
-            rows.push(row);
-            Ok(ControlFlow::Continue(()))
-        })?;
-        Ok(rows)
-    }
-}
-
-/// What a scan selects in SQL: the range, the matchers and the line filters.
-fn conditions(request: &Scan<'_>, matchers: &[LabelMatcher]) -> String {
-    let mut parts = vec![
-        format!("Timestamp >= {}", sql::nanos(request.start_nanos)),
-        format!("Timestamp <= {}", sql::nanos(request.end_nanos)),
-    ];
-    parts.extend(
-        matchers
-            .iter()
-            .map(|m| sql::matcher("Stream", "ServiceName", m)),
-    );
-    for filter in request.body_filters.iter().filter(|f| !f.text.is_empty()) {
-        let not = if filter.contains { "" } else { "NOT " };
-        parts.push(format!(
-            "Body {not}LIKE {}",
-            sql::like_contains(&filter.text)
-        ));
-    }
-    if let Some(text) = request.required_text.filter(|t| {
-        !t.is_empty()
-            && !request
-                .body_filters
-                .iter()
-                .any(|f| f.contains && f.text == *t)
-    }) {
-        parts.push(format!("Body LIKE {}", sql::like_contains(text)));
-    }
-    parts.join(" AND ")
-}
-
-fn over_ceiling(request: &Scan<'_>, collected: usize) -> Result<()> {
-    if request.abort_over != 0 && collected > request.abort_over {
-        return Err(Error::BadRequest(format!(
-            "this query matched more than {} records, which is more than one query is \
-             allowed to hold at once",
-            request.abort_over
-        )));
-    }
-    Ok(())
-}
-
-impl LogStore for ClickHouseLogs {
-    fn buckets(&self, request: &BucketRequest<'_>) -> Result<Option<Buckets>> {
-        if request.width_nanos == 0 {
-            return Ok(None);
-        }
-        let anchor = i64::try_from(request.anchor_nanos).unwrap_or(i64::MAX);
-        let width = i64::try_from(request.width_nanos).unwrap_or(i64::MAX);
-        let scan = Scan::range(request.anchor_nanos, request.until_nanos)
-            .body_filters(request.body_filters);
-        let base = conditions(&scan, request.matchers);
-        // `conditions` reads `>=`; a window's floor is exclusive.
-        let base = format!(
-            "{base} AND Timestamp > {}",
-            sql::nanos(request.anchor_nanos)
-        );
-        let individual = individual_condition(request.group_by);
-
-        let groups: Vec<String> = request
-            .group_by
-            .iter()
-            .enumerate()
-            .map(|(i, name)| format!("{} AS g{i}", group_value(name)))
-            .collect();
-        let keys: Vec<String> = (0..request.group_by.len())
-            .map(|i| format!("g{i}"))
-            .collect();
-        let query = format!(
-            "SELECT intDiv(toUnixTimestamp64Nano(Timestamp) - {anchor} - 1, {width}) AS k, \
-             count() AS lines, sum(length(Body)) AS bytes{comma}{groups} \
-             FROM {LOGS} WHERE {base} AND NOT ({individual}) GROUP BY k{comma}{keys}",
-            comma = if groups.is_empty() { "" } else { ", " },
-            groups = groups.join(", "),
-            keys = keys.join(", "),
-        );
-        let mut out = Buckets::default();
-        let mut index: std::collections::HashMap<Vec<String>, usize> =
-            std::collections::HashMap::new();
-        self.client.query_lines(&query, |line| {
-            let row: serde_json::Value = serde_json::from_slice(line).map_err(|e| {
-                Error::Unavailable(format!("reading a bucket from ClickHouse: {e}"))
-            })?;
-            let values: Vec<String> = (0..request.group_by.len())
-                .map(|i| {
-                    row.get(format!("g{i}"))
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned()
-                })
-                .collect();
-            let number = |name: &str| {
-                row.get(name)
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0)
-            };
-            let (k, lines, bytes) = (number("k"), number("lines"), number("bytes"));
-            out.lines += lines;
-            let next = out.groups.len();
-            let slot = *index.entry(values.clone()).or_insert(next);
-            if slot == next {
-                out.groups.push((values, Vec::new()));
-            }
-            out.groups[slot].1.push((k, lines, bytes));
-            Ok(ControlFlow::Continue(()))
-        })?;
-
-        self.read(
-            &format!("{base} AND ({individual})"),
-            Order::Ascending,
-            None,
-            |row| {
-                let record = row.into_record();
-                if matches_all(request.matchers, &record.stream) {
-                    out.lines += 1;
-                    out.individual.push(record);
-                }
-                Ok(ControlFlow::Continue(()))
-            },
-        )?;
-        Ok(Some(out))
-    }
-
-    fn scan(
+    /// Accept rows from one window into `out`, newest or oldest first, until it holds
+    /// the scan's limit; `true` once it does.
+    ///
+    /// Keyset pagination on the timestamp. A page that ends partway through one timestamp
+    /// leaves the rest of it for the next page, which starts at that timestamp again:
+    /// dropping the last timestamp's rows from this page and asking from it inclusively
+    /// means rows that share a timestamp are neither skipped nor read twice. A page that
+    /// is one timestamp throughout reads that timestamp whole.
+    fn read_window(
         &self,
-        request: Scan<'_>,
-        matchers: &[LabelMatcher],
-        extra: RecordFilter<'_, LogRecord>,
-    ) -> Result<Vec<LogRecord>> {
-        let base = conditions(&request, matchers);
-        let accepts = |record: &LogRecord| {
-            record.timestamp_nanos >= request.start_nanos
-                && record.timestamp_nanos <= request.end_nanos
-                && matches_all(matchers, &record.stream)
-                && extra(record)
-        };
-        let mut out = Vec::new();
-
-        if request.limit == 0 {
-            let mut failed = None;
-            self.read(&base, request.order, None, |row| {
-                let record = row.into_record();
-                if accepts(&record) {
-                    out.push(record);
-                    if let Err(error) = over_ceiling(&request, out.len()) {
-                        failed = Some(error);
-                        return Ok(ControlFlow::Break(()));
-                    }
-                }
-                Ok(ControlFlow::Continue(()))
-            })?;
-            return failed.map_or(Ok(out), Err);
-        }
-
-        // Keyset pagination on the timestamp. A page that ends partway through one
-        // timestamp leaves the rest of it for the next page, which starts at that
-        // timestamp again: dropping the last timestamp's rows from this page and asking
-        // from it inclusively means rows that share a timestamp are neither skipped nor
-        // read twice. A page that is one timestamp throughout reads that timestamp whole.
+        window: &str,
+        request: &Scan<'_>,
+        accepts: &dyn Fn(&LogRecord) -> bool,
+        out: &mut Vec<LogRecord>,
+    ) -> Result<bool> {
         let page = page_size(request.limit);
         let mut bound: Option<String> = None;
         loop {
             let conditions = match &bound {
-                Some(bound) => format!("{base} AND {bound}"),
-                None => base.clone(),
+                Some(bound) => format!("{window} AND {bound}"),
+                None => window.to_owned(),
             };
             let mut rows = self.rows(&conditions, request.order, Some(page))?;
             let full = rows.len() == page;
@@ -293,7 +140,7 @@ impl LogStore for ClickHouseLogs {
                 let first = rows.first().map_or(0, |r| r.t);
                 if first == last {
                     rows = self.rows(
-                        &format!("{base} AND Timestamp = {}", sql::nanos(last)),
+                        &format!("{window} AND Timestamp = {}", sql::nanos(last)),
                         request.order,
                         None,
                     )?;
@@ -316,9 +163,9 @@ impl LogStore for ClickHouseLogs {
                 let record = row.into_record();
                 if accepts(&record) {
                     out.push(record);
-                    over_ceiling(&request, out.len())?;
+                    over_ceiling(request, out.len())?;
                     if out.len() >= request.limit {
-                        return Ok(out);
+                        return Ok(true);
                     }
                 }
             }
@@ -326,8 +173,378 @@ impl LogStore for ClickHouseLogs {
                 Some((op, at)) if full => {
                     bound = Some(format!("Timestamp {op} {}", sql::nanos(at)));
                 }
-                _ => return Ok(out),
+                _ => return Ok(false),
             }
+        }
+    }
+
+    fn rows(&self, conditions: &str, order: Order, limit: Option<usize>) -> Result<Vec<Row>> {
+        let mut rows = Vec::new();
+        self.read(conditions, order, limit, |row| {
+            rows.push(row);
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(rows)
+    }
+}
+
+/// More streams than this and listing their hashes stops paying: the matchers go into
+/// the query as conditions on the stream map instead.
+const MAX_LISTED_STREAMS: usize = 10_000;
+
+/// Candidate rows a limited scan's first window is sized to hold, per row it needs.
+const WINDOW_ROWS_PER_RESULT: u64 = 4;
+
+/// The streams a query selects, resolved against `otel_log_streams` by the same
+/// matcher code every store uses — exactly, so what reaches `otel_logs` is a list of
+/// hashes rather than conditions on a map.
+struct Selected {
+    streams: HashMap<u64, Labels>,
+    services: BTreeSet<String>,
+}
+
+impl Selected {
+    fn condition(&self) -> String {
+        if self.streams.is_empty() {
+            return "0".to_owned();
+        }
+        let services: Vec<String> = self.services.iter().map(|s| sql::quote(s)).collect();
+        let hashes: Vec<String> = self.streams.keys().map(u64::to_string).collect();
+        format!(
+            "ServiceName IN ({}) AND StreamHash IN ({})",
+            services.join(", "),
+            hashes.join(", ")
+        )
+    }
+}
+
+impl ClickHouseLogs {
+    /// The streams with data in the range that the matchers select, or `None` for more
+    /// than [`MAX_LISTED_STREAMS`] of them.
+    fn select(&self, start: u64, end: u64, matchers: &[LabelMatcher]) -> Result<Option<Selected>> {
+        let mut conditions = vec![stream_range(start, end)];
+        conditions.extend(
+            matchers
+                .iter()
+                .map(|m| sql::matcher("Stream", "ServiceName", m)),
+        );
+        let query = format!(
+            "SELECT StreamHash AS hash, any(Stream) AS labels, any(ServiceName) AS service \
+             FROM {LOG_STREAMS} WHERE {} GROUP BY StreamHash LIMIT {}",
+            conditions.join(" AND "),
+            MAX_LISTED_STREAMS + 1
+        );
+        let mut selected = Selected {
+            streams: HashMap::new(),
+            services: BTreeSet::new(),
+        };
+        let mut listed = 0usize;
+        self.client.query_lines(&query, |line| {
+            #[derive(Deserialize)]
+            struct StreamRow {
+                hash: u64,
+                labels: BTreeMap<String, String>,
+                service: String,
+            }
+            let row: StreamRow = serde_json::from_slice(line).map_err(|e| {
+                Error::Unavailable(format!("reading a stream from ClickHouse: {e}"))
+            })?;
+            listed += 1;
+            let labels = labels_of(row.labels);
+            if !labels.is_empty() && matches_all(matchers, &labels) {
+                selected.streams.insert(row.hash, labels);
+                selected.services.insert(row.service);
+            }
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok((listed <= MAX_LISTED_STREAMS).then_some(selected))
+    }
+
+    /// Rows the selected streams hold per hour of the range, as `(hour, rows)`.
+    fn hourly_rows(&self, start: u64, end: u64, selected: &Selected) -> Result<Vec<(u64, u64)>> {
+        let query = format!(
+            "SELECT toUInt64(toUnixTimestamp(Hour)) AS hour, sum(Rows) AS rows \
+             FROM {LOG_STREAMS} WHERE {} AND {} GROUP BY hour ORDER BY hour",
+            stream_range(start, end),
+            selected.condition()
+        );
+        let mut hours = Vec::new();
+        self.client.query_lines(&query, |line| {
+            let value: serde_json::Value = serde_json::from_slice(line).map_err(|e| {
+                Error::Unavailable(format!("reading hourly rows from ClickHouse: {e}"))
+            })?;
+            let number = |name: &str| {
+                value
+                    .get(name)
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            };
+            hours.push((number("hour").saturating_mul(1_000_000_000), number("rows")));
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(hours)
+    }
+}
+
+/// How the stream matchers reach `otel_logs`: as hashes, or as map conditions.
+fn stream_condition(selected: Option<&Selected>, matchers: &[LabelMatcher]) -> String {
+    match selected {
+        Some(selected) => selected.condition(),
+        None if matchers.is_empty() => "1".to_owned(),
+        None => matchers
+            .iter()
+            .map(|m| sql::matcher("Stream", "ServiceName", m))
+            .collect::<Vec<_>>()
+            .join(" AND "),
+    }
+}
+
+/// The line filters as conditions on the body.
+fn body_conditions(request: &Scan<'_>) -> Vec<String> {
+    let mut parts = Vec::new();
+    for filter in request.body_filters.iter().filter(|f| !f.text.is_empty()) {
+        let not = if filter.contains { "" } else { "NOT " };
+        parts.push(format!(
+            "Body {not}LIKE {}",
+            sql::like_contains(&filter.text)
+        ));
+    }
+    if let Some(text) = request.required_text.filter(|t| {
+        !t.is_empty()
+            && !request
+                .body_filters
+                .iter()
+                .any(|f| f.contains && f.text == *t)
+    }) {
+        parts.push(format!("Body LIKE {}", sql::like_contains(text)));
+    }
+    parts
+}
+
+/// `Timestamp` between two bounds, each inclusive or not.
+fn time_condition(
+    (low, low_inclusive): (u64, bool),
+    (high, high_inclusive): (u64, bool),
+) -> String {
+    format!(
+        "Timestamp {} {} AND Timestamp {} {}",
+        if low_inclusive { ">=" } else { ">" },
+        sql::nanos(low),
+        if high_inclusive { "<=" } else { "<" },
+        sql::nanos(high),
+    )
+}
+
+/// The span a limited scan's first window covers, from how densely the selected streams
+/// wrote at the end it starts from: wide enough to hold the candidates `need` rows ask
+/// for, if the rate held, and never narrower than a second.
+fn first_window(hours: &[(u64, u64)], order: Order, need: u64, span: u64) -> u64 {
+    const HOUR: u64 = 3_600_000_000_000;
+    let busiest_end = match order {
+        Order::Descending => hours.iter().rev().find(|(_, rows)| *rows > 0),
+        Order::Ascending => hours.iter().find(|(_, rows)| *rows > 0),
+    };
+    let window = busiest_end.map_or(60_000_000_000, |(_, rows)| {
+        u64::try_from(u128::from(need) * u128::from(HOUR) / u128::from(*rows)).unwrap_or(u64::MAX)
+    });
+    window.clamp(1_000_000_000, span.max(1))
+}
+
+fn over_ceiling(request: &Scan<'_>, collected: usize) -> Result<()> {
+    if request.abort_over != 0 && collected > request.abort_over {
+        return Err(Error::BadRequest(format!(
+            "this query matched more than {} records, which is more than one query is \
+             allowed to hold at once",
+            request.abort_over
+        )));
+    }
+    Ok(())
+}
+
+impl LogStore for ClickHouseLogs {
+    fn buckets(&self, request: &BucketRequest<'_>) -> Result<Option<Buckets>> {
+        if request.width_nanos == 0 {
+            return Ok(None);
+        }
+        let Some(selected) =
+            self.select(request.anchor_nanos, request.until_nanos, request.matchers)?
+        else {
+            return Ok(None);
+        };
+        let mut out = Buckets::default();
+        if selected.streams.is_empty() {
+            return Ok(Some(out));
+        }
+        let anchor = i64::try_from(request.anchor_nanos).unwrap_or(i64::MAX);
+        let width = i64::try_from(request.width_nanos).unwrap_or(i64::MAX);
+        let scan = Scan::range(request.anchor_nanos, request.until_nanos)
+            .body_filters(request.body_filters);
+        let mut base = vec![
+            time_condition((request.anchor_nanos, false), (request.until_nanos, true)),
+            selected.condition(),
+        ];
+        base.extend(body_conditions(&scan));
+        let base = base.join(" AND ");
+        // Rows an attribute could regroup are read whole and grouped by the caller.
+        let individual = if request.group_by.is_empty() {
+            None
+        } else {
+            let names: Vec<String> = request.group_by.iter().map(|n| sql::quote(n)).collect();
+            Some(format!("hasAny(AttributeLabels, [{}])", names.join(", ")))
+        };
+        let bytes = if request.bytes {
+            "sum(length(Body))"
+        } else {
+            "0"
+        };
+        let query = format!(
+            "SELECT intDiv(toUnixTimestamp64Nano(Timestamp) - {anchor} - 1, {width}) AS k, \
+             StreamHash AS s, count() AS lines, {bytes} AS bytes \
+             FROM {LOGS} WHERE {base}{not_individual} GROUP BY k, s",
+            not_individual = individual
+                .as_ref()
+                .map_or(String::new(), |c| format!(" AND NOT {c}")),
+        );
+        let mut index: HashMap<Vec<String>, usize> = HashMap::new();
+        self.client.query_lines(&query, |line| {
+            let row: serde_json::Value = serde_json::from_slice(line).map_err(|e| {
+                Error::Unavailable(format!("reading a bucket from ClickHouse: {e}"))
+            })?;
+            let number = |name: &str| {
+                row.get(name)
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            };
+            let (k, lines, bytes) = (number("k"), number("lines"), number("bytes"));
+            let Some(stream) = selected.streams.get(&number("s")) else {
+                return Ok(ControlFlow::Continue(()));
+            };
+            let values: Vec<String> = request
+                .group_by
+                .iter()
+                .map(|name| group_value(stream, name).to_owned())
+                .collect();
+            out.lines += lines;
+            let next = out.groups.len();
+            let slot = *index.entry(values.clone()).or_insert(next);
+            if slot == next {
+                out.groups.push((values, Vec::new()));
+            }
+            out.groups[slot].1.push((k, lines, bytes));
+            Ok(ControlFlow::Continue(()))
+        })?;
+
+        if let Some(individual) = individual {
+            self.read(
+                &format!("{base} AND {individual}"),
+                Order::Ascending,
+                None,
+                |row| {
+                    let record = row.into_record();
+                    if matches_all(request.matchers, &record.stream) {
+                        out.lines += 1;
+                        out.individual.push(record);
+                    }
+                    Ok(ControlFlow::Continue(()))
+                },
+            )?;
+        }
+        Ok(Some(out))
+    }
+
+    fn scan(
+        &self,
+        request: Scan<'_>,
+        matchers: &[LabelMatcher],
+        extra: RecordFilter<'_, LogRecord>,
+    ) -> Result<Vec<LogRecord>> {
+        let (start, end) = (request.start_nanos, request.end_nanos);
+        let mut out = Vec::new();
+        if start > end {
+            return Ok(out);
+        }
+        let selected = self.select(start, end, matchers)?;
+        if selected.as_ref().is_some_and(|s| s.streams.is_empty()) {
+            return Ok(out);
+        }
+        let mut base = vec![stream_condition(selected.as_ref(), matchers)];
+        base.extend(body_conditions(&request));
+        let base = base.join(" AND ");
+        let accepts = |record: &LogRecord| {
+            record.timestamp_nanos >= start
+                && record.timestamp_nanos <= end
+                && matches_all(matchers, &record.stream)
+                && extra(record)
+        };
+
+        if request.limit == 0 {
+            let mut failed = None;
+            let conditions = format!("{} AND {base}", time_condition((start, true), (end, true)));
+            self.read(&conditions, request.order, None, |row| {
+                let record = row.into_record();
+                if accepts(&record) {
+                    out.push(record);
+                    if let Err(error) = over_ceiling(&request, out.len()) {
+                        failed = Some(error);
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+                Ok(ControlFlow::Continue(()))
+            })?;
+            return failed.map_or(Ok(out), Err);
+        }
+
+        // Windows from the end the scan starts at, each four times the last. The table
+        // is sorted by time within an app, so a window costs what it holds — the newest
+        // hundred lines of a day need the last few seconds read, not the day. The first
+        // is sized from how densely the selected streams wrote there.
+        let hours = match &selected {
+            Some(selected) => self.hourly_rows(start, end, selected)?,
+            None => Vec::new(),
+        };
+        let need = (request.limit as u64)
+            .saturating_mul(WINDOW_ROWS_PER_RESULT)
+            .max(1_000);
+        let mut width = first_window(&hours, request.order, need, end - start);
+        let mut edge = match request.order {
+            Order::Descending => end,
+            Order::Ascending => start,
+        };
+        loop {
+            let (window, last) = match request.order {
+                Order::Descending => {
+                    let low = edge.saturating_sub(width);
+                    if low <= start {
+                        (time_condition((start, true), (edge, true)), true)
+                    } else {
+                        (time_condition((low, false), (edge, true)), false)
+                    }
+                }
+                Order::Ascending => {
+                    let high = edge.saturating_add(width);
+                    if high >= end {
+                        (time_condition((edge, true), (end, true)), true)
+                    } else {
+                        (time_condition((edge, true), (high, false)), false)
+                    }
+                }
+            };
+            if self.read_window(
+                &format!("{window} AND {base}"),
+                &request,
+                &accepts,
+                &mut out,
+            )? {
+                return Ok(out);
+            }
+            if last {
+                return Ok(out);
+            }
+            edge = match request.order {
+                Order::Descending => edge.saturating_sub(width),
+                Order::Ascending => edge.saturating_add(width),
+            };
+            width = width.saturating_mul(4);
         }
     }
 
@@ -373,20 +590,19 @@ impl LogStore for ClickHouseLogs {
                 .map(|m| sql::matcher("Stream", "ServiceName", m)),
         );
         let query = format!(
-            "SELECT any(Stream) AS Stream FROM {LOG_STREAMS} WHERE {} GROUP BY StreamHash",
+            "SELECT any(Stream) AS labels FROM {LOG_STREAMS} WHERE {} GROUP BY StreamHash",
             conditions.join(" AND ")
         );
         let mut seen = std::collections::BTreeSet::new();
         self.client.query_lines(&query, |line| {
             #[derive(Deserialize)]
             struct StreamRow {
-                #[serde(rename = "Stream")]
-                stream: BTreeMap<String, String>,
+                labels: BTreeMap<String, String>,
             }
             let row: StreamRow = serde_json::from_slice(line).map_err(|e| {
                 Error::Unavailable(format!("reading a stream from ClickHouse: {e}"))
             })?;
-            let labels = labels_of(row.stream);
+            let labels = labels_of(row.labels);
             if !labels.is_empty() && matches_all(matchers, &labels) {
                 seen.insert(labels);
             }
@@ -396,58 +612,18 @@ impl LogStore for ClickHouseLogs {
     }
 }
 
-/// A grouped label's value as its stream gives it. `detected_level` is the one label a
+/// A grouped label's value as a stream gives it. `detected_level` is the one label a
 /// line carries that is not a stream label but follows from one: it is the record's
 /// level, unless the stream names one of its own.
-fn group_value(name: &str) -> String {
+fn group_value<'a>(stream: &'a Labels, name: &str) -> &'a str {
     if name == "detected_level" {
-        "if(mapContains(Stream, 'detected_level'), Stream['detected_level'], Stream['level'])"
-            .to_owned()
+        stream
+            .get("detected_level")
+            .or_else(|| stream.get(LEVEL_LABEL))
+            .unwrap_or_default()
     } else {
-        format!("Stream[{}]", sql::quote(name))
+        stream.get(name).unwrap_or_default()
     }
-}
-
-/// Rows whose grouped labels cannot be read off `Stream` alone, and so are grouped by
-/// the caller, one record at a time.
-///
-/// A label a line is grouped by comes from its stream unless an attribute stands in for
-/// it: one of the record's own whose name sanitises to the label, or an unpromoted
-/// resource attribute that does where the stream has no such label (see
-/// `LogRecord::filter_labels`). Sanitising is matched loosely here, on letters alone —
-/// sanitising never changes an ASCII letter, so a key that sanitises to the label always
-/// has its letters — which can only ever send a row the slow way that did not need it.
-/// A row with no stream at all, written by something other than telemetryd, goes the
-/// same way, since its stream is reconstructed rather than stored.
-fn individual_condition(group_by: &[String]) -> String {
-    let letters = |text: &str| {
-        text.chars()
-            .filter(char::is_ascii_alphabetic)
-            .collect::<String>()
-    };
-    let mut parts = vec!["empty(Stream)".to_owned()];
-    if !group_by.is_empty() {
-        let names: Vec<String> = group_by.iter().map(|n| sql::quote(&letters(n))).collect();
-        parts.push(format!(
-            "arrayExists(k -> replaceRegexpAll(k, '[^a-zA-Z]', '') IN ({}), mapKeys(LogAttributes))",
-            names.join(", ")
-        ));
-        let resource: Vec<String> = group_by
-            .iter()
-            .map(|n| {
-                format!(
-                    "(replaceRegexpAll(k, '[^a-zA-Z]', '') = {} AND NOT mapContains(Stream, {}))",
-                    sql::quote(&letters(n)),
-                    sql::quote(n)
-                )
-            })
-            .collect();
-        parts.push(format!(
-            "arrayExists(k -> {}, mapKeys(ResourceAttributes))",
-            resource.join(" OR ")
-        ));
-    }
-    parts.join(" OR ")
 }
 
 /// The streams summary's rows that can hold data in the range. Each row records the
@@ -506,6 +682,7 @@ struct WriteRow<'a> {
     resource_attributes: &'a Labels,
     log_attributes: OwnAttributes<'a>,
     stream: &'a Labels,
+    attribute_labels: Vec<String>,
 }
 
 impl<'a> From<&'a LogRecord> for WriteRow<'a> {
@@ -521,8 +698,20 @@ impl<'a> From<&'a LogRecord> for WriteRow<'a> {
             resource_attributes: &record.resource,
             log_attributes: OwnAttributes(record),
             stream: &record.stream,
+            attribute_labels: attribute_labels(record),
         }
     }
+}
+
+/// Every label name the record's attributes give it, as `LogRecord::filter_labels`
+/// does: each attribute under its own name and its sanitised one.
+fn attribute_labels(record: &LogRecord) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    for (name, _) in record.attributes.iter() {
+        names.insert(name.to_owned());
+        names.insert(sanitize_label_name(name));
+    }
+    names.into_iter().collect()
 }
 
 /// The record's attributes without the resource attributes ingest merged into them.

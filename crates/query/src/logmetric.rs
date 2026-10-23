@@ -760,6 +760,10 @@ impl RangeAggregation {
             matchers: &self.query.matchers,
             body_filters: &body,
             group_by: &group_by,
+            bytes: matches!(
+                self.function,
+                RangeFunction::BytesOverTime | RangeFunction::BytesRate
+            ),
         };
         let Some(counted) = store.buckets(&request)? else {
             return Ok(None);
