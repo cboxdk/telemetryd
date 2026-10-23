@@ -36,7 +36,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # The pin is only worth having if both halves move together. If they drift,
       # cargo obeys the file and every other job's assumption is wrong.
       - name: the pinned toolchain matches rust-toolchain.toml
@@ -91,7 +91,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # The SBOM is committed, so this is a real drift check: it fails exactly when a
       # dependency changed and the manifest was not regenerated.
       # The formula carries its own version stanza, deliberately, so the tap cannot
@@ -160,7 +160,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # `+${{ ... }}` is load-bearing: rust-toolchain.toml would otherwise redirect
       # cargo to the pinned compiler and this job would pass without ever exercising
       # the minimum version it exists to check.
@@ -194,7 +194,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ matrix.target }}
 
