@@ -634,6 +634,12 @@ impl Store {
     /// to fix that short of one segment per app.
     #[must_use]
     pub fn app_usage(&self) -> Vec<AppUsage> {
+        if let Some(clickhouse) = &self.clickhouse {
+            return clickhouse.app_usage().unwrap_or_else(|error| {
+                tracing::warn!(%error, "could not read what each app holds from ClickHouse");
+                Vec::new()
+            });
+        }
         let mut apps: BTreeMap<String, AppUsage> = BTreeMap::new();
 
         for (signal, segments) in [

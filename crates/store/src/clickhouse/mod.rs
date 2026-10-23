@@ -56,6 +56,74 @@ impl ClickHouse {
         &self.client
     }
 
+    /// What each app holds, from the streams summaries: series and rows exact, bytes
+    /// apportioned by each app's share of a table's rows, as the local store does.
+    ///
+    /// # Errors
+    /// When ClickHouse cannot be read.
+    pub fn app_usage(&self) -> Result<Vec<crate::AppUsage>> {
+        use std::collections::BTreeMap;
+        let mut apps: BTreeMap<String, crate::AppUsage> = BTreeMap::new();
+        for (table, summary) in [
+            (schema::LOGS, schema::LOG_STREAMS),
+            (schema::TRACES, schema::TRACE_STREAMS),
+        ] {
+            let mut bytes = 0u64;
+            self.client.query_lines(
+                &format!(
+                    "SELECT sum(data_compressed_bytes) AS bytes FROM system.parts \
+                     WHERE active AND database = currentDatabase() AND table = {}",
+                    sql::quote(table)
+                ),
+                |line| {
+                    let value: serde_json::Value = serde_json::from_slice(line).unwrap_or_default();
+                    bytes = value
+                        .get("bytes")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    Ok(std::ops::ControlFlow::Continue(()))
+                },
+            )?;
+            let mut rows_here: Vec<(String, u64, u64)> = Vec::new();
+            self.client.query_lines(
+                &format!(
+                    "SELECT ServiceName AS app, uniqExact(StreamHash) AS series, sum(Rows) AS rows \
+                     FROM {summary} GROUP BY app"
+                ),
+                |line| {
+                    let value: serde_json::Value = serde_json::from_slice(line).unwrap_or_default();
+                    let number = |n: &str| {
+                        value
+                            .get(n)
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0)
+                    };
+                    let app = value
+                        .get("app")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    rows_here.push((app.to_owned(), number("series"), number("rows")));
+                    Ok(std::ops::ControlFlow::Continue(()))
+                },
+            )?;
+            let total: u64 = rows_here.iter().map(|(_, _, rows)| rows).sum();
+            for (app, series, rows) in rows_here {
+                let usage = apps.entry(app.clone()).or_insert_with(|| crate::AppUsage {
+                    app,
+                    ..crate::AppUsage::default()
+                });
+                usage.series += series;
+                usage.rows += rows;
+                if total > 0 {
+                    usage.estimated_bytes +=
+                        u64::try_from(u128::from(bytes) * u128::from(rows) / u128::from(total))
+                            .unwrap_or(u64::MAX);
+                }
+            }
+        }
+        Ok(apps.into_values().collect())
+    }
+
     /// Give the tables a changed retention, as a reload does.
     ///
     /// # Errors
