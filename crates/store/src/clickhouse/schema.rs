@@ -185,16 +185,24 @@ impl Layout<'_> {
     }
 
     /// The `SETTINGS` clause every table shares.
+    ///
+    /// Replicated, a table would by default drop a block identical to one it took
+    /// recently, as a retried insert. A rollup's blocks are computed: two different
+    /// batches can count the same second of the same stream to the same number, and the
+    /// second would vanish. Nothing here relies on the deduplication, so it is off.
     pub(super) fn settings(&self) -> String {
+        let mut settings = vec![
+            "index_granularity = 8192".to_owned(),
+            "ttl_only_drop_parts = 1".to_owned(),
+        ];
         let policy = self.config.storage_policy.trim();
-        if policy.is_empty() {
-            "SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1".to_owned()
-        } else {
-            format!(
-                "SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, storage_policy = {}",
-                quote(policy)
-            )
+        if !policy.is_empty() {
+            settings.push(format!("storage_policy = {}", quote(policy)));
         }
+        if !self.config.cluster.trim().is_empty() {
+            settings.push("replicated_deduplication_window = 0".to_owned());
+        }
+        format!("SETTINGS {}", settings.join(", "))
     }
 
     fn aging(&self, table: &str) -> String {
