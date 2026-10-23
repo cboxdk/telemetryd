@@ -37,6 +37,13 @@ use super::Client;
 pub const LOGS: &str = "otel_logs";
 pub const LOG_STREAMS: &str = "otel_log_streams";
 const LOG_STREAMS_VIEW: &str = "otel_log_streams_mv";
+pub const TRACES: &str = "otel_traces";
+pub const TRACE_IDS: &str = "otel_traces_trace_id_ts";
+const TRACE_IDS_VIEW: &str = "otel_traces_trace_id_ts_mv";
+pub const TRACE_STREAMS: &str = "otel_trace_streams";
+const TRACE_STREAMS_VIEW: &str = "otel_trace_streams_mv";
+pub const TRACE_KEYS: &str = "otel_trace_attribute_keys";
+const TRACE_KEYS_VIEW: &str = "otel_trace_attribute_keys_mv";
 
 /// The table engine: plain on one server, replicated on a cluster.
 struct Engine<'a> {
@@ -113,8 +120,35 @@ ORDER BY (ServiceName, toDateTime(Timestamp))
             "ALTER TABLE {LOGS}{on} ADD COLUMN IF NOT EXISTS \
              AttributeLabels Array(LowCardinality(String)) CODEC(ZSTD(1))"
         ),
+    ]
+    .into_iter()
+    .chain(streams_summary(
+        &engine,
+        LOGS,
+        LOG_STREAMS,
+        LOG_STREAMS_VIEW,
+        "Timestamp",
+        days,
+    ))
+    .chain(traces(&engine, &ttl, settings, days))
+    .collect()
+}
+
+/// A table of every stream a signal's table holds, per hour, kept current by a
+/// materialized view: what stream matchers resolve against and label names and values
+/// answer from.
+fn streams_summary(
+    engine: &Engine<'_>,
+    source: &str,
+    summary: &str,
+    view: &str,
+    time: &str,
+    days: u32,
+) -> Vec<String> {
+    let on = engine.on_cluster();
+    vec![
         format!(
-            "CREATE TABLE IF NOT EXISTS {LOG_STREAMS}{on} (
+            "CREATE TABLE IF NOT EXISTS {summary}{on} (
     Hour DateTime CODEC(Delta(4), ZSTD(1)),
     ServiceName LowCardinality(String),
     StreamHash UInt64,
@@ -126,23 +160,129 @@ ORDER BY (ServiceName, toDateTime(Timestamp))
 PARTITION BY toDate(Hour)
 ORDER BY (Hour, ServiceName, StreamHash)
 TTL Hour + INTERVAL {days} DAY
-{settings}",
-            engine.engine(LOG_STREAMS, "AggregatingMergeTree")
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
+            engine.engine(summary, "AggregatingMergeTree")
         ),
         format!(
-            "CREATE MATERIALIZED VIEW IF NOT EXISTS {LOG_STREAMS_VIEW}{on} TO {LOG_STREAMS} AS
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS {view}{on} TO {summary} AS
 SELECT
-    toStartOfHour(Timestamp) AS Hour,
+    toStartOfHour({time}) AS Hour,
     ServiceName,
     cityHash64(S) AS StreamHash,
     any(S) AS Stream,
     count() AS Rows,
-    min(Timestamp) AS MinTimestamp,
-    max(Timestamp) AS MaxTimestamp
-FROM (SELECT Timestamp, ServiceName, Stream AS S FROM {LOGS})
+    min({time}) AS MinTimestamp,
+    max({time}) AS MaxTimestamp
+FROM (SELECT {time}, ServiceName, Stream AS S FROM {source})
 GROUP BY Hour, ServiceName, StreamHash"
         ),
     ]
+}
+
+/// `otel_traces`, as the Collector and the store package lay it out, with the stream
+/// columns logs have; the trace-id index the Collector keeps beside it; the streams
+/// summary; and every attribute key per hour, for the tag lists Grafana offers.
+///
+/// Sorted by app and time, not by app, span name and time as the Collector sorts it:
+/// a search reads newest first, and with the name ahead of the time in the key every
+/// name's newest spans are in a different place.
+fn traces(engine: &Engine<'_>, ttl: &str, settings: &str, days: u32) -> Vec<String> {
+    let on = engine.on_cluster();
+    let mut statements = vec![
+        format!(
+            "CREATE TABLE IF NOT EXISTS {TRACES}{on} (
+    Timestamp DateTime64(9, 'UTC') CODEC(Delta(8), ZSTD(1)),
+    TraceId String CODEC(ZSTD(1)),
+    SpanId String CODEC(ZSTD(1)),
+    ParentSpanId String CODEC(ZSTD(1)),
+    TraceState String CODEC(ZSTD(1)),
+    SpanName LowCardinality(String) CODEC(ZSTD(1)),
+    SpanKind LowCardinality(String) CODEC(ZSTD(1)),
+    ServiceName LowCardinality(String) CODEC(ZSTD(1)),
+    ResourceAttributes Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    SpanAttributes Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    Duration UInt64 CODEC(ZSTD(1)),
+    StatusCode LowCardinality(String) CODEC(ZSTD(1)),
+    StatusMessage String CODEC(ZSTD(1)),
+    Events Nested (Timestamp DateTime64(9, 'UTC'), Name LowCardinality(String), Attributes Map(LowCardinality(String), String)) CODEC(ZSTD(1)),
+    Links Nested (TraceId String, SpanId String, TraceState String, Attributes Map(LowCardinality(String), String)) CODEC(ZSTD(1)),
+    Stream Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    StreamHash UInt64 MATERIALIZED cityHash64(Stream) CODEC(ZSTD(1)),
+    INDEX idx_trace_id TraceId TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_span_attr_key mapKeys(SpanAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_span_attr_value mapValues(SpanAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_duration Duration TYPE minmax GRANULARITY 1
+) ENGINE = {}
+PARTITION BY toDate(Timestamp)
+ORDER BY (ServiceName, toDateTime(Timestamp))
+{ttl}
+{settings}",
+            engine.engine(TRACES, "MergeTree")
+        ),
+    ];
+    // A table the store package created has none of these.
+    for column in [
+        "TraceState String CODEC(ZSTD(1))",
+        "`Links.TraceState` Array(String) CODEC(ZSTD(1))",
+        "Stream Map(LowCardinality(String), String) CODEC(ZSTD(1))",
+        "StreamHash UInt64 MATERIALIZED cityHash64(Stream) CODEC(ZSTD(1))",
+    ] {
+        statements.push(format!(
+            "ALTER TABLE {TRACES}{on} ADD COLUMN IF NOT EXISTS {column}"
+        ));
+    }
+    statements.push(format!(
+        "CREATE TABLE IF NOT EXISTS {TRACE_IDS}{on} (
+    TraceId String CODEC(ZSTD(1)),
+    Start DateTime64(9, 'UTC') CODEC(Delta(8), ZSTD(1)),
+    End DateTime64(9, 'UTC') CODEC(Delta(8), ZSTD(1))
+) ENGINE = {}
+PARTITION BY toDate(Start)
+ORDER BY (TraceId, toUnixTimestamp(Start))
+TTL toDateTime(Start) + INTERVAL {days} DAY
+{settings}",
+        engine.engine(TRACE_IDS, "MergeTree")
+    ));
+    statements.push(format!(
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS {TRACE_IDS_VIEW}{on} TO {TRACE_IDS} AS
+SELECT TraceId, min(Timestamp) AS Start, max(Timestamp) AS End
+FROM {TRACES}
+WHERE TraceId != ''
+GROUP BY TraceId"
+    ));
+    statements.extend(streams_summary(
+        engine,
+        TRACES,
+        TRACE_STREAMS,
+        TRACE_STREAMS_VIEW,
+        "Timestamp",
+        days,
+    ));
+    statements.push(format!(
+        "CREATE TABLE IF NOT EXISTS {TRACE_KEYS}{on} (
+    Hour DateTime CODEC(Delta(4), ZSTD(1)),
+    ServiceName LowCardinality(String),
+    Scope LowCardinality(String),
+    Key LowCardinality(String),
+    Spans SimpleAggregateFunction(sum, UInt64)
+) ENGINE = {}
+PARTITION BY toDate(Hour)
+ORDER BY (Hour, ServiceName, Scope, Key)
+TTL Hour + INTERVAL {days} DAY
+{settings}",
+        engine.engine(TRACE_KEYS, "AggregatingMergeTree")
+    ));
+    statements.push(format!(
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS {TRACE_KEYS_VIEW}{on} TO {TRACE_KEYS} AS
+SELECT toStartOfHour(Timestamp) AS Hour, ServiceName, scope.1 AS Scope, scope.2 AS Key, count() AS Spans
+FROM {TRACES}
+ARRAY JOIN arrayConcat(
+    arrayMap(k -> ('span', k), mapKeys(SpanAttributes)),
+    arrayMap(k -> ('resource', k), mapKeys(ResourceAttributes))
+) AS scope
+GROUP BY Hour, ServiceName, Scope, Key"
+    ));
+    statements
 }
 
 /// Create whatever is missing.

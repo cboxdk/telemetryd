@@ -13,6 +13,7 @@
 
 mod client;
 pub mod logs;
+mod scan;
 pub mod schema;
 pub(crate) mod sql;
 
