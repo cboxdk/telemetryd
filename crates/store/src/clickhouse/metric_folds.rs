@@ -473,6 +473,9 @@ fn oldest_hour(client: &Client) -> Result<Option<u64>> {
     Ok(oldest)
 }
 
+/// One series' summaries by tier and bucket, each with the `Version` it was read at.
+type Versioned = BTreeMap<(u8, u64), (u64, StreamFold)>;
+
 /// One piece of a window, in time order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Piece {
@@ -517,7 +520,7 @@ fn completeness(
         Ok(ControlFlow::Continue(()))
     })?;
     let folded = format!(
-        "SELECT Bucket AS bucket, sum(Seen) AS n FROM {FOLDS} FINAL \
+        "SELECT Bucket AS bucket, sum(Seen) AS n FROM {FOLDS} \
          WHERE {} AND Tier = {tier} AND Bucket >= {first} AND Bucket < {last} GROUP BY bucket",
         reading.condition
     );
@@ -624,6 +627,33 @@ pub(super) fn fold_windows(
     if first_hour > last_hour {
         return Ok(None);
     }
+    // Whether summaries could help at all, before asking which are complete: a chart of
+    // five-minute windows holds no whole hour, and costs nothing more here.
+    let hopeful: Vec<Vec<Piece>> = windows
+        .iter()
+        .map(|&window| plan(window, &|_| true, &|_| true))
+        .collect();
+    let hopeful_raw: u64 = merged(
+        hopeful
+            .iter()
+            .flatten()
+            .filter_map(|piece| match *piece {
+                Piece::Raw(from, to) => Some((from, to)),
+                _ => None,
+            })
+            .collect(),
+    )
+    .iter()
+    .map(|(a, b)| b - a)
+    .sum();
+    if !hopeful
+        .iter()
+        .flatten()
+        .any(|p| !matches!(p, Piece::Raw(..)))
+        || hopeful_raw > (high - low) / 4
+    {
+        return Ok(None);
+    }
     let hours = completeness(client, reading, HOURLY, first_hour, last_hour)?;
     let days = completeness(client, reading, DAILY, first_hour, last_hour)?;
     let complete = |sums: &HashMap<u64, (u64, u64)>, bucket: u64| {
@@ -690,7 +720,7 @@ pub(super) fn fold_windows(
     }
 
     // The summaries the plans use, a series at a time.
-    let mut folds: HashMap<u64, BTreeMap<(u8, u64), StreamFold>> = HashMap::new();
+    let mut folds: HashMap<u64, Versioned> = HashMap::new();
     let mut tiers = Vec::new();
     for (first, last) in runs(&hours_used) {
         tiers.push(format!(
@@ -702,15 +732,21 @@ pub(super) fn fold_windows(
             "(Tier = {DAILY} AND Bucket >= {first} AND Bucket <= {last})"
         ));
     }
+    // A counter's rate needs neither the sum nor the extremes: a third less to send.
+    let gauge_columns = if gauges {
+        "Sum, Compensation, Min, Max"
+    } else {
+        "toUInt64(0), toUInt64(0), toUInt64(0), toUInt64(0)"
+    };
     let query = format!(
         "SELECT Tier, toUInt32(Bucket), SeriesHash, Seen, FirstNanos, LastNanos, FirstValue, \
-         LastValue, Increase, Sum, Compensation, Min, Max FROM {FOLDS} FINAL \
-         WHERE {} AND ({})",
+         LastValue, Increase, {gauge_columns}, Version FROM {FOLDS} WHERE {} AND ({})",
         reading.condition,
         tiers.join(" OR ")
     );
-    let mut poisoned = false;
-    client.query_rows(&query, 1 + 4 + 8 + 10 * 8, |row| {
+    // Not `FINAL`, which costs more than the read: a fold made again is a second row
+    // until the table merges, and the newer one is kept here.
+    client.query_rows(&query, 1 + 4 + 8 + 11 * 8, |row| {
         let read = |at: usize| {
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&row[at..at + 8]);
@@ -732,15 +768,26 @@ pub(super) fn fold_windows(
             min: field(8),
             max: field(9),
         });
-        // As the local store declines a counter summary with a NaN folded in.
-        if !gauges && fold.seen > 0 && (fold.increase.is_nan() || fold.last_value.is_nan()) {
-            poisoned = true;
-            return Ok(ControlFlow::Break(()));
+        let version = field(10);
+        let slot = folds.entry(hash).or_default().entry((tier, bucket));
+        match slot {
+            std::collections::btree_map::Entry::Vacant(vacant) => {
+                vacant.insert((version, fold));
+            }
+            std::collections::btree_map::Entry::Occupied(mut held) if held.get().0 <= version => {
+                held.insert((version, fold));
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
         }
-        folds.entry(hash).or_default().insert((tier, bucket), fold);
         Ok(ControlFlow::Continue(()))
     })?;
-    if poisoned {
+    // As the local store declines a counter summary with a NaN folded in.
+    if !gauges
+        && folds
+            .values()
+            .flat_map(BTreeMap::values)
+            .any(|(_, fold)| fold.seen > 0 && (fold.increase.is_nan() || fold.last_value.is_nan()))
+    {
         return Ok(None);
     }
 
@@ -768,11 +815,11 @@ pub(super) fn fold_windows(
                     }
                     Piece::Hour(hour) => own_folds
                         .and_then(|f| f.get(&(HOURLY, hour)))
-                        .copied()
+                        .map(|(_, fold)| *fold)
                         .unwrap_or_default(),
                     Piece::Day(day) => own_folds
                         .and_then(|f| f.get(&(DAILY, day)))
-                        .copied()
+                        .map(|(_, fold)| *fold)
                         .unwrap_or_default(),
                 };
                 if part.seen == 0 {
