@@ -149,8 +149,8 @@ cd telemetryd
 cargo build --release
 ```
 
-Needs Rust 1.89 or newer and a C compiler: zstd and `ring`, the TLS library's
-cryptography, are built from C and assembly. Nothing is linked from the system — the
+Needs Rust 1.89 or newer and a C compiler: zstd, `ring` (the TLS library's
+cryptography) and mimalloc (the allocator) are built from C and assembly. Nothing is linked from the system — the
 release binaries are static — so there is no library to install on the machine that runs
 it.
 

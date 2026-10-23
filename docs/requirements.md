@@ -64,7 +64,7 @@ Stated because these are the dependencies comparable systems do need:
 | | |
 |---|---|
 | Rust | 1.89 or newer, stable |
-| C toolchain | None. There are no C dependencies in the tree at all, which is what keeps the static musl builds straightforward |
+| C toolchain | A C compiler. zstd, `ring` (the TLS library's cryptography) and mimalloc (the allocator) are built from C, and linked statically: the binary still needs no library on the machine that runs it |
 
 ```bash
 cargo build --release
