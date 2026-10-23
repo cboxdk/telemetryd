@@ -22,6 +22,9 @@ use telemetryd_server::{AppState, router};
 use telemetryd_store::Store;
 use tower::ServiceExt;
 
+mod common;
+use common::clickhouse_under_test;
+
 #[tokio::test]
 async fn every_query_answers_as_loki_does() {
     let tmp = tempfile::tempdir().unwrap();
@@ -55,27 +58,6 @@ async fn every_query_answers_as_loki_does_on_clickhouse() {
         ..Config::default()
     })
     .await;
-}
-
-/// A `[clickhouse]` section for a test, on a fresh database, or `None` without one.
-fn clickhouse_under_test(name: &str) -> Option<telemetryd_core::config::ClickHouseConfig> {
-    let raw = std::env::var("TELEMETRYD_TEST_CLICKHOUSE_URL").ok()?;
-    let (scheme, rest) = raw.split_once("://").unwrap();
-    let (credentials, host) = rest.rsplit_once('@').unwrap_or(("default:", rest));
-    let (user, password) = credentials.split_once(':').unwrap_or((credentials, ""));
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    Some(telemetryd_core::config::ClickHouseConfig {
-        url: format!("{scheme}://{host}"),
-        database: format!("td_test_{name}_{unique}"),
-        user: user.to_owned(),
-        password: telemetryd_core::Secret::new(password),
-        // The corpus is dated; a month's TTL would have ClickHouse drop it on insert.
-        retention_days: 3_650,
-        ..telemetryd_core::config::ClickHouseConfig::default()
-    })
 }
 
 async fn conforms(config: Config) {

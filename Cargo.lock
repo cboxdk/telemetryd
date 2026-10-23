@@ -2587,6 +2587,7 @@ dependencies = [
  "mimalloc",
  "parquet",
  "postcard",
+ "regex",
  "serde",
  "serde_json",
  "telemetryd-core",

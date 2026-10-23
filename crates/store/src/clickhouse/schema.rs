@@ -47,8 +47,6 @@ pub const TRACE_IDS: &str = "otel_traces_trace_id_ts";
 const TRACE_IDS_VIEW: &str = "otel_traces_trace_id_ts_mv";
 pub const TRACE_STREAMS: &str = "otel_trace_streams";
 const TRACE_STREAMS_VIEW: &str = "otel_trace_streams_mv";
-pub const TRACE_KEYS: &str = "otel_trace_attribute_keys";
-const TRACE_KEYS_VIEW: &str = "otel_trace_attribute_keys_mv";
 
 /// The table engine: plain on one server, replicated on a cluster.
 struct Engine<'a> {
@@ -239,8 +237,8 @@ ORDER BY Name",
 }
 
 /// `otel_traces`, as the Collector and the store package lay it out, with the stream
-/// columns logs have; the trace-id index the Collector keeps beside it; the streams
-/// summary; and every attribute key per hour, for the tag lists Grafana offers.
+/// columns logs have; the trace-id index the Collector keeps beside it; and the streams
+/// summary.
 ///
 /// Sorted by app and time, not by app, span name and time as the Collector sorts it:
 /// a search reads newest first, and with the name ahead of the time in the key every
@@ -316,30 +314,6 @@ GROUP BY TraceId"
         TRACE_STREAMS_VIEW,
         "Timestamp",
         days,
-    ));
-    statements.push(format!(
-        "CREATE TABLE IF NOT EXISTS {TRACE_KEYS}{on} (
-    Hour DateTime CODEC(Delta(4), ZSTD(1)),
-    ServiceName LowCardinality(String),
-    Scope LowCardinality(String),
-    Key LowCardinality(String),
-    Spans SimpleAggregateFunction(sum, UInt64)
-) ENGINE = {}
-PARTITION BY toDate(Hour)
-ORDER BY (Hour, ServiceName, Scope, Key)
-TTL Hour + INTERVAL {days} DAY
-{settings}",
-        engine.engine(TRACE_KEYS, "AggregatingMergeTree")
-    ));
-    statements.push(format!(
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS {TRACE_KEYS_VIEW}{on} TO {TRACE_KEYS} AS
-SELECT toStartOfHour(Timestamp) AS Hour, ServiceName, scope.1 AS Scope, scope.2 AS Key, count() AS Spans
-FROM {TRACES}
-ARRAY JOIN arrayConcat(
-    arrayMap(k -> ('span', k), mapKeys(SpanAttributes)),
-    arrayMap(k -> ('resource', k), mapKeys(ResourceAttributes))
-) AS scope
-GROUP BY Hour, ServiceName, Scope, Key"
     ));
     statements
 }

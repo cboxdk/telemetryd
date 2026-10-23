@@ -38,7 +38,10 @@ use telemetryd_core::span::SpanRecord;
 use crate::schema::RecordSchema;
 use telemetryd_core::{Labels, LogRecord, Result, Signal};
 
-pub use backend::{BodyFilter, BucketRequest, Buckets, LogStore, RecordFilter};
+pub use backend::{
+    BodyFilter, BucketRequest, Buckets, LogStore, RecordFilter, SpanCondition, SpanField, SpanOp,
+    SpanStore, SpanValue,
+};
 pub use cardinality::{Admission, Admitted, Cardinality};
 pub use datadir::{DataDir, DiskUsage};
 pub use logs::LogSchema;
@@ -202,10 +205,21 @@ impl Store {
         &self.traces
     }
 
+    /// Spans, wherever they are kept: what the query engines read.
+    pub fn span_store(&self) -> &dyn SpanStore {
+        match &self.clickhouse {
+            Some(clickhouse) => &clickhouse.spans,
+            None => &self.traces,
+        }
+    }
+
     /// Append trace spans. Durable before this returns.
     pub fn append_spans(&self, records: &[SpanRecord]) -> Result<Admitted> {
         self.append_within_limits(records, SpanSchema::index_labels, |kept| {
-            self.traces.append(kept)
+            match &self.clickhouse {
+                Some(clickhouse) => clickhouse.spans.append(kept),
+                None => self.traces.append(kept),
+            }
         })
     }
 
