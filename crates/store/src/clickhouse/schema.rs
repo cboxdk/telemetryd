@@ -68,6 +68,10 @@ pub const TRACE_IDS: &str = "otel_traces_trace_id_ts";
 const TRACE_IDS_VIEW: &str = "otel_traces_trace_id_ts_mv";
 pub const TRACE_STREAMS: &str = "otel_trace_streams";
 const TRACE_STREAMS_VIEW: &str = "otel_trace_streams_mv";
+pub const TRACE_KEYS: &str = "otel_trace_keys";
+const TRACE_KEYS_VIEW: &str = "otel_trace_keys_mv";
+/// The key in [`META`] saying from when `otel_trace_keys` holds every key.
+pub const TRACE_KEYS_SINCE: &str = "trace_keys_since";
 
 /// Which retention a table keeps rows for.
 #[derive(Debug, Clone, Copy)]
@@ -123,6 +127,12 @@ const AGING: &[Aging] = &[
     Aging {
         table: TRACE_IDS,
         time: "toDateTime(Start)",
+        signal: Signal::Traces,
+        moves: false,
+    },
+    Aging {
+        table: TRACE_KEYS,
+        time: "Hour",
         signal: Signal::Traces,
         moves: false,
     },
@@ -485,16 +495,19 @@ ORDER BY (ServiceName, toDateTime(Timestamp))
         ));
     }
     statements.push(format!(
+        // One row per trace once merged, not one per batch its spans came in: a trace's
+        // first and last span are a min and a max, and reads take them as such, so a
+        // part not merged yet answers the same.
         "CREATE TABLE IF NOT EXISTS {TRACE_IDS}{on} (
     TraceId String CODEC(ZSTD(1)),
-    Start DateTime64(9, 'UTC') CODEC(Delta(8), ZSTD(1)),
-    End DateTime64(9, 'UTC') CODEC(Delta(8), ZSTD(1))
+    Start SimpleAggregateFunction(min, DateTime64(9, 'UTC')) CODEC(Delta(8), ZSTD(1)),
+    End SimpleAggregateFunction(max, DateTime64(9, 'UTC')) CODEC(Delta(8), ZSTD(1))
 ) ENGINE = {}
 PARTITION BY toDate(Start)
-ORDER BY (TraceId, toUnixTimestamp(Start))
+ORDER BY TraceId
 {}
 {}",
-        layout.engine(TRACE_IDS, "MergeTree"),
+        layout.engine(TRACE_IDS, "AggregatingMergeTree"),
         layout.aging(TRACE_IDS),
         layout.settings(),
     ));
@@ -510,6 +523,34 @@ GROUP BY TraceId"
         TRACES,
         TRACE_STREAMS,
         TRACE_STREAMS_VIEW,
+    ));
+    // Every attribute key per app per hour: what turns a relaxed attribute lookup into a
+    // list of the keys it could find, instead of a pattern run on every key of every span.
+    statements.push(format!(
+        "CREATE TABLE IF NOT EXISTS {TRACE_KEYS}{on} (
+    Hour DateTime CODEC(Delta(4), ZSTD(1)),
+    ServiceName LowCardinality(String),
+    Scope LowCardinality(String),
+    Key String CODEC(ZSTD(1)),
+    Spans SimpleAggregateFunction(sum, UInt64)
+) ENGINE = {}
+PARTITION BY toDate(Hour)
+ORDER BY (ServiceName, Hour, Scope, Key)
+{}
+{}",
+        layout.engine(TRACE_KEYS, "AggregatingMergeTree"),
+        layout.aging(TRACE_KEYS),
+        layout.settings(),
+    ));
+    statements.push(format!(
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS {TRACE_KEYS_VIEW}{on} TO {TRACE_KEYS} AS
+SELECT toStartOfHour(Timestamp) AS Hour, ServiceName, key.1 AS Scope, key.2 AS Key, count() AS Spans
+FROM {TRACES}
+ARRAY JOIN arrayConcat(
+    arrayMap(k -> ('span', k), mapKeys(SpanAttributes)),
+    arrayMap(k -> ('resource', k), mapKeys(ResourceAttributes))
+) AS key
+GROUP BY Hour, ServiceName, Scope, Key"
     ));
     statements
 }
@@ -611,7 +652,8 @@ pub fn ensure(
     }
     apply_ttl(client, config, retention)?;
     record_rollup_start(client, LOG_VOLUME_SINCE, LOGS)?;
-    record_rollup_start(client, LOG_VOLUME_MINUTES_SINCE, LOGS)
+    record_rollup_start(client, LOG_VOLUME_MINUTES_SINCE, LOGS)?;
+    record_rollup_start(client, TRACE_KEYS_SINCE, TRACES)
 }
 
 /// Bring every table's TTL to the configuration's, without rewriting existing parts.
