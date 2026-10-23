@@ -40,7 +40,7 @@ async fn every_query_answers_as_tempo_does() {
 #[tokio::test]
 async fn every_query_answers_as_tempo_does_on_clickhouse() {
     let Some(clickhouse) = clickhouse_under_test("tempo") else {
-        eprintln!("TELEMETRYD_TEST_CLICKHOUSE_URL is not set; skipped");
+        common::skip("TELEMETRYD_TEST_CLICKHOUSE_URL");
         return;
     };
     let tmp = tempfile::tempdir().unwrap();

@@ -38,7 +38,14 @@ pub struct ClickHouse {
     pub logs: ClickHouseLogs,
     pub metrics: ClickHouseMetrics,
     pub spans: ClickHouseSpans,
+    /// The last [`ClickHouse::app_usage`] answer and when it was read.
+    usage: std::sync::Mutex<Option<(std::time::Instant, Vec<crate::AppUsage>)>>,
 }
+
+/// How long an [`ClickHouse::app_usage`] answer is reused: it reads every stream
+/// summary in the retention window, and `/metrics` is scraped every few seconds by
+/// every instance.
+const USAGE_FOR: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl ClickHouse {
     /// Connect, and create what is missing when the configuration says to.
@@ -68,6 +75,7 @@ impl ClickHouse {
             logs: ClickHouseLogs::new(client.clone()),
             metrics: ClickHouseMetrics::new(client.clone()),
             spans: ClickHouseSpans::new(client.clone()),
+            usage: std::sync::Mutex::new(None),
             client,
         })
     }
@@ -93,6 +101,21 @@ impl ClickHouse {
     /// # Errors
     /// When ClickHouse cannot be read.
     pub fn app_usage(&self) -> Result<Vec<crate::AppUsage>> {
+        let mut cached = self
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((read, usage)) = cached.as_ref()
+            && read.elapsed() < USAGE_FOR
+        {
+            return Ok(usage.clone());
+        }
+        let usage = self.read_app_usage()?;
+        *cached = Some((std::time::Instant::now(), usage.clone()));
+        Ok(usage)
+    }
+
+    fn read_app_usage(&self) -> Result<Vec<crate::AppUsage>> {
         use std::collections::BTreeMap;
         let mut apps: BTreeMap<String, crate::AppUsage> = BTreeMap::new();
         for (table, summary, hash, rows) in [

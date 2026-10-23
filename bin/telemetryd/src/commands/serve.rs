@@ -126,6 +126,14 @@ fn open_store(config: &Config) -> anyhow::Result<Store> {
             )
         });
     }
+    if opened.is_ok() && config.clickhouse.is_enabled() {
+        tracing::info!(
+            url = %telemetryd_core::http::redact_url(&config.clickhouse.url),
+            database = %config.clickhouse.database,
+            cluster = %config.clickhouse.cluster,
+            "storing logs, traces and metrics in ClickHouse"
+        );
+    }
     opened.with_context(|| {
         format!(
             "opening the data directory at {}\n\

@@ -204,7 +204,7 @@ fn urlencode(raw: &str) -> String {
 #[allow(clippy::too_many_lines)]
 async fn clickhouse_answers_as_the_local_store_does() {
     let Some(clickhouse) = clickhouse_under_test("parity") else {
-        eprintln!("TELEMETRYD_TEST_CLICKHOUSE_URL is not set; skipped");
+        common::skip("TELEMETRYD_TEST_CLICKHOUSE_URL");
         return;
     };
     let local_dir = tempfile::tempdir().unwrap();

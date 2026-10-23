@@ -52,11 +52,12 @@ use telemetryd_core::config::Overrides;
     name = "telemetryd",
     version,
     about = "Single-binary observability backend — OTLP in, Loki/Tempo/Prometheus APIs out",
-    long_about = "telemetryd stores logs, traces and metrics in one directory \
-                  and serves the Loki, Tempo and Prometheus query APIs that \
-                  laravel-telemetry-ui speaks.\n\n\
+    long_about = "telemetryd stores logs, traces and metrics in one directory, \
+                  or in ClickHouse shared by several instances, and serves the \
+                  Loki, Tempo and Prometheus query APIs that laravel-telemetry-ui \
+                  speaks.\n\n\
                   Your telemetry never leaves your infrastructure: one binary, one \
-                  port, one data directory, no sidecars.",
+                  port, no sidecars.",
     propagate_version = true
 )]
 struct Cli {

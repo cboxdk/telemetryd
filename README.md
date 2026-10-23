@@ -264,6 +264,22 @@ cargo bench -p telemetryd-store                         # measures the constants
 cargo test -p telemetryd-store --test scale --release   # asserts the asymptotics
 ```
 
+The tests that run against ClickHouse skip unless they are given one. A replicated
+cluster of two replicas, as CI runs, is in `scripts/clickhouse/compose.yml`:
+
+```bash
+docker compose -f scripts/clickhouse/compose.yml up -d --wait
+TELEMETRYD_TEST_CLICKHOUSE_URL=http://td:td@127.0.0.1:18124 \
+TELEMETRYD_TEST_CLICKHOUSE_CLUSTER=td \
+TELEMETRYD_TEST_CLICKHOUSE_REPLICAS=http://td:td@127.0.0.1:18124,http://td:td@127.0.0.1:18125 \
+TELEMETRYD_TEST_CLICKHOUSE_REQUIRED=1 \
+  cargo test -p telemetryd-server -p telemetryd-query
+```
+
+`TELEMETRYD_TEST_CLICKHOUSE_REQUIRED=1` turns a skip into a failure. Each test writes
+to a database of its own, `td_test_*`, and leaves it behind for inspection;
+`docker compose … down -v` removes them all.
+
 Performance is held in place from two directions: benchmarks measure the constants,
 and `tests/scale.rs` asserts the asymptotics as *segment-open counts* rather than
 wall-clock times — so they mean something on a shared CI runner. See

@@ -455,7 +455,12 @@ cargo deny check                      # advisories, licenses, bans, sources
 python3 scripts/generate-sbom.py --check
 python3 scripts/check-docs.py
 python3 scripts/soak.py target/debug/telemetryd   # the binary, over HTTP
+cargo test -p telemetryd-server -p telemetryd-query   # again, on a replicated ClickHouse
 ```
+
+The last runs in the "ClickHouse as the store" job against the two-replica cluster in
+`scripts/clickhouse/compose.yml`, with `TELEMETRYD_TEST_CLICKHOUSE_REQUIRED=1` so a
+test that could not reach ClickHouse fails rather than skips.
 
 The soak is the one that runs the product rather than its parts: it starts the real
 binary, pushes all three signals at it, queries them back through the Loki, Tempo and

@@ -172,7 +172,7 @@ fn encode(raw: &str) -> String {
 #[tokio::test]
 async fn clickhouse_answers_traces_as_the_local_store_does() {
     let Some(clickhouse) = clickhouse_under_test("trace_parity") else {
-        eprintln!("TELEMETRYD_TEST_CLICKHOUSE_URL is not set; skipped");
+        common::skip("TELEMETRYD_TEST_CLICKHOUSE_URL");
         return;
     };
     let local_dir = tempfile::tempdir().unwrap();
@@ -331,7 +331,7 @@ fn close(a: &Value, b: &Value) -> bool {
 #[tokio::test]
 async fn a_search_reads_past_spans_the_predicate_turns_down() {
     let Some(clickhouse) = clickhouse_under_test("trace_window") else {
-        eprintln!("TELEMETRYD_TEST_CLICKHOUSE_URL is not set; skipped");
+        common::skip("TELEMETRYD_TEST_CLICKHOUSE_URL");
         return;
     };
     let dir = tempfile::tempdir().unwrap();

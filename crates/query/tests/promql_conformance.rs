@@ -117,6 +117,11 @@ fn every_expression_answers_as_prometheus_does() {
 #[test]
 fn every_expression_answers_as_prometheus_does_on_clickhouse() {
     let Ok(raw) = std::env::var("TELEMETRYD_TEST_CLICKHOUSE_URL") else {
+        // Fail rather than skip where CI says ClickHouse is there to test against.
+        assert!(
+            std::env::var("TELEMETRYD_TEST_CLICKHOUSE_REQUIRED").as_deref() != Ok("1"),
+            "TELEMETRYD_TEST_CLICKHOUSE_URL is not set, and TELEMETRYD_TEST_CLICKHOUSE_REQUIRED=1 says it must be"
+        );
         eprintln!("TELEMETRYD_TEST_CLICKHOUSE_URL is not set; skipped");
         return;
     };

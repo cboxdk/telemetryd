@@ -345,7 +345,7 @@ fn seconds(nanos: u64) -> String {
 #[allow(clippy::too_many_lines)]
 async fn clickhouse_answers_metrics_as_the_local_store_does() {
     let Some(clickhouse) = clickhouse() else {
-        eprintln!("TELEMETRYD_TEST_CLICKHOUSE_URL is not set; skipped");
+        common::skip("TELEMETRYD_TEST_CLICKHOUSE_URL");
         return;
     };
     let local_dir = tempfile::tempdir().unwrap();
@@ -469,7 +469,7 @@ async fn clickhouse_answers_metrics_as_the_local_store_does() {
 #[allow(clippy::too_many_lines)]
 async fn summaries_answer_long_windows_as_the_samples_do() {
     let Some(clickhouse) = clickhouse() else {
-        eprintln!("TELEMETRYD_TEST_CLICKHOUSE_URL is not set; skipped");
+        common::skip("TELEMETRYD_TEST_CLICKHOUSE_URL");
         return;
     };
     // Three whole days from a UTC midnight, so days in the data are days in the table.
@@ -663,7 +663,7 @@ async fn summaries_answer_long_windows_as_the_samples_do() {
 #[tokio::test]
 async fn a_selector_of_many_series_answers_as_the_local_store_does() {
     let Some(clickhouse) = clickhouse() else {
-        eprintln!("TELEMETRYD_TEST_CLICKHOUSE_URL is not set; skipped");
+        common::skip("TELEMETRYD_TEST_CLICKHOUSE_URL");
         return;
     };
     let names: Vec<String> = (0..10_500).map(|i| i.to_string()).collect();

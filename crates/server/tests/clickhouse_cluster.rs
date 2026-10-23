@@ -106,7 +106,7 @@ fn encode(raw: &str) -> String {
 #[tokio::test]
 async fn instances_on_different_replicas_answer_alike() {
     let Some((cluster, configs)) = replicas() else {
-        eprintln!("TELEMETRYD_TEST_CLICKHOUSE_CLUSTER is not set; skipped");
+        common::skip("TELEMETRYD_TEST_CLICKHOUSE_CLUSTER");
         return;
     };
     assert!(configs.len() >= 2, "two replicas are needed");
@@ -189,6 +189,7 @@ async fn instances_on_different_replicas_answer_alike() {
         "otel_traces",
         "otel_traces_trace_id_ts",
         "otel_trace_streams",
+        "otel_trace_keys",
         "telemetryd_samples",
         "telemetryd_series",
         "telemetryd_sample_counts",

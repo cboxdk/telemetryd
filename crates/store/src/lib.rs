@@ -211,8 +211,9 @@ impl Store {
             .transpose()
     }
 
-    /// Whether logs are kept in ClickHouse rather than on this machine.
-    pub fn logs_in_clickhouse(&self) -> bool {
+    /// Whether logs, traces and metrics are kept in ClickHouse rather than on this
+    /// machine.
+    pub fn in_clickhouse(&self) -> bool {
         self.clickhouse.is_some()
     }
 

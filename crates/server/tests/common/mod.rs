@@ -30,6 +30,17 @@ pub(crate) fn clickhouse_under_test(name: &str) -> Option<ClickHouseConfig> {
     })
 }
 
+/// Say that a test needing `variable` did not run — or, when
+/// `TELEMETRYD_TEST_CLICKHOUSE_REQUIRED=1` is set, as CI sets it, fail it: a job meant to
+/// test against ClickHouse that tested nothing should not pass.
+pub(crate) fn skip(variable: &str) {
+    assert!(
+        std::env::var("TELEMETRYD_TEST_CLICKHOUSE_REQUIRED").as_deref() != Ok("1"),
+        "{variable} is not set, and TELEMETRYD_TEST_CLICKHOUSE_REQUIRED=1 says it must be"
+    );
+    eprintln!("{variable} is not set; skipped");
+}
+
 /// Ten years of everything: what a test against ClickHouse keeps its dated rows for.
 pub(crate) fn long_retention() -> RetentionConfig {
     let ten_years = DurationSetting(Duration::from_secs(3650 * 86_400));

@@ -221,7 +221,7 @@ pub async fn tail(
         .max_frame_size(4 * 1024)
         .on_upgrade(move |socket| async move {
             let query = std::sync::Arc::new(query);
-            if state.store.logs_in_clickhouse() {
+            if state.store.in_clickhouse() {
                 let delay = params
                     .delay_for
                     .as_deref()

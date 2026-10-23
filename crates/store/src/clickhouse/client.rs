@@ -61,14 +61,33 @@ pub struct Stats {
 pub struct StatsSnapshot {
     pub url: String,
     pub database: String,
-    /// Per operation: `(operation, succeeded, failed, seconds)`.
-    pub requests: Vec<(&'static str, u64, u64, f64)>,
+    /// Per operation.
+    pub requests: Vec<RequestStats>,
     pub bytes_sent: u64,
     pub rows_written: u64,
-    /// The most recent failure, as Unix seconds and what ClickHouse or the connection
-    /// said. Kept after recovery: a write that failed an hour ago is still worth knowing
-    /// about.
-    pub last_error: Option<(u64, String)>,
+    /// The most recent failure. Kept after recovery: a write that failed an hour ago
+    /// is still worth knowing about.
+    pub last_error: Option<LastError>,
+}
+
+/// The requests of one kind this process made to ClickHouse.
+#[derive(Debug, Clone, Serialize)]
+pub struct RequestStats {
+    /// `insert`, `query` or `schema`.
+    pub operation: &'static str,
+    pub succeeded: u64,
+    pub failed: u64,
+    /// Time spent waiting on them, all together.
+    pub seconds: f64,
+}
+
+/// The most recent failed request to ClickHouse.
+#[derive(Debug, Clone, Serialize)]
+pub struct LastError {
+    /// Unix seconds.
+    pub at: u64,
+    /// What ClickHouse or the connection said.
+    pub message: String,
 }
 
 impl Stats {
@@ -171,12 +190,12 @@ impl Client {
             .iter()
             .map(|op| {
                 let i = op.index();
-                (
-                    op.as_str(),
-                    stats.succeeded[i].load(Ordering::Relaxed),
-                    stats.failed[i].load(Ordering::Relaxed),
-                    stats.nanos[i].load(Ordering::Relaxed) as f64 / 1e9,
-                )
+                RequestStats {
+                    operation: op.as_str(),
+                    succeeded: stats.succeeded[i].load(Ordering::Relaxed),
+                    failed: stats.failed[i].load(Ordering::Relaxed),
+                    seconds: stats.nanos[i].load(Ordering::Relaxed) as f64 / 1e9,
+                }
             })
             .collect();
         let last_error = stats
@@ -188,7 +207,7 @@ impl Client {
                 let secs = at
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs());
-                (secs, message)
+                LastError { at: secs, message }
             });
         StatsSnapshot {
             url: self.shown.clone(),

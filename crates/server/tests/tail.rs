@@ -340,7 +340,7 @@ async fn tails_past_the_cap_are_refused() {
 #[tokio::test]
 async fn a_tail_on_clickhouse_sees_what_another_instance_accepted() {
     let Some(clickhouse) = common::clickhouse_under_test("tail") else {
-        eprintln!("TELEMETRYD_TEST_CLICKHOUSE_URL is not set; skipped");
+        common::skip("TELEMETRYD_TEST_CLICKHOUSE_URL");
         return;
     };
     let watching = Server::start_with(clickhouse.clone()).await;

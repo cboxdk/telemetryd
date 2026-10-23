@@ -152,6 +152,13 @@ fn describes_this_deployment(mut response: Response) -> Response {
 }
 
 pub async fn status(State(state): State<AppState>) -> Result<Response, ApiError> {
+    // Off the runtime, as for `/metrics`: on ClickHouse this is a query.
+    let apps = tokio::task::spawn_blocking({
+        let store = state.store.clone();
+        move || store.app_usage()
+    })
+    .await
+    .unwrap_or_default();
     let config = &state.config;
     let storage = state.store.snapshot()?;
 
@@ -201,7 +208,7 @@ pub async fn status(State(state): State<AppState>) -> Result<Response, ApiError>
             },
             storage,
             retention,
-            apps: state.store.app_usage(),
+            apps,
             limits: LimitsStatus {
                 max_series: config.limits.resolved_max_series(),
                 max_series_per_app: config.limits.resolved_max_series_per_app(),
@@ -276,7 +283,15 @@ pub fn status_identity() -> Response {
 }
 
 pub async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
-    let body = state.metrics.render(&gauges(&state)?);
+    // Off the runtime: on ClickHouse the gauges are queries, and a slow answer would
+    // hold a worker every other request needs.
+    let samples = tokio::task::spawn_blocking({
+        let state = state.clone();
+        move || gauges(&state)
+    })
+    .await
+    .map_err(|error| Error::Unavailable(format!("could not gather the gauges: {error}")))??;
+    let body = state.metrics.render(&samples);
     Ok(describes_this_deployment(
         (
             StatusCode::OK,
@@ -470,18 +485,19 @@ fn gauges(state: &AppState) -> Result<Vec<Sample>, Error> {
     push_per_signal_gauges(&snapshot, &mut samples);
 
     if let Some(clickhouse) = &snapshot.clickhouse {
-        for (operation, succeeded, failed, seconds) in &clickhouse.requests {
-            for (outcome, count) in [("ok", succeeded), ("error", failed)] {
+        for request in &clickhouse.requests {
+            let operation = request.operation;
+            for (outcome, count) in [("ok", request.succeeded), ("error", request.failed)] {
                 samples.push(Sample::new(
                     "telemetryd_clickhouse_requests_total",
                     &[("operation", operation), ("outcome", outcome)],
-                    *count as f64,
+                    count as f64,
                 ));
             }
             samples.push(Sample::new(
                 "telemetryd_clickhouse_request_seconds_total",
                 &[("operation", operation)],
-                *seconds,
+                request.seconds,
             ));
         }
         samples.push(Sample::new(

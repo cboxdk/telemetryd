@@ -288,7 +288,7 @@ impl Maintenance {
     /// instance runs it; a lease in the database keeps them from doing the same hour at
     /// once.
     fn spawn_metric_rollup(tasks: &mut Vec<tokio::task::JoinHandle<()>>, store: &Arc<Store>) {
-        if !store.logs_in_clickhouse() {
+        if !store.in_clickhouse() {
             return;
         }
         let store = Arc::clone(store);

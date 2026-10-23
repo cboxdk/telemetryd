@@ -198,7 +198,7 @@ pub async fn otlp_logs(
         let ingest = state.config.ingest.clone();
         let now = telemetryd_store::now_nanos();
         let ctx = DecodeContext {
-            keep_resource: state.store.logs_in_clickhouse(),
+            keep_resource: state.store.in_clickhouse(),
             pool: Some(&state.ingest_memory),
             limits: &limits,
             ingest: &ingest,
