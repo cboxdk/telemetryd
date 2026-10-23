@@ -51,12 +51,12 @@ pub const TRACE_KEYS: &str = "otel_trace_attribute_keys";
 const TRACE_KEYS_VIEW: &str = "otel_trace_attribute_keys_mv";
 
 /// The table engine: plain on one server, replicated on a cluster.
-struct Engine<'a> {
-    cluster: &'a str,
+pub(super) struct Engine<'a> {
+    pub(super) cluster: &'a str,
 }
 
 impl Engine<'_> {
-    fn on_cluster(&self) -> String {
+    pub(super) fn on_cluster(&self) -> String {
         if self.cluster.is_empty() {
             String::new()
         } else {
@@ -64,7 +64,7 @@ impl Engine<'_> {
         }
     }
 
-    fn engine(&self, table: &str, kind: &str) -> String {
+    pub(super) fn engine(&self, table: &str, kind: &str) -> String {
         if self.cluster.is_empty() {
             format!("{kind}()")
         } else {
@@ -137,6 +137,7 @@ ORDER BY (ServiceName, toDateTime(Timestamp))
     ))
     .chain(log_volume(&engine, days))
     .chain(traces(&engine, &ttl, settings, days))
+    .chain(super::metrics_schema::statements(config))
     .collect()
 }
 

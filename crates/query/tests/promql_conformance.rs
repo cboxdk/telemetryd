@@ -110,6 +110,83 @@ fn every_expression_answers_as_prometheus_does() {
     );
 }
 
+/// The same expressions with ClickHouse as the store, read for one instant and for a
+/// range of points, when there is one to test against:
+/// `TELEMETRYD_TEST_CLICKHOUSE_URL=http://user:password@host:8123`. Each run writes to a
+/// database of its own.
+#[test]
+fn every_expression_answers_as_prometheus_does_on_clickhouse() {
+    let Ok(raw) = std::env::var("TELEMETRYD_TEST_CLICKHOUSE_URL") else {
+        eprintln!("TELEMETRYD_TEST_CLICKHOUSE_URL is not set; skipped");
+        return;
+    };
+    let doc: Json = serde_json::from_str(include_str!("conformance/promql.json")).unwrap();
+    let test = &doc["tests"][0];
+    let interval = duration(test["interval"].as_str().unwrap());
+    let samples: Vec<MetricSample> = test["input_series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|input| {
+            expand(
+                input["series"].as_str().unwrap(),
+                input["values"].as_str().unwrap(),
+                interval,
+            )
+        })
+        .collect();
+
+    let (scheme, rest) = raw.split_once("://").unwrap();
+    let (credentials, host) = rest.rsplit_once('@').unwrap_or(("default:", rest));
+    let (user, password) = credentials.split_once(':').unwrap_or((credentials, ""));
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.storage.data_dir = Some(dir.path().to_path_buf());
+    config.clickhouse = telemetryd_core::config::ClickHouseConfig {
+        url: format!("{scheme}://{host}"),
+        database: format!("td_test_metrics_promql_{unique}"),
+        user: user.to_owned(),
+        password: telemetryd_core::Secret::new(password),
+        retention_days: 3_650,
+        ..telemetryd_core::config::ClickHouseConfig::default()
+    };
+    let store = Store::open(&config).unwrap();
+    store.append_samples(&samples).unwrap();
+    let metrics = store.metric_store();
+
+    let mut failures = Vec::new();
+    let cases = test["promql_expr_test"].as_array().unwrap();
+    for case in cases {
+        let query = case["expr"].as_str().unwrap();
+        let at = BASE + duration(case["eval_time"].as_str().unwrap());
+        let expected = shifted(query, expected(&case["exp_samples"]));
+        let expr = promql::parse(&at_shifted(query)).unwrap();
+        let instant = Snapshot::load_at(metrics, &expr, &[at], 0).unwrap();
+        let points: Vec<u64> = (0..20).map(|i| at - (19 - i) * interval).collect();
+        let ranged = Snapshot::load_at(metrics, &expr, &points, 0).unwrap();
+        for (road, snapshot) in [("one instant", &instant), ("a range", &ranged)] {
+            let got = answer(snapshot.eval(&expr, at).unwrap());
+            if let Some(difference) = differs(&expected, &got) {
+                failures.push(format!(
+                    "{query} at {}, read {road}: {difference}",
+                    case["eval_time"].as_str().unwrap()
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} answers differ from Prometheus on ClickHouse:\n{}",
+        failures.len(),
+        cases.len() * 2,
+        failures.join("\n")
+    );
+}
+
 /// promtool's value notation, one sample per step: `a+bxn` is `a`, `a+b`, … `a+nb`;
 /// `a-bxn` counts down; `axn` repeats `a`; `_` skips a step; `stale` ends the series.
 fn expand(series: &str, values: &str, interval: u64) -> Vec<MetricSample> {

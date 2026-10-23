@@ -10,8 +10,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use telemetryd_core::{Error, LabelMatcher, Labels, Result};
-use telemetryd_store::RecordStore;
-use telemetryd_store::metrics::MetricSchema;
+use telemetryd_store::MetricStore;
 
 use crate::promeval::{Snapshot, Value};
 use crate::promql::{self, Expr};
@@ -273,7 +272,7 @@ fn required_query(query: Option<&String>) -> Result<Expr> {
 
 /// `GET,POST /api/v1/query`
 pub fn instant(
-    store: &RecordStore<MetricSchema>,
+    store: &dyn MetricStore,
     params: &InstantParams,
     now_nanos: u64,
     max_samples: u64,
@@ -333,7 +332,7 @@ pub fn instant(
 
 /// `GET,POST /api/v1/query_range`
 pub fn range(
-    store: &RecordStore<MetricSchema>,
+    store: &dyn MetricStore,
     params: &RangeParams,
     now_nanos: u64,
     max_samples: u64,
@@ -431,14 +430,14 @@ pub fn range(
 /// client scoping a metric browser to one app — laravel-telemetry-ui's schema
 /// detection does exactly that — was told about every app's labels.
 pub fn label_names(
-    store: &RecordStore<MetricSchema>,
+    store: &dyn MetricStore,
     selectors: &[String],
     start_nanos: u64,
     end_nanos: u64,
 ) -> Result<PromResponse<Vec<String>>> {
     if selectors.is_empty() {
         return Ok(PromResponse::success(
-            store.label_names(start_nanos, end_nanos),
+            store.label_names(start_nanos, end_nanos)?,
         ));
     }
     let streams = matching_streams(store, selectors, start_nanos, end_nanos)?;
@@ -447,7 +446,7 @@ pub fn label_names(
 
 /// `GET /api/v1/label/{name}/values`, scoped by `match[]` like the names.
 pub fn label_values(
-    store: &RecordStore<MetricSchema>,
+    store: &dyn MetricStore,
     name: &str,
     selectors: &[String],
     start_nanos: u64,
@@ -468,7 +467,7 @@ pub fn label_values(
 
 /// Every series any selector matches — the union, as Prometheus defines `match[]`.
 fn matching_streams(
-    store: &RecordStore<MetricSchema>,
+    store: &dyn MetricStore,
     selectors: &[String],
     start_nanos: u64,
     end_nanos: u64,
@@ -482,7 +481,7 @@ fn matching_streams(
 
 /// `GET /api/v1/series`
 pub fn series(
-    store: &RecordStore<MetricSchema>,
+    store: &dyn MetricStore,
     selectors: &[String],
     start_nanos: u64,
     end_nanos: u64,

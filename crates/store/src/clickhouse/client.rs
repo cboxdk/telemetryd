@@ -280,6 +280,59 @@ impl Client {
         outcome
     }
 
+    /// Run a query in `RowBinary` and hand each fixed-width row to `each` as it
+    /// arrives: for the samples a PromQL query reads, which are many and small, and
+    /// which JSON would spend most of its time spelling out.
+    ///
+    /// A response that does not end on a row boundary is an error: ClickHouse reports a
+    /// failure that happens after it started answering by appending its message to the
+    /// rows, and this is how that is noticed rather than read as data.
+    ///
+    /// # Errors
+    /// [`Error::Unavailable`] for a transport or server failure, and whatever `each`
+    /// returns.
+    pub fn query_rows(
+        &self,
+        sql: &str,
+        width: usize,
+        mut each: impl FnMut(&[u8]) -> Result<ControlFlow<()>>,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let outcome = (|| {
+            let body = format!("{sql}\nFORMAT RowBinary");
+            let response = self.post(&[("max_query_size", "67108864")], body.as_bytes(), sql)?;
+            let mut reader = BufReader::with_capacity(1 << 20, response.into_body().into_reader());
+            let mut row = vec![0u8; width];
+            loop {
+                let mut filled = 0;
+                while filled < width {
+                    let read = std::io::Read::read(&mut reader, &mut row[filled..])
+                        .map_err(|e| unavailable(&self.shown, sql, &e.to_string()))?;
+                    if read == 0 {
+                        break;
+                    }
+                    filled += read;
+                }
+                if filled == 0 {
+                    return Ok(());
+                }
+                if filled < width {
+                    let tail = String::from_utf8_lossy(&row[..filled]).into_owned();
+                    return Err(unavailable(
+                        &self.shown,
+                        sql,
+                        &format!("the answer ended partway through a row: {tail}"),
+                    ));
+                }
+                if each(&row)?.is_break() {
+                    return Ok(());
+                }
+            }
+        })();
+        self.stats.record(Operation::Query, started, &outcome);
+        outcome
+    }
+
     fn read_lines(
         &self,
         sql: &str,
@@ -290,6 +343,8 @@ impl Client {
             &[
                 ("output_format_json_quote_64bit_integers", "0"),
                 ("output_format_json_quote_64bit_floats", "0"),
+                // A query naming every series it reads is long.
+                ("max_query_size", "67108864"),
             ],
             body.as_bytes(),
             sql,

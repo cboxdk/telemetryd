@@ -13,12 +13,15 @@
 
 mod client;
 pub mod logs;
+pub mod metrics;
+pub mod metrics_schema;
 mod scan;
 pub mod schema;
 pub(crate) mod sql;
 
 pub use client::{Client, Operation, Stats, StatsSnapshot};
 pub use logs::ClickHouseLogs;
+pub use metrics::ClickHouseMetrics;
 
 use telemetryd_core::Result;
 use telemetryd_core::config::ClickHouseConfig;
@@ -28,6 +31,7 @@ use telemetryd_core::config::ClickHouseConfig;
 pub struct ClickHouse {
     client: Client,
     pub logs: ClickHouseLogs,
+    pub metrics: ClickHouseMetrics,
 }
 
 impl ClickHouse {
@@ -43,6 +47,7 @@ impl ClickHouse {
         }
         Ok(Self {
             logs: ClickHouseLogs::new(client.clone()),
+            metrics: ClickHouseMetrics::new(client.clone()),
             client,
         })
     }

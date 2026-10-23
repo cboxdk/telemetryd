@@ -705,7 +705,7 @@ fn metrics(
             // Not a chart and not a range query: the names that exist, and the newest
             // sample of each. That is the whole "is it arriving" question for a metric,
             // and a graph is `laravel-telemetry-ui`'s job.
-            let names = store.metrics().label_values(
+            let names = store.metric_store().label_values(
                 telemetryd_core::metric::METRIC_NAME_LABEL,
                 start,
                 end,
@@ -716,7 +716,7 @@ fn metrics(
                     continue;
                 }
                 let response = telemetryd_query::prometheus::instant(
-                    store.metrics(),
+                    store.metric_store(),
                     &telemetryd_query::prometheus::InstantParams {
                         query: Some(name.clone()),
                         time: None,
