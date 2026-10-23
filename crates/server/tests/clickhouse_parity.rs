@@ -23,28 +23,12 @@ use telemetryd_server::{AppState, router};
 use telemetryd_store::Store;
 use tower::ServiceExt;
 
+mod common;
+use common::clickhouse_under_test;
+
 /// A fixed hour, so both stores hold the same timestamps and every query names them.
 const BASE: u64 = 1_790_000_000_000_000_000;
 const SECOND: u64 = 1_000_000_000;
-
-fn clickhouse() -> Option<ClickHouseConfig> {
-    let raw = std::env::var("TELEMETRYD_TEST_CLICKHOUSE_URL").ok()?;
-    let (scheme, rest) = raw.split_once("://").unwrap();
-    let (credentials, host) = rest.rsplit_once('@').unwrap_or(("default:", rest));
-    let (user, password) = credentials.split_once(':').unwrap_or((credentials, ""));
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    Some(ClickHouseConfig {
-        url: format!("{scheme}://{host}"),
-        database: format!("td_test_parity_{unique}"),
-        user: user.to_owned(),
-        password: telemetryd_core::Secret::new(password),
-        retention_days: 3_650,
-        ..ClickHouseConfig::default()
-    })
-}
 
 fn instance(dir: &std::path::Path, clickhouse: ClickHouseConfig) -> axum::Router {
     let config = Config {
@@ -53,6 +37,7 @@ fn instance(dir: &std::path::Path, clickhouse: ClickHouseConfig) -> axum::Router
             ..StorageConfig::default()
         },
         clickhouse,
+        retention: common::long_retention(),
         ..Config::default()
     };
     config.validate().unwrap();
@@ -218,7 +203,7 @@ fn urlencode(raw: &str) -> String {
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn clickhouse_answers_as_the_local_store_does() {
-    let Some(clickhouse) = clickhouse() else {
+    let Some(clickhouse) = clickhouse_under_test("parity") else {
         eprintln!("TELEMETRYD_TEST_CLICKHOUSE_URL is not set; skipped");
         return;
     };
@@ -331,6 +316,25 @@ async fn clickhouse_answers_as_the_local_store_does() {
                 ("query", query.to_owned()),
                 ("start", split_start.clone()),
                 ("end", split_end.clone()),
+                ("step", step.to_owned()),
+            ],
+        ));
+    }
+
+    // Bounds on whole minutes: the minute rollup alone answers.
+    for (query, step) in [
+        (
+            r#"sum by (level) (count_over_time({app=~".+"}[5m]))"#,
+            "300",
+        ),
+        (r#"sum(bytes_over_time({app="api"}[2m]))"#, "120"),
+    ] {
+        cases.push((
+            "query_range",
+            vec![
+                ("query", query.to_owned()),
+                ("start", (BASE + 300 * SECOND).to_string()),
+                ("end", (BASE + 600 * SECOND).to_string()),
                 ("step", step.to_owned()),
             ],
         ));

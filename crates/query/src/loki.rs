@@ -551,7 +551,7 @@ pub(crate) type Prefilter =
 
 /// The query's line filters on the stored body, for a store that selects with them
 /// itself — what [`build_line_prefilter`] is for the local one.
-pub(crate) fn body_filters(query: &LogQuery) -> Vec<telemetryd_store::BodyFilter> {
+pub fn body_filters(query: &LogQuery) -> Vec<telemetryd_store::BodyFilter> {
     query
         .raw_line_filters()
         .filter_map(|filter| {

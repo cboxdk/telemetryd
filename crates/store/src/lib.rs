@@ -39,7 +39,10 @@ use telemetryd_core::span::SpanRecord;
 use crate::schema::RecordSchema;
 use telemetryd_core::{Labels, LogRecord, Result, Signal};
 
-pub use backend::{BodyFilter, BucketRequest, Buckets, LogStore, RecordFilter};
+pub use backend::{
+    BodyFilter, BucketRequest, Buckets, LogStore, RecordFilter, SpanCondition, SpanField, SpanOp,
+    SpanStore, SpanValue,
+};
 pub use cardinality::{Admission, Admitted, Cardinality};
 pub use datadir::{DataDir, DiskUsage};
 pub use logs::LogSchema;
@@ -122,7 +125,10 @@ impl Store {
         // Before anything is opened: a ClickHouse that cannot be reached or refuses the
         // schema is a startup error, not a first failed request.
         let clickhouse = if config.clickhouse.is_enabled() {
-            Some(clickhouse::ClickHouse::open(&config.clickhouse)?)
+            Some(clickhouse::ClickHouse::open(
+                &config.clickhouse,
+                &config.retention,
+            )?)
         } else {
             None
         };
@@ -217,10 +223,21 @@ impl Store {
         &self.traces
     }
 
+    /// Spans, wherever they are kept: what the query engines read.
+    pub fn span_store(&self) -> &dyn SpanStore {
+        match &self.clickhouse {
+            Some(clickhouse) => &clickhouse.spans,
+            None => &self.traces,
+        }
+    }
+
     /// Append trace spans. Durable before this returns.
     pub fn append_spans(&self, records: &[SpanRecord]) -> Result<Admitted> {
         self.append_within_limits(records, SpanSchema::index_labels, |kept| {
-            self.traces.append(kept)
+            match &self.clickhouse {
+                Some(clickhouse) => clickhouse.spans.append(kept),
+                None => self.traces.append(kept),
+            }
         })
     }
 
@@ -616,6 +633,14 @@ impl Store {
                 ));
             }
         }
+        // The tables age by the same retention, so they change with it — and a
+        // retention a ClickHouse refuses is reported, not taken as applied.
+        if let Some(clickhouse) = &self.clickhouse
+            && changes.iter().any(|c| c.starts_with("retention."))
+            && let Err(error) = clickhouse.apply_retention(&config.clickhouse, &config.retention)
+        {
+            changes.push(format!("ClickHouse TTLs not changed: {error}"));
+        }
         policy.retention = config.retention.clone();
 
         changes
@@ -635,6 +660,12 @@ impl Store {
     /// to fix that short of one segment per app.
     #[must_use]
     pub fn app_usage(&self) -> Vec<AppUsage> {
+        if let Some(clickhouse) = &self.clickhouse {
+            return clickhouse.app_usage().unwrap_or_else(|error| {
+                tracing::warn!(%error, "could not read what each app holds from ClickHouse");
+                Vec::new()
+            });
+        }
         let mut apps: BTreeMap<String, AppUsage> = BTreeMap::new();
 
         for (signal, segments) in [

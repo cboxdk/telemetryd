@@ -31,11 +31,7 @@
 //! samples in `(k·width, (k+1)·width]`, so a window whose bounds fall on bucket bounds
 //! is exactly the buckets inside it.
 
-use std::time::Duration;
-
-use telemetryd_core::config::ClickHouseConfig;
-
-use super::schema::Engine;
+use super::schema::Layout;
 
 pub const INGEST: &str = "telemetryd_metrics_ingest";
 pub const SAMPLES: &str = "telemetryd_samples";
@@ -68,35 +64,14 @@ pub fn bucket_of(nanos: u64, width: u64) -> u64 {
     nanos.saturating_sub(1) / width
 }
 
-/// `TTL` for a table whose rows age by `time`, after `retention`.
-fn ttl(time: &str, retention: Duration) -> String {
-    format!(
-        "TTL {time} + INTERVAL {} SECOND",
-        retention.as_secs().max(1)
-    )
-}
-
-const SETTINGS: &str = "SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1";
-
-/// What each table's rows age by, for its `TTL`.
-fn aged_tables() -> [(&'static str, &'static str); 4] {
-    [
-        (SAMPLES, "toDateTime(Timestamp)"),
-        (SERIES, "toDateTime(Day)"),
-        (COUNTS, "toDateTime(toUInt64(Hour) * 3600)"),
-        (FOLDS, "toDateTime(Starts)"),
-    ]
-}
-
 /// Every statement, in the order they must run, keeping `retention` of metrics.
 #[must_use]
-pub fn statements(config: &ClickHouseConfig, retention: Duration) -> Vec<String> {
-    let engine = Engine {
-        cluster: config.cluster.trim(),
-    };
+pub(super) fn statements(layout: &Layout<'_>) -> Vec<String> {
+    let engine = layout;
     let on = engine.on_cluster();
-    let [samples_ttl, series_ttl, counts_ttl, folds_ttl] =
-        aged_tables().map(|(_, time)| ttl(time, retention));
+    let (samples_ttl, series_ttl) = (layout.aging(SAMPLES), layout.aging(SERIES));
+    let (counts_ttl, folds_ttl) = (layout.aging(COUNTS), layout.aging(FOLDS));
+    let settings = layout.settings();
     vec![
         format!(
             "CREATE TABLE IF NOT EXISTS {INGEST}{on} (
@@ -121,7 +96,7 @@ pub fn statements(config: &ClickHouseConfig, retention: Duration) -> Vec<String>
 PARTITION BY toDate(Timestamp)
 ORDER BY (MetricName, SeriesHash, Timestamp)
 {samples_ttl}
-{SETTINGS}",
+{settings}",
             engine.engine(SAMPLES, "MergeTree")
         ),
         format!(
@@ -143,7 +118,7 @@ FROM {INGEST}"
 PARTITION BY Day
 ORDER BY (MetricName, Day, SeriesHash)
 {series_ttl}
-{SETTINGS}",
+{settings}",
             engine.engine(SERIES, "AggregatingMergeTree")
         ),
         format!(
@@ -162,13 +137,14 @@ GROUP BY Day, MetricName, ServiceName, SeriesHash"
         ),
     ]
     .into_iter()
-    .chain(summaries(&engine, &counts_ttl, &folds_ttl))
+    .chain(summaries(engine, &counts_ttl, &folds_ttl))
     .collect()
 }
 
 /// The sample counts and the summaries checked against them.
-fn summaries(engine: &Engine<'_>, counts_ttl: &str, folds_ttl: &str) -> Vec<String> {
+fn summaries(engine: &Layout<'_>, counts_ttl: &str, folds_ttl: &str) -> Vec<String> {
     let on = engine.on_cluster();
+    let settings = engine.settings();
     vec![
         format!(
             "CREATE TABLE IF NOT EXISTS {COUNTS}{on} (
@@ -180,7 +156,7 @@ fn summaries(engine: &Engine<'_>, counts_ttl: &str, folds_ttl: &str) -> Vec<Stri
 PARTITION BY intDiv(Hour, 24 * 30)
 ORDER BY (MetricName, Hour, SeriesHash)
 {counts_ttl}
-{SETTINGS}",
+{settings}",
             engine.engine(COUNTS, "AggregatingMergeTree")
         ),
         format!(
@@ -215,7 +191,7 @@ GROUP BY MetricName, Hour, SeriesHash"
 PARTITION BY (Tier, toYYYYMM(Starts))
 ORDER BY (MetricName, Tier, Bucket, SeriesHash)
 {folds_ttl}
-{SETTINGS}",
+{settings}",
             versioned(&engine.engine(FOLDS, "ReplacingMergeTree"))
         ),
     ]
@@ -231,24 +207,4 @@ fn versioned(engine: &str) -> String {
             None => engine.to_owned(),
         },
     }
-}
-
-/// The `TTL` of every metric table set to `retention`, for a retention changed after the
-/// tables were made. Not applied to parts already written until they merge, so it costs
-/// nothing at the moment it runs.
-#[must_use]
-pub fn ttl_statements(config: &ClickHouseConfig, retention: Duration) -> Vec<String> {
-    let on = Engine {
-        cluster: config.cluster.trim(),
-    }
-    .on_cluster();
-    aged_tables()
-        .into_iter()
-        .map(|(table, time)| {
-            format!(
-                "ALTER TABLE {table}{on} MODIFY {} SETTINGS materialize_ttl_after_modify = 0",
-                ttl(time, retention)
-            )
-        })
-        .collect()
 }

@@ -605,6 +605,48 @@ impl TraceQuery {
     pub fn is_empty(&self) -> bool {
         self.conditions.is_empty()
     }
+
+    /// The conditions as data a store can select by. Every span that matches meets
+    /// them; whether one that meets them matches is still [`Self::matches`]'s to say.
+    /// `nestedSetParent` has no stored form and is left out.
+    pub fn pushdown(&self) -> Vec<telemetryd_store::SpanCondition> {
+        use telemetryd_store::{SpanCondition, SpanField, SpanOp, SpanValue};
+        self.conditions
+            .iter()
+            .filter_map(|c| {
+                let field = match &c.field {
+                    Field::Intrinsic(Intrinsic::Name) => SpanField::Name,
+                    Field::Intrinsic(Intrinsic::Status) => SpanField::Status,
+                    Field::Intrinsic(Intrinsic::StatusMessage) => SpanField::StatusMessage,
+                    Field::Intrinsic(Intrinsic::Kind) => SpanField::Kind,
+                    Field::Intrinsic(Intrinsic::Duration) => SpanField::Duration,
+                    Field::Intrinsic(Intrinsic::NestedSetParent) => return None,
+                    Field::Resource(name) => SpanField::Resource(name.clone()),
+                    Field::Span(name) => SpanField::Span(name.clone()),
+                    Field::Unscoped(name) => SpanField::Unscoped(name.clone()),
+                };
+                let op = match c.op {
+                    CompareOp::Equal => SpanOp::Equal,
+                    CompareOp::NotEqual => SpanOp::NotEqual,
+                    CompareOp::Regex => SpanOp::Regex,
+                    CompareOp::NotRegex => SpanOp::NotRegex,
+                    CompareOp::Greater => SpanOp::Greater,
+                    CompareOp::GreaterEqual => SpanOp::GreaterEqual,
+                    CompareOp::Less => SpanOp::Less,
+                    CompareOp::LessEqual => SpanOp::LessEqual,
+                };
+                let value = match &c.value {
+                    Value::Str(text) => SpanValue::Text(text.clone()),
+                    Value::Number(number) => SpanValue::Number(*number),
+                    Value::Duration(nanos) => SpanValue::Nanos(*nanos),
+                    Value::Status(status) => SpanValue::Status(*status),
+                    Value::Kind(kind) => SpanValue::Kind(*kind),
+                    Value::Nil => SpanValue::Nil,
+                };
+                Some(SpanCondition { field, op, value })
+            })
+            .collect()
+    }
 }
 
 impl Field {

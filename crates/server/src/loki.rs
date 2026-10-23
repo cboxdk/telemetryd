@@ -219,7 +219,144 @@ pub async fn tail(
     Ok(upgrade
         .max_message_size(4 * 1024)
         .max_frame_size(4 * 1024)
-        .on_upgrade(move |socket| run_tail(socket, state, std::sync::Arc::new(query), slot)))
+        .on_upgrade(move |socket| async move {
+            let query = std::sync::Arc::new(query);
+            if state.store.logs_in_clickhouse() {
+                let delay = params
+                    .delay_for
+                    .as_deref()
+                    .and_then(|d| d.trim().parse::<u64>().ok())
+                    .unwrap_or(0)
+                    .min(MAX_TAIL_DELAY_SECONDS);
+                run_tail_from_clickhouse(socket, state, query, delay, slot).await;
+            } else {
+                run_tail(socket, state, query, slot).await;
+            }
+        }))
+}
+
+/// How often a tail on ClickHouse asks for lines that arrived since it last asked.
+const POLL_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How far each ask reaches back past the last, in nanoseconds. Lines another instance
+/// accepted become readable once ClickHouse has flushed their batch, and a producer's
+/// clock may run behind: either way a line can turn up with a timestamp older than the
+/// last ask, and this is how much older it may be and still be shown.
+const POLL_OVERLAP: u64 = 10_000_000_000;
+
+/// Lines one ask returns at most. A busier second is read on from where the last ask
+/// stopped, and a tail that falls further behind than [`MAX_TAIL_LAG`] skips ahead and
+/// reports what it skipped as dropped, as Loki's does.
+const POLL_LIMIT: usize = 1_000;
+
+/// How far behind the present a tail may fall before it skips ahead, in nanoseconds.
+const MAX_TAIL_LAG: u64 = 30_000_000_000;
+
+/// Loki's ceiling on `delay_for`.
+const MAX_TAIL_DELAY_SECONDS: u64 = 5;
+
+/// A live tail with ClickHouse as the store: every instance's lines, not only this one's.
+///
+/// The local tail is fed by this process's own ingest, which with several instances
+/// behind one load balancer is a fraction of the lines. This one asks ClickHouse each
+/// second for what matched since it last asked, reaching back [`POLL_OVERLAP`] to catch
+/// lines that landed late, and shows each line once.
+async fn run_tail_from_clickhouse(
+    mut socket: WebSocket,
+    state: AppState,
+    query: std::sync::Arc<logql::LogQuery>,
+    delay_seconds: u64,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+) {
+    use std::hash::{Hash, Hasher};
+
+    state.metrics.incr("telemetryd_tail_connections_total", &[]);
+    let delay = delay_seconds.saturating_mul(1_000_000_000);
+    let mut since = telemetryd_store::now_nanos().saturating_sub(delay);
+    // Set when the last ask filled up: the next starts exactly where it stopped, without
+    // reaching back, or a busy stream would read the same overlap forever.
+    let mut resume: Option<u64> = None;
+    // Lines shown, by identity, with their timestamps: forgotten once older than any ask
+    // can reach.
+    let mut shown: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut ticker = tokio::time::interval(POLL_EVERY);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                    Some(Ok(_)) => {}
+                }
+            }
+            _ = ticker.tick() => {
+                let until = telemetryd_store::now_nanos().saturating_sub(delay);
+                let from = resume.take().unwrap_or_else(|| since.saturating_sub(POLL_OVERLAP));
+                let store = std::sync::Arc::clone(&state.store);
+                let wanted = std::sync::Arc::clone(&query);
+                let read = tokio::task::spawn_blocking(move || {
+                    let body = loki::body_filters(&wanted);
+                    let scan = telemetryd_store::Scan::range(from, until)
+                        .limit(POLL_LIMIT)
+                        .order(telemetryd_store::Order::Ascending)
+                        .body_filters(&body);
+                    store
+                        .log_store()
+                        .scan(scan, &wanted.matchers, &|record| matches_tail(&wanted, record))
+                })
+                .await;
+                let records = match read {
+                    Ok(Ok(records)) => records,
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "a live tail could not read ClickHouse; retrying");
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let full = records.len() >= POLL_LIMIT;
+                let last = records.last().map(|r| r.timestamp_nanos);
+                let mut gone = false;
+                for record in records {
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    record.timestamp_nanos.hash(&mut hasher);
+                    record.stream.fingerprint().hash(&mut hasher);
+                    record.body.hash(&mut hasher);
+                    if shown.insert(hasher.finish(), record.timestamp_nanos).is_some() {
+                        continue;
+                    }
+                    let frame = TailResponse {
+                        streams: vec![TailStream {
+                            stream: tail_labels(&record),
+                            values: vec![serde_json::json!([
+                                record.timestamp_nanos.to_string(),
+                                record.body
+                            ])],
+                        }],
+                        dropped_entries: Vec::new(),
+                    };
+                    let Ok(json) = serde_json::to_string(&frame) else { continue };
+                    if socket.send(Message::Text(json.into())).await.is_err() {
+                        gone = true;
+                        break;
+                    }
+                }
+                if gone {
+                    break;
+                }
+                match last.filter(|_| full) {
+                    Some(last) if until.saturating_sub(last) <= MAX_TAIL_LAG => resume = Some(last),
+                    Some(_) if !report_dropped(&mut socket, &state, 1).await => break,
+                    _ => {}
+                }
+                since = until;
+                let horizon = until.saturating_sub(POLL_OVERLAP);
+                shown.retain(|_, at| *at >= horizon);
+            }
+        }
+    }
+
+    state.metrics.incr("telemetryd_tail_disconnects_total", &[]);
 }
 
 /// How many ingested records a tail filters in one go on the blocking pool.

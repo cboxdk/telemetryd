@@ -141,7 +141,7 @@ pub async fn export(
                 Scanned::Logs(store.log_store().scan(scan, &[], &|_| true)?)
             }
             telemetryd_core::Signal::Traces => {
-                Scanned::Traces(store.traces().scan(scan, &[], &|_| true)?)
+                Scanned::Traces(store.span_store().scan(scan, &[], &|_| true)?)
             }
             telemetryd_core::Signal::Metrics => {
                 Scanned::Metrics(store.metric_store().scan(scan, &[], &|_| true)?)

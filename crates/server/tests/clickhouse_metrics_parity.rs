@@ -11,6 +11,8 @@
 
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -33,22 +35,7 @@ const STEP: u64 = 15 * SECOND;
 const DAY: u64 = 86_400 * SECOND;
 
 fn clickhouse() -> Option<ClickHouseConfig> {
-    let raw = std::env::var("TELEMETRYD_TEST_CLICKHOUSE_URL").ok()?;
-    let (scheme, rest) = raw.split_once("://").unwrap();
-    let (credentials, host) = rest.rsplit_once('@').unwrap_or(("default:", rest));
-    let (user, password) = credentials.split_once(':').unwrap_or((credentials, ""));
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    Some(ClickHouseConfig {
-        url: format!("{scheme}://{host}"),
-        database: format!("td_test_metrics_parity_{unique}"),
-        user: user.to_owned(),
-        password: telemetryd_core::Secret::new(password),
-        retention_days: 3_650,
-        ..ClickHouseConfig::default()
-    })
+    common::clickhouse_under_test("metrics_parity")
 }
 
 fn instance(dir: &std::path::Path, clickhouse: ClickHouseConfig) -> (axum::Router, Arc<Store>) {
@@ -58,6 +45,7 @@ fn instance(dir: &std::path::Path, clickhouse: ClickHouseConfig) -> (axum::Route
             ..StorageConfig::default()
         },
         clickhouse,
+        retention: common::long_retention(),
         ..Config::default()
     };
     config.validate().unwrap();

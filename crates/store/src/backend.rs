@@ -6,10 +6,12 @@
 //! local store's — same records, same order, same limits, same errors — so an answer
 //! does not depend on which one is configured.
 
+use telemetryd_core::span::{SpanKind, SpanRecord, SpanStatus};
 use telemetryd_core::{LabelMatcher, Labels, LogRecord, Result};
 
 use crate::logs::LogSchema;
 use crate::records::{RecordStore, Scan};
+use crate::spans::SpanSchema;
 
 /// A record predicate, applied after the store's own selection.
 pub type RecordFilter<'a, R> = &'a (dyn Fn(&R) -> bool + Sync);
@@ -137,5 +139,111 @@ impl LogStore for RecordStore<LogSchema> {
         matchers: &[LabelMatcher],
     ) -> Result<Vec<Labels>> {
         Self::streams(self, start_nanos, end_nanos, matchers)
+    }
+}
+
+/// What a TraceQL condition reads, as data a store can turn into its own conditions.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpanField {
+    Name,
+    Status,
+    StatusMessage,
+    Kind,
+    Duration,
+    /// `span.x`: the span's attributes, which hold its resource's under `resource.`.
+    Span(String),
+    /// `resource.x`: a stream label, or a resource attribute.
+    Resource(String),
+    /// `.x`: either.
+    Unscoped(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanOp {
+    Equal,
+    NotEqual,
+    Regex,
+    NotRegex,
+    Greater,
+    GreaterEqual,
+    Less,
+    LessEqual,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpanValue {
+    Text(String),
+    Number(f64),
+    Nanos(u64),
+    Status(SpanStatus),
+    Kind(SpanKind),
+    Nil,
+}
+
+/// One condition every span a query wants must meet.
+///
+/// Like a [`BodyFilter`] it is a hint: a store may select by it, too loosely if it must,
+/// and the query's own predicate still decides each span.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpanCondition {
+    pub field: SpanField,
+    pub op: SpanOp,
+    pub value: SpanValue,
+}
+
+/// Spans, as the Tempo API and TraceQL read them.
+pub trait SpanStore: Send + Sync {
+    /// Spans in the scan's range, that `extra` accepts, in its order and within its
+    /// limit. `conditions` are what `extra` requires, for a store that can select by
+    /// them.
+    ///
+    /// # Errors
+    /// As [`RecordStore::scan`].
+    fn scan(
+        &self,
+        request: Scan<'_>,
+        conditions: &[SpanCondition],
+        extra: RecordFilter<'_, SpanRecord>,
+    ) -> Result<Vec<SpanRecord>>;
+
+    /// Every span of one trace, whenever it happened.
+    ///
+    /// # Errors
+    /// When the store cannot be read.
+    fn trace(&self, trace_id: &str) -> Result<Vec<SpanRecord>>;
+
+    /// The spans of these traces within the scan.
+    ///
+    /// # Errors
+    /// As [`Self::scan`].
+    fn of_traces(&self, trace_ids: &[&str], request: Scan<'_>) -> Result<Vec<SpanRecord>>;
+}
+
+impl SpanStore for RecordStore<SpanSchema> {
+    fn scan(
+        &self,
+        request: Scan<'_>,
+        _conditions: &[SpanCondition],
+        extra: RecordFilter<'_, SpanRecord>,
+    ) -> Result<Vec<SpanRecord>> {
+        Self::scan(self, request, &[], extra)
+    }
+
+    fn trace(&self, trace_id: &str) -> Result<Vec<SpanRecord>> {
+        // The whole retention window, but not the whole store: `exact_key` lets each
+        // segment's Bloom filter answer "this trace is definitely not here" without any
+        // I/O.
+        let mut request = Scan::range(0, u64::MAX).exact_key(trace_id);
+        request.order = crate::topk::Order::Ascending;
+        Self::scan(self, request, &[], &|span: &SpanRecord| {
+            span.trace_id == trace_id
+        })
+    }
+
+    fn of_traces(&self, trace_ids: &[&str], request: Scan<'_>) -> Result<Vec<SpanRecord>> {
+        let wanted: std::collections::HashSet<&str> = trace_ids.iter().copied().collect();
+        Self::scan(self, request, &[], &|span: &SpanRecord| {
+            wanted.contains(span.trace_id.as_str())
+        })
     }
 }

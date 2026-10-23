@@ -18,14 +18,16 @@ pub mod metrics;
 pub mod metrics_schema;
 mod scan;
 pub mod schema;
+pub mod spans;
 pub(crate) mod sql;
 
 pub use client::{Client, Operation, Stats, StatsSnapshot};
 pub use logs::ClickHouseLogs;
 pub use metrics::ClickHouseMetrics;
+pub use spans::ClickHouseSpans;
 
 use telemetryd_core::Result;
-use telemetryd_core::config::ClickHouseConfig;
+use telemetryd_core::config::{ClickHouseConfig, RetentionConfig};
 
 /// Everything kept in ClickHouse, behind one connection.
 #[derive(Debug)]
@@ -33,6 +35,7 @@ pub struct ClickHouse {
     client: Client,
     pub logs: ClickHouseLogs,
     pub metrics: ClickHouseMetrics,
+    pub spans: ClickHouseSpans,
 }
 
 impl ClickHouse {
@@ -41,14 +44,15 @@ impl ClickHouse {
     /// # Errors
     /// When the password cannot be resolved or ClickHouse refuses the schema: a startup
     /// error, not a first failed request.
-    pub fn open(config: &ClickHouseConfig) -> Result<Self> {
+    pub fn open(config: &ClickHouseConfig, retention: &RetentionConfig) -> Result<Self> {
         let client = Client::new(config)?;
         if config.create_schema {
-            schema::ensure(&client, config)?;
+            schema::ensure(&client, config, retention)?;
         }
         Ok(Self {
             logs: ClickHouseLogs::new(client.clone()),
             metrics: ClickHouseMetrics::new(client.clone()),
+            spans: ClickHouseSpans::new(client.clone()),
             client,
         })
     }
@@ -56,5 +60,94 @@ impl ClickHouse {
     #[must_use]
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// What each app holds, from the streams summaries: series and rows exact, bytes
+    /// apportioned by each app's share of a table's rows, as the local store does.
+    ///
+    /// # Errors
+    /// When ClickHouse cannot be read.
+    pub fn app_usage(&self) -> Result<Vec<crate::AppUsage>> {
+        use std::collections::BTreeMap;
+        let mut apps: BTreeMap<String, crate::AppUsage> = BTreeMap::new();
+        for (table, summary, hash, rows) in [
+            (schema::LOGS, schema::LOG_STREAMS, "StreamHash", "Rows"),
+            (schema::TRACES, schema::TRACE_STREAMS, "StreamHash", "Rows"),
+            (
+                metrics_schema::SAMPLES,
+                metrics_schema::SERIES,
+                "SeriesHash",
+                "Samples",
+            ),
+        ] {
+            let mut bytes = 0u64;
+            self.client.query_lines(
+                &format!(
+                    "SELECT sum(data_compressed_bytes) AS bytes FROM system.parts \
+                     WHERE active AND database = currentDatabase() AND table = {}",
+                    sql::quote(table)
+                ),
+                |line| {
+                    let value: serde_json::Value = serde_json::from_slice(line).unwrap_or_default();
+                    bytes = value
+                        .get("bytes")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    Ok(std::ops::ControlFlow::Continue(()))
+                },
+            )?;
+            let mut rows_here: Vec<(String, u64, u64)> = Vec::new();
+            self.client.query_lines(
+                &format!(
+                    "SELECT ServiceName AS app, uniqExact({hash}) AS series, sum({rows}) AS rows \
+                     FROM {summary} GROUP BY app"
+                ),
+                |line| {
+                    let value: serde_json::Value = serde_json::from_slice(line).unwrap_or_default();
+                    let number = |n: &str| {
+                        value
+                            .get(n)
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0)
+                    };
+                    let app = value
+                        .get("app")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    rows_here.push((app.to_owned(), number("series"), number("rows")));
+                    Ok(std::ops::ControlFlow::Continue(()))
+                },
+            )?;
+            let total: u64 = rows_here.iter().map(|(_, _, rows)| rows).sum();
+            for (app, series, rows) in rows_here {
+                let usage = apps.entry(app.clone()).or_insert_with(|| crate::AppUsage {
+                    app,
+                    ..crate::AppUsage::default()
+                });
+                usage.series += series;
+                usage.rows += rows;
+                if total > 0 {
+                    usage.estimated_bytes +=
+                        u64::try_from(u128::from(bytes) * u128::from(rows) / u128::from(total))
+                            .unwrap_or(u64::MAX);
+                }
+            }
+        }
+        Ok(apps.into_values().collect())
+    }
+
+    /// Give the tables a changed retention, as a reload does.
+    ///
+    /// # Errors
+    /// When ClickHouse refuses the change.
+    pub fn apply_retention(
+        &self,
+        config: &ClickHouseConfig,
+        retention: &RetentionConfig,
+    ) -> Result<()> {
+        if config.create_schema {
+            schema::apply_ttl(&self.client, config, retention)?;
+        }
+        Ok(())
     }
 }

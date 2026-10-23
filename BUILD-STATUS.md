@@ -632,7 +632,9 @@ Not gaps. These are decisions:
 
 - **Inbound TLS** — terminate at a reverse proxy. *Outbound* TLS is built: the key fetch, relay shipping and transfer all verify against roots compiled into the binary, or the host's store with the `platform-verifier` feature. That distinction was a defect before it was a decision.
 - **Multi-tenancy** — `app` is a query namespace, not a security boundary
-- **Clustering, replication, object-store tiering** — single node is the design
+- **Clustering telemetryd itself** — with ClickHouse as the store, instances share
+  nothing but the database, and replication and tiering to object storage are
+  ClickHouse's (docs/cookbook/scale-out-on-clickhouse.md)
 - **Plugins, relabelling rules, write-path transformations** — shape data in the
   instrumentation
 - **A separate "events" signal** — OpenTelemetry has no such signal. An event is a log

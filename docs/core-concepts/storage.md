@@ -6,6 +6,11 @@ description: "WAL, immutable segments, retention, and exactly what survives a cr
 
 # Storage
 
+Everything on this page is the local store: files in one directory, one instance. With
+`[clickhouse]` set, telemetryd keeps nothing of its own and every instance reads and
+writes one ClickHouse instead — see
+[Scale out on ClickHouse](../cookbook/scale-out-on-clickhouse.md).
+
 ## On disk
 
 ```

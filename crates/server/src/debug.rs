@@ -660,7 +660,7 @@ fn traces(
         {
             let parsed = telemetryd_query::traceql::parse(query)?;
             let response = telemetryd_query::tempo::search(
-                store.traces(),
+                store.span_store(),
                 &telemetryd_query::tempo::SearchRequest {
                     query: parsed,
                     start_nanos: start,

@@ -23,6 +23,7 @@ parquet.workspace = true
 postcard.workspace = true
 zstd.workspace = true
 ureq.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 mimalloc = { workspace = true }

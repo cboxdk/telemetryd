@@ -20,17 +20,44 @@ use telemetryd_server::{AppState, router};
 use telemetryd_store::Store;
 use tower::ServiceExt;
 
+mod common;
+use common::clickhouse_under_test;
+
 #[tokio::test]
 async fn every_query_answers_as_tempo_does() {
-    let doc: Value = serde_json::from_str(include_str!("conformance/tempo.json")).unwrap();
     let tmp = tempfile::tempdir().unwrap();
-    let config = Config {
+    conforms(Config {
         storage: StorageConfig {
             data_dir: Some(tmp.path().join("data")),
             ..StorageConfig::default()
         },
         ..Config::default()
+    })
+    .await;
+}
+
+/// The same answers with ClickHouse as the store; see `common::clickhouse_under_test`.
+#[tokio::test]
+async fn every_query_answers_as_tempo_does_on_clickhouse() {
+    let Some(clickhouse) = clickhouse_under_test("tempo") else {
+        eprintln!("TELEMETRYD_TEST_CLICKHOUSE_URL is not set; skipped");
+        return;
     };
+    let tmp = tempfile::tempdir().unwrap();
+    conforms(Config {
+        storage: StorageConfig {
+            data_dir: Some(tmp.path().join("data")),
+            ..StorageConfig::default()
+        },
+        clickhouse,
+        retention: common::long_retention(),
+        ..Config::default()
+    })
+    .await;
+}
+
+async fn conforms(config: Config) {
+    let doc: Value = serde_json::from_str(include_str!("conformance/tempo.json")).unwrap();
     config.validate().unwrap();
     let store = Arc::new(Store::open(&config).unwrap());
     let app = router(AppState::new(Arc::new(config), store).unwrap());

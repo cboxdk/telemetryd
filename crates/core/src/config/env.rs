@@ -159,8 +159,13 @@ pub(super) const ENV_KEYS: &[(&str, &str)] = &[
         "clickhouse.create_schema",
     ),
     (
-        "TELEMETRYD_CLICKHOUSE_RETENTION_DAYS",
-        "clickhouse.retention_days",
+        "TELEMETRYD_CLICKHOUSE_STORAGE_POLICY",
+        "clickhouse.storage_policy",
+    ),
+    ("TELEMETRYD_CLICKHOUSE_COLD_AFTER", "clickhouse.cold_after"),
+    (
+        "TELEMETRYD_CLICKHOUSE_COLD_VOLUME",
+        "clickhouse.cold_volume",
     ),
     ("TELEMETRYD_CLICKHOUSE_TIMEOUT", "clickhouse.timeout"),
     (

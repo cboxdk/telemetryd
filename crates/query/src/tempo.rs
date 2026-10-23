@@ -13,8 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 use telemetryd_core::span::SpanRecord;
 use telemetryd_core::{Error, Result};
-use telemetryd_store::RecordStore;
-use telemetryd_store::spans::SpanSchema;
+use telemetryd_store::SpanStore;
 
 use crate::traceql::{self, TraceQuery};
 
@@ -455,21 +454,20 @@ fn distinct_spans(mut spans: Vec<SpanRecord>) -> Vec<SpanRecord> {
 /// query need not have matched. They used to come from the matched spans alone, so
 /// `{ span.db.system = "mysql" }` listed every trace under the name and duration of
 /// its database query.
-pub fn search(store: &RecordStore<SpanSchema>, request: &SearchRequest) -> Result<SearchResponse> {
+pub fn search(store: &dyn SpanStore, request: &SearchRequest) -> Result<SearchResponse> {
     let inspected = std::sync::atomic::AtomicU32::new(0);
     let filter = |span: &SpanRecord| {
         inspected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         request.query.matches(span)
     };
     let window = || newest(request.start_nanos, request.end_nanos);
-    let matched = by_trace(store.scan(window(), &[], &filter)?);
+    let matched = by_trace(store.scan(window(), &request.query.pushdown(), &filter)?);
 
     let whole = if matched.is_empty() {
         HashMap::new()
     } else {
-        by_trace(store.scan(window(), &[], &|span: &SpanRecord| {
-            matched.contains_key(&span.trace_id)
-        })?)
+        let ids: Vec<&str> = matched.keys().map(String::as_str).collect();
+        by_trace(store.of_traces(&ids, window())?)
     };
 
     let mut summaries: Vec<(u64, TraceSummary)> = matched
@@ -537,7 +535,7 @@ pub fn search(store: &RecordStore<SpanSchema>, request: &SearchRequest) -> Resul
 /// Returns every span in the trace, grouped by resource, in OTLP shape. The whole
 /// retention window is searched rather than a time range: a trace id is exact, and a
 /// client that has one should not also have to know when it happened.
-pub fn trace(store: &RecordStore<SpanSchema>, trace_id: &str) -> Result<TraceResponse> {
+pub fn trace(store: &dyn SpanStore, trace_id: &str) -> Result<TraceResponse> {
     let wanted = ids::normalize(trace_id, 32).ok_or_else(|| {
         Error::BadRequest(format!(
             "{trace_id:?} is not a trace id: 32 hex digits, fewer with the leading zeros \
@@ -564,21 +562,7 @@ pub fn trace(store: &RecordStore<SpanSchema>, trace_id: &str) -> Result<TraceRes
         // segment's Bloom filter answer "this trace is definitely not here" without any
         // I/O. Without it a trace lookup reads every segment, which is the difference
         // between a millisecond and several seconds on a full disk.
-        spans = store.scan(
-            telemetryd_store::Scan {
-                abort_over: 0,
-                start_nanos: 0,
-                end_nanos: u64::MAX,
-                limit: 0,
-                order: telemetryd_store::Order::Ascending,
-                exact_key: Some(candidate),
-                columns: None,
-                required_text: None,
-                body_filters: &[],
-            },
-            &[],
-            &|span: &SpanRecord| span.trace_id == *candidate,
-        )?;
+        spans = store.trace(candidate)?;
         if !spans.is_empty() {
             break;
         }
@@ -651,11 +635,7 @@ fn to_span_json(span: &SpanRecord) -> SpanJson {
 /// `GET /api/search/tags`
 ///
 /// Both resource labels and span attributes, since TraceQL can filter on either.
-pub fn tags(
-    store: &RecordStore<SpanSchema>,
-    start_nanos: u64,
-    end_nanos: u64,
-) -> Result<TagsResponse> {
+pub fn tags(store: &dyn SpanStore, start_nanos: u64, end_nanos: u64) -> Result<TagsResponse> {
     let scoped = scoped_tags(store, start_nanos, end_nanos)?;
     let mut names: BTreeSet<String> = BTreeSet::new();
     for (_, tags) in scoped {
@@ -673,7 +653,7 @@ pub fn tags(
 /// and autocomplete empty. `scope` narrows the answer to one of `resource`, `span` or
 /// `intrinsic`, as Tempo's does.
 pub fn tags_v2(
-    store: &RecordStore<SpanSchema>,
+    store: &dyn SpanStore,
     start_nanos: u64,
     end_nanos: u64,
     scope: Option<&str>,
@@ -695,7 +675,7 @@ pub fn tags_v2(
 /// Tag names by scope: stream labels are the resource, span attributes are the span,
 /// and the intrinsics every span has.
 fn scoped_tags(
-    store: &RecordStore<SpanSchema>,
+    store: &dyn SpanStore,
     start_nanos: u64,
     end_nanos: u64,
 ) -> Result<Vec<(&'static str, BTreeSet<String>)>> {
@@ -721,7 +701,7 @@ fn scoped_tags(
 
 /// `GET /api/v2/search/tag/{name}/values`
 pub fn tag_values(
-    store: &RecordStore<SpanSchema>,
+    store: &dyn SpanStore,
     tag: &str,
     request: &SearchRequest,
 ) -> Result<TagValuesResponse> {
@@ -737,7 +717,7 @@ pub fn tag_values(
     let mut values: BTreeSet<String> = BTreeSet::new();
     for span in store.scan(
         newest(request.start_nanos, request.end_nanos),
-        &[],
+        &request.query.pushdown(),
         &|span| request.query.matches(span),
     )? {
         match wanted.as_str() {

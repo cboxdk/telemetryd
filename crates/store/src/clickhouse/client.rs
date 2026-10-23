@@ -224,8 +224,16 @@ impl Client {
     /// # Errors
     /// [`Error::Unavailable`] when ClickHouse cannot be reached or refuses it.
     pub fn execute(&self, sql: &str) -> Result<()> {
+        self.execute_with(sql, &[])
+    }
+
+    /// [`Self::execute`], with settings for this statement.
+    ///
+    /// # Errors
+    /// As [`Self::execute`].
+    pub fn execute_with(&self, sql: &str, settings: &[(&str, &str)]) -> Result<()> {
         let started = Instant::now();
-        let outcome = self.post(&[], sql.as_bytes(), sql).map(|_| ());
+        let outcome = self.post(settings, sql.as_bytes(), sql).map(|_| ());
         self.stats.record(Operation::Schema, started, &outcome);
         outcome
     }

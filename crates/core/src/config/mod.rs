@@ -148,6 +148,7 @@ impl Config {
 
     /// Relay mode's own checks, kept out of `validate` so neither grows past reading.
     fn validate_clickhouse(&self) -> Result<()> {
+        const TEN_YEARS: std::time::Duration = std::time::Duration::from_secs(3650 * 86_400);
         if !self.clickhouse.is_enabled() {
             return Ok(());
         }
@@ -157,14 +158,50 @@ impl Config {
                 "clickhouse.url must be the HTTP interface, http:// or https:// (got {url:?})"
             )));
         }
-        // The TTL is `toDateTime(Timestamp) + INTERVAL n DAY`, and `DateTime` ends in
+        // The TTL is `toDateTime(Timestamp) + INTERVAL n SECOND`, and `DateTime` ends in
         // 2106: past that the sum wraps to a date already gone, and ClickHouse drops
-        // every row as it arrives. Ten years is far inside it and far past any need.
-        if !(1..=3650).contains(&self.clickhouse.retention_days) {
-            return Err(Error::Config(format!(
-                "clickhouse.retention_days must be between 1 and 3650 (got {})",
-                self.clickhouse.retention_days
-            )));
+        // every row as it arrives. Ten years is far inside it.
+        for (name, keep) in self.retention.each() {
+            if keep > TEN_YEARS {
+                return Err(Error::Config(format!(
+                    "{name} can be at most 3650d with ClickHouse as the store (got {})",
+                    humantime::format_duration(keep)
+                )));
+            }
+        }
+        let cold = self.clickhouse.cold_after;
+        if !cold.is_zero() {
+            if self.clickhouse.storage_policy.trim().is_empty() {
+                return Err(Error::Config(
+                    "clickhouse.cold_after needs clickhouse.storage_policy: the policy is \
+                     what names the volume rows move to"
+                        .to_owned(),
+                ));
+            }
+            if self.clickhouse.cold_volume.trim().is_empty() {
+                return Err(Error::Config(
+                    "clickhouse.cold_after needs clickhouse.cold_volume".to_owned(),
+                ));
+            }
+            for (name, keep) in self.retention.each() {
+                if name != "retention.metrics" && cold >= keep {
+                    return Err(Error::Config(format!(
+                        "clickhouse.cold_after ({}) is not shorter than {name} ({}), so \
+                         nothing would ever move; shorten it or set it to 0",
+                        humantime::format_duration(cold),
+                        humantime::format_duration(keep)
+                    )));
+                }
+            }
+        }
+        if self.relay.is_enabled() {
+            return Err(Error::Config(
+                "relay.upstream and [clickhouse] are both set. A relay forwards what it \
+                 stores on its own disk; with ClickHouse as the store there is nothing \
+                 local to forward. Send to the instances in front of ClickHouse directly, \
+                 or run the relay without [clickhouse]"
+                    .to_owned(),
+            ));
         }
         Ok(())
     }
@@ -263,6 +300,10 @@ impl Config {
     /// the latter from an hour to five minutes multiplied the bill by twelve.
     #[must_use]
     pub fn memory_notes(&self) -> Vec<String> {
+        // With ClickHouse as the store there are no local segments to hold open.
+        if self.clickhouse.is_enabled() {
+            return Vec::new();
+        }
         let (implied, budget) = crate::config::manifest_memory(self);
         if implied <= budget {
             return Vec::new();

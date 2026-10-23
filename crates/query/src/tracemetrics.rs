@@ -15,8 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use serde::Deserialize;
 use telemetryd_core::span::SpanRecord;
 use telemetryd_core::{Error, Result};
-use telemetryd_store::RecordStore;
-use telemetryd_store::spans::SpanSchema;
+use telemetryd_store::SpanStore;
 
 use crate::traceql::{self, MetricsFunction, MetricsStage, TraceQuery};
 
@@ -164,7 +163,7 @@ pub enum LabelValue {
 ///
 /// # Errors
 /// A `400` for more than [`MAX_SERIES`] series; storage errors as they come.
-pub fn evaluate(store: &RecordStore<SpanSchema>, request: &MetricsRequest) -> Result<Vec<Series>> {
+pub fn evaluate(store: &dyn SpanStore, request: &MetricsRequest) -> Result<Vec<Series>> {
     let stage = request.stage();
     let steps = request.steps();
     let per_series = steps.saturating_mul(stage.quantiles.len().max(1));
@@ -226,7 +225,7 @@ pub fn evaluate(store: &RecordStore<SpanSchema>, request: &MetricsRequest) -> Re
         false
     };
     let scan = telemetryd_store::Scan::range(request.start_nanos, request.end_nanos - 1);
-    store.scan(scan, &[], &visit)?;
+    store.scan(scan, &request.query.pushdown(), &visit)?;
     // Given back, not dropped: `Mutex` has no `Drop` on Linux, so clippy there calls a
     // drop pointless, while on macOS the borrow would outlive it without one.
     let _ = gathered.into_inner();

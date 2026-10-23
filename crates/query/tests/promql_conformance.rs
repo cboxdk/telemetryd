@@ -151,8 +151,15 @@ fn every_expression_answers_as_prometheus_does_on_clickhouse() {
         database: format!("td_test_metrics_promql_{unique}"),
         user: user.to_owned(),
         password: telemetryd_core::Secret::new(password),
-        retention_days: 3_650,
         ..telemetryd_core::config::ClickHouseConfig::default()
+    };
+    // The corpus is dated; a shorter retention would have ClickHouse drop it on insert.
+    let ten_years =
+        telemetryd_core::config::DurationSetting(std::time::Duration::from_secs(3650 * 86_400));
+    config.retention = telemetryd_core::config::RetentionConfig {
+        logs: ten_years,
+        traces: ten_years,
+        metrics: ten_years,
     };
     let store = Store::open(&config).unwrap();
     store.append_samples(&samples).unwrap();

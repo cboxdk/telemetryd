@@ -17,6 +17,8 @@ use telemetryd_server::{AppState, router};
 use telemetryd_store::Store;
 use tokio_tungstenite::tungstenite::Message;
 
+mod common;
+
 const NOW: u64 = 1_750_000_000_000_000_000;
 
 struct Server {
@@ -58,12 +60,17 @@ mod reqwest_lite {
 
 impl Server {
     async fn start() -> Self {
+        Self::start_with(telemetryd_core::config::ClickHouseConfig::default()).await
+    }
+
+    async fn start_with(clickhouse: telemetryd_core::config::ClickHouseConfig) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let config = Config {
             storage: StorageConfig {
                 data_dir: Some(tmp.path().join("data")),
                 ..StorageConfig::default()
             },
+            clickhouse,
             ..Config::default()
         };
         let store = Arc::new(Store::open(&config).unwrap());
@@ -326,4 +333,51 @@ async fn tails_past_the_cap_are_refused() {
     let (socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     drop(socket);
     server.stop().await;
+}
+
+/// With ClickHouse as the store, a tail on one instance shows lines another accepted:
+/// behind a load balancer, which instance a sender reached is chance.
+#[tokio::test]
+async fn a_tail_on_clickhouse_sees_what_another_instance_accepted() {
+    let Some(clickhouse) = common::clickhouse_under_test("tail") else {
+        eprintln!("TELEMETRYD_TEST_CLICKHOUSE_URL is not set; skipped");
+        return;
+    };
+    let watching = Server::start_with(clickhouse.clone()).await;
+    let writing = Server::start_with(clickhouse).await;
+    let mut socket = watching.connect_tail(r#"{app="checkout"} |= "paid""#).await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let mut payload = otlp("order 7 paid", "info");
+    payload["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["timeUnixNano"] =
+        json!(now.to_string());
+    writing.post_logs(&payload).await;
+    let mut skipped = otlp("order 8 refunded", "info");
+    skipped["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["timeUnixNano"] =
+        json!((now + 1).to_string());
+    writing.post_logs(&skipped).await;
+
+    let frame = tokio::time::timeout(Duration::from_secs(10), socket.next())
+        .await
+        .expect("a line within the poll interval")
+        .unwrap()
+        .unwrap();
+    let Message::Text(text) = frame else {
+        panic!("expected a text frame, got {frame:?}");
+    };
+    let value: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["streams"][0]["values"][0][1], "order 7 paid");
+    // Shown once, though every later ask reaches back over it.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), socket.next())
+            .await
+            .is_err(),
+        "the line came twice, or the filtered one came through"
+    );
+    drop(socket);
+    watching.stop().await;
+    writing.stop().await;
 }
