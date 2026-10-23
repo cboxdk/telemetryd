@@ -640,7 +640,11 @@ impl Store {
             && changes.iter().any(|c| c.starts_with("retention."))
             && let Err(error) = clickhouse.apply_retention(&config.clickhouse, &config.retention)
         {
-            changes.push(format!("ClickHouse TTLs not changed: {error}"));
+            tracing::error!(
+                %error,
+                "retention changed, but ClickHouse refused the new TTLs; its tables keep the old ones"
+            );
+            changes.push(format!("ClickHouse TTLs NOT changed: {error}"));
         }
         policy.retention = config.retention.clone();
 

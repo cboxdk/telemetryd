@@ -514,6 +514,51 @@ GROUP BY TraceId"
     statements
 }
 
+/// Every table and view the statements create, by name, in order: what a database whose
+/// schema someone else manages must hold.
+#[must_use]
+pub fn objects(config: &ClickHouseConfig, retention: &RetentionConfig) -> Vec<String> {
+    statements(config, retention)
+        .iter()
+        .filter_map(|statement| {
+            let rest = statement
+                .strip_prefix("CREATE TABLE IF NOT EXISTS ")
+                .or_else(|| statement.strip_prefix("CREATE MATERIALIZED VIEW IF NOT EXISTS "))?;
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect()
+}
+
+/// Which of [`objects`] the configured database does not have.
+///
+/// # Errors
+/// When ClickHouse cannot be read.
+pub fn missing(
+    client: &Client,
+    config: &ClickHouseConfig,
+    retention: &RetentionConfig,
+) -> Result<Vec<String>> {
+    let mut present = std::collections::BTreeSet::new();
+    client.query_lines(
+        "SELECT name FROM system.tables WHERE database = currentDatabase()",
+        |line| {
+            let value: serde_json::Value = serde_json::from_slice(line).unwrap_or_default();
+            if let Some(name) = value.get("name").and_then(serde_json::Value::as_str) {
+                present.insert(name.to_owned());
+            }
+            Ok(std::ops::ControlFlow::Continue(()))
+        },
+    )?;
+    Ok(objects(config, retention)
+        .into_iter()
+        .filter(|name| !present.contains(name))
+        .collect())
+}
+
 /// Create whatever is missing, give every table the TTL the configuration asks for, and
 /// record from when each rollup is complete.
 ///

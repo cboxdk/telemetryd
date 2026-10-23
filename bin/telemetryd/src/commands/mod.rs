@@ -1,4 +1,5 @@
 pub mod bench;
+pub mod clickhouse;
 pub mod init;
 pub mod local_token;
 pub mod query;

@@ -167,6 +167,10 @@ pub(super) const ENV_KEYS: &[(&str, &str)] = &[
         "TELEMETRYD_CLICKHOUSE_COLD_VOLUME",
         "clickhouse.cold_volume",
     ),
+    (
+        "TELEMETRYD_CLICKHOUSE_ALLOW_PLAINTEXT",
+        "clickhouse.allow_plaintext",
+    ),
     ("TELEMETRYD_CLICKHOUSE_TIMEOUT", "clickhouse.timeout"),
     (
         "TELEMETRYD_SERVER_TLS_SELF_SIGNED",

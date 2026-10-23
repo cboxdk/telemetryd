@@ -65,13 +65,16 @@ pub struct ClickHouseConfig {
     /// Needed for `cold_after`: it names the volumes rows move between. Applies when a
     /// table is created; ClickHouse cannot move an existing table to another policy.
     pub storage_policy: String,
-    /// Move logs and spans this old to `cold_volume` — object storage or slower disks,
+    /// Move logs, spans and metric samples this old to `cold_volume` — object storage or slower disks,
     /// still queryable — and keep them there until `retention.*` deletes them. Zero =
     /// never: everything stays on the policy's first volume.
     #[serde(with = "humantime_serde")]
     pub cold_after: Duration,
     /// The volume of `storage_policy` that `cold_after` moves rows to.
     pub cold_volume: String,
+    /// Allow `http://` to a ClickHouse on another machine, sending the password and every
+    /// record unencrypted. For a network you trust; `https://` otherwise.
+    pub allow_plaintext: bool,
     /// How long one request to ClickHouse may take.
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
@@ -89,6 +92,7 @@ impl Default for ClickHouseConfig {
             storage_policy: String::new(),
             cold_after: Duration::ZERO,
             cold_volume: "cold".to_owned(),
+            allow_plaintext: false,
             timeout: Duration::from_secs(30),
         }
     }

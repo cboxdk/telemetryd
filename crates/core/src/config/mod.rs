@@ -146,16 +146,42 @@ impl Config {
         })
     }
 
-    /// Relay mode's own checks, kept out of `validate` so neither grows past reading.
+    /// `[clickhouse]`'s own checks: a URL that keeps the password and the telemetry off
+    /// the wire in clear, a retention the TTL can express, tiers that can move rows.
     fn validate_clickhouse(&self) -> Result<()> {
         const TEN_YEARS: std::time::Duration = std::time::Duration::from_secs(3650 * 86_400);
         if !self.clickhouse.is_enabled() {
             return Ok(());
         }
         let url = self.clickhouse.url.trim();
+        let shown = crate::http::redact_url(url);
         if !url.starts_with("http://") && !url.starts_with("https://") {
             return Err(Error::Config(format!(
-                "clickhouse.url must be the HTTP interface, http:// or https:// (got {url:?})"
+                "clickhouse.url must be the HTTP interface, http:// or https:// (got {shown:?})"
+            )));
+        }
+        // Credentials go in their own keys: in the URL they would be shown wherever the
+        // URL is, and ClickHouse refuses a request that carries them twice.
+        let authority = url.split_once("://").map_or("", |(_, rest)| {
+            rest.split(['/', '?', '#']).next().unwrap_or("")
+        });
+        if authority.contains('@') || url.contains('?') {
+            return Err(Error::Config(format!(
+                "clickhouse.url carries credentials or parameters ({shown:?}); give the \
+                 server only, and the account as clickhouse.user and clickhouse.password"
+            )));
+        }
+        // The same rule as relay.upstream: every request carries the password, and every
+        // write the telemetry, so off this machine they go encrypted unless an operator
+        // says otherwise.
+        if url.starts_with("http://")
+            && !crate::http::is_loopback_url(url)
+            && !self.clickhouse.allow_plaintext
+        {
+            return Err(Error::Config(format!(
+                "clickhouse.url is plain http to another machine ({shown:?}), which sends the \
+                 password and every record in cleartext. Use https://, or set \
+                 clickhouse.allow_plaintext = true for a network you trust"
             )));
         }
         // The TTL is `toDateTime(Timestamp) + INTERVAL n SECOND`, and `DateTime` ends in
@@ -184,7 +210,7 @@ impl Config {
                 ));
             }
             for (name, keep) in self.retention.each() {
-                if name != "retention.metrics" && cold >= keep {
+                if cold >= keep {
                     return Err(Error::Config(format!(
                         "clickhouse.cold_after ({}) is not shorter than {name} ({}), so \
                          nothing would ever move; shorten it or set it to 0",
@@ -206,6 +232,7 @@ impl Config {
         Ok(())
     }
 
+    /// Relay mode's own checks, kept out of `validate` so neither grows past reading.
     fn validate_relay(&self) -> Result<()> {
         if !self.relay.is_enabled() {
             return Ok(());

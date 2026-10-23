@@ -84,6 +84,13 @@ enum Command {
     /// Check a configuration and show where every value came from.
     Validate(ConfigArgs),
 
+    /// With ClickHouse as the store: print its schema, or check the account can use it.
+    #[command(name = "clickhouse")]
+    ClickHouse {
+        #[command(subcommand)]
+        action: commands::clickhouse::ClickHouseAction,
+    },
+
     /// Write a configuration with generated tokens, ready for `service install`.
     Init(commands::init::InitArgs),
 
@@ -133,15 +140,15 @@ struct ServeArgs {
 }
 
 #[derive(Debug, Args, Clone)]
-struct ConfigArgs {
+pub(crate) struct ConfigArgs {
     /// Path to telemetryd.toml. Discovered automatically when omitted.
     #[arg(long, short, value_name = "PATH")]
-    config: Option<PathBuf>,
+    pub(crate) config: Option<PathBuf>,
 
     /// Where to store data. Defaults to ./telemetryd-data if it exists, else the
     /// platform data directory.
     #[arg(long, value_name = "DIR")]
-    data_dir: Option<PathBuf>,
+    pub(crate) data_dir: Option<PathBuf>,
 }
 
 impl ServeArgs {
@@ -197,6 +204,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Validate(args) => {
             commands::validate::run(args.config.as_deref(), args.data_dir.as_deref())
         }
+        Command::ClickHouse { action } => commands::clickhouse::run(&action),
         Command::Init(args) => commands::init::run(&args),
         Command::Service { action } => commands::service::run(&action),
         Command::Version { check } => {

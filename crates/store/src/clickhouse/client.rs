@@ -80,13 +80,9 @@ impl Stats {
             Ok(()) => {
                 self.succeeded[i].fetch_add(1, Ordering::Relaxed);
             }
-            Err(error) => {
+            // What went wrong is kept where it happened, in full; see `Client::failed`.
+            Err(_) => {
                 self.failed[i].fetch_add(1, Ordering::Relaxed);
-                *self
-                    .last_error
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some((std::time::SystemTime::now(), error.to_string()));
             }
         }
     }
@@ -96,9 +92,20 @@ impl Stats {
     }
 }
 
+/// How long a readiness answer is reused: a probe every second from every load
+/// balancer should not be a request to ClickHouse each.
+const PING_REUSE: Duration = Duration::from_secs(1);
+
+/// A readiness answer and when it was had.
+type Readiness = (Instant, std::result::Result<(), String>);
+
 /// A connection to one ClickHouse endpoint, as configured.
+///
+/// One `ureq` agent behind every clone, so connections — and their TLS sessions — are
+/// kept and reused across requests rather than made for each.
 #[derive(Clone)]
 pub struct Client {
+    agent: ureq::Agent,
     url: String,
     shown: String,
     database: String,
@@ -106,6 +113,8 @@ pub struct Client {
     password: String,
     timeout: Duration,
     stats: Arc<Stats>,
+    /// The last readiness answer and when it was had.
+    readiness: Arc<Mutex<Option<Readiness>>>,
 }
 
 impl std::fmt::Debug for Client {
@@ -123,7 +132,18 @@ impl Client {
     /// When the password names a secret that cannot be read.
     pub fn new(config: &ClickHouseConfig) -> Result<Self> {
         let url = config.url.trim().trim_end_matches('/').to_owned();
+        // No redirects: one to `http://` would send the password in cleartext, and one
+        // to another host would send it somewhere nobody configured.
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .tls_config(telemetryd_core::http::tls())
+            .timeout_connect(Some(CONNECT_TIMEOUT))
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build()
+            .into();
         Ok(Self {
+            agent,
+            readiness: Arc::new(Mutex::new(None)),
             shown: telemetryd_core::http::redact_url(&url),
             url: format!("{url}/"),
             database: config.database.clone(),
@@ -180,29 +200,52 @@ impl Client {
         }
     }
 
-    /// Whether ClickHouse answers at all, within [`PING_TIMEOUT`]: what readiness asks.
+    /// Whether this instance can use ClickHouse right now: what readiness asks.
+    ///
+    /// A query, not ClickHouse's `/ping`, which answers without credentials or a
+    /// database: an instance with the wrong password, or a database nobody created,
+    /// would be ready by it and refuse every write. Within [`PING_TIMEOUT`], and reused
+    /// for [`PING_REUSE`].
     ///
     /// # Errors
-    /// [`Error::Unavailable`], naming what went wrong.
+    /// [`Error::Unavailable`], saying no more than that ClickHouse is not usable; the
+    /// reason is logged and kept in `/status`.
     pub fn ping(&self) -> Result<()> {
-        let mut response = ureq::get(&format!("{}ping", self.url))
-            .config()
-            .tls_config(telemetryd_core::http::tls())
-            .timeout_global(Some(PING_TIMEOUT))
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .build()
-            .call()
-            .map_err(|e| unavailable(&self.shown, "ping", &e.to_string()))?;
-        if response.status().is_success() {
-            return Ok(());
+        let mut held = self
+            .readiness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((at, answer)) = held.as_ref()
+            && at.elapsed() < PING_REUSE
+        {
+            return answer.clone().map_err(Error::Unavailable);
         }
-        let body = response.body_mut().read_to_string().unwrap_or_default();
-        Err(unavailable(
-            &self.shown,
-            "ping",
-            &format!("HTTP {}: {}", response.status().as_u16(), body.trim()),
-        ))
+        let answer = self
+            .request(
+                &[("readonly", "2")],
+                b"SELECT 1",
+                "readiness",
+                Some(PING_TIMEOUT),
+            )
+            .map(|_| ())
+            .map_err(|failure| {
+                tracing::warn!(%failure, "ClickHouse is not usable; not ready");
+                "ClickHouse is not answering this instance's queries; its log says why".to_owned()
+            });
+        *held = Some((Instant::now(), answer.clone()));
+        answer.map_err(Error::Unavailable)
+    }
+
+    /// Run a read and discard its answer, failing with everything ClickHouse said: for
+    /// an operator's check, not for a client.
+    ///
+    /// # Errors
+    /// [`Error::Unavailable`], in full.
+    pub fn probe(&self, sql: &str) -> Result<()> {
+        let settings = self.read_settings();
+        self.request(&settings, sql.as_bytes(), sql, None)
+            .map(|_| ())
+            .map_err(Failure::detailed)
     }
 
     /// The same connection, naming another database.
@@ -233,7 +276,12 @@ impl Client {
     /// As [`Self::execute`].
     pub fn execute_with(&self, sql: &str, settings: &[(&str, &str)]) -> Result<()> {
         let started = Instant::now();
-        let outcome = self.post(settings, sql.as_bytes(), sql).map(|_| ());
+        // An operator's statement, at startup or reload: what ClickHouse said is theirs
+        // to read in full.
+        let outcome = self
+            .request(settings, sql.as_bytes(), sql, None)
+            .map(|_| ())
+            .map_err(Failure::detailed);
         self.stats.record(Operation::Schema, started, &outcome);
         outcome
     }
@@ -256,7 +304,7 @@ impl Client {
             .bytes_sent
             .fetch_add(rows.len() as u64, Ordering::Relaxed);
         let outcome = self
-            .post(
+            .request(
                 &[
                     ("query", sql.as_str()),
                     ("async_insert", "1"),
@@ -265,8 +313,10 @@ impl Client {
                 ],
                 rows,
                 &sql,
+                None,
             )
-            .map(|_| ());
+            .map(|_| ())
+            .map_err(Failure::brief);
         self.stats.record(Operation::Insert, started, &outcome);
         outcome
     }
@@ -283,8 +333,9 @@ impl Client {
             .bytes_sent
             .fetch_add(rows.len() as u64, Ordering::Relaxed);
         let outcome = self
-            .post(&[("query", sql.as_str())], rows, &sql)
-            .map(|_| ());
+            .request(&[("query", sql.as_str())], rows, &sql, None)
+            .map(|_| ())
+            .map_err(Failure::brief);
         self.stats.record(Operation::Insert, started, &outcome);
         outcome
     }
@@ -326,14 +377,16 @@ impl Client {
         let started = Instant::now();
         let outcome = (|| {
             let body = format!("{sql}\nFORMAT RowBinary");
-            let response = self.post(&[("max_query_size", "67108864")], body.as_bytes(), sql)?;
+            let response = self
+                .request(&self.read_settings(), body.as_bytes(), sql, None)
+                .map_err(Failure::brief)?;
             let mut reader = BufReader::with_capacity(1 << 20, response.into_body().into_reader());
             let mut row = vec![0u8; width];
             loop {
                 let mut filled = 0;
                 while filled < width {
                     let read = std::io::Read::read(&mut reader, &mut row[filled..])
-                        .map_err(|e| unavailable(&self.shown, sql, &e.to_string()))?;
+                        .map_err(|e| self.failed(sql, &e.to_string()).brief())?;
                     if read == 0 {
                         break;
                     }
@@ -344,11 +397,12 @@ impl Client {
                 }
                 if filled < width {
                     let tail = String::from_utf8_lossy(&row[..filled]).into_owned();
-                    return Err(unavailable(
-                        &self.shown,
-                        sql,
-                        &format!("the answer ended partway through a row: {tail}"),
-                    ));
+                    return Err(self
+                        .failed(
+                            sql,
+                            &format!("the answer ended partway through a row: {tail}"),
+                        )
+                        .brief());
                 }
                 if each(&row)?.is_break() {
                     return Ok(());
@@ -365,23 +419,19 @@ impl Client {
         each: &mut impl FnMut(&[u8]) -> Result<ControlFlow<()>>,
     ) -> Result<()> {
         let body = format!("{sql}\nFORMAT JSONEachRow");
-        let response = self.post(
-            &[
-                ("output_format_json_quote_64bit_integers", "0"),
-                ("output_format_json_quote_64bit_floats", "0"),
-                // A query naming every series it reads is long.
-                ("max_query_size", "67108864"),
-            ],
-            body.as_bytes(),
-            sql,
-        )?;
+        let mut settings = self.read_settings();
+        settings.push(("output_format_json_quote_64bit_integers", "0".to_owned()));
+        settings.push(("output_format_json_quote_64bit_floats", "0".to_owned()));
+        let response = self
+            .request(&settings, body.as_bytes(), sql, None)
+            .map_err(Failure::brief)?;
         let mut reader = BufReader::new(response.into_body().into_reader());
         let mut line = Vec::new();
         loop {
             line.clear();
             let read = reader
                 .read_until(b'\n', &mut line)
-                .map_err(|e| unavailable(&self.shown, sql, &e.to_string()))?;
+                .map_err(|e| self.failed(sql, &e.to_string()).brief())?;
             if read == 0 {
                 return Ok(());
             }
@@ -395,19 +445,42 @@ impl Client {
         }
     }
 
-    fn post(
+    /// What every read is sent with.
+    ///
+    /// - `readonly = 2`: a read runs with read rights only, whatever the account may do.
+    /// - `max_execution_time`: ClickHouse stops what telemetryd has stopped waiting for,
+    ///   so a query refused at the timeout does not go on loading the shared server.
+    /// - `cancel_http_readonly_queries_on_client_close`: and stops a read whose caller
+    ///   went away.
+    /// - `max_query_size`: a query naming every series or trace it reads is long.
+    fn read_settings(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("readonly", "2".to_owned()),
+            (
+                "max_execution_time",
+                self.timeout.as_secs().max(1).to_string(),
+            ),
+            (
+                "cancel_http_readonly_queries_on_client_close",
+                "1".to_owned(),
+            ),
+            ("max_query_size", "67108864".to_owned()),
+        ]
+    }
+
+    /// One request, its failure kept whole for the caller to word.
+    fn request<V: AsRef<str>>(
         &self,
-        params: &[(&str, &str)],
+        params: &[(&str, V)],
         body: &[u8],
         what: &str,
-    ) -> Result<ureq::http::Response<ureq::Body>> {
-        let mut request = ureq::post(&self.url)
+        timeout: Option<Duration>,
+    ) -> std::result::Result<ureq::http::Response<ureq::Body>, Failure> {
+        let mut request = self
+            .agent
+            .post(&self.url)
             .config()
-            .tls_config(telemetryd_core::http::tls())
-            .timeout_connect(Some(CONNECT_TIMEOUT))
-            .timeout_global(Some(self.timeout))
-            .http_status_as_error(false)
-            .max_redirects(0)
+            .timeout_global(Some(timeout.unwrap_or(self.timeout)))
             .build()
             .query("database", &self.database)
             .header("x-clickhouse-user", &self.user);
@@ -415,11 +488,11 @@ impl Client {
             request = request.header("x-clickhouse-key", &self.password);
         }
         for (name, value) in params {
-            request = request.query(*name, *value);
+            request = request.query(*name, value.as_ref());
         }
         let mut response = request
             .send(body)
-            .map_err(|e| unavailable(&self.shown, what, &e.to_string()))?;
+            .map_err(|e| self.failed(what, &e.to_string()))?;
         if response.status().is_success() {
             return Ok(response);
         }
@@ -430,15 +503,93 @@ impl Client {
             .unwrap_or_default()
             .trim()
             .to_owned();
-        Err(unavailable(
-            &self.shown,
-            what,
-            &format!("HTTP {status}: {detail}"),
+        Err(self.failed(what, &format!("HTTP {status}: {detail}")))
+    }
+
+    fn failed(&self, what: &str, detail: &str) -> Failure {
+        *self
+            .stats
+            .last_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((
+            std::time::SystemTime::now(),
+            format!(
+                "{} ({}): {detail}",
+                self.shown,
+                what.chars().take(120).collect::<String>()
+            ),
+        ));
+        Failure {
+            shown: self.shown.clone(),
+            what: what.chars().take(120).collect(),
+            detail: detail.to_owned(),
+        }
+    }
+}
+
+/// A request that failed: where, doing what, and what was said.
+#[derive(Debug)]
+struct Failure {
+    shown: String,
+    what: String,
+    detail: String,
+}
+
+impl Failure {
+    /// In full, for the operator: at startup and on reload.
+    fn detailed(self) -> Error {
+        Error::Unavailable(format!(
+            "ClickHouse at {} failed ({}): {}",
+            self.shown, self.what, self.detail
+        ))
+    }
+
+    /// Without the host, the SQL or ClickHouse's own text, for whoever sent the request
+    /// — an ingest client, a dashboard — who is owed a reason but not the database's
+    /// internals. The whole is logged.
+    fn brief(self) -> Error {
+        tracing::warn!(
+            clickhouse = %self.shown,
+            request = %self.what,
+            detail = %self.detail,
+            "a request to ClickHouse failed"
+        );
+        let class = if let Some(rest) = self.detail.strip_prefix("HTTP ") {
+            let status = rest.split(':').next().unwrap_or_default();
+            match exception_name(&self.detail) {
+                Some(name) => format!("refused it ({name})"),
+                None => format!("refused it (HTTP {status})"),
+            }
+        } else {
+            "could not be reached".to_owned()
+        };
+        Error::Unavailable(format!(
+            "the ClickHouse store {class}; retry shortly — the instance's log says more"
         ))
     }
 }
 
-fn unavailable(shown: &str, what: &str, detail: &str) -> Error {
-    let what: String = what.chars().take(120).collect();
-    Error::Unavailable(format!("ClickHouse at {shown} failed ({what}): {detail}"))
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ClickHouse at {} failed ({}): {}",
+            self.shown, self.what, self.detail
+        )
+    }
+}
+
+/// The name ClickHouse gives an exception, `MEMORY_LIMIT_EXCEEDED` in
+/// `… (MEMORY_LIMIT_EXCEEDED) (version …)`: what a client can be told without the text
+/// around it.
+fn exception_name(detail: &str) -> Option<&str> {
+    detail
+        .split('(')
+        .filter_map(|part| part.split(')').next())
+        .find(|name| {
+            name.len() > 3
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+        })
 }

@@ -11,6 +11,7 @@
 //! columns telemetryd needs to answer its own APIs exactly as the local store does. See
 //! [`schema`].
 
+mod check;
 mod client;
 pub mod logs;
 pub mod metric_folds;
@@ -49,6 +50,19 @@ impl ClickHouse {
         let client = Client::new(config)?;
         if config.create_schema {
             schema::ensure(&client, config, retention)?;
+        } else {
+            // Someone else manages the schema: find out now that it is not all there,
+            // rather than from the first write refused.
+            let missing = schema::missing(&client, config, retention)?;
+            if !missing.is_empty() {
+                return Err(telemetryd_core::Error::Config(format!(
+                    "clickhouse.create_schema = false, and database {:?} lacks {}: create \
+                     them with the statements `telemetryd clickhouse schema` prints, or let \
+                     telemetryd create them",
+                    client.database(),
+                    missing.join(", ")
+                )));
+            }
         }
         Ok(Self {
             logs: ClickHouseLogs::new(client.clone()),
@@ -61,6 +75,16 @@ impl ClickHouse {
     #[must_use]
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// Whether the configured account can do what an instance needs, checked one thing
+    /// at a time, without changing anything: `(what was checked, what is wrong)`.
+    #[must_use]
+    pub fn check(
+        config: &ClickHouseConfig,
+        retention: &RetentionConfig,
+    ) -> Vec<(String, Option<String>)> {
+        check::run(config, retention)
     }
 
     /// What each app holds, from the streams summaries: series and rows exact, bytes
@@ -148,6 +172,11 @@ impl ClickHouse {
     ) -> Result<()> {
         if config.create_schema {
             schema::apply_ttl(&self.client, config, retention)?;
+        } else {
+            tracing::warn!(
+                "retention changed with clickhouse.create_schema = false: telemetryd does not \
+                 manage the tables, so their TTLs are as whoever created them set them"
+            );
         }
         Ok(())
     }
