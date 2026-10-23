@@ -63,7 +63,8 @@ pub struct ClickHouseConfig {
     pub create_schema: bool,
     /// The storage policy new tables are created with. Empty = the server's default.
     /// Needed for `cold_after`: it names the volumes rows move between. Applies when a
-    /// table is created; ClickHouse cannot move an existing table to another policy.
+    /// table is created. An existing table keeps its policy: ClickHouse moves one only
+    /// to a policy holding all the old one's disks, by `ALTER TABLE … MODIFY SETTING`.
     pub storage_policy: String,
     /// Move logs, spans and metric samples this old to `cold_volume` — object storage or slower disks,
     /// still queryable — and keep them there until `retention.*` deletes them. Zero =

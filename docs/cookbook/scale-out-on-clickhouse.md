@@ -395,8 +395,8 @@ has given up on rather than letting it go on loading the shared server; a query 
 outlives it is refused as unavailable.
 
 TLS to ClickHouse trusts the same authorities as every other outbound connection:
-`tls.ca_file` for a private CA, the built-in roots otherwise. `telemetryd clickhouse
-check` reads no `tls.ca_file` from the file — set `TELEMETRYD_TLS_CA_FILE` for it.
+`tls.ca_file` for a private CA, the built-in roots otherwise, and `telemetryd
+clickhouse check` trusts what `serve` would.
 There are no client certificates; ClickHouse authenticates the user and password,
 which `http://` would send in clear — so it is refused to anything but loopback unless
 `allow_plaintext = true`.

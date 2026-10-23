@@ -248,23 +248,16 @@ impl Table<'_> {
         }
 
         let hours = match selected {
-            Some(selected) if selected.services.len() > 1 => {
-                self.hourly_rows(start, end, selected)?
-            }
-            _ => Vec::new(),
+            Some(selected) => self.hourly_rows(start, end, selected)?,
+            None => Vec::new(),
         };
         let need = (request.limit as u64)
             .saturating_mul(WINDOW_ROWS_PER_RESULT)
             .max(1_000);
-        // With one app the read is in the sort key's order, and ClickHouse stops once it
-        // has the page: one window, the whole range, costs what the answer costs. With
-        // several it sorts what a window holds, so windows keep that small.
-        let one_app = selected.is_some_and(|s| s.services.len() == 1);
-        let mut width = if one_app {
-            end - start
-        } else {
-            first_window(&hours, request.order, need, end - start)
-        };
+        // Windows even when the read is in the sort key's order: ClickHouse reads every
+        // part in a range at once, in blocks, before the limit stops it, so one window
+        // over a day read some 70M rows for a page of 100 a narrow window found in 1M.
+        let mut width = first_window(&hours, request.order, need, end - start);
         let mut edge = match request.order {
             Order::Descending => end,
             Order::Ascending => start,

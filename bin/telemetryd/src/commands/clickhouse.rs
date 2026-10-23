@@ -27,6 +27,10 @@ pub fn run(action: &ClickHouseAction) -> anyhow::Result<()> {
     if !config.clickhouse.is_enabled() {
         anyhow::bail!("this configuration has no [clickhouse] section: clickhouse.url is not set");
     }
+    // The CA bundle `serve` trusts, so `check` reaches ClickHouse as an instance would.
+    if let Some(ca_file) = &config.tls.ca_file {
+        telemetryd_core::http::init_trust(ca_file).map_err(|e| anyhow::anyhow!(e))?;
+    }
     match action {
         ClickHouseAction::Schema(_) => {
             print_schema(&config);
