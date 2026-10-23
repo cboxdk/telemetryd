@@ -80,7 +80,14 @@ impl ClickHouseLogs {
                 .map_err(|e| Error::Unavailable(format!("encoding a log row: {e}")))?;
             body.push(b'\n');
         }
-        self.client.insert(LOGS, &body)
+        self.client.insert(LOGS, &body)?;
+        self.client.stats().count_rows(records.len());
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn client(&self) -> &Client {
+        &self.client
     }
 
     fn read(

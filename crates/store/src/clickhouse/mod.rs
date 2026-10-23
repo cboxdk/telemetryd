@@ -16,5 +16,38 @@ pub mod logs;
 pub mod schema;
 pub(crate) mod sql;
 
-pub use client::Client;
+pub use client::{Client, Operation, Stats, StatsSnapshot};
 pub use logs::ClickHouseLogs;
+
+use telemetryd_core::Result;
+use telemetryd_core::config::ClickHouseConfig;
+
+/// Everything kept in ClickHouse, behind one connection.
+#[derive(Debug)]
+pub struct ClickHouse {
+    client: Client,
+    pub logs: ClickHouseLogs,
+}
+
+impl ClickHouse {
+    /// Connect, and create what is missing when the configuration says to.
+    ///
+    /// # Errors
+    /// When the password cannot be resolved or ClickHouse refuses the schema: a startup
+    /// error, not a first failed request.
+    pub fn open(config: &ClickHouseConfig) -> Result<Self> {
+        let client = Client::new(config)?;
+        if config.create_schema {
+            schema::ensure(&client, config)?;
+        }
+        Ok(Self {
+            logs: ClickHouseLogs::new(client.clone()),
+            client,
+        })
+    }
+
+    #[must_use]
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+}

@@ -469,6 +469,33 @@ fn gauges(state: &AppState) -> Result<Vec<Sample>, Error> {
     // here while showing up in /status — two answers to the same question.
     push_per_signal_gauges(&snapshot, &mut samples);
 
+    if let Some(clickhouse) = &snapshot.clickhouse {
+        for (operation, succeeded, failed, seconds) in &clickhouse.requests {
+            for (outcome, count) in [("ok", succeeded), ("error", failed)] {
+                samples.push(Sample::new(
+                    "telemetryd_clickhouse_requests_total",
+                    &[("operation", operation), ("outcome", outcome)],
+                    *count as f64,
+                ));
+            }
+            samples.push(Sample::new(
+                "telemetryd_clickhouse_request_seconds_total",
+                &[("operation", operation)],
+                *seconds,
+            ));
+        }
+        samples.push(Sample::new(
+            "telemetryd_clickhouse_rows_written_total",
+            &[],
+            clickhouse.rows_written as f64,
+        ));
+        samples.push(Sample::new(
+            "telemetryd_clickhouse_bytes_sent_total",
+            &[],
+            clickhouse.bytes_sent as f64,
+        ));
+    }
+
     push_auth_and_cardinality_gauges(state, &mut samples);
 
     // Per app, so a dashboard can show who is growing rather than only that the total

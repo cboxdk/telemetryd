@@ -79,8 +79,9 @@ pub struct Store {
     /// has not forwarded yet, with `relay.when_full = "reject"`; cleared by the next pass
     /// that finds room. While set, every append is refused.
     refusing: std::sync::atomic::AtomicBool,
-    /// Logs in ClickHouse instead of in `logs`, when `[clickhouse]` is configured.
-    clickhouse_logs: Option<clickhouse::ClickHouseLogs>,
+    /// The database, instead of the files in `data_dir`, when `[clickhouse]` is
+    /// configured.
+    clickhouse: Option<clickhouse::ClickHouse>,
 }
 
 /// What one app holds in the store.
@@ -118,12 +119,8 @@ impl Store {
 
         // Before anything is opened: a ClickHouse that cannot be reached or refuses the
         // schema is a startup error, not a first failed request.
-        let clickhouse_logs = if config.clickhouse.is_enabled() {
-            let client = clickhouse::Client::new(&config.clickhouse)?;
-            if config.clickhouse.create_schema {
-                clickhouse::schema::ensure(&client, &config.clickhouse)?;
-            }
-            Some(clickhouse::ClickHouseLogs::new(client))
+        let clickhouse = if config.clickhouse.is_enabled() {
+            Some(clickhouse::ClickHouse::open(&config.clickhouse)?)
         } else {
             None
         };
@@ -180,21 +177,21 @@ impl Store {
             reaper: Mutex::new(ReaperReport::default()),
             wal_truncations: RwLock::new(truncations),
             refusing: std::sync::atomic::AtomicBool::new(false),
-            clickhouse_logs,
+            clickhouse,
         })
     }
 
     /// Logs, wherever they are kept: what the query engines read.
     pub fn log_store(&self) -> &dyn LogStore {
-        match &self.clickhouse_logs {
-            Some(clickhouse) => clickhouse,
+        match &self.clickhouse {
+            Some(clickhouse) => &clickhouse.logs,
             None => &self.logs,
         }
     }
 
     /// Whether logs are kept in ClickHouse rather than on this machine.
     pub fn logs_in_clickhouse(&self) -> bool {
-        self.clickhouse_logs.is_some()
+        self.clickhouse.is_some()
     }
 
     pub fn logs(&self) -> &RecordStore<LogSchema> {
@@ -230,8 +227,8 @@ impl Store {
     /// Append log records. Durable before this returns.
     pub fn append_logs(&self, records: &[LogRecord]) -> Result<Admitted> {
         self.append_within_limits(records, LogSchema::index_labels, |kept| {
-            match &self.clickhouse_logs {
-                Some(clickhouse) => clickhouse.append(kept),
+            match &self.clickhouse {
+                Some(clickhouse) => clickhouse.logs.append(kept),
                 None => self.logs.append(kept),
             }
         })
@@ -695,6 +692,12 @@ impl Store {
     /// Why writes are being refused right now, if they are — what `/ready` answers with.
     #[must_use]
     pub fn not_accepting(&self) -> Option<String> {
+        // Every write goes to ClickHouse, so one that does not answer is one this
+        // instance cannot store anything in — and a load balancer should know before a
+        // sender finds out.
+        if let Some(Err(error)) = self.clickhouse.as_ref().map(|c| c.client().ping()) {
+            return Some(error.to_string());
+        }
         if self.refusing.load(std::sync::atomic::Ordering::Relaxed) {
             return Some(
                 "the disk budget is full of telemetry not yet forwarded upstream".to_owned(),
@@ -776,6 +779,7 @@ impl Store {
             series_evicted: self.cardinality.evicted_series(),
             series_rejected: self.cardinality.rejected_records(),
             wal_truncations: lock_read(&self.wal_truncations).clone(),
+            clickhouse: self.clickhouse.as_ref().map(|c| c.client().snapshot()),
         })
     }
 }
@@ -817,6 +821,9 @@ pub struct StoreStatus {
     pub series_by_app: std::collections::BTreeMap<String, u64>,
     /// Non-empty when a crash cost us records. "Degrade loudly."
     pub wal_truncations: Vec<Truncation>,
+    /// Requests to ClickHouse, when it is the store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clickhouse: Option<clickhouse::StatsSnapshot>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
