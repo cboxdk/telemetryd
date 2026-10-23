@@ -38,12 +38,15 @@ Stated plainly, because an unstated limit is indistinguishable from a bug:
 
 - **No plugins.** No scripting, no WASM, no dynamic loading. A single static binary is
   the product.
-- **No custom storage backends.** Files in one directory, by design.
+- **Two stores, not a plugin interface.** Files in one directory, or ClickHouse
+  ([Scale out on ClickHouse](../cookbook/scale-out-on-clickhouse.md)); there is no API
+  for a third.
 - **No write-path transformations.** No relabelling rules, no sampling, no drop filters.
   Shape the data in your instrumentation, where you have the context to do it well.
 - **No TLS.** Terminate at a reverse proxy.
 - **No multi-tenancy.** `app` is a namespace, not a boundary.
-- **No clustering or replication.** Single node is the design.
+- **No clustering of telemetryd itself.** Instances in front of ClickHouse share
+  nothing but the database; replication is ClickHouse's.
 
 ## Extending around it
 
