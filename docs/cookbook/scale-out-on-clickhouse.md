@@ -116,6 +116,15 @@ lines a month that is about a terabyte a month, three for ninety days. Your line
 compress differently; `telemetryd_app_bytes_estimate` and ClickHouse's `system.parts`
 say what yours cost.
 
+### How much ingest
+
+Four instances in front of one ClickHouse — all of it in Docker on one 12-core laptop
+— took OTLP/HTTP JSON log batches from 64 concurrent senders at **232,000 records a
+second** in batches of 500, and **440,000** in batches of 2,000, with no request
+refused. Most of a request's latency is ClickHouse gathering concurrent inserts into
+one part (`async_insert`), so throughput grows with how many senders write at once,
+and the number of parts stays small whatever the fleet.
+
 ## How queries stay fast
 
 A query is answered by ClickHouse doing the selecting and telemetryd doing the
