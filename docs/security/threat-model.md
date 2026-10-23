@@ -61,10 +61,31 @@ misread. A format-version mismatch refuses to start rather than guessing.
 
 **Two processes on one data directory.** Refused by an advisory lock.
 
+**Query input reaching ClickHouse.** With [ClickHouse as the
+store](../cookbook/scale-out-on-clickhouse.md), LogQL, TraceQL and PromQL are parsed by
+telemetryd and turned into SQL by telemetryd; every value from a query is quoted as a
+literal, never spliced in as SQL. Each read is also sent with `readonly = 2`, so even a
+statement that somehow got through runs with read rights only, and with
+`max_execution_time`, so a query nobody waits for any more stops loading the shared
+server. A regular expression is decided in ClickHouse only where its engine and
+telemetryd's agree on what it matches; otherwise telemetryd decides.
+
+**ClickHouse credentials in transit and in errors.** The password is sent only over
+`https://`, or `http://` to loopback, unless `clickhouse.allow_plaintext` says the
+network is trusted; a URL carrying credentials or a query string is refused at startup.
+A failed request answers the client with a generic reason — `/ready` answers anyone —
+and keeps ClickHouse's own words, which can name hosts and statements, for the server
+log and the admin view of `/status`.
+
 ## Not defended
 
 **Anyone with read access to the data directory.** There is no encryption at rest and no
 access control below the process. Use filesystem permissions and full-disk encryption.
+
+**Anyone with access to the ClickHouse database.** With ClickHouse as the store the
+telemetry is in its tables, and ClickHouse's users, grants, encryption and backups are
+what protect it. telemetryd's tokens guard its own APIs, not the database. The account
+telemetryd uses can write and alter its database; give it no more than that.
 
 **A holder of the ingest token writing another app's data.** `app` is a query namespace.
 Any ingest-token holder can write any `app` value.
@@ -72,7 +93,9 @@ Any ingest-token holder can write any `app` value.
 **A holder of the query token reading everything.** There is no per-app read
 restriction.
 
-**Network eavesdropping.** telemetryd speaks plain HTTP. Terminate TLS at a proxy.
+**Network eavesdropping.** telemetryd speaks plain HTTP unless `[tls]` is set; otherwise
+terminate TLS at a proxy. To ClickHouse there are no client certificates: the server is
+verified against `tls.ca_file` or the built-in roots, and the account by its password.
 
 **Fingerprinting the build.** `/` and `/status` publish the version to anyone who can
 reach the port, which turns "which build is this" into "which advisories apply". It is a
@@ -102,7 +125,9 @@ SBOM makes the graph auditable, but neither stops a novel compromise.
 
 The ingest and query boundaries are separate on purpose: app servers push, humans read,
 and those are different credentials with different rotation cadences. The boundary
-between telemetryd and its data directory is the filesystem's, not telemetryd's.
+between telemetryd and its data directory is the filesystem's, not telemetryd's. With
+ClickHouse as the store the data directory holds no telemetry, and the boundary that
+matters is ClickHouse's: one account, shared by every instance, over TLS.
 
 ## Reporting
 
