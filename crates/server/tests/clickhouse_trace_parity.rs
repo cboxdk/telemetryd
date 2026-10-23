@@ -79,6 +79,9 @@ fn payload() -> Value {
                     kv("http.route", text(route)),
                     kv("http.response.status_code", json!({"intValue": status.to_string()})),
                     kv("http.request.method", text("GET")),
+                    // Values Rust's regex and ClickHouse's read differently: a word with
+                    // a non-ASCII letter, a value across a newline.
+                    kv("user", text(["José", "ana", "Øystein", "x\ny"][(i % 4) as usize])),
                 ],
             }));
             spans.push(json!({
@@ -208,6 +211,16 @@ async fn clickhouse_answers_traces_as_the_local_store_does() {
         ),
     ];
     for (q, limit) in [
+        (r#"{ span.user =~ "\\w+" }"#, 50),
+        (r#"{ span.user !~ "\\w+" }"#, 50),
+        (r#"{ span.user =~ "x.y" }"#, 50),
+        (r#"{ span.user =~ "Jos." }"#, 50),
+        (r"{ .db.rows > 10 }", 50),
+        (r"{ .db_rows <= 10 && kind = client }", 50),
+        (
+            r#"{ nestedSetParent < 0 && span.http.route = "/geocode" }"#,
+            10,
+        ),
         ("{}", 20),
         ("{}", 100),
         (r#"{ resource.service.name = "geo" }"#, 50),
@@ -246,6 +259,11 @@ async fn clickhouse_answers_traces_as_the_local_store_does() {
         paths.push(search(q, limit));
     }
     for q in [
+        r#"{ span.user =~ "\\w+" } | rate()"#,
+        r#"{ span.user !~ "\\d" } | count_over_time() by (span.user)"#,
+        r"{ } | count_over_time() by (.db.rows)",
+        r"{ kind = client } | count_over_time() by (span.db.rows)",
+        r"{ } | rate() by (.service.name)",
         "{ } | histogram_over_time(duration)",
         r"{ kind = server } | max_over_time(duration) by (span.http.route)",
         r"{ kind = client } | min_over_time(duration) by (name)",
@@ -305,4 +323,58 @@ fn close(a: &Value, b: &Value) -> bool {
         }
         _ => a == b,
     }
+}
+
+/// A search reads every row of the windows it covers, however many the predicate turns
+/// down: with a limit on rows rather than on spans taken, the newest span the predicate
+/// takes, past that many it did not, was never read.
+#[tokio::test]
+async fn a_search_reads_past_spans_the_predicate_turns_down() {
+    let Some(clickhouse) = clickhouse_under_test("trace_window") else {
+        eprintln!("TELEMETRYD_TEST_CLICKHOUSE_URL is not set; skipped");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        storage: StorageConfig {
+            data_dir: Some(dir.path().to_path_buf()),
+            ..StorageConfig::default()
+        },
+        clickhouse,
+        retention: common::long_retention(),
+        ..Config::default()
+    };
+    config.validate().unwrap();
+    let store = Arc::new(Store::open(&config).unwrap());
+    let app = router(AppState::new(Arc::new(config), Arc::clone(&store)).unwrap());
+    // Ten spans a millisecond apart, the newest six called "skip".
+    let spans: Vec<Value> = (0..10u64)
+        .map(|i| {
+            json!({
+                "traceId": format!("{:032x}", i + 1),
+                "spanId": format!("{:016x}", i + 1),
+                "name": if i >= 4 { "skip" } else { "keep" },
+                "kind": 2,
+                "startTimeUnixNano": (BASE + i * 1_000_000).to_string(),
+                "endTimeUnixNano": (BASE + i * 1_000_000 + 500).to_string(),
+            })
+        })
+        .collect();
+    send(
+        &app,
+        &json!({"resourceSpans": [{
+            "resource": {"attributes": [kv("service.name", text("geo"))]},
+            "scopeSpans": [{"spans": spans}],
+        }]}),
+    )
+    .await;
+    let mut scan = telemetryd_store::Scan::range(BASE, BASE + SECOND);
+    scan.limit = 4;
+    scan.order = telemetryd_store::Order::Descending;
+    let ids = store
+        .span_store()
+        .search_traces(scan, &[], &|span| span.name == "keep", 1)
+        .unwrap();
+    // The newest span kept is the fourth.
+    assert!(ids.contains(&format!("{:032x}", 4)), "{ids:?}");
 }

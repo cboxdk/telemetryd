@@ -106,6 +106,28 @@ fn letters_sql(column: &str) -> String {
     format!("replaceRegexpAll({column}, '[^a-zA-Z]', '')")
 }
 
+/// Whether ClickHouse's RE2 matches `pattern` exactly as Rust's `regex` does.
+///
+/// Both read UTF-8 a character at a time, fold case alike under `(?i)`, and — with the
+/// `(?s)` both sides compile it under — let `.` match a newline. Where they part is
+/// the Perl classes: `\w`, `\d`, `\s` and `\b` are Unicode in Rust and ASCII in
+/// RE2, so `\w+` matches `José` in one and not the other. A pattern using any of them
+/// is not decided in ClickHouse.
+pub(super) fn same_in_re2(pattern: &str) -> bool {
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && matches!(
+                chars.next(),
+                Some('w' | 'W' | 'd' | 'D' | 's' | 'S' | 'b' | 'B')
+            )
+        {
+            return false;
+        }
+    }
+    true
+}
+
 fn anchored(pattern: &str) -> String {
     quote(&format!("^(?s:{pattern})$"))
 }
@@ -138,12 +160,18 @@ fn present_value(op: SpanOp, value: &SpanValue, v: &str) -> Option<Stated> {
         (SpanOp::NotEqual, SpanValue::Text(text), _) => {
             Stated::exact(format!("{v} != {}", quote(text)))
         }
-        (SpanOp::Regex, SpanValue::Text(pattern), _) => {
+        (SpanOp::Regex, SpanValue::Text(pattern), _) if same_in_re2(pattern) => {
             Stated::exact(format!("match({v}, {})", anchored(pattern)))
         }
-        (SpanOp::NotRegex, SpanValue::Text(pattern), _) => {
+        (SpanOp::NotRegex, SpanValue::Text(pattern), _) if same_in_re2(pattern) => {
             Stated::exact(format!("NOT match({v}, {})", anchored(pattern)))
         }
+        // A pattern the two engines read differently: any present value may match, and
+        // none is certain to.
+        (SpanOp::Regex | SpanOp::NotRegex, SpanValue::Text(_), _) => Stated {
+            necessary: "1".to_owned(),
+            sufficient: "0".to_owned(),
+        },
         (SpanOp::Equal, _, Some(n)) => {
             let equal = format!("abs({parsed} - {}) < {EPSILON}", float(n));
             Stated {
@@ -288,8 +316,97 @@ fn resource_arms(name: &str) -> Vec<(String, String)> {
     ]
 }
 
-/// Both forms of one TraceQL condition.
-pub(super) fn condition(c: &SpanCondition) -> Stated {
+/// Every attribute key and stream label the spans a query reads can carry, when known:
+/// what turns a relaxed lookup — a key that sanitises alike — into the list of keys it
+/// could find, each looked up exactly, in the order Rust's sorted map tries them.
+#[derive(Debug, Default)]
+pub(super) struct Keys {
+    pub span: std::collections::BTreeSet<String>,
+    pub resource: std::collections::BTreeSet<String>,
+    pub stream: std::collections::BTreeSet<String>,
+}
+
+/// The keys besides `name` itself that `Labels::get_relaxed(name)` could take from a
+/// span's attributes, in the order it tries them: the span's own and its resource's
+/// under `resource.`, as one sorted map holds them.
+fn relaxed_span_arms(name: &str, keys: &Keys) -> Vec<(String, String)> {
+    let wanted = sanitize_label_name(name);
+    let mut found: Vec<(String, &'static str, &str)> = keys
+        .span
+        .iter()
+        .map(|k| (k.clone(), "SpanAttributes", k.as_str()))
+        .chain(keys.resource.iter().map(|k| {
+            (
+                format!("{RESOURCE_ATTRIBUTE_PREFIX}{k}"),
+                "ResourceAttributes",
+                k.as_str(),
+            )
+        }))
+        .filter(|(full, _, _)| full != name && sanitize_label_name(full) == wanted)
+        .collect();
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+        .into_iter()
+        .map(|(_, map, key)| {
+            let key = quote(key);
+            (
+                format!("mapContains({map}, {key})"),
+                format!("{map}[{key}]"),
+            )
+        })
+        .collect()
+}
+
+/// The stream labels besides `name` that `Labels::get_relaxed(name)` could take.
+fn relaxed_stream_arms(name: &str, keys: &Keys) -> Vec<(String, String)> {
+    let wanted = sanitize_label_name(name);
+    keys.stream
+        .iter()
+        .filter(|k| k.as_str() != name && sanitize_label_name(k) == wanted)
+        .map(|k| {
+            let key = quote(k);
+            (
+                format!("mapContains(Stream, {key})"),
+                format!("Stream[{key}]"),
+            )
+        })
+        .collect()
+}
+
+/// `span.x`'s lookup: the exact keys, then the relaxed ones — listed when the keys are
+/// known, otherwise unknown wherever a key with the same letters is there.
+fn span_lookup(name: &str, keys: Option<&Keys>) -> Vec<Arm> {
+    let mut arms: Vec<Arm> = values(span_arms(name)).collect();
+    match keys {
+        Some(keys) => arms.extend(values(relaxed_span_arms(name, keys))),
+        None => arms.push(Arm::Unknown {
+            present: span_candidates(name),
+        }),
+    }
+    arms
+}
+
+/// `.x`'s lookup: the span's attributes, relaxed; then the resource, exactly; then the
+/// stream, relaxed.
+fn unscoped_lookup(name: &str, keys: Option<&Keys>) -> Vec<Arm> {
+    let stream_key = quote(name);
+    let mut arms = span_lookup(name, keys);
+    arms.extend(values(resource_arms(name)));
+    arms.push(Arm::Value {
+        present: format!("mapContains(Stream, {stream_key})"),
+        value: format!("Stream[{stream_key}]"),
+    });
+    match keys {
+        Some(keys) => arms.extend(values(relaxed_stream_arms(name, keys))),
+        None => arms.push(Arm::Unknown {
+            present: candidate("Stream", "", name),
+        }),
+    }
+    arms
+}
+
+/// Both forms of one TraceQL condition, with the keys the spans can carry if known.
+pub(super) fn condition(c: &SpanCondition, keys: Option<&Keys>) -> Stated {
     match &c.field {
         SpanField::Name => text_intrinsic("SpanName", c),
         SpanField::StatusMessage => text_intrinsic("StatusMessage", c),
@@ -314,17 +431,11 @@ pub(super) fn condition(c: &SpanCondition) -> Stated {
             };
             Stated::exact(equality("SpanKind", c.op, wanted.map(kind_name)))
         }
-        SpanField::Span(name) => {
-            let mut arms: Vec<Arm> = values(span_arms(name)).collect();
-            arms.push(Arm::Unknown {
-                present: span_candidates(name),
-            });
-            with_presence(
-                lookup(&arms, c.op, &c.value),
-                c,
-                &["SpanAttributes", "ResourceAttributes"],
-            )
-        }
+        SpanField::Span(name) => with_presence(
+            lookup(&span_lookup(name, keys), c.op, &c.value),
+            c,
+            &["SpanAttributes", "ResourceAttributes"],
+        ),
         SpanField::Resource(name) => {
             let arms: Vec<Arm> = values(resource_arms(name)).collect();
             with_presence(
@@ -333,28 +444,11 @@ pub(super) fn condition(c: &SpanCondition) -> Stated {
                 &["Stream", "ResourceAttributes"],
             )
         }
-        SpanField::Unscoped(name) => {
-            // The span's attributes, relaxed; then the resource, exactly; then the
-            // stream, relaxed.
-            let stream_key = quote(name);
-            let mut arms: Vec<Arm> = values(span_arms(name)).collect();
-            arms.push(Arm::Unknown {
-                present: span_candidates(name),
-            });
-            arms.extend(values(resource_arms(name)));
-            arms.push(Arm::Value {
-                present: format!("mapContains(Stream, {stream_key})"),
-                value: format!("Stream[{stream_key}]"),
-            });
-            arms.push(Arm::Unknown {
-                present: candidate("Stream", "", name),
-            });
-            with_presence(
-                lookup(&arms, c.op, &c.value),
-                c,
-                &["SpanAttributes", "ResourceAttributes", "Stream"],
-            )
-        }
+        SpanField::Unscoped(name) => with_presence(
+            lookup(&unscoped_lookup(name, keys), c.op, &c.value),
+            c,
+            &["SpanAttributes", "ResourceAttributes", "Stream"],
+        ),
     }
 }
 
@@ -407,43 +501,61 @@ fn equality(column: &str, op: SpanOp, wanted: Option<&str>) -> String {
 
 /// A field's value as SQL, for grouping, with the condition under which it is the
 /// value Rust would read: `None` for a field ClickHouse cannot read exactly.
-pub(super) fn group_value(field: &SpanField) -> Option<(String, String)> {
+pub(super) fn group_value(field: &SpanField, keys: Option<&Keys>) -> Option<(String, String)> {
+    let chain = |arms: &[Arm]| -> String {
+        let steps: Vec<String> = arms
+            .iter()
+            .filter_map(|arm| match arm {
+                Arm::Value { present, value } => Some(format!("{present}, {value}")),
+                Arm::Unknown { .. } => None,
+            })
+            .collect();
+        format!("multiIf({}, NULL)", steps.join(", "))
+    };
     Some(match field {
         SpanField::Name => ("SpanName".to_owned(), "1".to_owned()),
         SpanField::StatusMessage => ("StatusMessage".to_owned(), "1".to_owned()),
         SpanField::Status => ("lower(StatusCode)".to_owned(), "1".to_owned()),
         SpanField::Kind => ("lower(SpanKind)".to_owned(), "1".to_owned()),
         SpanField::Resource(name) => {
-            let arms = resource_arms(name);
-            (
-                format!(
-                    "multiIf({}, NULL)",
-                    arms.iter()
-                        .map(|(present, expr)| format!("{present}, {expr}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-                "1".to_owned(),
-            )
+            let arms: Vec<Arm> = values(resource_arms(name)).collect();
+            (chain(&arms), "1".to_owned())
         }
         SpanField::Span(name) => {
-            let arms = span_arms(name);
-            let present: Vec<&str> = arms.iter().map(|(p, _)| p.as_str()).collect();
-            (
-                format!(
-                    "multiIf({}, NULL)",
-                    arms.iter()
-                        .map(|(present, expr)| format!("{present}, {expr}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
+            let arms = span_lookup(name, keys);
+            let decided = if keys.is_some() {
+                "1".to_owned()
+            } else {
+                // The value is certain where an exact key is there, or no key with the
+                // same letters is.
+                let present: Vec<String> = span_arms(name).into_iter().map(|(p, _)| p).collect();
                 format!(
                     "({} OR NOT {})",
                     present.join(" OR "),
                     span_candidates(name)
-                ),
-            )
+                )
+            };
+            (chain(&arms), decided)
         }
-        SpanField::Duration | SpanField::Unscoped(_) => return None,
+        // Without the keys, a relaxed stream lookup has no exact form.
+        SpanField::Unscoped(name) => {
+            keys?;
+            (chain(&unscoped_lookup(name, keys)), "1".to_owned())
+        }
+        SpanField::Duration => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pattern_with_a_perl_class_is_not_decided_in_clickhouse() {
+        assert!(same_in_re2("GET /(geo|re).*"));
+        assert!(same_in_re2(r"a\.b\\w"));
+        assert!(!same_in_re2(r"\w+"));
+        assert!(!same_in_re2(r"id=\d{3}"));
+        assert!(!same_in_re2(r"\bx"));
+    }
 }
