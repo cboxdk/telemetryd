@@ -29,7 +29,7 @@
 //!   asked of the tables would read the stream column of every row in the range.
 //! - **Log volume rollups**, lines and bytes per stream per second and per minute, so a
 //!   log volume chart over ninety days reads thousands of rows rather than hundreds of
-//!   billions. See [`log_volume`].
+//!   billions. See `log_volume`.
 //!
 //! # Retention and tiers
 //!

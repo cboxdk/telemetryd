@@ -19,7 +19,7 @@
 //!
 //! TraceQL conditions become conditions ClickHouse selects by — each one necessary for
 //! the span to match, never sufficient — and the query's own predicate decides every
-//! span that comes back. See [`condition`].
+//! span that comes back. See `condition`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;

@@ -223,8 +223,8 @@ impl Client {
     ///
     /// A query, not ClickHouse's `/ping`, which answers without credentials or a
     /// database: an instance with the wrong password, or a database nobody created,
-    /// would be ready by it and refuse every write. Within [`PING_TIMEOUT`], and reused
-    /// for [`PING_REUSE`].
+    /// would be ready by it and refuse every write. Within `PING_TIMEOUT`, and reused
+    /// for `PING_REUSE`.
     ///
     /// # Errors
     /// [`Error::Unavailable`], saying no more than that ClickHouse is not usable; the

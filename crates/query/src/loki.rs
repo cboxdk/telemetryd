@@ -550,7 +550,7 @@ pub(crate) type Prefilter =
     Box<dyn Fn(&arrow::record_batch::RecordBatch, &mut Vec<u32>) -> Result<()> + Send + Sync>;
 
 /// The query's line filters on the stored body, for a store that selects with them
-/// itself — what [`build_line_prefilter`] is for the local one.
+/// itself — what `build_line_prefilter` is for the local one.
 pub fn body_filters(query: &LogQuery) -> Vec<telemetryd_store::BodyFilter> {
     query
         .raw_line_filters()
