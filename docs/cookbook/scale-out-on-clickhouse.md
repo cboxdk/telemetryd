@@ -66,7 +66,19 @@ small tables kept by materialized views:
 | `otel_log_streams`, `otel_trace_streams` | each stream per hour | label names and values, series, which streams a selector means |
 | `otel_log_volume`, `otel_log_volume_1m` | lines and bytes per stream per second, per minute | log volume: `count_over_time`, `rate`, `bytes_*` with no line filter |
 | `otel_traces_trace_id_ts` | each trace's first and last span | a trace by id, without probing every part |
+| `telemetryd_samples` | every metric sample, by name, series and time | PromQL |
+| `telemetryd_series` | each series per day, with its labels | label names and values, series, which series a selector means |
+| `telemetryd_folds`, `telemetryd_sample_counts` | each series' counter and gauge summary per hour and per day, and the samples it covers | `rate`, `increase`, `*_over_time` over long windows |
 | `telemetryd_meta` | from when each rollup is complete | — |
+
+Metrics are not the Collector's `otel_metrics_*`. telemetryd keeps them as Prometheus
+does — label sets, classic histograms already expanded into `_bucket` series,
+staleness markers, `remote_write` samples with no type — and PromQL reads them that
+way; converting each one to an OTLP point and back would be two lossy translations.
+Every value reads back bit for bit, staleness markers and infinities included. The
+hourly and daily folds are made by each instance in the background from the samples,
+with the local store's own arithmetic; one whose hour has received late samples since
+is not used, and is made again.
 
 Set `create_schema = false` for a database whose schema someone else manages;
 `telemetryd` then expects the tables to exist.
@@ -155,6 +167,22 @@ And through the Tempo API, against a day of 600 million spans (200 million trace
 | `{ status = error } \| rate() by (span.http.route)`, 1 h at 1 m | 0.26 s |
 | the same, 24 h at 1 h | 6 s |
 
+And through the Prometheus API, against 42,500 series sampled every 30 seconds for 30
+days (3.7 billion samples, 3.1 GiB), with Grafana's step-aligned ranges:
+
+| Query | 24 h | 7 d | 30 d |
+|---|---|---|---|
+| p95 of a request histogram over the range, instant | 0.6 s | 0.9 s | 1.5 s |
+| `increase` per route over the range, instant | 0.07 s | 0.10 s | 0.15 s |
+| `rate` per route, charted (5 m / 1 h / 1 h step) | 0.18 s | 0.39 s | 1.4 s |
+| p95 per route, charted (1 d step) | — | — | 2.4 s |
+| label values, series | < 0.07 s | | |
+
+What stays expensive is a quantile per series at a fine step over a long range — p95
+per route at a one-hour step over thirty days, 45 s here: each of the histogram's
+series is evaluated at every step in telemetryd. Chart such panels at a coarser step,
+or record them as their own series.
+
 A search reads matching spans newest first and stops as soon as no trace it has not
 seen could start later than the ones it has; only those are read whole. TraceQL
 metrics are counted in ClickHouse, by intrinsics, resource and span attributes, with
@@ -189,6 +217,9 @@ each one on its own:
 - **Span metrics and service graphs.** `metrics_generator` pairs a client span with its
   server span in memory. Spans of one trace that reach different instances do not pair;
   route by trace id (most OTLP load balancers can) if you use service graphs.
+- **Folds.** Every instance makes the hourly and daily metric folds; it is cheap and
+  idempotent, so several doing it at once only repeat one another. Samples arriving
+  more than 72 hours late are not folded in again: those hours are read from the samples.
 - **`/status` and `/metrics`** describe the instance you asked, and its requests to
   ClickHouse (`telemetryd_clickhouse_*`); what each app holds comes from ClickHouse and
   is the same on every instance.

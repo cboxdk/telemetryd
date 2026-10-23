@@ -274,7 +274,7 @@ jobs:
           TELEMETRYD_TEST_CLICKHOUSE_URL: http://td:td@127.0.0.1:18124
           TELEMETRYD_TEST_CLICKHOUSE_CLUSTER: td
           TELEMETRYD_TEST_CLICKHOUSE_REPLICAS: http://td:td@127.0.0.1:18124,http://td:td@127.0.0.1:18125
-        run: cargo test --locked -p telemetryd-server
+        run: cargo test --locked -p telemetryd-server -p telemetryd-query
       - name: what ClickHouse said, if it refused
         if: failure()
         run: docker compose -f scripts/clickhouse/compose.yml logs --tail 200
