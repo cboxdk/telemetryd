@@ -300,6 +300,10 @@ impl Config {
     /// the latter from an hour to five minutes multiplied the bill by twelve.
     #[must_use]
     pub fn memory_notes(&self) -> Vec<String> {
+        // With ClickHouse as the store there are no local segments to hold open.
+        if self.clickhouse.is_enabled() {
+            return Vec::new();
+        }
         let (implied, budget) = crate::config::manifest_memory(self);
         if implied <= budget {
             return Vec::new();
