@@ -139,7 +139,7 @@ impl LogStore for ClickHouseLogs {
         };
         let mut grouper = Grouper::new(&selected, request.group_by);
         if selected.streams.is_empty() {
-            return Ok(Some(grouper.out));
+            return Ok(Some(grouper.finish()));
         }
         let (anchor, width) = (request.anchor_nanos, request.width_nanos);
         let scan = Scan::range(anchor, request.until_nanos).body_filters(request.body_filters);
@@ -171,8 +171,9 @@ impl LogStore for ClickHouseLogs {
         for time in &from_lines {
             let query = format!(
                 "SELECT intDiv(toUnixTimestamp64Nano(Timestamp) - {anchor} - 1, {width}) AS k, \
-                 StreamHash AS s, count() AS lines, {bytes} AS bytes \
-                 FROM {LOGS} WHERE ({time}) AND {base}{not_individual} GROUP BY k, s",
+                 {group} AS g, count() AS lines, {bytes} AS bytes \
+                 FROM {LOGS} WHERE ({time}) AND {base}{not_individual} GROUP BY k, g",
+                group = grouper.expression,
             );
             self.client
                 .query_lines(&query, |line| grouper.absorb(line))?;
@@ -203,22 +204,30 @@ impl LogStore for ClickHouseLogs {
             self.count_from_rollups(plan, (anchor, width), &selected, None, &mut grouper)?;
         }
 
-        let mut out = grouper.out;
+        let mut out = grouper.finish();
         if let Some(individual) = &individual {
+            let mut overflowed = false;
             for time in &individual_times {
                 table.read(
                     &format!("({time}) AND {base} AND {individual}"),
                     Order::Ascending,
-                    None,
+                    Some(MAX_INDIVIDUAL + 1 - out.individual.len()),
                     |row: Row| {
                         let record = row.into_record();
                         if matches_all(request.matchers, &record.stream) {
                             out.lines += 1;
                             out.individual.push(record);
                         }
+                        if out.individual.len() > MAX_INDIVIDUAL {
+                            overflowed = true;
+                            return Ok(ControlFlow::Break(()));
+                        }
                         Ok(ControlFlow::Continue(()))
                     },
                 )?;
+                if overflowed {
+                    return Ok(None);
+                }
             }
         }
         Ok(Some(out))
@@ -316,60 +325,42 @@ impl LogStore for ClickHouseLogs {
 const SECOND: u64 = 1_000_000_000;
 const MINUTE: u64 = 60 * SECOND;
 
-/// Ranges or split units per query: each is a condition of its own, and ClickHouse
-/// refuses a query text past a quarter of a megabyte.
+/// Ranges per query: each is a condition of its own, and ClickHouse refuses a query
+/// text past a quarter of a megabyte.
 const PER_QUERY: usize = 500;
 
-/// One rollup's part of a count: which of its units, by index, it answers.
+/// Lines grouped one by one at most, before the count is left to the caller's scan,
+/// which holds nothing: a label every line carries as an attribute would otherwise read
+/// every line of the range into memory here.
+const MAX_INDIVIDUAL: usize = 100_000;
+
+/// `unit`, an index of `nanos`-long units, lies wholly in one bucket: its first and
+/// last nanosecond fall in the same one. In SQL, signed, so a unit before the anchor
+/// compares harmlessly rather than wrapping.
+fn whole(unit: &str, nanos: u64, anchor: u64, width: u64) -> String {
+    format!(
+        "intDiv(toInt64({unit}) * {nanos} - {anchor}, {width}) \
+         = intDiv((toInt64({unit}) + 1) * {nanos} - {anchor} - 1, {width})"
+    )
+}
+
+/// One rollup's part of a count: its units, as conditions, a query each.
 struct Tier {
     table: &'static str,
     /// `Second` or `Minute`: the column, and what a unit is.
     unit: &'static str,
     nanos: u64,
-    /// Inclusive ranges of unit indexes.
-    ranges: Vec<(u64, u64)>,
-    /// Units inside the ranges that a bucket bound splits, left to a finer tier.
-    excluded: Vec<u64>,
-}
-
-impl Tier {
-    /// The tier's units as conditions, a few hundred ranges to a query.
-    fn conditions(&self) -> Vec<String> {
-        self.ranges
-            .chunks(PER_QUERY)
-            .map(|ranges| {
-                let (low, high) = (ranges[0].0, ranges[ranges.len() - 1].1);
-                let within: Vec<String> = ranges
-                    .iter()
-                    .map(|(a, b)| format!("({unit} >= {a} AND {unit} <= {b})", unit = self.unit))
-                    .collect();
-                let excluded: Vec<String> = self
-                    .excluded
-                    .iter()
-                    .filter(|u| (low..=high).contains(*u))
-                    .map(u64::to_string)
-                    .collect();
-                let mut condition = format!("({})", within.join(" OR "));
-                if !excluded.is_empty() {
-                    condition = format!(
-                        "{condition} AND {} NOT IN ({})",
-                        self.unit,
-                        excluded.join(", ")
-                    );
-                }
-                condition
-            })
-            .collect()
-    }
+    conditions: Vec<String>,
 }
 
 /// How a bucketed count with no line filter is answered.
 ///
 /// A unit — `(s, s + 1]` of a second, `(m, m + 60]` of a minute — lies wholly in one
 /// bucket unless a bucket bound falls strictly inside it. Whole minutes are counted from
-/// the minute rollup; the whole seconds of minutes a bound splits, from the second
-/// rollup; the seconds a bound splits, from the lines, whose timestamps put each line on
-/// its side of the bound. With bounds on whole minutes the lines are not read at all.
+/// the minute rollup, in one query; the whole seconds of minutes a bound splits, from
+/// the second rollup; the seconds a bound splits, from the lines, whose timestamps put
+/// each line on its side of the bound. With bounds on whole minutes the lines are not
+/// read at all.
 struct RollupPlan {
     tiers: Vec<Tier>,
     split_seconds: Vec<u64>,
@@ -395,25 +386,45 @@ impl RollupPlan {
     }
 }
 
-/// Bucket counts, keyed by stream hash, folded into groups by their labels' values.
-struct Grouper<'a> {
-    selected: &'a super::scan::Selected,
-    group_by: &'a [String],
-    index: HashMap<Vec<String>, usize>,
+/// Bucket counts folded into groups by their labels' values — in ClickHouse, which is
+/// told each stream's group, so a count over thousands of streams comes back as one row
+/// per group per bucket.
+struct Grouper {
+    /// `transform(StreamHash, [hashes], [groups], 0)`: a stream's group, by number.
+    expression: String,
     out: Buckets,
 }
 
-impl<'a> Grouper<'a> {
-    fn new(selected: &'a super::scan::Selected, group_by: &'a [String]) -> Self {
+impl Grouper {
+    fn new(selected: &super::scan::Selected, group_by: &[String]) -> Self {
+        let mut out = Buckets::default();
+        let mut index: HashMap<Vec<String>, u64> = HashMap::new();
+        let mut hashes = Vec::with_capacity(selected.streams.len());
+        let mut groups = Vec::with_capacity(selected.streams.len());
+        for (hash, stream) in &selected.streams {
+            let values: Vec<String> = group_by
+                .iter()
+                .map(|name| group_value(stream, name).to_owned())
+                .collect();
+            let next = out.groups.len() as u64;
+            let group = *index.entry(values.clone()).or_insert_with(|| {
+                out.groups.push((values, Vec::new()));
+                next
+            });
+            hashes.push(hash.to_string());
+            groups.push(group.to_string());
+        }
         Self {
-            selected,
-            group_by,
-            index: HashMap::new(),
-            out: Buckets::default(),
+            expression: format!(
+                "transform(StreamHash, [{}], [{}], toUInt64(0))",
+                hashes.join(", "),
+                groups.join(", ")
+            ),
+            out,
         }
     }
 
-    /// One `{k, s, lines, bytes}` row.
+    /// One `{k, g, lines, bytes}` row.
     fn absorb(&mut self, line: &[u8]) -> Result<ControlFlow<()>> {
         let row: serde_json::Value = serde_json::from_slice(line)
             .map_err(|e| Error::Unavailable(format!("reading a bucket from ClickHouse: {e}")))?;
@@ -423,22 +434,21 @@ impl<'a> Grouper<'a> {
                 .unwrap_or(0)
         };
         let (k, lines, bytes) = (number("k"), number("lines"), number("bytes"));
-        let Some(stream) = self.selected.streams.get(&number("s")) else {
+        let Some((_, buckets)) = usize::try_from(number("g"))
+            .ok()
+            .and_then(|g| self.out.groups.get_mut(g))
+        else {
             return Ok(ControlFlow::Continue(()));
         };
-        let values: Vec<String> = self
-            .group_by
-            .iter()
-            .map(|name| group_value(stream, name).to_owned())
-            .collect();
+        buckets.push((k, lines, bytes));
         self.out.lines += lines;
-        let next = self.out.groups.len();
-        let slot = *self.index.entry(values.clone()).or_insert(next);
-        if slot == next {
-            self.out.groups.push((values, Vec::new()));
-        }
-        self.out.groups[slot].1.push((k, lines, bytes));
         Ok(ControlFlow::Continue(()))
+    }
+
+    /// The groups that counted something.
+    fn finish(mut self) -> Buckets {
+        self.out.groups.retain(|(_, buckets)| !buckets.is_empty());
+        self.out
     }
 }
 
@@ -451,20 +461,21 @@ impl ClickHouseLogs {
         (anchor, width): (u64, u64),
         selected: &super::scan::Selected,
         individual: Option<&str>,
-        grouper: &mut Grouper<'_>,
+        grouper: &mut Grouper,
     ) -> Result<bool> {
         let not_individual = individual.map_or(String::new(), |c| format!(" AND NOT {c}"));
         let mut any = false;
         for tier in &plan.tiers {
-            for units in tier.conditions() {
+            for units in &tier.conditions {
                 let base = format!("{} AND {units}", selected.condition());
                 let query = format!(
                     "SELECT intDiv((toUInt64({unit}) + 1) * {nanos} - {anchor} - 1, {width}) AS k, \
-                     StreamHash AS s, sum(Lines) AS lines, sum(Bytes) AS bytes \
-                     FROM {table} WHERE {base}{not_individual} GROUP BY k, s",
+                     {group} AS g, sum(Lines) AS lines, sum(Bytes) AS bytes \
+                     FROM {table} WHERE {base}{not_individual} GROUP BY k, g",
                     unit = tier.unit,
                     nanos = tier.nanos,
                     table = tier.table,
+                    group = grouper.expression,
                 );
                 self.client
                     .query_lines(&query, |line| grouper.absorb(line))?;
@@ -516,13 +527,13 @@ impl ClickHouseLogs {
             split
         };
         let split_seconds = split_units(SECOND);
+        let whole_second = whole("Second", SECOND, anchor, width);
 
         let minutes = self
             .minutes_since
             .is_some_and(|since| since <= anchor && width >= MINUTE);
         let mut tiers = Vec::new();
         if minutes {
-            let split_minutes = split_units(MINUTE);
             let first_minute = anchor.div_ceil(MINUTE);
             if let Some(last_minute) = (until / MINUTE).checked_sub(1)
                 && first_minute <= last_minute
@@ -531,24 +542,30 @@ impl ClickHouseLogs {
                     table: LOG_VOLUME_MINUTES,
                     unit: "Minute",
                     nanos: MINUTE,
-                    ranges: vec![(first_minute, last_minute)],
-                    excluded: split_minutes.clone(),
+                    conditions: vec![format!(
+                        "Minute >= {first_minute} AND Minute <= {last_minute} AND {}",
+                        whole("Minute", MINUTE, anchor, width)
+                    )],
                 });
             }
             // The seconds no whole minute holds: those of the minutes a bound splits —
-            // which, since the range's own ends are bounds, include its ragged ends.
-            let ranges: Vec<(u64, u64)> = split_minutes
+            // which, since the range's own ends are bounds, include its ragged ends. As
+            // ranges, so the rollup's sort key reads those minutes and no others.
+            let ranges: Vec<String> = split_units(MINUTE)
                 .iter()
                 .map(|m| ((m * 60).max(first_second), (m * 60 + 59).min(last_second)))
                 .filter(|(low, high)| low <= high)
+                .map(|(low, high)| format!("(Second >= {low} AND Second <= {high})"))
                 .collect();
             if !ranges.is_empty() {
                 tiers.push(Tier {
                     table: LOG_VOLUME,
                     unit: "Second",
                     nanos: SECOND,
-                    ranges,
-                    excluded: split_seconds.clone(),
+                    conditions: ranges
+                        .chunks(PER_QUERY)
+                        .map(|chunk| format!("({}) AND {whole_second}", chunk.join(" OR ")))
+                        .collect(),
                 });
             }
         } else {
@@ -556,8 +573,9 @@ impl ClickHouseLogs {
                 table: LOG_VOLUME,
                 unit: "Second",
                 nanos: SECOND,
-                ranges: vec![(first_second, last_second)],
-                excluded: split_seconds.clone(),
+                conditions: vec![format!(
+                    "Second >= {first_second} AND Second <= {last_second} AND {whole_second}"
+                )],
             });
         }
         Some(RollupPlan {

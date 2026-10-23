@@ -574,15 +574,8 @@ pub fn ensure(
     // request naming a database that does not exist is refused before it runs.
     let on = Layout { config, retention }.on_cluster();
     let server = client.in_database("default");
-    server.execute(&format!(
-        "CREATE DATABASE IF NOT EXISTS {}{on}",
-        identifier(client.database())
-    ))?;
-    // On a cluster the statement can return before this replica has run it — another
-    // instance's identical statement, queued first, is the one this replica ran — and a
-    // table created in a database not there yet is refused. Wait until it is there.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    loop {
+    one_shard(&server, config)?;
+    let database_there = || -> Result<bool> {
         let mut there = false;
         server.query_lines(
             &format!(
@@ -594,24 +587,177 @@ pub fn ensure(
                 Ok(std::ops::ControlFlow::Break(()))
             },
         )?;
-        if there {
-            break;
+        Ok(there)
+    };
+    if !database_there()? {
+        server.execute(&format!(
+            "CREATE DATABASE IF NOT EXISTS {}{on}",
+            identifier(client.database())
+        ))?;
+        // On a cluster the statement can return before this replica has run it —
+        // another instance's identical statement, queued first, is the one this replica
+        // ran — and a table created in a database not there yet is refused. Wait until
+        // it is there.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !database_there()? {
+            if std::time::Instant::now() >= deadline {
+                return Err(telemetryd_core::Error::Unavailable(format!(
+                    "database {:?} was created on the cluster but has not appeared on this \
+                     replica within a minute; check the cluster's distributed DDL queue",
+                    client.database()
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
-        if std::time::Instant::now() >= deadline {
-            return Err(telemetryd_core::Error::Unavailable(format!(
-                "database {:?} was created on the cluster but has not appeared on this \
-                 replica within a minute; check the cluster's distributed DDL queue",
-                client.database()
-            )));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
     }
+    // What is there already is left alone: on a cluster every statement is a task for
+    // every replica through Keeper, and a fleet restarting one instance at a time would
+    // queue the whole schema once per instance for nothing.
+    let existing = existing_columns(client)?;
     for statement in statements(config, retention) {
+        if already_there(&statement, &existing) {
+            continue;
+        }
         client.execute(&statement)?;
     }
-    apply_ttl(client, config, retention)?;
+    let ttl = ttl_statements(config, retention).join(";\n");
+    let applied = setting(client, TTL_APPLIED)?;
+    if applied.as_deref() != Some(ttl.as_str()) {
+        apply_ttl(client, config, retention)?;
+    }
     record_rollup_start(client, LOG_VOLUME_SINCE, LOGS)?;
     record_rollup_start(client, LOG_VOLUME_MINUTES_SINCE, LOGS)
+}
+
+/// The key in [`META`] holding the TTL statements last applied, so a start with the
+/// same retention runs none of them.
+const TTL_APPLIED: &str = "ttl_applied";
+
+/// Refuse a cluster of more than one shard, and one the server does not know.
+///
+/// The tables are replicated, not distributed: on a cluster of several shards each
+/// instance would read and write only its own replica's shard, and every answer would
+/// be part of one. Shards need `Distributed` tables, which telemetryd does not create.
+fn one_shard(server: &Client, config: &ClickHouseConfig) -> Result<()> {
+    let cluster = config.cluster.trim();
+    if cluster.is_empty() {
+        return Ok(());
+    }
+    let mut shards = None;
+    server.query_lines(
+        &format!(
+            "SELECT uniqExact(shard_num) AS shards FROM system.clusters WHERE cluster = {}",
+            quote(cluster)
+        ),
+        |line| {
+            let value: serde_json::Value = serde_json::from_slice(line).unwrap_or_default();
+            shards = value.get("shards").and_then(serde_json::Value::as_u64);
+            Ok(std::ops::ControlFlow::Continue(()))
+        },
+    )?;
+    match shards.unwrap_or(0) {
+        0 => Err(telemetryd_core::Error::Config(format!(
+            "clickhouse.cluster is {cluster:?}, which the server's remote_servers does not define"
+        ))),
+        1 => Ok(()),
+        n => Err(telemetryd_core::Error::Config(format!(
+            "clickhouse.cluster {cluster:?} has {n} shards. telemetryd's tables are replicated, \
+             not distributed: on more than one shard each instance would see one shard's \
+             data. Use a cluster of one shard and as many replicas as you like"
+        ))),
+    }
+}
+
+/// Every table in the database, and its columns.
+fn existing_columns(
+    client: &Client,
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>> {
+    let mut tables: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    // `c.name`, not `name`: the first column's alias `name` would otherwise shadow
+    // the column, and every table would seem to have a column named after itself.
+    client.query_lines(
+        "SELECT name, '' AS column FROM system.tables WHERE database = currentDatabase() \
+         UNION ALL \
+         SELECT c.table AS name, c.name AS column FROM system.columns AS c \
+         WHERE c.database = currentDatabase()",
+        |line| {
+            let value: serde_json::Value = serde_json::from_slice(line).unwrap_or_default();
+            let text = |key: &str| {
+                value
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            let columns = tables.entry(text("name")).or_default();
+            let column = text("column");
+            if !column.is_empty() {
+                columns.insert(column);
+            }
+            Ok(std::ops::ControlFlow::Continue(()))
+        },
+    )?;
+    Ok(tables)
+}
+
+/// Whether a statement would change nothing: a `CREATE … IF NOT EXISTS` of something
+/// there, an `ADD COLUMN IF NOT EXISTS` of a column there.
+fn already_there(
+    statement: &str,
+    existing: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+) -> bool {
+    let name = |rest: &str| -> String {
+        rest.chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect()
+    };
+    if let Some(rest) = statement
+        .strip_prefix("CREATE TABLE IF NOT EXISTS ")
+        .or_else(|| statement.strip_prefix("CREATE MATERIALIZED VIEW IF NOT EXISTS "))
+    {
+        return existing.contains_key(&name(rest));
+    }
+    if let Some(rest) = statement.strip_prefix("ALTER TABLE ")
+        && let Some((_, column)) = rest.split_once(" ADD COLUMN IF NOT EXISTS ")
+    {
+        let column: String = column
+            .trim_start_matches('`')
+            .chars()
+            .take_while(|c| *c != '`' && *c != ' ')
+            .collect();
+        return existing
+            .get(&name(rest))
+            .is_some_and(|columns| columns.contains(&column));
+    }
+    false
+}
+
+/// A value in [`META`], the latest written.
+fn setting(client: &Client, name: &str) -> Result<Option<String>> {
+    let mut value = None;
+    client.query_lines(
+        &format!(
+            "SELECT argMax(Value, Updated) AS value, count() AS n FROM {META} WHERE Name = {}",
+            quote(name)
+        ),
+        |line| {
+            let row: serde_json::Value = serde_json::from_slice(line).unwrap_or_default();
+            if row
+                .get("n")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                > 0
+            {
+                value = row
+                    .get("value")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+            }
+            Ok(std::ops::ControlFlow::Continue(()))
+        },
+    )?;
+    Ok(value)
 }
 
 /// Bring every table's TTL to the configuration's, without rewriting existing parts.
@@ -624,10 +770,15 @@ pub fn apply_ttl(
     config: &ClickHouseConfig,
     retention: &RetentionConfig,
 ) -> Result<()> {
-    for statement in ttl_statements(config, retention) {
-        client.execute_with(&statement, &[("materialize_ttl_after_modify", "0")])?;
+    let statements = ttl_statements(config, retention);
+    for statement in &statements {
+        client.execute_with(statement, &[("materialize_ttl_after_modify", "0")])?;
     }
-    Ok(())
+    client.execute(&format!(
+        "INSERT INTO {META} SELECT {}, {}, now64(9)",
+        quote(TTL_APPLIED),
+        quote(&statements.join(";\n"))
+    ))
 }
 
 /// How far back a rollup can be trusted, recorded once, when it is first created.

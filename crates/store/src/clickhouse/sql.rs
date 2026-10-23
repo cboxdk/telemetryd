@@ -57,13 +57,42 @@ pub(crate) fn matcher(stream_column: &str, service_column: &str, m: &LabelMatche
     } else {
         format!("{stream_column}[{}]", quote(&m.name))
     };
-    let anchored = || quote(&format!("^(?:{})$", m.value));
+    // `(?-s)`: `.` stops at a newline in Rust, and must here too, or `!~ "x.y"` would
+    // drop a value with a newline in it that Rust keeps.
+    let anchored = || quote(&format!("^(?-s:{})$", m.value));
     match m.op {
         MatchOp::Equal => format!("{column} = {}", quote(&m.value)),
         MatchOp::NotEqual => format!("{column} != {}", quote(&m.value)),
+        // A pattern the two engines could read differently selects nothing here: the
+        // matchers are checked again on what comes back, so leaving it out can only
+        // read more.
+        MatchOp::Regex | MatchOp::NotRegex if !same_in_both(&m.value) => "1".to_owned(),
         MatchOp::Regex => format!("match({column}, {})", anchored()),
         MatchOp::NotRegex => format!("NOT match({column}, {})", anchored()),
     }
+}
+
+/// Whether ClickHouse's RE2 reads a pattern as Rust's regex does.
+///
+/// They share their syntax but not their classes: `\w`, `\d`, `\s` and `\b` are
+/// Unicode-aware in Rust and ASCII in RE2, so `\w+` matches "José" in one and not the
+/// other. A pattern using any of them, or any Unicode at all, is left to Rust.
+pub(crate) fn same_in_both(pattern: &str) -> bool {
+    if !pattern.is_ascii() {
+        return false;
+    }
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && matches!(
+                chars.next(),
+                Some('w' | 'W' | 'd' | 'D' | 's' | 'S' | 'b' | 'B' | 'p' | 'P' | 'X')
+            )
+        {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -91,7 +120,18 @@ mod tests {
         let m = LabelMatcher::new("level", MatchOp::Regex, "err.*").unwrap();
         assert_eq!(
             matcher("Stream", "ServiceName", &m),
-            "match(Stream['level'], '^(?:err.*)$')"
+            "match(Stream['level'], '^(?-s:err.*)$')"
         );
+    }
+
+    #[test]
+    fn a_pattern_the_engines_read_differently_is_left_to_rust() {
+        for pattern in [r"\w+", r"user\d", r"a\sb", r"\bword", "José.*", r"\p{L}+"] {
+            let m = LabelMatcher::new("user", MatchOp::Regex, pattern).unwrap();
+            assert_eq!(matcher("Stream", "ServiceName", &m), "1", "{pattern}");
+            let m = LabelMatcher::new("user", MatchOp::NotRegex, pattern).unwrap();
+            assert_eq!(matcher("Stream", "ServiceName", &m), "1", "{pattern}");
+        }
+        assert!(same_in_both(r"api|shop\.v[0-9]+"));
     }
 }
