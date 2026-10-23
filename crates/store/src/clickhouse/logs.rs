@@ -347,7 +347,8 @@ fn first_window(hours: &[(u64, u64)], order: Order, need: u64, span: u64) -> u64
     let window = busiest_end.map_or(60_000_000_000, |(_, rows)| {
         u64::try_from(u128::from(need) * u128::from(HOUR) / u128::from(*rows)).unwrap_or(u64::MAX)
     });
-    window.clamp(1_000_000_000, span.max(1))
+    // Not `clamp`: a range shorter than a second would make its bounds cross.
+    window.max(1_000_000_000).min(span.max(1))
 }
 
 fn over_ceiling(request: &Scan<'_>, collected: usize) -> Result<()> {
@@ -801,5 +802,30 @@ impl Row {
             span_id: Some(self.span_id).filter(|id| !id.is_empty()),
             resource,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOUR: u64 = 3_600_000_000_000;
+
+    #[test]
+    fn the_first_window_holds_what_the_last_hour_wrote_at_its_rate() {
+        // 3.6 million rows an hour is a thousand a second: 4,000 rows is four seconds.
+        let hours = [(0, 7), (HOUR, 3_600_000)];
+        assert_eq!(
+            first_window(&hours, Order::Descending, 4_000, 2 * HOUR),
+            4_000_000_000
+        );
+        // From the other end the first hour is the one that counts.
+        assert_eq!(first_window(&hours, Order::Ascending, 7, 2 * HOUR), HOUR);
+    }
+
+    #[test]
+    fn the_first_window_never_exceeds_the_range_even_under_a_second() {
+        assert_eq!(first_window(&[], Order::Descending, 100, 0), 1);
+        assert_eq!(first_window(&[(0, 1)], Order::Descending, 100, 500), 500);
     }
 }
