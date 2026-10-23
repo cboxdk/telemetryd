@@ -123,7 +123,10 @@ impl Store {
         // Before anything is opened: a ClickHouse that cannot be reached or refuses the
         // schema is a startup error, not a first failed request.
         let clickhouse = if config.clickhouse.is_enabled() {
-            Some(clickhouse::ClickHouse::open(&config.clickhouse)?)
+            Some(clickhouse::ClickHouse::open(
+                &config.clickhouse,
+                &config.retention,
+            )?)
         } else {
             None
         };
@@ -603,6 +606,14 @@ impl Store {
                     new.as_secs()
                 ));
             }
+        }
+        // The tables age by the same retention, so they change with it — and a
+        // retention a ClickHouse refuses is reported, not taken as applied.
+        if let Some(clickhouse) = &self.clickhouse
+            && changes.iter().any(|c| c.starts_with("retention."))
+            && let Err(error) = clickhouse.apply_retention(&config.clickhouse, &config.retention)
+        {
+            changes.push(format!("ClickHouse TTLs not changed: {error}"));
         }
         policy.retention = config.retention.clone();
 

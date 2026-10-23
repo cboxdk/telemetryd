@@ -23,7 +23,7 @@ pub use logs::ClickHouseLogs;
 pub use spans::ClickHouseSpans;
 
 use telemetryd_core::Result;
-use telemetryd_core::config::ClickHouseConfig;
+use telemetryd_core::config::{ClickHouseConfig, RetentionConfig};
 
 /// Everything kept in ClickHouse, behind one connection.
 #[derive(Debug)]
@@ -39,10 +39,10 @@ impl ClickHouse {
     /// # Errors
     /// When the password cannot be resolved or ClickHouse refuses the schema: a startup
     /// error, not a first failed request.
-    pub fn open(config: &ClickHouseConfig) -> Result<Self> {
+    pub fn open(config: &ClickHouseConfig, retention: &RetentionConfig) -> Result<Self> {
         let client = Client::new(config)?;
         if config.create_schema {
-            schema::ensure(&client, config)?;
+            schema::ensure(&client, config, retention)?;
         }
         Ok(Self {
             logs: ClickHouseLogs::new(client.clone()),
@@ -54,5 +54,20 @@ impl ClickHouse {
     #[must_use]
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// Give the tables a changed retention, as a reload does.
+    ///
+    /// # Errors
+    /// When ClickHouse refuses the change.
+    pub fn apply_retention(
+        &self,
+        config: &ClickHouseConfig,
+        retention: &RetentionConfig,
+    ) -> Result<()> {
+        if config.create_schema {
+            schema::apply_ttl(&self.client, config, retention)?;
+        }
+        Ok(())
     }
 }

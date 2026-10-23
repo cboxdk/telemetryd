@@ -37,6 +37,7 @@ fn instance(dir: &std::path::Path, clickhouse: ClickHouseConfig) -> axum::Router
             ..StorageConfig::default()
         },
         clickhouse,
+        retention: common::long_retention(),
         ..Config::default()
     };
     config.validate().unwrap();
@@ -315,6 +316,25 @@ async fn clickhouse_answers_as_the_local_store_does() {
                 ("query", query.to_owned()),
                 ("start", split_start.clone()),
                 ("end", split_end.clone()),
+                ("step", step.to_owned()),
+            ],
+        ));
+    }
+
+    // Bounds on whole minutes: the minute rollup alone answers.
+    for (query, step) in [
+        (
+            r#"sum by (level) (count_over_time({app=~".+"}[5m]))"#,
+            "300",
+        ),
+        (r#"sum(bytes_over_time({app="api"}[2m]))"#, "120"),
+    ] {
+        cases.push((
+            "query_range",
+            vec![
+                ("query", query.to_owned()),
+                ("start", (BASE + 300 * SECOND).to_string()),
+                ("end", (BASE + 600 * SECOND).to_string()),
                 ("step", step.to_owned()),
             ],
         ));

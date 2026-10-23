@@ -39,6 +39,7 @@ fn instance(dir: &std::path::Path, clickhouse: ClickHouseConfig) -> axum::Router
             ..StorageConfig::default()
         },
         clickhouse,
+        retention: common::long_retention(),
         ..Config::default()
     };
     config.validate().unwrap();

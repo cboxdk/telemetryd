@@ -55,6 +55,7 @@ async fn every_query_answers_as_loki_does_on_clickhouse() {
             ..StorageConfig::default()
         },
         clickhouse,
+        retention: common::long_retention(),
         ..Config::default()
     })
     .await;

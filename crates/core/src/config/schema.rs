@@ -58,12 +58,20 @@ pub struct ClickHouseConfig {
     /// Create the tables on `ON CLUSTER` this cluster, with `ReplicatedMergeTree`.
     /// Empty = one server, plain `MergeTree`.
     pub cluster: String,
-    /// Create the tables and columns that are missing at startup. Off for a database
-    /// whose schema someone else manages.
+    /// Create the tables and columns that are missing at startup, and bring their TTLs
+    /// to `retention.*`. Off for a database whose schema someone else manages.
     pub create_schema: bool,
-    /// Days ClickHouse keeps a row, as the table's TTL. Applies when the tables are
-    /// created; an existing table keeps the TTL it has.
-    pub retention_days: u32,
+    /// The storage policy new tables are created with. Empty = the server's default.
+    /// Needed for `cold_after`: it names the volumes rows move between. Applies when a
+    /// table is created; ClickHouse cannot move an existing table to another policy.
+    pub storage_policy: String,
+    /// Move logs and spans this old to `cold_volume` — object storage or slower disks,
+    /// still queryable — and keep them there until `retention.*` deletes them. Zero =
+    /// never: everything stays on the policy's first volume.
+    #[serde(with = "humantime_serde")]
+    pub cold_after: Duration,
+    /// The volume of `storage_policy` that `cold_after` moves rows to.
+    pub cold_volume: String,
     /// How long one request to ClickHouse may take.
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
@@ -78,7 +86,9 @@ impl Default for ClickHouseConfig {
             password: Secret::default(),
             cluster: String::new(),
             create_schema: true,
-            retention_days: 30,
+            storage_policy: String::new(),
+            cold_after: Duration::ZERO,
+            cold_volume: "cold".to_owned(),
             timeout: Duration::from_secs(30),
         }
     }

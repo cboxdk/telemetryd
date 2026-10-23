@@ -2,13 +2,16 @@
 
 #![allow(dead_code, clippy::unwrap_used)]
 
-use telemetryd_core::config::ClickHouseConfig;
+use std::time::Duration;
+
+use telemetryd_core::config::{ClickHouseConfig, DurationSetting, RetentionConfig};
 
 /// A `[clickhouse]` section on a database of its own, or `None` when
 /// `TELEMETRYD_TEST_CLICKHOUSE_URL=http://user:password@host:8123` is not set.
 ///
-/// Each call names a fresh database, so tests never read each other's rows. The corpora
-/// are dated, so the TTL is long: a month's would have ClickHouse drop them on insert.
+/// Each call names a fresh database, so tests never read each other's rows. Pair it with
+/// [`long_retention`]: the corpora are dated, and a week's TTL would have ClickHouse
+/// drop them on insert.
 pub(crate) fn clickhouse_under_test(name: &str) -> Option<ClickHouseConfig> {
     let raw = std::env::var("TELEMETRYD_TEST_CLICKHOUSE_URL").ok()?;
     let (scheme, rest) = raw.split_once("://").unwrap();
@@ -23,7 +26,16 @@ pub(crate) fn clickhouse_under_test(name: &str) -> Option<ClickHouseConfig> {
         database: format!("td_test_{name}_{unique}"),
         user: user.to_owned(),
         password: telemetryd_core::Secret::new(password),
-        retention_days: 3_650,
         ..ClickHouseConfig::default()
     })
+}
+
+/// Ten years of everything: what a test against ClickHouse keeps its dated rows for.
+pub(crate) fn long_retention() -> RetentionConfig {
+    let ten_years = DurationSetting(Duration::from_secs(3650 * 86_400));
+    RetentionConfig {
+        logs: ten_years,
+        traces: ten_years,
+        metrics: ten_years,
+    }
 }
