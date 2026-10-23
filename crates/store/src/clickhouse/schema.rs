@@ -137,7 +137,10 @@ ORDER BY (ServiceName, toDateTime(Timestamp))
     ))
     .chain(log_volume(&engine, days))
     .chain(traces(&engine, &ttl, settings, days))
-    .chain(super::metrics_schema::statements(config))
+    .chain(super::metrics_schema::statements(
+        config,
+        std::time::Duration::from_secs(u64::from(days) * 86_400),
+    ))
     .collect()
 }
 

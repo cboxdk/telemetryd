@@ -191,6 +191,19 @@ impl Store {
         }
     }
 
+    /// Summarise settled metric hours in ClickHouse; `None` without ClickHouse.
+    ///
+    /// # Errors
+    /// When ClickHouse cannot be read or written.
+    pub fn roll_up_metrics(&self, now: u64) -> Result<Option<clickhouse::metric_folds::RollUp>> {
+        static OWNER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let owner = OWNER.get_or_init(|| format!("{}-{}", std::process::id(), now_nanos()));
+        self.clickhouse
+            .as_ref()
+            .map(|c| c.metrics.roll_up(now, owner))
+            .transpose()
+    }
+
     /// Whether logs are kept in ClickHouse rather than on this machine.
     pub fn logs_in_clickhouse(&self) -> bool {
         self.clickhouse.is_some()

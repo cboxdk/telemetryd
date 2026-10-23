@@ -263,6 +263,24 @@ impl Client {
         outcome
     }
 
+    /// [`Self::insert`] without `async_insert`: for a batch telemetryd assembled itself,
+    /// large and one at a time, which a server-side buffer would only copy.
+    ///
+    /// # Errors
+    /// [`Error::Unavailable`].
+    pub fn insert_bulk(&self, table: &str, rows: &[u8]) -> Result<()> {
+        let sql = format!("INSERT INTO {table} FORMAT JSONEachRow");
+        let started = Instant::now();
+        self.stats
+            .bytes_sent
+            .fetch_add(rows.len() as u64, Ordering::Relaxed);
+        let outcome = self
+            .post(&[("query", sql.as_str())], rows, &sql)
+            .map(|_| ());
+        self.stats.record(Operation::Insert, started, &outcome);
+        outcome
+    }
+
     /// Run a query and hand each `JSONEachRow` line to `each` as it arrives, so a large
     /// answer is never held whole. `each` may stop the read early.
     ///

@@ -30,6 +30,7 @@ const SECOND: u64 = 1_000_000_000;
 const END: u64 = 1_790_007_200 * SECOND;
 const START: u64 = END - 7_200 * SECOND;
 const STEP: u64 = 15 * SECOND;
+const DAY: u64 = 86_400 * SECOND;
 
 fn clickhouse() -> Option<ClickHouseConfig> {
     let raw = std::env::var("TELEMETRYD_TEST_CLICKHOUSE_URL").ok()?;
@@ -50,7 +51,7 @@ fn clickhouse() -> Option<ClickHouseConfig> {
     })
 }
 
-fn instance(dir: &std::path::Path, clickhouse: ClickHouseConfig) -> axum::Router {
+fn instance(dir: &std::path::Path, clickhouse: ClickHouseConfig) -> (axum::Router, Arc<Store>) {
     let config = Config {
         storage: StorageConfig {
             data_dir: Some(dir.to_path_buf()),
@@ -61,7 +62,49 @@ fn instance(dir: &std::path::Path, clickhouse: ClickHouseConfig) -> axum::Router
     };
     config.validate().unwrap();
     let store = Arc::new(Store::open(&config).unwrap());
-    router(AppState::new(Arc::new(config), store).unwrap())
+    (
+        router(AppState::new(Arc::new(config), Arc::clone(&store)).unwrap()),
+        store,
+    )
+}
+
+/// Run the summariser to the end of the data and past it, as the server's maintenance
+/// would over the next hours.
+fn summarise(store: &Store, now: u64) -> usize {
+    let mut written = 0;
+    for _ in 0..64 {
+        let done = store.roll_up_metrics(now).unwrap().unwrap();
+        written += done.folds_written;
+        if done.hours == 0 && done.days == 0 && done.repaired_hours == 0 {
+            break;
+        }
+    }
+    written
+}
+
+/// Two answers the same up to floating-point rounding: an answer from summaries adds a
+/// window up in a different order than one from the samples, as the local store's own
+/// summaries do; the conformance corpus holds every road to the same `1e-9`.
+fn same(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::String(x), Value::String(y)) => {
+            x == y
+                || match (x.parse::<f64>(), y.parse::<f64>()) {
+                    (Ok(x), Ok(y)) => {
+                        (x.is_nan() && y.is_nan())
+                            || (x - y).abs() <= 1e-9 * x.abs().max(y.abs()).max(1.0)
+                    }
+                    _ => false,
+                }
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same(x, y))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| same(v, w)))
+        }
+        _ => a == b,
+    }
 }
 
 fn kv(key: &str, value: &str) -> Value {
@@ -319,10 +362,11 @@ async fn clickhouse_answers_metrics_as_the_local_store_does() {
     };
     let local_dir = tempfile::tempdir().unwrap();
     let remote_dir = tempfile::tempdir().unwrap();
-    let local = instance(local_dir.path(), ClickHouseConfig::default());
-    let remote = instance(remote_dir.path(), clickhouse);
+    let (local, _) = instance(local_dir.path(), ClickHouseConfig::default());
+    let (remote, remote_store) = instance(remote_dir.path(), clickhouse);
     load(&local).await;
     load(&remote).await;
+    assert!(summarise(&remote_store, END + 3_600 * SECOND) > 0);
 
     let bucket = "http_server_request_duration_seconds_bucket";
     let count = "http_server_request_duration_seconds_count";
@@ -407,7 +451,7 @@ async fn clickhouse_answers_metrics_as_the_local_store_does() {
         {
             answered_with_data += 1;
         }
-        if want != got {
+        if !same(&want, &got) {
             differences.push(format!(
                 "{path} {:?}\n  local:      {}\n  clickhouse: {}",
                 params.first().map(|(_, v)| v),
@@ -426,6 +470,163 @@ async fn clickhouse_answers_metrics_as_the_local_store_does() {
         differences.is_empty(),
         "{} of {answered} answers differ:\n{}",
         differences.len(),
+        differences.join("\n")
+    );
+}
+
+/// Three days of counters and a gauge, every minute: windows of days answered from
+/// daily summaries, of hours from hourly ones, with uneven edges read as samples — and
+/// the same answers after late data lands in an hour already summarised.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn summaries_answer_long_windows_as_the_samples_do() {
+    let Some(clickhouse) = clickhouse() else {
+        eprintln!("TELEMETRYD_TEST_CLICKHOUSE_URL is not set; skipped");
+        return;
+    };
+    // Three whole days from a UTC midnight, so days in the data are days in the table.
+    let start = (END / DAY - 3) * DAY;
+    let end = start + 3 * DAY;
+    let minute = 60 * SECOND;
+    let steps = (end - start) / minute;
+    let mut requests = Vec::new();
+    let mut errors = Vec::new();
+    let mut memory = Vec::new();
+    let (mut r, mut e) = (0.0f64, 0.0f64);
+    for step in 1..=steps {
+        let at = start + step * minute;
+        if step % 1_500 == 0 {
+            r = 0.0;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        {
+            r += (step % 11) as f64 * 0.75 + 0.1;
+            e += (step % 3) as f64;
+            memory.push(((step % 977) as f64 * 3.25, at));
+        }
+        requests.push((r, at));
+        errors.push((e, at));
+    }
+    let batch = remote_write(&[
+        (
+            vec![
+                ("__name__", "requests_total"),
+                ("app", "geo"),
+                ("route", "/geocode"),
+            ],
+            requests,
+        ),
+        (
+            vec![
+                ("__name__", "requests_total"),
+                ("app", "geo"),
+                ("route", "/reverse"),
+            ],
+            errors,
+        ),
+        (vec![("__name__", "memory_bytes"), ("app", "geo")], memory),
+    ]);
+    let local_dir = tempfile::tempdir().unwrap();
+    let remote_dir = tempfile::tempdir().unwrap();
+    let (local, _) = instance(local_dir.path(), ClickHouseConfig::default());
+    let (remote, remote_store) = instance(remote_dir.path(), clickhouse);
+    for app in [&local, &remote] {
+        let request = Request::post("/api/v1/write")
+            .header(header::CONTENT_TYPE, "application/x-protobuf")
+            .header("content-encoding", "snappy")
+            .body(Body::from(batch.clone()))
+            .unwrap();
+        assert!(send(app, request).await.is_success());
+    }
+    assert!(summarise(&remote_store, end + 2 * 3_600 * SECOND) > 0);
+
+    let expressions = [
+        "increase(requests_total[1d])",
+        "sum by (route) (rate(requests_total[6h]))",
+        "rate(requests_total[2d])",
+        "sum(increase(requests_total[3d]))",
+        "resets(requests_total[1d])",
+        "sum_over_time(memory_bytes[1d])",
+        "max_over_time(memory_bytes[2d])",
+        "min_over_time(memory_bytes[1d])",
+        "avg_over_time(memory_bytes[12h])",
+        "count_over_time(memory_bytes[1d])",
+    ];
+    let mut cases: Vec<(&str, Vec<(&str, String)>)> = Vec::new();
+    for expression in expressions {
+        for time in [
+            end,
+            start + 2 * DAY,
+            start + 2 * DAY + 37 * minute + 125_000_000,
+        ] {
+            cases.push((
+                "/api/v1/query",
+                vec![("query", expression.to_owned()), ("time", seconds(time))],
+            ));
+        }
+        for (from, step) in [
+            (start + DAY, "3600"),
+            (start + DAY, "86400"),
+            (start + DAY + 7 * minute, "5400"),
+        ] {
+            cases.push((
+                "/api/v1/query_range",
+                vec![
+                    ("query", expression.to_owned()),
+                    ("start", seconds(from)),
+                    ("end", seconds(end)),
+                    ("step", step.to_owned()),
+                ],
+            ));
+        }
+    }
+
+    let compare = |round: &'static str| {
+        let cases = cases.clone();
+        let local = local.clone();
+        let remote = remote.clone();
+        async move {
+            let mut differences = Vec::new();
+            for (path, params) in &cases {
+                let want = ask(&local, path, params).await;
+                let got = ask(&remote, path, params).await;
+                if !same(&want, &got) {
+                    differences.push(format!(
+                        "{round} {path} {:?}\n  local:      {}\n  clickhouse: {}",
+                        params.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
+                        want.to_string().chars().take(400).collect::<String>(),
+                        got.to_string().chars().take(400).collect::<String>(),
+                    ));
+                }
+            }
+            differences
+        }
+    };
+    let mut differences = compare("summarised").await;
+
+    // Late data: a sample for an hour of the first day, long summarised.
+    let late = remote_write(&[(
+        vec![("__name__", "memory_bytes"), ("app", "geo")],
+        vec![(123_456.0, start + 5 * 3_600 * SECOND + 30 * SECOND)],
+    )]);
+    for app in [&local, &remote] {
+        let request = Request::post("/api/v1/write")
+            .header(header::CONTENT_TYPE, "application/x-protobuf")
+            .header("content-encoding", "snappy")
+            .body(Body::from(late.clone()))
+            .unwrap();
+        assert!(send(app, request).await.is_success());
+    }
+    differences.extend(compare("with late data").await);
+    // And once the summariser has made that hour and its day again.
+    summarise(&remote_store, end + 3 * 3_600 * SECOND);
+    differences.extend(compare("repaired").await);
+
+    assert!(
+        differences.is_empty(),
+        "{} of {} answers differ:\n{}",
+        differences.len(),
+        cases.len() * 3,
         differences.join("\n")
     );
 }

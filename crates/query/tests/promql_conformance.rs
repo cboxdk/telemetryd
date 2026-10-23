@@ -156,6 +156,14 @@ fn every_expression_answers_as_prometheus_does_on_clickhouse() {
     };
     let store = Store::open(&config).unwrap();
     store.append_samples(&samples).unwrap();
+    // Summarised as the server would by the time anyone asks, so the windows that hold
+    // whole hours are answered from the summaries.
+    let later = samples.iter().map(|s| s.timestamp_nanos).max().unwrap() + 86_400 * SECOND;
+    while store
+        .roll_up_metrics(later)
+        .unwrap()
+        .is_some_and(|done| done.hours > 0 || done.days > 0)
+    {}
     let metrics = store.metric_store();
 
     let mut failures = Vec::new();

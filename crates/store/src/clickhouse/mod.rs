@@ -13,6 +13,7 @@
 
 mod client;
 pub mod logs;
+pub mod metric_folds;
 pub mod metrics;
 pub mod metrics_schema;
 mod scan;

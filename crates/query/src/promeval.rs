@@ -1012,20 +1012,24 @@ impl Snapshot {
             let range_nanos = duration_nanos(*range);
             let gauges = summarises_gauge(*function);
             let mut by_step: Vec<Vec<(usize, f64)>> = vec![Vec::new(); points.len()];
+            let windows: Vec<(u64, u64)> = points
+                .iter()
+                .map(|at_nanos| {
+                    let at = offset.apply(*at_nanos);
+                    (at.saturating_sub(range_nanos), at)
+                })
+                .collect();
+            // The selector's own matchers, not the pushdown shared by every selector: the
+            // pushdown is only what all of them have in common, so `x{code="500"}` divided
+            // by `x` would otherwise fold every code into both sides and read as exactly 1.
+            // The selector's matchers include the pushdown, so this only ever prunes more.
+            let Some(folded_windows) =
+                store.fold_windows(&windows, &selector.matchers, whole_reads, gauges)?
+            else {
+                return Ok(None);
+            };
 
-            for (point, at_nanos) in points.iter().enumerate() {
-                let at = offset.apply(*at_nanos);
-                let floor = at.saturating_sub(range_nanos);
-                // The selector's own matchers, not the pushdown shared by every selector:
-                // the pushdown is only what all of them have in common, so `x{code="500"}`
-                // divided by `x` would otherwise fold every code into both sides and read
-                // as exactly 1. The selector's matchers include the pushdown, so this only
-                // ever prunes more.
-                let Some(folded) =
-                    store.fold_window(floor, at, &selector.matchers, whole_reads, gauges)?
-                else {
-                    return Ok(None);
-                };
+            for ((point, at_nanos), folded) in points.iter().enumerate().zip(folded_windows) {
                 for (series, summary) in folded {
                     let value = if gauges {
                         // Every series here has samples in the window, so each of these

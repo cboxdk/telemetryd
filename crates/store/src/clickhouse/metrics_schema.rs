@@ -19,6 +19,19 @@
 //! - **`telemetryd_series`**: every series per day, its labels, app, first and last
 //!   sample. Matchers are resolved against it, exactly, by the matcher code every store
 //!   uses; label names, values and `/series` answer from it.
+//! - **`telemetryd_sample_counts`**: samples per series per hour, staleness markers left
+//!   out as a fold leaves them out, kept by a view. What says whether a fold below still
+//!   describes every sample of its hour, or late data has arrived since it was made.
+//! - **`telemetryd_folds`**: a counter-and-gauge summary per series per hour (tier 1)
+//!   and per day (tier 2), the same summary a sealed local segment carries, made by
+//!   telemetryd from the samples with the local store's own arithmetic. A window of
+//!   whole hours or days is answered from these instead of from every sample in it.
+//!
+//! Hours and days here are half open the way a PromQL window is: bucket `k` holds the
+//! samples in `(k·width, (k+1)·width]`, so a window whose bounds fall on bucket bounds
+//! is exactly the buckets inside it.
+
+use std::time::Duration;
 
 use telemetryd_core::config::ClickHouseConfig;
 
@@ -29,6 +42,9 @@ pub const SAMPLES: &str = "telemetryd_samples";
 const SAMPLES_VIEW: &str = "telemetryd_samples_mv";
 pub const SERIES: &str = "telemetryd_series";
 const SERIES_VIEW: &str = "telemetryd_series_mv";
+pub const COUNTS: &str = "telemetryd_sample_counts";
+const COUNTS_VIEW: &str = "telemetryd_sample_counts_mv";
+pub const FOLDS: &str = "telemetryd_folds";
 
 /// `Special`: the value column holds the value itself.
 pub const VALUE: u8 = 0;
@@ -39,14 +55,48 @@ pub const NAN: u8 = 2;
 pub const POSITIVE_INFINITY: u8 = 3;
 pub const NEGATIVE_INFINITY: u8 = 4;
 
-/// Every statement, in the order they must run.
+pub const HOUR_NANOS: u64 = 3_600_000_000_000;
+pub const DAY_NANOS: u64 = 24 * HOUR_NANOS;
+/// `Tier` of an hourly fold.
+pub const HOURLY: u8 = 1;
+/// `Tier` of a daily fold.
+pub const DAILY: u8 = 2;
+
+/// The bucket of `width` holding a sample at `nanos`: `(k·width, (k+1)·width]`.
 #[must_use]
-pub fn statements(config: &ClickHouseConfig) -> Vec<String> {
+pub fn bucket_of(nanos: u64, width: u64) -> u64 {
+    nanos.saturating_sub(1) / width
+}
+
+/// `TTL` for a table whose rows age by `time`, after `retention`.
+fn ttl(time: &str, retention: Duration) -> String {
+    format!(
+        "TTL {time} + INTERVAL {} SECOND",
+        retention.as_secs().max(1)
+    )
+}
+
+const SETTINGS: &str = "SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1";
+
+/// What each table's rows age by, for its `TTL`.
+fn aged_tables() -> [(&'static str, &'static str); 4] {
+    [
+        (SAMPLES, "toDateTime(Timestamp)"),
+        (SERIES, "toDateTime(Day)"),
+        (COUNTS, "toDateTime(toUInt64(Hour) * 3600)"),
+        (FOLDS, "toDateTime(Starts)"),
+    ]
+}
+
+/// Every statement, in the order they must run, keeping `retention` of metrics.
+#[must_use]
+pub fn statements(config: &ClickHouseConfig, retention: Duration) -> Vec<String> {
     let engine = Engine {
         cluster: config.cluster.trim(),
     };
     let on = engine.on_cluster();
-    let days = config.retention_days.max(1);
+    let [samples_ttl, series_ttl, counts_ttl, folds_ttl] =
+        aged_tables().map(|(_, time)| ttl(time, retention));
     vec![
         format!(
             "CREATE TABLE IF NOT EXISTS {INGEST}{on} (
@@ -70,8 +120,8 @@ pub fn statements(config: &ClickHouseConfig) -> Vec<String> {
 ) ENGINE = {}
 PARTITION BY toDate(Timestamp)
 ORDER BY (MetricName, SeriesHash, Timestamp)
-TTL toDateTime(Timestamp) + INTERVAL {days} DAY
-SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
+{samples_ttl}
+{SETTINGS}",
             engine.engine(SAMPLES, "MergeTree")
         ),
         format!(
@@ -92,8 +142,8 @@ FROM {INGEST}"
 ) ENGINE = {}
 PARTITION BY Day
 ORDER BY (MetricName, Day, SeriesHash)
-TTL Day + INTERVAL {days} DAY
-SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
+{series_ttl}
+{SETTINGS}",
             engine.engine(SERIES, "AggregatingMergeTree")
         ),
         format!(
@@ -111,4 +161,94 @@ FROM (SELECT Timestamp, MetricName, ServiceName, Series AS S FROM {INGEST})
 GROUP BY Day, MetricName, ServiceName, SeriesHash"
         ),
     ]
+    .into_iter()
+    .chain(summaries(&engine, &counts_ttl, &folds_ttl))
+    .collect()
+}
+
+/// The sample counts and the summaries checked against them.
+fn summaries(engine: &Engine<'_>, counts_ttl: &str, folds_ttl: &str) -> Vec<String> {
+    let on = engine.on_cluster();
+    vec![
+        format!(
+            "CREATE TABLE IF NOT EXISTS {COUNTS}{on} (
+    MetricName LowCardinality(String),
+    Hour UInt32,
+    SeriesHash UInt64,
+    Samples SimpleAggregateFunction(sum, UInt64)
+) ENGINE = {}
+PARTITION BY intDiv(Hour, 24 * 30)
+ORDER BY (MetricName, Hour, SeriesHash)
+{counts_ttl}
+{SETTINGS}",
+            engine.engine(COUNTS, "AggregatingMergeTree")
+        ),
+        format!(
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS {COUNTS_VIEW}{on} TO {COUNTS} AS
+SELECT
+    MetricName,
+    toUInt32(intDiv(toUnixTimestamp64Nano(Timestamp) - 1, {HOUR_NANOS})) AS Hour,
+    cityHash64(S) AS SeriesHash,
+    countIf(Special != {STALE}) AS Samples
+FROM (SELECT Timestamp, MetricName, Series AS S, Special FROM {INGEST})
+GROUP BY MetricName, Hour, SeriesHash"
+        ),
+        format!(
+            "CREATE TABLE IF NOT EXISTS {FOLDS}{on} (
+    MetricName LowCardinality(String),
+    Tier UInt8,
+    Bucket UInt32,
+    SeriesHash UInt64,
+    Starts DateTime CODEC(Delta(4), ZSTD(1)),
+    Seen UInt64,
+    FirstNanos UInt64,
+    LastNanos UInt64,
+    FirstValue UInt64,
+    LastValue UInt64,
+    Increase UInt64,
+    Sum UInt64,
+    Compensation UInt64,
+    Min UInt64,
+    Max UInt64,
+    Version UInt64
+) ENGINE = {}
+PARTITION BY (Tier, toYYYYMM(Starts))
+ORDER BY (MetricName, Tier, Bucket, SeriesHash)
+{folds_ttl}
+{SETTINGS}",
+            versioned(&engine.engine(FOLDS, "ReplacingMergeTree"))
+        ),
+    ]
+}
+
+/// A `ReplacingMergeTree` engine clause that keeps the highest `Version`: the engine
+/// takes it as its last argument, after a replicated one's path and replica.
+fn versioned(engine: &str) -> String {
+    match engine.strip_suffix("()") {
+        Some(name) => format!("{name}(Version)"),
+        None => match engine.strip_suffix(')') {
+            Some(open) => format!("{open}, Version)"),
+            None => engine.to_owned(),
+        },
+    }
+}
+
+/// The `TTL` of every metric table set to `retention`, for a retention changed after the
+/// tables were made. Not applied to parts already written until they merge, so it costs
+/// nothing at the moment it runs.
+#[must_use]
+pub fn ttl_statements(config: &ClickHouseConfig, retention: Duration) -> Vec<String> {
+    let on = Engine {
+        cluster: config.cluster.trim(),
+    }
+    .on_cluster();
+    aged_tables()
+        .into_iter()
+        .map(|(table, time)| {
+            format!(
+                "ALTER TABLE {table}{on} MODIFY {} SETTINGS materialize_ttl_after_modify = 0",
+                ttl(time, retention)
+            )
+        })
+        .collect()
 }

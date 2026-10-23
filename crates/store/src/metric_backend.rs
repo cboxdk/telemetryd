@@ -14,6 +14,9 @@ use crate::folds::StreamFold;
 use crate::metrics::{MetricSchema, SeriesRun};
 use crate::records::{RecordStore, Scan};
 
+/// Every matching series' summary over one window, in label order.
+pub type Folded = Vec<(Labels, StreamFold)>;
+
 /// Metric samples, as the Prometheus API and PromQL read them.
 pub trait MetricStore: Send + Sync {
     /// Hand `visit` every series matching `matchers` with samples inside `windows` —
@@ -41,7 +44,30 @@ pub trait MetricStore: Send + Sync {
         matchers: &[LabelMatcher],
         whole_reads_allowed: usize,
         gauges: bool,
-    ) -> Result<Option<Vec<(Labels, StreamFold)>>>;
+    ) -> Result<Option<Folded>>;
+
+    /// [`Self::fold_window`] for several windows at once, in their order, or `None` when
+    /// any one is declined. A store that can answer them together — one read for the
+    /// summaries every window draws on — does; the default asks one at a time.
+    ///
+    /// # Errors
+    /// When the store cannot be read.
+    fn fold_windows(
+        &self,
+        windows: &[(u64, u64)],
+        matchers: &[LabelMatcher],
+        whole_reads_allowed: usize,
+        gauges: bool,
+    ) -> Result<Option<Vec<Folded>>> {
+        let mut out = Vec::with_capacity(windows.len());
+        for &(start, end) in windows {
+            match self.fold_window(start, end, matchers, whole_reads_allowed, gauges)? {
+                Some(folded) => out.push(folded),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(out))
+    }
 
     /// Every matching sample in `[start, end]` that `extra` accepts, refusing more than
     /// `ceiling` (`0`: no ceiling).
@@ -117,7 +143,7 @@ impl MetricStore for RecordStore<MetricSchema> {
         matchers: &[LabelMatcher],
         whole_reads_allowed: usize,
         gauges: bool,
-    ) -> Result<Option<Vec<(Labels, StreamFold)>>> {
+    ) -> Result<Option<Folded>> {
         Self::fold_window(
             self,
             start_nanos,

@@ -102,7 +102,7 @@ fn split_value(value: f64) -> (f64, u8) {
     }
 }
 
-fn joined_value(value: f64, special: u8) -> f64 {
+pub(super) fn joined_value(value: f64, special: u8) -> f64 {
     match special {
         STALE => f64::from_bits(STALE_MARKER_BITS),
         NAN => f64::NAN,
@@ -225,6 +225,15 @@ impl ClickHouseMetrics {
         self.client.insert(INGEST, &body)?;
         self.client.stats().count_rows(samples.len());
         Ok(())
+    }
+
+    /// Summarise what has settled since the last pass: see
+    /// [`super::metric_folds::roll_up`].
+    ///
+    /// # Errors
+    /// When ClickHouse cannot be read or written.
+    pub fn roll_up(&self, now: u64, owner: &str) -> Result<super::metric_folds::RollUp> {
+        super::metric_folds::roll_up(&self.client, now, owner)
     }
 
     /// The series with samples in the range that the matchers select.
@@ -363,13 +372,48 @@ impl MetricStore for ClickHouseMetrics {
 
     fn fold_window(
         &self,
-        _start_nanos: u64,
-        _end_nanos: u64,
-        _matchers: &[LabelMatcher],
-        _whole_reads_allowed: usize,
-        _gauges: bool,
+        start_nanos: u64,
+        end_nanos: u64,
+        matchers: &[LabelMatcher],
+        whole_reads_allowed: usize,
+        gauges: bool,
     ) -> Result<Option<Vec<(Labels, StreamFold)>>> {
-        Ok(None)
+        Ok(self
+            .fold_windows(
+                &[(start_nanos, end_nanos)],
+                matchers,
+                whole_reads_allowed,
+                gauges,
+            )?
+            .and_then(|mut windows| windows.pop()))
+    }
+
+    fn fold_windows(
+        &self,
+        windows: &[(u64, u64)],
+        matchers: &[LabelMatcher],
+        _whole_reads_allowed: usize,
+        gauges: bool,
+    ) -> Result<Option<Vec<crate::metric_backend::Folded>>> {
+        let (Some(start), Some(end)) = (
+            windows.iter().map(|w| w.0).min(),
+            windows.iter().map(|w| w.1).max(),
+        ) else {
+            return Ok(Some(Vec::new()));
+        };
+        let selected = self.select(start, end, matchers)?;
+        if selected.series.is_empty() {
+            return Ok(Some(vec![Vec::new(); windows.len()]));
+        }
+        super::metric_folds::fold_windows(
+            &self.client,
+            &super::metric_folds::Reading {
+                series: &selected.series,
+                condition: selected.condition(),
+            },
+            windows,
+            gauges,
+        )
     }
 
     fn query_bounded(
