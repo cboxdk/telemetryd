@@ -37,6 +37,11 @@ use super::Client;
 pub const LOGS: &str = "otel_logs";
 pub const LOG_STREAMS: &str = "otel_log_streams";
 const LOG_STREAMS_VIEW: &str = "otel_log_streams_mv";
+pub const LOG_VOLUME: &str = "otel_log_volume";
+const LOG_VOLUME_VIEW: &str = "otel_log_volume_mv";
+pub const META: &str = "telemetryd_meta";
+/// The key in [`META`] saying from when `otel_log_volume` counts every line.
+pub const LOG_VOLUME_SINCE: &str = "log_volume_since";
 pub const TRACES: &str = "otel_traces";
 pub const TRACE_IDS: &str = "otel_traces_trace_id_ts";
 const TRACE_IDS_VIEW: &str = "otel_traces_trace_id_ts_mv";
@@ -130,6 +135,7 @@ ORDER BY (ServiceName, toDateTime(Timestamp))
         "Timestamp",
         days,
     ))
+    .chain(log_volume(&engine, days))
     .chain(traces(&engine, &ttl, settings, days))
     .collect()
 }
@@ -175,6 +181,59 @@ SELECT
     max({time}) AS MaxTimestamp
 FROM (SELECT {time}, ServiceName, Stream AS S FROM {source})
 GROUP BY Hour, ServiceName, StreamHash"
+        ),
+    ]
+}
+
+/// Lines and bytes per stream per second, for log volume without reading the lines.
+///
+/// A second here is `(s, s + 1]`, half open the way a LogQL window is, so a second lies
+/// wholly inside every bucket whose bounds fall on whole seconds. Kept per set of
+/// attribute label names as well, so a count grouped by a label an attribute could
+/// stand in for can tell from here alone whether any line in the range needs reading.
+///
+/// [`META`] records when it was created: only from then does it hold every line, and
+/// a query reaching back before that counts from the lines.
+fn log_volume(engine: &Engine<'_>, days: u32) -> Vec<String> {
+    let on = engine.on_cluster();
+    vec![
+        format!(
+            "CREATE TABLE IF NOT EXISTS {LOG_VOLUME}{on} (
+    ServiceName LowCardinality(String),
+    Second UInt32 CODEC(Delta(4), ZSTD(1)),
+    StreamHash UInt64,
+    LabelsHash UInt64,
+    AttributeLabels SimpleAggregateFunction(any, Array(String)),
+    Lines SimpleAggregateFunction(sum, UInt64),
+    Bytes SimpleAggregateFunction(sum, UInt64)
+) ENGINE = {}
+PARTITION BY toDate(toDateTime(Second))
+ORDER BY (ServiceName, Second, StreamHash, LabelsHash)
+TTL toDateTime(Second) + INTERVAL {days} DAY
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1",
+            engine.engine(LOG_VOLUME, "AggregatingMergeTree")
+        ),
+        format!(
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS {LOG_VOLUME_VIEW}{on} TO {LOG_VOLUME} AS
+SELECT
+    ServiceName,
+    toUInt32(intDiv(toUnixTimestamp64Nano(Timestamp) - 1, 1000000000)) AS Second,
+    cityHash64(S) AS StreamHash,
+    cityHash64(A) AS LabelsHash,
+    any(A) AS AttributeLabels,
+    count() AS Lines,
+    sum(length(Body)) AS Bytes
+FROM (SELECT Timestamp, ServiceName, Stream AS S, arrayMap(x -> toString(x), AttributeLabels) AS A, Body FROM {LOGS})
+GROUP BY ServiceName, Second, StreamHash, LabelsHash"
+        ),
+        format!(
+            "CREATE TABLE IF NOT EXISTS {META}{on} (
+    Name String,
+    Value String,
+    Updated DateTime64(9, 'UTC')
+) ENGINE = {}
+ORDER BY Name",
+            engine.engine(META, "ReplacingMergeTree")
         ),
     ]
 }
@@ -304,7 +363,60 @@ pub fn ensure(client: &Client, config: &ClickHouseConfig) -> Result<()> {
     for statement in statements(config) {
         client.execute(&statement)?;
     }
-    Ok(())
+    record_rollup_start(client, LOG_VOLUME_SINCE, LOGS)
+}
+
+/// How far back a rollup can be trusted, recorded once, when it is first created.
+///
+/// A table with no rows yet has the rollup complete from the start. One that already
+/// held rows — written before this view existed, by an older telemetryd or another
+/// writer — has it complete only from now, and ten minutes later than now so that no
+/// line already written with a timestamp a little ahead of the clock is counted as if
+/// the rollup held it.
+fn record_rollup_start(client: &Client, name: &str, table: &str) -> Result<()> {
+    if rollup_start(client, name)?.is_some() {
+        return Ok(());
+    }
+    let mut empty = true;
+    client.query_lines(&format!("SELECT 1 AS one FROM {table} LIMIT 1"), |_| {
+        empty = false;
+        Ok(std::ops::ControlFlow::Break(()))
+    })?;
+    let since = if empty {
+        "'0'".to_owned()
+    } else {
+        "toString(toUnixTimestamp64Nano(now64(9)) + 600000000000)".to_owned()
+    };
+    client.execute(&format!(
+        "INSERT INTO {META} SELECT {}, {since}, now64(9)",
+        super::sql::quote(name)
+    ))
+}
+
+/// From when a rollup holds every row, in nanoseconds, if it was ever created.
+///
+/// The most recently written value wins: two instances starting together on a table
+/// that already held rows record moments seconds apart, and a backfill that has filled
+/// the rollup in for older rows writes an earlier one on purpose.
+///
+/// # Errors
+/// When ClickHouse cannot be read.
+pub fn rollup_start(client: &Client, name: &str) -> Result<Option<u64>> {
+    let mut since = None;
+    client.query_lines(
+        &format!(
+            "SELECT toUInt64OrZero(argMax(Value, Updated)) AS since, count() AS n FROM {META} WHERE Name = {}",
+            super::sql::quote(name)
+        ),
+        |line| {
+            let value: serde_json::Value = serde_json::from_slice(line).unwrap_or_default();
+            if value.get("n").and_then(serde_json::Value::as_u64).unwrap_or(0) > 0 {
+                since = value.get("since").and_then(serde_json::Value::as_u64);
+            }
+            Ok(std::ops::ControlFlow::Continue(()))
+        },
+    )?;
+    Ok(since)
 }
 
 /// A database name as an identifier, backquoted.

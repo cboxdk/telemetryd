@@ -311,6 +311,31 @@ async fn clickhouse_answers_as_the_local_store_does() {
         cases.push(("query_range", range(query, extra)));
     }
 
+    // Bounds that fall inside a second, as Grafana's millisecond ranges do: every bucket
+    // edge splits a second, which the rollup cannot answer and the lines must.
+    let split_start = (BASE + 7 * SECOND + 250_000_000).to_string();
+    let split_end = (BASE + 590 * SECOND + 875_000_000).to_string();
+    for (query, step) in [
+        (r#"sum by (level) (count_over_time({app=~".+"}[1m]))"#, "60"),
+        (
+            r#"sum by (detected_level) (count_over_time({app=~".+"}[30s]))"#,
+            "15",
+        ),
+        (r#"sum by (env) (count_over_time({app="geo"}[1m]))"#, "30"),
+        (r#"sum(bytes_rate({app=~".+"}[2m]))"#, "45"),
+        (r#"sum by (app) (rate({app=~".+"}[1m]))"#, "0.5"),
+    ] {
+        cases.push((
+            "query_range",
+            vec![
+                ("query", query.to_owned()),
+                ("start", split_start.clone()),
+                ("end", split_end.clone()),
+                ("step", step.to_owned()),
+            ],
+        ));
+    }
+
     let mut differences = Vec::new();
     for (path, params) in &cases {
         let want = ask(&local, path, params).await;
