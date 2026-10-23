@@ -300,18 +300,25 @@ impl Client {
     pub fn insert(&self, table: &str, rows: &[u8]) -> Result<()> {
         let sql = format!("INSERT INTO {table} FORMAT JSONEachRow");
         let started = Instant::now();
+        let body = compress(rows);
         self.stats
             .bytes_sent
-            .fetch_add(rows.len() as u64, Ordering::Relaxed);
+            .fetch_add(body.bytes.len() as u64, Ordering::Relaxed);
         let outcome = self
-            .request(
+            .request_encoded(
                 &[
                     ("query", sql.as_str()),
                     ("async_insert", "1"),
                     ("wait_for_async_insert", "1"),
+                    // ClickHouse's own window is 50–200 ms, which across a fleet and every
+                    // materialized view behind a table is many small parts a second to
+                    // merge. Up to half a second: fewer, larger parts, an acknowledgement
+                    // still well inside a sender's patience.
+                    ("async_insert_busy_timeout_min_ms", "200"),
+                    ("async_insert_busy_timeout_max_ms", "500"),
                     ("input_format_skip_unknown_fields", "0"),
                 ],
-                rows,
+                &body,
                 &sql,
                 None,
             )
@@ -329,11 +336,12 @@ impl Client {
     pub fn insert_bulk(&self, table: &str, rows: &[u8]) -> Result<()> {
         let sql = format!("INSERT INTO {table} FORMAT JSONEachRow");
         let started = Instant::now();
+        let body = compress(rows);
         self.stats
             .bytes_sent
-            .fetch_add(rows.len() as u64, Ordering::Relaxed);
+            .fetch_add(body.bytes.len() as u64, Ordering::Relaxed);
         let outcome = self
-            .request(&[("query", sql.as_str())], rows, &sql, None)
+            .request_encoded(&[("query", sql.as_str())], &body, &sql, None)
             .map(|_| ())
             .map_err(Failure::brief);
         self.stats.record(Operation::Insert, started, &outcome);
@@ -468,6 +476,17 @@ impl Client {
         ]
     }
 
+    /// [`Self::request`] with a body [`compress`]ed, as `Content-Encoding` says.
+    fn request_encoded<V: AsRef<str>>(
+        &self,
+        params: &[(&str, V)],
+        body: &Encoded,
+        what: &str,
+        timeout: Option<Duration>,
+    ) -> std::result::Result<ureq::http::Response<ureq::Body>, Failure> {
+        self.send(params, &body.bytes, body.encoding, what, timeout)
+    }
+
     /// One request, its failure kept whole for the caller to word.
     fn request<V: AsRef<str>>(
         &self,
@@ -476,6 +495,19 @@ impl Client {
         what: &str,
         timeout: Option<Duration>,
     ) -> std::result::Result<ureq::http::Response<ureq::Body>, Failure> {
+        self.send(params, body, None, what, timeout)
+    }
+
+    fn send<V: AsRef<str>>(
+        &self,
+        params: &[(&str, V)],
+        body: &[u8],
+        encoding: Option<&str>,
+        what: &str,
+        timeout: Option<Duration>,
+    ) -> std::result::Result<ureq::http::Response<ureq::Body>, Failure> {
+        // Every bound telemetryd sends is UTC, and so are the hour and day columns:
+        // `toStartOfHour` and `toDate` must not read them in the server's own zone.
         let mut request = self
             .agent
             .post(&self.url)
@@ -483,9 +515,13 @@ impl Client {
             .timeout_global(Some(timeout.unwrap_or(self.timeout)))
             .build()
             .query("database", &self.database)
+            .query("session_timezone", "UTC")
             .header("x-clickhouse-user", &self.user);
         if !self.password.is_empty() {
             request = request.header("x-clickhouse-key", &self.password);
+        }
+        if let Some(encoding) = encoding {
+            request = request.header("content-encoding", encoding);
         }
         for (name, value) in params {
             request = request.query(*name, value.as_ref());
@@ -592,4 +628,31 @@ fn exception_name(detail: &str) -> Option<&str> {
                     .chars()
                     .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
         })
+}
+
+/// A request body, compressed or not, and what `Content-Encoding` says it is.
+struct Encoded {
+    bytes: Vec<u8>,
+    encoding: Option<&'static str>,
+}
+
+/// Rows below this are sent as they are: compressing a few hundred bytes buys nothing.
+const COMPRESS_FROM: usize = 4096;
+
+/// zstd at its fastest level: JSON rows shrink about tenfold, for a few milliseconds of
+/// one core per megabyte — the difference between terabytes a month crossing the
+/// network to ClickHouse and a tenth of that. Sent as it was if compression fails.
+fn compress(rows: &[u8]) -> Encoded {
+    if rows.len() >= COMPRESS_FROM
+        && let Ok(bytes) = zstd::bulk::compress(rows, 1)
+    {
+        return Encoded {
+            bytes,
+            encoding: Some("zstd"),
+        };
+    }
+    Encoded {
+        bytes: rows.to_vec(),
+        encoding: None,
+    }
 }

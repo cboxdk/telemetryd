@@ -38,14 +38,15 @@ const MAX_LISTED_STREAMS: usize = 10_000;
 /// Candidate rows a limited scan's first window is sized to hold, per row it needs.
 const WINDOW_ROWS_PER_RESULT: u64 = 4;
 
-/// Rows asked for per round trip when a scan has a limit.
+/// Rows asked for per round trip when a scan still needs `wanted`.
 ///
-/// The record predicate runs here, not in ClickHouse, so a limited scan cannot simply
-/// ask for `limit` rows: it reads pages until the predicate has accepted enough. Twice
-/// the limit covers the common case of a predicate that accepts most of what the
-/// matchers selected in one trip.
-fn page_size(limit: usize) -> usize {
-    limit.saturating_mul(2).clamp(500, 10_000)
+/// The record predicate runs here, not in ClickHouse, so a page can come back with rows
+/// it rejects, and then another is read. Asking for more than is still needed would be
+/// cheaper in round trips and dearer in the case that matters: ClickHouse stops reading
+/// once it has a page, and a filter that matches a few hundred lines a day made it read
+/// the whole day looking for a page twice the limit.
+fn page_size(wanted: usize) -> usize {
+    wanted.clamp(100, 10_000)
 }
 
 /// A row with a timestamp, as every signal's rows have: `t`, in nanoseconds.
@@ -66,11 +67,14 @@ impl Selected {
         }
         let services: Vec<String> = self.services.iter().map(|s| sql::quote(s)).collect();
         let hashes: Vec<String> = self.streams.keys().map(u64::to_string).collect();
-        format!(
-            "ServiceName IN ({}) AND StreamHash IN ({})",
-            services.join(", "),
-            hashes.join(", ")
-        )
+        // One app as `=`, not `IN`: with the sort key's first column fixed, ClickHouse
+        // reads a time-ordered query in order and stops at its limit, rather than sorting
+        // every row of the window.
+        let service = match services.as_slice() {
+            [one] => format!("ServiceName = {one}"),
+            many => format!("ServiceName IN ({})", many.join(", ")),
+        };
+        format!("{service} AND StreamHash IN ({})", hashes.join(", "))
     }
 }
 
@@ -173,8 +177,12 @@ impl Table<'_> {
             Order::Descending => "DESC",
             Order::Ascending => "ASC",
         };
+        // In the sort key's own terms — `(ServiceName, toDateTime(Timestamp))` — so that
+        // an app fixed by the conditions lets ClickHouse read in order; the order is the
+        // timestamp's either way.
         let mut query = format!(
-            "SELECT {} FROM {} WHERE {conditions} ORDER BY Timestamp {direction}",
+            "SELECT {} FROM {} WHERE {conditions} \
+             ORDER BY toDateTime(Timestamp) {direction}, Timestamp {direction}",
             self.columns, self.name
         );
         if let Some(limit) = limit {
@@ -240,13 +248,23 @@ impl Table<'_> {
         }
 
         let hours = match selected {
-            Some(selected) => self.hourly_rows(start, end, selected)?,
-            None => Vec::new(),
+            Some(selected) if selected.services.len() > 1 => {
+                self.hourly_rows(start, end, selected)?
+            }
+            _ => Vec::new(),
         };
         let need = (request.limit as u64)
             .saturating_mul(WINDOW_ROWS_PER_RESULT)
             .max(1_000);
-        let mut width = first_window(&hours, request.order, need, end - start);
+        // With one app the read is in the sort key's order, and ClickHouse stops once it
+        // has the page: one window, the whole range, costs what the answer costs. With
+        // several it sorts what a window holds, so windows keep that small.
+        let one_app = selected.is_some_and(|s| s.services.len() == 1);
+        let mut width = if one_app {
+            end - start
+        } else {
+            first_window(&hours, request.order, need, end - start)
+        };
         let mut edge = match request.order {
             Order::Descending => end,
             Order::Ascending => start,
@@ -304,9 +322,9 @@ impl Table<'_> {
         accepts: &dyn Fn(&T) -> bool,
         out: &mut Vec<T>,
     ) -> Result<bool> {
-        let page = page_size(request.limit);
         let mut bound: Option<String> = None;
         loop {
+            let page = page_size(request.limit.saturating_sub(out.len()));
             let conditions = match &bound {
                 Some(bound) => format!("{window} AND {bound}"),
                 None => window.to_owned(),
