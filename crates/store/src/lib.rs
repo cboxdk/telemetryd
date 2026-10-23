@@ -39,8 +39,9 @@ use crate::schema::RecordSchema;
 use telemetryd_core::{Labels, LogRecord, Result, Signal};
 
 pub use backend::{
-    BodyFilter, BucketRequest, Buckets, LogStore, RecordFilter, SpanCondition, SpanField, SpanOp,
-    SpanStore, SpanValue,
+    BodyFilter, BucketRequest, Buckets, LogStore, RecordFilter, SpanAggregateRequest,
+    SpanAggregateRow, SpanAggregates, SpanAggregation, SpanCondition, SpanField, SpanOp, SpanStore,
+    SpanValue,
 };
 pub use cardinality::{Admission, Admitted, Cardinality};
 pub use datadir::{DataDir, DiskUsage};

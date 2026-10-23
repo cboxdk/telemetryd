@@ -141,6 +141,27 @@ Measured through telemetryd's Loki API, on one ClickHouse in Docker on a laptop
 The last is the shape that stays expensive: a line filter that most lines pass, over
 hours, reads every line it covers. It scales with ClickHouse's cores, not telemetryd's.
 
+And through the Tempo API, against a day of 600 million spans (200 million traces):
+
+| Query | Time |
+|---|---|
+| search `{}`, limit 20, 24 h | 0.15 s |
+| search `{ status = error }`, 24 h | 0.07 s |
+| search `{ span.http.route = "/places" && duration > 390ms }`, 24 h | 0.06 s |
+| search for one attribute value among 100,000, 24 h | 0.23 s |
+| trace by id | 0.01 s |
+| tag values, tag names, 24 h | 0.9 s |
+| `{ kind = server } \| quantile_over_time(duration, 0.95)`, 1 h at 5 m | 0.12 s |
+| `{ status = error } \| rate() by (span.http.route)`, 1 h at 1 m | 0.26 s |
+| the same, 24 h at 1 h | 6 s |
+
+A search reads matching spans newest first and stops as soon as no trace it has not
+seen could start later than the ones it has; only those are read whole. TraceQL
+metrics are counted in ClickHouse, by intrinsics, resource and span attributes, with
+the rare span ClickHouse cannot decide on — an attribute only a relaxed name reaches,
+a number written unusually — read and counted by telemetryd, so the answer is the one
+the local store gives.
+
 ## A replicated cluster
 
 For a ClickHouse you can lose a server of, name its cluster:

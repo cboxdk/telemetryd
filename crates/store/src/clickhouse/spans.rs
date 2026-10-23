@@ -21,7 +21,7 @@
 //! the span to match, never sufficient — and the query's own predicate decides every
 //! span that comes back. See [`condition`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
 use serde::{Deserialize, Serialize};
@@ -32,10 +32,14 @@ use telemetryd_core::span::{
 use telemetryd_core::{APP_LABEL, Error, Labels, Result, UNKNOWN_APP};
 
 use super::Client;
-use super::scan::{Selected, Table, Timed, labels_of};
+use super::scan::{Selected, Table, Timed, labels_of, time_condition};
 use super::schema::{TRACE_IDS, TRACE_STREAMS, TRACES};
 use super::sql;
-use crate::backend::{RecordFilter, SpanCondition, SpanField, SpanOp, SpanStore, SpanValue};
+use super::traceql::{KINDS, STATUSES, kind_name, status_name};
+use crate::backend::{
+    RecordFilter, SpanAggregateRequest, SpanAggregateRow, SpanAggregates, SpanAggregation,
+    SpanCondition, SpanField, SpanOp, SpanStore, SpanValue,
+};
 use crate::records::Scan;
 use crate::topk::Order;
 
@@ -84,6 +88,61 @@ impl ClickHouseSpans {
             streams: TRACE_STREAMS,
             columns: SELECT,
         }
+    }
+
+    /// Lower each new trace's start bound to its first span, from the trace-id index,
+    /// clipped to the range as the caller's ranking clips it.
+    fn lower_bounds(
+        &self,
+        fresh: &[String],
+        starts: &mut HashMap<String, (u64, u64)>,
+        start: u64,
+    ) -> Result<()> {
+        for ids in fresh.chunks(500) {
+            let quoted: Vec<String> = ids.iter().map(|id| sql::quote(id)).collect();
+            self.client.query_lines(
+                &format!(
+                    "SELECT TraceId AS id, toUnixTimestamp64Nano(min(Start)) AS first \
+                     FROM {TRACE_IDS} WHERE TraceId IN ({}) GROUP BY TraceId",
+                    quoted.join(", ")
+                ),
+                |line| {
+                    let value: serde_json::Value = serde_json::from_slice(line).unwrap_or_default();
+                    let id = value.get("id").and_then(serde_json::Value::as_str);
+                    let first = value.get("first").and_then(serde_json::Value::as_u64);
+                    if let (Some(id), Some(first)) = (id, first)
+                        && let Some((lower, _)) = starts.get_mut(id)
+                    {
+                        *lower = (*lower).min(first.max(start));
+                    }
+                    Ok(ControlFlow::Continue(()))
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The first and last span start of any of these traces, from the trace-id index:
+    /// quoted ids in, `None` when none of them is there.
+    fn trace_bounds(&self, quoted_ids: &[String]) -> Result<Option<(u64, u64)>> {
+        let mut bounds = None;
+        self.client.query_lines(
+            &format!(
+                "SELECT toUnixTimestamp64Nano(min(Start)) AS low, \
+                 toUnixTimestamp64Nano(max(End)) AS high, count() AS n \
+                 FROM {TRACE_IDS} WHERE TraceId IN ({})",
+                quoted_ids.join(", ")
+            ),
+            |line| {
+                let value: serde_json::Value = serde_json::from_slice(line).unwrap_or_default();
+                let number = |name: &str| value.get(name).and_then(serde_json::Value::as_u64);
+                if number("n").unwrap_or(0) > 0 {
+                    bounds = number("low").zip(number("high"));
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
+        Ok(bounds)
     }
 
     /// The streams with spans in the range that the conditions leave possible.
@@ -153,6 +212,77 @@ fn service_of(stream: &Labels) -> &str {
 }
 
 impl SpanStore for ClickHouseSpans {
+    /// The query aggregated in ClickHouse: the spans every condition's sufficient form
+    /// takes, counted and measured per step and group there; the ones only the
+    /// necessary forms take, handed back to be decided one by one. `None` for a field
+    /// ClickHouse cannot read as Rust does — a duration as a label, an unscoped name —
+    /// and for quantiles when any span is undecided, since quantiles do not add.
+    fn aggregate(&self, request: &SpanAggregateRequest<'_>) -> Result<Option<SpanAggregates>> {
+        let mut groups = Vec::new();
+        let mut exact = Vec::new();
+        for field in request.group_by {
+            let Some((expr, decided)) = super::traceql::group_value(field) else {
+                return Ok(None);
+            };
+            groups.push(expr);
+            exact.push(decided);
+        }
+        let mut out = SpanAggregates::default();
+        let Some(last) = request.end_nanos.checked_sub(1) else {
+            return Ok(Some(out));
+        };
+        if request.start_nanos > last || request.steps == 0 || request.step_nanos == 0 {
+            return Ok(Some(out));
+        }
+        let Some(selected) = self.select(request.start_nanos, last, request.conditions)? else {
+            return Ok(None);
+        };
+        if selected.streams.is_empty() {
+            return Ok(Some(out));
+        }
+        let stated: Vec<_> = request
+            .conditions
+            .iter()
+            .map(super::traceql::condition)
+            .collect();
+        let mut necessary = vec![
+            time_condition((request.start_nanos, true), (last, true)),
+            selected.condition(),
+        ];
+        necessary.extend(stated.iter().map(|s| s.necessary.clone()));
+        let necessary = necessary.join(" AND ");
+        let mut sufficient: Vec<String> = stated.iter().map(|s| s.sufficient.clone()).collect();
+        sufficient.extend(exact);
+        let sufficient = if sufficient.is_empty() {
+            "1".to_owned()
+        } else {
+            sufficient.join(" AND ")
+        };
+
+        let query = aggregate_query(request, &groups, &necessary, &sufficient);
+        let mut index: HashMap<(usize, Vec<Option<String>>), usize> = HashMap::new();
+        self.client.query_lines(&query, |line| {
+            absorb_aggregate(line, request, groups.len(), &mut index, &mut out)?;
+            Ok(ControlFlow::Continue(()))
+        })?;
+
+        self.table().read(
+            &format!("{necessary} AND NOT ({sufficient})"),
+            Order::Ascending,
+            None,
+            |row: Row| {
+                out.individual.push(row.into_span());
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
+        if matches!(request.aggregation, SpanAggregation::Quantiles(_))
+            && !out.individual.is_empty()
+        {
+            return Ok(None);
+        }
+        Ok(Some(out))
+    }
+
     fn scan(
         &self,
         request: Scan<'_>,
@@ -185,31 +315,14 @@ impl SpanStore for ClickHouseSpans {
         // The trace-id index first, the Collector's way: it is sorted by id, so finding
         // when a trace happened is a lookup, and the span table is then read for that
         // stretch only rather than probed by Bloom filter across every part it has.
-        let mut bounds = None;
-        self.client.query_lines(
-            &format!(
-                "SELECT toUnixTimestamp64Nano(min(Start)) AS low, \
-                 toUnixTimestamp64Nano(max(End)) AS high, count() AS n \
-                 FROM {TRACE_IDS} WHERE TraceId = {}",
-                sql::quote(trace_id)
-            ),
-            |line| {
-                let value: serde_json::Value = serde_json::from_slice(line).unwrap_or_default();
-                let number = |name: &str| value.get(name).and_then(serde_json::Value::as_u64);
-                if number("n").unwrap_or(0) > 0 {
-                    bounds = number("low").zip(number("high"));
-                }
-                Ok(ControlFlow::Continue(()))
-            },
-        )?;
-        let Some((low, high)) = bounds else {
+        let Some((low, high)) = self.trace_bounds(&[sql::quote(trace_id)])? else {
             return Ok(Vec::new());
         };
         let mut spans = Vec::new();
         self.table().read(
             &format!(
                 "{} AND TraceId = {}",
-                super::scan::time_condition((low, true), (high, true)),
+                time_condition((low, true), (high, true)),
                 sql::quote(trace_id)
             ),
             Order::Ascending,
@@ -222,268 +335,276 @@ impl SpanStore for ClickHouseSpans {
         Ok(spans)
     }
 
+    /// The latest-starting traces with a matching span, read newest first in widening
+    /// windows, until no trace not yet found could start later than the `want`th found.
+    ///
+    /// A trace's start is its earliest span, which a matching span is never before. So
+    /// once the `want`th latest start among the traces found lies after the earliest
+    /// time read so far, every trace still unread starts earlier than all of those, and
+    /// reading further cannot change which `want` started last. Starts come from the
+    /// trace-id index, clipped to the search's range as the caller's ranking clips them.
+    /// The scan's limit still caps how many matching spans are read.
+    fn search_traces(
+        &self,
+        request: Scan<'_>,
+        conditions: &[SpanCondition],
+        extra: RecordFilter<'_, SpanRecord>,
+        want: usize,
+    ) -> Result<Vec<String>> {
+        let (start, end) = (request.start_nanos, request.end_nanos);
+        let Some(selected) = self.select(start, end, conditions)? else {
+            let mut ids: Vec<String> = SpanStore::scan(self, request, conditions, extra)?
+                .into_iter()
+                .map(|span| span.trace_id)
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            return Ok(ids);
+        };
+        if selected.streams.is_empty() || start > end {
+            return Ok(Vec::new());
+        }
+        let mut base = vec![selected.condition()];
+        base.extend(conditions.iter().filter_map(condition));
+        let base = base.join(" AND ");
+        let table = self.table();
+        let cap = if request.limit == 0 {
+            usize::MAX
+        } else {
+            request.limit
+        };
+        let want = want.max(1);
+        let hours = table.hourly_rows(start, end, &selected)?;
+        let need = (want as u64).saturating_mul(20).max(2_000);
+        let mut width = super::scan::first_window(&hours, Order::Descending, need, end - start);
+
+        // Per trace, `(lower, upper)` bounds on its start: its earliest matching span
+        // read bounds it from above, the index's first span, clipped to the range, from
+        // below.
+        let mut starts: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut read = 0usize;
+        let mut edge = end;
+        loop {
+            let low = edge.saturating_sub(width);
+            let last = low <= start;
+            let window = if last {
+                time_condition((start, true), (edge, true))
+            } else {
+                time_condition((low, false), (edge, true))
+            };
+            let mut fresh: Vec<String> = Vec::new();
+            let mut full = false;
+            table.read(
+                &format!("{window} AND {base}"),
+                Order::Descending,
+                Some(cap - read),
+                |row: Row| {
+                    let span = row.into_span();
+                    if span.start_nanos >= start && span.start_nanos <= end && extra(&span) {
+                        read += 1;
+                        if let Some((lower, upper)) = starts.get_mut(&span.trace_id) {
+                            *upper = (*upper).min(span.start_nanos);
+                            *lower = (*lower).min(span.start_nanos);
+                        } else {
+                            starts.insert(
+                                span.trace_id.clone(),
+                                (span.start_nanos, span.start_nanos),
+                            );
+                            fresh.push(span.trace_id);
+                        }
+                        if read >= cap {
+                            full = true;
+                            return Ok(ControlFlow::Break(()));
+                        }
+                    }
+                    Ok(ControlFlow::Continue(()))
+                },
+            )?;
+            self.lower_bounds(&fresh, &mut starts, start)?;
+            let frontier = if last { start } else { low };
+            if full || last {
+                break;
+            }
+            if starts.len() >= want && kth_lower(&starts, want) > frontier {
+                break;
+            }
+            edge = low;
+            width = width.saturating_mul(4);
+        }
+        // A trace whose start cannot reach the `want`th surest one is not among the
+        // latest `want`, and need not be read whole.
+        if starts.len() > want {
+            let floor = kth_lower(&starts, want);
+            starts.retain(|_, (_, upper)| *upper >= floor);
+        }
+        Ok(starts.into_keys().collect())
+    }
+
     fn of_traces(&self, trace_ids: &[&str], request: Scan<'_>) -> Result<Vec<SpanRecord>> {
         if trace_ids.is_empty() {
             return Ok(Vec::new());
         }
         let wanted: std::collections::HashSet<&str> = trace_ids.iter().copied().collect();
-        let ids: Vec<String> = trace_ids.iter().map(|id| sql::quote(id)).collect();
-        let base = format!("TraceId IN ({})", ids.join(", "));
         let (start, end) = (request.start_nanos, request.end_nanos);
-        self.table().scan(
-            &request,
-            &base,
-            None,
-            &Row::into_span,
-            &|span: &SpanRecord| {
-                span.start_nanos >= start
-                    && span.start_nanos <= end
-                    && wanted.contains(span.trace_id.as_str())
-            },
-        )
+        let accepts = |span: &SpanRecord| {
+            span.start_nanos >= start
+                && span.start_nanos <= end
+                && wanted.contains(span.trace_id.as_str())
+        };
+        // A few hundred ids to a query: a search can match tens of thousands of traces,
+        // and ClickHouse refuses a query text past a quarter of a megabyte.
+        let mut spans = Vec::new();
+        for ids in trace_ids.chunks(500) {
+            let ids: Vec<String> = ids.iter().map(|id| sql::quote(id)).collect();
+            // The trace-id index says when these traces happened, so the table is read
+            // for that stretch rather than the whole range the search covered.
+            let Some((first, last)) = self.trace_bounds(&ids)? else {
+                continue;
+            };
+            let mut chunk = request;
+            chunk.start_nanos = request.start_nanos.max(first);
+            chunk.end_nanos = request.end_nanos.min(last);
+            if chunk.start_nanos > chunk.end_nanos {
+                continue;
+            }
+            let base = format!("TraceId IN ({})", ids.join(", "));
+            if request.abort_over != 0 {
+                chunk.abort_over = request.abort_over.saturating_sub(spans.len());
+            }
+            spans.extend(
+                self.table()
+                    .scan(&chunk, &base, None, &Row::into_span, &accepts)?,
+            );
+        }
+        Ok(spans)
     }
 }
 
-/// `replaceRegexpAll(x, '[^a-zA-Z]', '')`: a key's letters. Sanitising never changes an
-/// ASCII letter, so two keys a relaxed lookup treats as one always share them.
-fn letters_sql(column: &str) -> String {
-    format!("replaceRegexpAll({column}, '[^a-zA-Z]', '')")
-}
-
-fn letters(text: &str) -> String {
-    text.chars().filter(char::is_ascii_alphabetic).collect()
-}
-
-/// The condition a value must meet, as SQL over the expression `v`, when one can be
-/// stated.
-///
-/// Only conditions the span must meet to match are stated: `!=`, `!~` and `= nil` are
-/// left to the predicate, since an absent attribute and a present one read differently
-/// there and a map lookup cannot tell them apart.
-fn value_condition(op: SpanOp, value: &SpanValue, v: &str) -> Option<String> {
-    match (op, value) {
-        (SpanOp::Equal, SpanValue::Text(text)) => Some(format!("{v} = {}", sql::quote(text))),
-        (SpanOp::Equal, SpanValue::Number(number)) => Some(format!(
-            "abs(toFloat64OrNull({v}) - {}) < 2.220446049250313e-16",
-            float(*number)
-        )),
-        (SpanOp::Regex, SpanValue::Text(pattern)) => Some(format!(
-            "match({v}, {})",
-            sql::quote(&format!("^(?s:{pattern})$"))
-        )),
-        (
-            SpanOp::Greater | SpanOp::GreaterEqual | SpanOp::Less | SpanOp::LessEqual,
-            SpanValue::Number(number),
-        ) => Some(format!(
-            "toFloat64OrNull({v}) {} {}",
-            comparison(op),
-            float(*number)
-        )),
-        _ => None,
-    }
-}
-
-fn comparison(op: SpanOp) -> &'static str {
-    match op {
-        SpanOp::Greater => ">",
-        SpanOp::GreaterEqual => ">=",
-        SpanOp::Less => "<",
-        SpanOp::LessEqual => "<=",
-        SpanOp::NotEqual => "!=",
-        SpanOp::Equal | SpanOp::Regex | SpanOp::NotRegex => "=",
-    }
-}
-
-fn float(number: f64) -> String {
-    if number.is_finite() {
-        format!("{number:?}")
-    } else if number.is_nan() {
-        "nan".to_owned()
-    } else if number > 0.0 {
-        "inf".to_owned()
-    } else {
-        "-inf".to_owned()
-    }
-}
-
-/// Some key of `map` that a relaxed lookup of `name` could find, holding a value that
-/// meets the condition. `prefix` is what the span's own attribute key starts with for
-/// this map — `resource.` for the resource attributes, which the span holds under it.
-fn in_map(map: &str, prefix: &str, name: &str, op: SpanOp, value: &SpanValue) -> Option<String> {
-    let key = if prefix.is_empty() {
-        letters_sql("k")
-    } else {
-        format!(
-            "concat({}, {})",
-            sql::quote(&letters(prefix)),
-            letters_sql("k")
-        )
+/// The aggregate's one query: per step and group — and per histogram bound — what the
+/// aggregation needs, over the spans both forms take.
+fn aggregate_query(
+    request: &SpanAggregateRequest<'_>,
+    groups: &[String],
+    necessary: &str,
+    sufficient: &str,
+) -> String {
+    let seconds = "(toFloat64(Duration) / 1e9)";
+    let (measures, histogram) = match request.aggregation {
+        SpanAggregation::Count => ("count() AS n".to_owned(), false),
+        SpanAggregation::Duration => (
+            format!(
+                "count() AS n, sum({seconds}) AS total, min({seconds}) AS low, max({seconds}) AS high"
+            ),
+            false,
+        ),
+        SpanAggregation::Quantiles(levels) => (
+            format!(
+                "count() AS n, quantilesExactInclusive({})({seconds}) AS qs",
+                levels
+                    .iter()
+                    .map(|q| format!("{q:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            false,
+        ),
+        SpanAggregation::Histogram => ("count() AS n".to_owned(), true),
     };
-    let test = value_condition(op, value, "v")?;
-    Some(format!(
-        "arrayExists((k, v) -> {key} = {} AND {test}, mapKeys({map}), mapValues({map}))",
-        sql::quote(&letters(name))
-    ))
+    let mut select = vec![format!(
+        "least(intDiv(toUnixTimestamp64Nano(Timestamp) - {}, {}), {}) AS st",
+        request.start_nanos,
+        request.step_nanos,
+        request.steps - 1
+    )];
+    let mut keys = vec!["st".to_owned()];
+    for (i, expr) in groups.iter().enumerate() {
+        select.push(format!("{expr} AS g{i}"));
+        keys.push(format!("g{i}"));
+    }
+    if histogram {
+        select.push(format!(
+            "if(Duration = 0, 0, pow(2, ceil(log2({seconds})))) AS hb"
+        ));
+        keys.push("hb".to_owned());
+    }
+    format!(
+        "SELECT {}, {measures} FROM {TRACES} WHERE {necessary} AND ({sufficient}) GROUP BY {}",
+        select.join(", "),
+        keys.join(", ")
+    )
+}
+
+/// One row of [`aggregate_query`]'s answer, folded into `out`.
+fn absorb_aggregate(
+    line: &[u8],
+    request: &SpanAggregateRequest<'_>,
+    groups: usize,
+    index: &mut HashMap<(usize, Vec<Option<String>>), usize>,
+    out: &mut SpanAggregates,
+) -> Result<()> {
+    let value: serde_json::Value = serde_json::from_slice(line).map_err(|e| {
+        Error::Unavailable(format!("reading a span aggregate from ClickHouse: {e}"))
+    })?;
+    let float = |name: &str| {
+        value
+            .get(name)
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0)
+    };
+    let step = usize::try_from(
+        value
+            .get("st")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    )
+    .unwrap_or(0);
+    let key: Vec<Option<String>> = (0..groups)
+        .map(|i| {
+            value
+                .get(format!("g{i}"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+    let count = value
+        .get("n")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let next = out.rows.len();
+    let slot = *index.entry((step, key.clone())).or_insert(next);
+    if slot == next {
+        out.rows.push(SpanAggregateRow {
+            key,
+            step,
+            ..SpanAggregateRow::default()
+        });
+    }
+    let row = &mut out.rows[slot];
+    row.count += count;
+    match request.aggregation {
+        SpanAggregation::Duration => {
+            row.sum = float("total");
+            row.min = float("low");
+            row.max = float("high");
+        }
+        SpanAggregation::Quantiles(_) => {
+            row.quantiles = value
+                .get("qs")
+                .and_then(serde_json::Value::as_array)
+                .map(|qs| qs.iter().filter_map(serde_json::Value::as_f64).collect())
+                .unwrap_or_default();
+        }
+        SpanAggregation::Histogram => row.histogram.push((float("hb").to_bits(), count)),
+        SpanAggregation::Count => {}
+    }
+    Ok(())
 }
 
 /// One TraceQL condition as a condition ClickHouse selects by — necessary for the span
-/// to match, never sufficient — or `None` where none can be stated.
+/// to match, never sufficient.
+#[allow(clippy::unnecessary_wraps)]
 fn condition(c: &SpanCondition) -> Option<String> {
-    match &c.field {
-        SpanField::Name => text_column("SpanName", c),
-        SpanField::StatusMessage => text_column("StatusMessage", c),
-        SpanField::Duration => {
-            let nanos = match &c.value {
-                #[allow(clippy::cast_precision_loss)]
-                SpanValue::Nanos(nanos) => *nanos as f64,
-                SpanValue::Number(number) => *number,
-                _ => return Some("0".to_owned()),
-            };
-            Some(match c.op {
-                SpanOp::Equal => format!(
-                    "abs(toFloat64(Duration) - {}) < 2.220446049250313e-16",
-                    float(nanos)
-                ),
-                SpanOp::NotEqual => format!(
-                    "abs(toFloat64(Duration) - {}) >= 2.220446049250313e-16",
-                    float(nanos)
-                ),
-                SpanOp::Regex | SpanOp::NotRegex => "0".to_owned(),
-                op => format!("toFloat64(Duration) {} {}", comparison(op), float(nanos)),
-            })
-        }
-        SpanField::Status => {
-            let wanted = match &c.value {
-                SpanValue::Status(status) => Some(*status),
-                SpanValue::Text(text) => [SpanStatus::Unset, SpanStatus::Ok, SpanStatus::Error]
-                    .into_iter()
-                    .find(|s| s.as_str().eq_ignore_ascii_case(text)),
-                _ => return Some("0".to_owned()),
-            };
-            equality("StatusCode", c.op, wanted.map(status_name))
-        }
-        SpanField::Kind => {
-            let wanted = match &c.value {
-                SpanValue::Kind(kind) => Some(*kind),
-                SpanValue::Text(text) => KINDS
-                    .into_iter()
-                    .find(|k| k.as_str().eq_ignore_ascii_case(text)),
-                _ => return Some("0".to_owned()),
-            };
-            equality("SpanKind", c.op, wanted.map(kind_name))
-        }
-        SpanField::Span(name) => {
-            let own = in_map("SpanAttributes", "", name, c.op, &c.value)?;
-            let resource = in_map(
-                "ResourceAttributes",
-                RESOURCE_ATTRIBUTE_PREFIX,
-                name,
-                c.op,
-                &c.value,
-            )?;
-            Some(format!(
-                "({}({own} OR {resource}))",
-                present(c.op, &c.value, &["SpanAttributes", "ResourceAttributes"])
-            ))
-        }
-        SpanField::Resource(name) => {
-            let stream = in_map("Stream", "", name, c.op, &c.value)?;
-            let key = sql::quote(name);
-            let own = value_condition(c.op, &c.value, &format!("ResourceAttributes[{key}]"))?;
-            Some(format!(
-                "({}({stream} OR (mapContains(ResourceAttributes, {key}) AND {own})))",
-                present(c.op, &c.value, &["Stream", "ResourceAttributes"])
-            ))
-        }
-        SpanField::Unscoped(name) => {
-            let own = in_map("SpanAttributes", "", name, c.op, &c.value)?;
-            let resource = in_map(
-                "ResourceAttributes",
-                RESOURCE_ATTRIBUTE_PREFIX,
-                name,
-                c.op,
-                &c.value,
-            )?;
-            let stream = in_map("Stream", "", name, c.op, &c.value)?;
-            // A resource attribute is reachable unprefixed too, through `resource.x`'s
-            // own lookup; letters of the bare name cover it.
-            let bare = in_map("ResourceAttributes", "", name, c.op, &c.value)?;
-            Some(format!(
-                "({}({own} OR {resource} OR {stream} OR {bare}))",
-                present(
-                    c.op,
-                    &c.value,
-                    &["SpanAttributes", "ResourceAttributes", "Stream"]
-                )
-            ))
-        }
-    }
-}
-
-const KINDS: [SpanKind; 6] = [
-    SpanKind::Unspecified,
-    SpanKind::Internal,
-    SpanKind::Server,
-    SpanKind::Client,
-    SpanKind::Producer,
-    SpanKind::Consumer,
-];
-
-/// For equality with a text value, that it is among some map's values at all — implied by the
-/// lookup it is put in front of, and the form a Bloom filter index on `mapValues` skips
-/// granules by — as `"(…) AND "`; nothing for any other value.
-fn present(op: SpanOp, value: &SpanValue, maps: &[&str]) -> String {
-    let (SpanOp::Equal, SpanValue::Text(text)) = (op, value) else {
-        return String::new();
-    };
-    let any: Vec<String> = maps
-        .iter()
-        .map(|map| format!("has(mapValues({map}), {})", sql::quote(text)))
-        .collect();
-    format!("({}) AND ", any.join(" OR "))
-}
-
-fn text_column(column: &str, c: &SpanCondition) -> Option<String> {
-    match (c.op, &c.value) {
-        (SpanOp::NotEqual, SpanValue::Text(text)) => {
-            Some(format!("{column} != {}", sql::quote(text)))
-        }
-        (SpanOp::NotRegex, SpanValue::Text(pattern)) => Some(format!(
-            "NOT match({column}, {})",
-            sql::quote(&format!("^(?s:{pattern})$"))
-        )),
-        _ => value_condition(c.op, &c.value, column),
-    }
-}
-
-fn equality(column: &str, op: SpanOp, wanted: Option<&str>) -> Option<String> {
-    match (op, wanted) {
-        (SpanOp::Equal, Some(name)) => Some(format!("{column} = {}", sql::quote(name))),
-        (SpanOp::NotEqual, Some(name)) => Some(format!("{column} != {}", sql::quote(name))),
-        // A status or kind nobody has: equal to nothing, unequal to everything.
-        (SpanOp::NotEqual, None) => None,
-        _ => Some("0".to_owned()),
-    }
-}
-
-/// Kind as the Collector and the store package write it.
-fn kind_name(kind: SpanKind) -> &'static str {
-    match kind {
-        SpanKind::Unspecified => "Unspecified",
-        SpanKind::Internal => "Internal",
-        SpanKind::Server => "Server",
-        SpanKind::Client => "Client",
-        SpanKind::Producer => "Producer",
-        SpanKind::Consumer => "Consumer",
-    }
-}
-
-fn status_name(status: SpanStatus) -> &'static str {
-    match status {
-        SpanStatus::Unset => "Unset",
-        SpanStatus::Ok => "Ok",
-        SpanStatus::Error => "Error",
-    }
+    Some(super::traceql::condition(c).necessary)
 }
 
 /// One span as written.
@@ -607,7 +728,7 @@ impl Row {
             .into_iter()
             .find(|k| kind_name(*k).eq_ignore_ascii_case(&self.span_kind))
             .unwrap_or(SpanKind::Unspecified);
-        let status = [SpanStatus::Unset, SpanStatus::Ok, SpanStatus::Error]
+        let status = STATUSES
             .into_iter()
             .find(|s| status_name(*s).eq_ignore_ascii_case(&self.status_code))
             .unwrap_or(SpanStatus::Unset);
@@ -668,4 +789,11 @@ impl Row {
             links,
         }
     }
+}
+
+/// The `k`th greatest lower bound on a trace's start, `k` from one.
+fn kth_lower(starts: &HashMap<String, (u64, u64)>, k: usize) -> u64 {
+    let mut lowers: Vec<u64> = starts.values().map(|(lower, _)| *lower).collect();
+    lowers.sort_unstable_by(|a, b| b.cmp(a));
+    lowers.get(k.saturating_sub(1)).copied().unwrap_or(0)
 }

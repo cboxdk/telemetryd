@@ -461,13 +461,51 @@ pub fn search(store: &dyn SpanStore, request: &SearchRequest) -> Result<SearchRe
         request.query.matches(span)
     };
     let window = || newest(request.start_nanos, request.end_nanos);
-    let matched = by_trace(store.scan(window(), &request.query.pushdown(), &filter)?);
-
-    let whole = if matched.is_empty() {
-        HashMap::new()
-    } else {
-        let ids: Vec<&str> = matched.keys().map(String::as_str).collect();
-        by_trace(store.of_traces(&ids, window())?)
+    let conditions = request.query.pushdown();
+    // The store names the traces to consider — at least the `want` that started last —
+    // and those are read whole: what a row says is about the trace, not the spans that
+    // matched. A duration bound can rule some out once they are whole, so a short
+    // answer asks again for more, until the store has no more to give.
+    let mut want = request.limit.max(1);
+    let mut considered = 0;
+    let (matched, whole) = loop {
+        let ids = store.search_traces(window(), &conditions, &filter, want)?;
+        // Fewer than asked for, or no more than last time — the local store names every
+        // trace its scan read, whatever is asked — means there are no more to find.
+        let exhausted = ids.len() < want || ids.len() <= considered || want >= MAX_SPANS_READ;
+        considered = ids.len();
+        let whole = if ids.is_empty() {
+            HashMap::new()
+        } else {
+            let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+            by_trace(store.of_traces(&ids, window())?)
+        };
+        let matched: HashMap<String, Vec<SpanRecord>> = whole
+            .iter()
+            .filter_map(|(trace_id, spans)| {
+                let hit: Vec<SpanRecord> = spans
+                    .iter()
+                    .filter(|s| request.query.matches(s))
+                    .cloned()
+                    .collect();
+                (!hit.is_empty()).then(|| (trace_id.clone(), hit))
+            })
+            .collect();
+        let enough = matched
+            .iter()
+            .filter(|(id, _)| {
+                whole.get(*id).is_some_and(|all| {
+                    let first = all.iter().map(|s| s.start_nanos).min().unwrap_or(0);
+                    let last = all.iter().map(|s| s.end_nanos).max().unwrap_or(first);
+                    request.duration_ok(last.saturating_sub(first))
+                })
+            })
+            .count()
+            >= request.limit;
+        if enough || exhausted {
+            break (matched, whole);
+        }
+        want = want.saturating_mul(4);
     };
 
     let mut summaries: Vec<(u64, TraceSummary)> = matched

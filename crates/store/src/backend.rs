@@ -191,8 +191,71 @@ pub struct SpanCondition {
     pub value: SpanValue,
 }
 
+/// What a TraceQL metrics query aggregates per step: spans counted, or their duration.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpanAggregation {
+    /// `rate`, `count_over_time`.
+    Count,
+    /// `sum_`, `avg_`, `min_`, `max_over_time(duration)`: count, sum, min and max of the
+    /// duration in seconds.
+    Duration,
+    /// `quantile_over_time(duration, …)`, by Prometheus's method.
+    Quantiles(Vec<f64>),
+    /// `histogram_over_time(duration)`: spans per power-of-two upper bound in seconds.
+    Histogram,
+}
+
+/// A TraceQL metrics query, for a store that can aggregate it itself.
+#[derive(Debug, Clone)]
+pub struct SpanAggregateRequest<'a> {
+    /// Spans starting from here, inclusive…
+    pub start_nanos: u64,
+    /// …to here, exclusive.
+    pub end_nanos: u64,
+    pub step_nanos: u64,
+    /// A span past the last step's end counts in the last step, as the caller counts it.
+    pub steps: usize,
+    pub conditions: &'a [SpanCondition],
+    /// What the series are keyed by, in order; a span without one of them has no value
+    /// for it.
+    pub group_by: &'a [SpanField],
+    pub aggregation: &'a SpanAggregation,
+}
+
+/// One group's aggregate in one step.
+#[derive(Debug, Clone, Default)]
+pub struct SpanAggregateRow {
+    pub key: Vec<Option<String>>,
+    pub step: usize,
+    pub count: u64,
+    /// Seconds, for [`SpanAggregation::Duration`].
+    pub sum: f64,
+    pub min: f64,
+    pub max: f64,
+    pub quantiles: Vec<f64>,
+    /// `(upper bound's f64 bits, spans)`.
+    pub histogram: Vec<(u64, u64)>,
+}
+
+/// What a store aggregated, and the spans it could not decide on, for the caller to
+/// evaluate and add.
+#[derive(Debug, Default)]
+pub struct SpanAggregates {
+    pub rows: Vec<SpanAggregateRow>,
+    pub individual: Vec<SpanRecord>,
+}
+
 /// Spans, as the Tempo API and TraceQL read them.
 pub trait SpanStore: Send + Sync {
+    /// Aggregate a TraceQL metrics query in the store, if it can; `None` to scan.
+    ///
+    /// # Errors
+    /// When the store cannot be read.
+    fn aggregate(&self, request: &SpanAggregateRequest<'_>) -> Result<Option<SpanAggregates>> {
+        let _ = request;
+        Ok(None)
+    }
+
     /// Spans in the scan's range, that `extra` accepts, in its order and within its
     /// limit. `conditions` are what `extra` requires, for a store that can select by
     /// them.
@@ -217,6 +280,33 @@ pub trait SpanStore: Send + Sync {
     /// # Errors
     /// As [`Self::scan`].
     fn of_traces(&self, trace_ids: &[&str], request: Scan<'_>) -> Result<Vec<SpanRecord>>;
+
+    /// The traces a search considers: those with a span in the scan that `extra`
+    /// accepts. Among them, at least the `want` that started latest, where there are that
+    /// many; a store may return more, and the caller ranks them.
+    ///
+    /// The default reads the scan's spans and returns every trace among them, which is
+    /// what the local store does: its scan stops at the scan's limit.
+    ///
+    /// # Errors
+    /// As [`Self::scan`].
+    fn search_traces(
+        &self,
+        request: Scan<'_>,
+        conditions: &[SpanCondition],
+        extra: RecordFilter<'_, SpanRecord>,
+        want: usize,
+    ) -> Result<Vec<String>> {
+        let _ = want;
+        let mut ids: Vec<String> = self
+            .scan(request, conditions, extra)?
+            .into_iter()
+            .map(|span| span.trace_id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
 }
 
 impl SpanStore for RecordStore<SpanSchema> {

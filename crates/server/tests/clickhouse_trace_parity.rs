@@ -246,6 +246,17 @@ async fn clickhouse_answers_traces_as_the_local_store_does() {
         paths.push(search(q, limit));
     }
     for q in [
+        "{ } | histogram_over_time(duration)",
+        r"{ kind = server } | max_over_time(duration) by (span.http.route)",
+        r"{ kind = client } | min_over_time(duration) by (name)",
+        r#"{ resource.service.version = "1.2" } | avg_over_time(duration) by (status)"#,
+        r#"{ span.http.route != "/batch" } | count_over_time() by (span.http.route)"#,
+        r"{ span.db_rows > 50 } | rate()",
+        r"{ span.db.rows <= 10 } | count_over_time() by (resource.service.name)",
+        r"{ span.missing = nil && kind = client } | count_over_time()",
+        r"{ span.http.response.status_code = 500 } | rate() by (resource.service.name)",
+        "{ } | rate() by (kind) | topk(1)",
+        r"{ } | quantile_over_time(duration, 0.99) by (resource.service.name)",
         r"{ } | rate() by (resource.service.name)",
         r"{ status = error } | count_over_time() by (name)",
         r#"{ name = "db.query" } | quantile_over_time(duration, 0.5, 0.9)"#,
@@ -261,7 +272,7 @@ async fn clickhouse_answers_traces_as_the_local_store_does() {
     for path in &paths {
         let want = ask(&local, path).await;
         let got = ask(&remote, path).await;
-        if want != got {
+        if !close(&want, &got) {
             differences.push(format!(
                 "{path}\n  local:      {}\n  clickhouse: {}",
                 want.to_string().chars().take(600).collect::<String>(),
@@ -276,4 +287,22 @@ async fn clickhouse_answers_traces_as_the_local_store_does() {
         paths.len(),
         differences.join("\n")
     );
+}
+
+/// Equal, numbers within a relative 1e-9: a sum or a quantile over the same spans in a
+/// different order differs in its last bits, on either store, from one run to the next.
+fn close(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => {
+            let (x, y) = (x.as_f64().unwrap(), y.as_f64().unwrap());
+            (x - y).abs() <= 1e-9 * x.abs().max(y.abs()).max(1.0)
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| close(x, y))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| close(v, w)))
+        }
+        _ => a == b,
+    }
 }

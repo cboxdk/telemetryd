@@ -650,6 +650,23 @@ impl TraceQuery {
 }
 
 impl Field {
+    /// The field as a store reads it, when it has a stored form.
+    #[must_use]
+    pub fn stored(&self) -> Option<telemetryd_store::SpanField> {
+        use telemetryd_store::SpanField;
+        Some(match self {
+            Self::Intrinsic(Intrinsic::Name) => SpanField::Name,
+            Self::Intrinsic(Intrinsic::Status) => SpanField::Status,
+            Self::Intrinsic(Intrinsic::StatusMessage) => SpanField::StatusMessage,
+            Self::Intrinsic(Intrinsic::Kind) => SpanField::Kind,
+            Self::Intrinsic(Intrinsic::Duration) => SpanField::Duration,
+            Self::Intrinsic(Intrinsic::NestedSetParent) => return None,
+            Self::Resource(name) => SpanField::Resource(name.clone()),
+            Self::Span(name) => SpanField::Span(name.clone()),
+            Self::Unscoped(name) => SpanField::Unscoped(name.clone()),
+        })
+    }
+
     /// The field's value on a span as text, for a series label; `None` when the span
     /// does not have it.
     pub fn text(&self, span: &SpanRecord) -> Option<String> {

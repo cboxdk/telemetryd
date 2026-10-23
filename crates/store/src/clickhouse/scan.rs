@@ -132,7 +132,12 @@ impl Table<'_> {
     }
 
     /// Rows the selected streams hold per hour of the range, as `(hour, rows)`.
-    fn hourly_rows(&self, start: u64, end: u64, selected: &Selected) -> Result<Vec<(u64, u64)>> {
+    pub(super) fn hourly_rows(
+        &self,
+        start: u64,
+        end: u64,
+        selected: &Selected,
+    ) -> Result<Vec<(u64, u64)>> {
         let query = format!(
             "SELECT toUInt64(toUnixTimestamp(Hour)) AS hour, sum(Rows) AS rows \
              FROM {} WHERE {} AND {} GROUP BY hour ORDER BY hour",
@@ -394,7 +399,7 @@ pub(super) fn stream_range(start_nanos: u64, end_nanos: u64) -> String {
 /// The span a limited scan's first window covers, from how densely the selected streams
 /// wrote at the end it starts from: wide enough to hold the candidates `need` rows ask
 /// for, if the rate held, and never narrower than a second or wider than the range.
-fn first_window(hours: &[(u64, u64)], order: Order, need: u64, span: u64) -> u64 {
+pub(super) fn first_window(hours: &[(u64, u64)], order: Order, need: u64, span: u64) -> u64 {
     const HOUR: u64 = 3_600_000_000_000;
     let at_the_end = match order {
         Order::Descending => hours.iter().rev().find(|(_, rows)| *rows > 0),

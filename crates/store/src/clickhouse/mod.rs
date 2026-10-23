@@ -17,6 +17,7 @@ mod scan;
 pub mod schema;
 pub mod spans;
 pub(crate) mod sql;
+mod traceql;
 
 pub use client::{Client, Operation, Stats, StatsSnapshot};
 pub use logs::ClickHouseLogs;
