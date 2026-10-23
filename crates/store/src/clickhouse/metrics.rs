@@ -49,15 +49,43 @@ pub struct ClickHouseMetrics {
     client: Client,
 }
 
+/// More series than this and their hashes are not listed in a read: the read selects
+/// them with the same conditions on the series table, as a subquery, instead.
+const MAX_LISTED_SERIES: usize = 10_000;
+
+/// More series than this in one selector is refused: each is held, with its labels, for
+/// the query, and a selector that matches millions is a mistake, not a dashboard.
+const MAX_SELECTED_SERIES: usize = 1_000_000;
+
+/// One series as the series table gives it.
+#[derive(Deserialize)]
+struct SeriesRow {
+    hash: u64,
+    labels: BTreeMap<String, String>,
+    name: String,
+}
+
 /// Series a selector selects, resolved exactly.
 struct Selected {
     series: HashMap<u64, Labels>,
     names: BTreeSet<String>,
+    /// The series table's conditions the selection came from, for reading many series
+    /// without naming each.
+    from: String,
 }
 
 impl Selected {
     fn condition(&self) -> String {
         let names: Vec<String> = self.names.iter().map(|n| sql::quote(n)).collect();
+        if self.series.len() > MAX_LISTED_SERIES {
+            // Over-selecting is safe: a row of a series not in `series` is skipped by
+            // every reader.
+            return format!(
+                "MetricName IN ({}) AND SeriesHash IN (SELECT SeriesHash FROM {SERIES} WHERE {})",
+                names.join(", "),
+                self.from
+            );
+        }
         let hashes: Vec<String> = self.series.keys().map(u64::to_string).collect();
         format!(
             "MetricName IN ({}) AND SeriesHash IN ({})",
@@ -127,7 +155,7 @@ struct WriteRow<'a> {
 /// The days a range touches, as `Day` conditions on the series table.
 fn days(start_nanos: u64, end_nanos: u64) -> String {
     format!(
-        "Day >= toDate(toDateTime({})) AND Day <= toDate(toDateTime({}))",
+        "Day >= toDate(toDateTime({}, 'UTC')) AND Day <= toDate(toDateTime({}, 'UTC'))",
         start_nanos / 1_000_000_000,
         end_nanos.min(u64::from(u32::MAX) * 1_000_000_000) / 1_000_000_000
     )
@@ -246,22 +274,20 @@ impl ClickHouseMetrics {
                 sql::matcher("Series", "ServiceName", m)
             }
         }));
+        let from = conditions.join(" AND ");
         let query = format!(
             "SELECT SeriesHash AS hash, any(Series) AS labels, any(MetricName) AS name \
-             FROM {SERIES} WHERE {} GROUP BY SeriesHash",
-            conditions.join(" AND ")
+             FROM {SERIES} WHERE {from} GROUP BY SeriesHash LIMIT {}",
+            MAX_SELECTED_SERIES + 1
         );
         let mut selected = Selected {
             series: HashMap::new(),
             names: BTreeSet::new(),
+            from,
         };
+        let mut listed = 0usize;
         self.client.query_lines(&query, |line| {
-            #[derive(Deserialize)]
-            struct SeriesRow {
-                hash: u64,
-                labels: BTreeMap<String, String>,
-                name: String,
-            }
+            listed += 1;
             let row: SeriesRow = serde_json::from_slice(line).map_err(|e| {
                 Error::Unavailable(format!("reading a series from ClickHouse: {e}"))
             })?;
@@ -272,6 +298,12 @@ impl ClickHouseMetrics {
             }
             Ok(ControlFlow::Continue(()))
         })?;
+        if listed > MAX_SELECTED_SERIES {
+            return Err(Error::BadRequest(format!(
+                "this selector matches more than {MAX_SELECTED_SERIES} series; narrow it \
+                 with a metric name or a label matcher"
+            )));
+        }
         Ok(selected)
     }
 
@@ -624,7 +656,7 @@ mod tests {
     fn days_cover_the_range() {
         assert_eq!(
             days(0, NANOS_PER_DAY),
-            "Day >= toDate(toDateTime(0)) AND Day <= toDate(toDateTime(86400))"
+            "Day >= toDate(toDateTime(0, 'UTC')) AND Day <= toDate(toDateTime(86400, 'UTC'))"
         );
     }
 }

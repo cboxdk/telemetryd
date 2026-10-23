@@ -27,6 +27,11 @@
 //!   telemetryd from the samples with the local store's own arithmetic. A window of
 //!   whole hours or days is answered from these instead of from every sample in it.
 //!
+//! Every table is partitioned by day, the summaries and counts as much as the samples:
+//! with `ttl_only_drop_parts` a row leaves when its whole partition has expired, so a
+//! coarser partition would keep a month's summaries past the retention they belong to.
+//! Times are UTC throughout, whatever the server's own timezone is.
+//!
 //! Hours and days here are half open the way a PromQL window is: bucket `k` holds the
 //! samples in `(k·width, (k+1)·width]`, so a window whose bounds fall on bucket bounds
 //! is exactly the buckets inside it.
@@ -153,7 +158,7 @@ fn summaries(engine: &Layout<'_>, counts_ttl: &str, folds_ttl: &str) -> Vec<Stri
     SeriesHash UInt64,
     Samples SimpleAggregateFunction(sum, UInt64)
 ) ENGINE = {}
-PARTITION BY intDiv(Hour, 24 * 30)
+PARTITION BY intDiv(Hour, 24)
 ORDER BY (MetricName, Hour, SeriesHash)
 {counts_ttl}
 {settings}",
@@ -175,7 +180,7 @@ GROUP BY MetricName, Hour, SeriesHash"
     Tier UInt8,
     Bucket UInt32,
     SeriesHash UInt64,
-    Starts DateTime CODEC(Delta(4), ZSTD(1)),
+    Starts DateTime('UTC') CODEC(Delta(4), ZSTD(1)),
     Seen UInt64,
     FirstNanos UInt64,
     LastNanos UInt64,
@@ -188,7 +193,7 @@ GROUP BY MetricName, Hour, SeriesHash"
     Max UInt64,
     Version UInt64
 ) ENGINE = {}
-PARTITION BY (Tier, toYYYYMM(Starts))
+PARTITION BY (Tier, toDate(Starts))
 ORDER BY (MetricName, Tier, Bucket, SeriesHash)
 {folds_ttl}
 {settings}",

@@ -517,6 +517,7 @@ async fn summaries_answer_long_windows_as_the_samples_do() {
     let local_dir = tempfile::tempdir().unwrap();
     let remote_dir = tempfile::tempdir().unwrap();
     let (local, _) = instance(local_dir.path(), ClickHouseConfig::default());
+    let direct = telemetryd_store::clickhouse::Client::new(&clickhouse).unwrap();
     let (remote, remote_store) = instance(remote_dir.path(), clickhouse);
     for app in [&local, &remote] {
         let request = Request::post("/api/v1/write")
@@ -610,11 +611,109 @@ async fn summaries_answer_long_windows_as_the_samples_do() {
     summarise(&remote_store, end + 3 * 3_600 * SECOND);
     differences.extend(compare("repaired").await);
 
+    // A summary made again is a second row until its table merges. With merges held
+    // off: an hour of sixty samples is folded, sixty more land late and it is folded
+    // again, then a sender replays the late batch. The hour now holds 180 samples —
+    // exactly the 60 + 120 the two versions saw together — and is complete only if
+    // the versions are told apart.
+    direct
+        .execute("SYSTEM STOP MERGES telemetryd_folds")
+        .unwrap();
+    let hour = start + 7 * 3_600 * SECOND;
+    let replayed = remote_write(&[(
+        vec![("__name__", "memory_bytes"), ("app", "geo")],
+        (0..60u64)
+            .map(|m| (7.0, hour + m * minute + 20 * SECOND))
+            .collect(),
+    )]);
+    let write = |batch: Vec<u8>| {
+        let local = local.clone();
+        let remote = remote.clone();
+        async move {
+            for app in [&local, &remote] {
+                let request = Request::post("/api/v1/write")
+                    .header(header::CONTENT_TYPE, "application/x-protobuf")
+                    .header("content-encoding", "snappy")
+                    .body(Body::from(batch.clone()))
+                    .unwrap();
+                assert!(send(app, request).await.is_success());
+            }
+        }
+    };
+    write(replayed.clone()).await;
+    summarise(&remote_store, end + 4 * 3_600 * SECOND);
+    differences.extend(compare("refolded, unmerged").await);
+    write(replayed).await;
+    differences.extend(compare("replayed, unmerged").await);
+    direct
+        .execute("SYSTEM START MERGES telemetryd_folds")
+        .unwrap();
+
     assert!(
         differences.is_empty(),
         "{} of {} answers differ:\n{}",
         differences.len(),
-        cases.len() * 3,
+        cases.len() * 5,
         differences.join("\n")
     );
+}
+
+/// A selector matching more series than are listed by hash in a read: the read selects
+/// them with the series table's conditions instead, and answers the same.
+#[tokio::test]
+async fn a_selector_of_many_series_answers_as_the_local_store_does() {
+    let Some(clickhouse) = clickhouse() else {
+        eprintln!("TELEMETRYD_TEST_CLICKHOUSE_URL is not set; skipped");
+        return;
+    };
+    let names: Vec<String> = (0..10_500).map(|i| i.to_string()).collect();
+    let series: Vec<WriteSeries<'_>> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            #[allow(clippy::cast_precision_loss)]
+            let value = i as f64;
+            (
+                vec![
+                    ("__name__", "many_total"),
+                    ("app", "geo"),
+                    ("i", name.as_str()),
+                ],
+                vec![
+                    (value, END - 120 * SECOND),
+                    (value * 2.0, END - 60 * SECOND),
+                ],
+            )
+        })
+        .collect();
+    let batch = remote_write(&series);
+    let local_dir = tempfile::tempdir().unwrap();
+    let remote_dir = tempfile::tempdir().unwrap();
+    let (local, _) = instance(local_dir.path(), ClickHouseConfig::default());
+    let (remote, _) = instance(remote_dir.path(), clickhouse);
+    for app in [&local, &remote] {
+        let request = Request::post("/api/v1/write")
+            .header(header::CONTENT_TYPE, "application/x-protobuf")
+            .header("content-encoding", "snappy")
+            .body(Body::from(batch.clone()))
+            .unwrap();
+        assert!(send(app, request).await.is_success());
+    }
+    let mut differences = Vec::new();
+    for expression in [
+        "sum(many_total)",
+        "count(many_total)",
+        "sum(increase(many_total[5m]))",
+        r#"count(many_total{i=~"1.*"})"#,
+    ] {
+        let params = [("query", expression.to_owned()), ("time", seconds(END))];
+        let want = ask(&local, "/api/v1/query", &params).await;
+        let got = ask(&remote, "/api/v1/query", &params).await;
+        if !same(&want, &got) {
+            differences.push(format!(
+                "{expression}\n  local: {want}\n  clickhouse: {got}"
+            ));
+        }
+    }
+    assert!(differences.is_empty(), "{}", differences.join("\n"));
 }
