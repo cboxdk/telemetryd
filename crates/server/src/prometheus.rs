@@ -80,7 +80,7 @@ pub async fn instant(
 
     let expression = params.query.clone().unwrap_or_default();
     let response = crate::auth::spawn_read(move || {
-        prometheus::instant(store.metrics(), &params, now, max_samples)
+        prometheus::instant(store.metric_store(), &params, now, max_samples)
     })
     .await
     .map_err(|e| Error::Config(format!("query task panicked: {e}")))?
@@ -100,7 +100,7 @@ pub async fn range(
 
     let expression = params.query.clone().unwrap_or_default();
     let response = crate::auth::spawn_read(move || {
-        prometheus::range(store.metrics(), &params, now, max_samples)
+        prometheus::range(store.metric_store(), &params, now, max_samples)
     })
     .await
     .map_err(|e| Error::Config(format!("query task panicked: {e}")))?
@@ -117,7 +117,7 @@ pub async fn labels(
     let (start, end, selectors) = meta(&pairs)?;
     let store = std::sync::Arc::clone(&state.store);
     let response = crate::auth::spawn_read(move || {
-        prometheus::label_names(store.metrics(), &selectors, start, end)
+        prometheus::label_names(store.metric_store(), &selectors, start, end)
     })
     .await
     .map_err(|e| Error::Config(format!("query task panicked: {e}")))??;
@@ -133,7 +133,7 @@ pub async fn label_values(
     let (start, end, selectors) = meta(&pairs)?;
     let store = std::sync::Arc::clone(&state.store);
     let response = crate::auth::spawn_read(move || {
-        prometheus::label_values(store.metrics(), &name, &selectors, start, end)
+        prometheus::label_values(store.metric_store(), &name, &selectors, start, end)
     })
     .await
     .map_err(|e| Error::Config(format!("query task panicked: {e}")))??;
@@ -148,7 +148,7 @@ pub async fn series(
     let (start, end, selectors) = meta(&pairs)?;
     let store = std::sync::Arc::clone(&state.store);
     let response = crate::auth::spawn_read(move || {
-        prometheus::series(store.metrics(), &selectors, start, end)
+        prometheus::series(store.metric_store(), &selectors, start, end)
     })
     .await
     .map_err(|e| Error::Config(format!("query task panicked: {e}")))??;

@@ -14,6 +14,7 @@ mod dictionary;
 pub mod folds;
 pub mod intern;
 pub mod logs;
+pub mod metric_backend;
 pub mod metrics;
 pub mod records;
 pub mod retention;
@@ -46,6 +47,7 @@ pub use backend::{
 pub use cardinality::{Admission, Admitted, Cardinality};
 pub use datadir::{DataDir, DiskUsage};
 pub use logs::LogSchema;
+pub use metric_backend::MetricStore;
 pub use metrics::MetricSchema;
 pub use records::{RecordStore, RecordStoreStatus, Scan, StoreSettings};
 pub use retention::{Candidate, Plan, ReaperReport};
@@ -196,6 +198,19 @@ impl Store {
         }
     }
 
+    /// Summarise settled metric hours in ClickHouse; `None` without ClickHouse.
+    ///
+    /// # Errors
+    /// When ClickHouse cannot be read or written.
+    pub fn roll_up_metrics(&self, now: u64) -> Result<Option<clickhouse::metric_folds::RollUp>> {
+        static OWNER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let owner = OWNER.get_or_init(|| format!("{}-{}", std::process::id(), now_nanos()));
+        self.clickhouse
+            .as_ref()
+            .map(|c| c.metrics.roll_up(now, owner))
+            .transpose()
+    }
+
     /// Whether logs are kept in ClickHouse rather than on this machine.
     pub fn logs_in_clickhouse(&self) -> bool {
         self.clickhouse.is_some()
@@ -231,10 +246,21 @@ impl Store {
         &self.metrics
     }
 
+    /// Metrics, wherever they are kept: what the PromQL engine reads.
+    pub fn metric_store(&self) -> &dyn MetricStore {
+        match &self.clickhouse {
+            Some(clickhouse) => &clickhouse.metrics,
+            None => &self.metrics,
+        }
+    }
+
     /// Append metric samples. Durable before this returns.
     pub fn append_samples(&self, records: &[MetricSample]) -> Result<Admitted> {
         self.append_within_limits(records, MetricSchema::index_labels, |kept| {
-            self.metrics.append(kept)
+            match &self.clickhouse {
+                Some(clickhouse) => clickhouse.metrics.append(kept),
+                None => self.metrics.append(kept),
+            }
         })
     }
 

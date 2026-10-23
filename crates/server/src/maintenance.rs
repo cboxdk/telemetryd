@@ -20,6 +20,9 @@ use tokio::task::JoinHandle;
 /// figure does not matter.
 const SERIES_RECLAIM_TICK: Duration = Duration::from_secs(60);
 
+/// How often settled metric hours are summarised in ClickHouse.
+const METRIC_ROLLUP_TICK: Duration = Duration::from_secs(60);
+
 /// Segments to summarise per tick.
 ///
 /// Each one is read whole, so this competes with ingest for memory. A few at a time
@@ -280,6 +283,43 @@ impl Maintenance {
         }));
     }
 
+    /// Summarise metrics in ClickHouse as their hours settle: what answers a `rate` over
+    /// months from a row per series per hour or day instead of every sample. Every
+    /// instance runs it; a lease in the database keeps them from doing the same hour at
+    /// once.
+    fn spawn_metric_rollup(tasks: &mut Vec<tokio::task::JoinHandle<()>>, store: &Arc<Store>) {
+        if !store.logs_in_clickhouse() {
+            return;
+        }
+        let store = Arc::clone(store);
+        tasks.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(METRIC_ROLLUP_TICK);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let rolling = Arc::clone(&store);
+                match tokio::task::spawn_blocking(move || {
+                    rolling.roll_up_metrics(telemetryd_store::now_nanos())
+                })
+                .await
+                {
+                    Ok(Ok(Some(done))) if done.folds_written > 0 => tracing::debug!(
+                        hours = done.hours,
+                        repaired = done.repaired_hours,
+                        days = done.days,
+                        folds = done.folds_written,
+                        "summarised metrics in ClickHouse"
+                    ),
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "could not summarise metrics in ClickHouse");
+                    }
+                    Err(e) => tracing::error!(error = %e, "metric summaries did not finish"),
+                }
+            }
+        }));
+    }
+
     /// Start the maintenance tasks against `store`.
     pub fn start(store: &Arc<Store>, wal_sync_interval: Duration) -> Self {
         Self::start_with(store, wal_sync_interval, None, None, Duration::ZERO)
@@ -373,6 +413,7 @@ impl Maintenance {
         Self::spawn_retention(&mut tasks, store, relay.clone());
         Self::spawn_series_reclaim(&mut tasks, store);
         Self::spawn_fold_backfill(&mut tasks, store);
+        Self::spawn_metric_rollup(&mut tasks, store);
 
         Self::spawn_relay(&mut tasks, store, relay, relay_interval);
 

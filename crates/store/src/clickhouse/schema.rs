@@ -48,6 +48,7 @@ use telemetryd_core::Result;
 use telemetryd_core::config::{ClickHouseConfig, RetentionConfig};
 
 use super::Client;
+use super::metrics_schema;
 use super::sql::quote;
 
 pub const LOGS: &str = "otel_logs";
@@ -74,7 +75,6 @@ pub(super) enum Signal {
     Logs,
     Traces,
     /// For the metric tables, which age by `retention.metrics`.
-    #[allow(dead_code)]
     Metrics,
 }
 
@@ -130,6 +130,30 @@ const AGING: &[Aging] = &[
         table: TRACE_STREAMS,
         time: "Hour",
         signal: Signal::Traces,
+        moves: false,
+    },
+    Aging {
+        table: metrics_schema::SAMPLES,
+        time: "toDateTime(Timestamp)",
+        signal: Signal::Metrics,
+        moves: true,
+    },
+    Aging {
+        table: metrics_schema::SERIES,
+        time: "toDateTime(Day)",
+        signal: Signal::Metrics,
+        moves: false,
+    },
+    Aging {
+        table: metrics_schema::COUNTS,
+        time: "toDateTime(toUInt64(Hour) * 3600)",
+        signal: Signal::Metrics,
+        moves: false,
+    },
+    Aging {
+        table: metrics_schema::FOLDS,
+        time: "toDateTime(Starts)",
+        signal: Signal::Metrics,
         moves: false,
     },
 ];
@@ -205,7 +229,7 @@ impl Layout<'_> {
         format!("SETTINGS {}", settings.join(", "))
     }
 
-    fn aging(&self, table: &str) -> String {
+    pub(super) fn aging(&self, table: &str) -> String {
         let aging = AGING
             .iter()
             .find(|a| a.table == table)
@@ -270,6 +294,7 @@ ORDER BY (ServiceName, toDateTime(Timestamp))
     ));
     statements.extend(log_volume(&layout));
     statements.extend(traces(&layout));
+    statements.extend(super::metrics_schema::statements(&layout));
     statements.push(format!(
         "CREATE TABLE IF NOT EXISTS {META}{on} (
     Name String,

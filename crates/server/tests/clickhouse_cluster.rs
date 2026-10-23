@@ -156,6 +156,28 @@ async fn instances_on_different_replicas_answer_alike() {
     )
     .await;
 
+    let points: Vec<Value> = (0..60u64)
+        .map(|i| {
+            json!({
+                "timeUnixNano": (BASE + i * 10 * SECOND).to_string(),
+                "asDouble": f64::from(u32::try_from(i * i).unwrap()),
+                "attributes": [kv("http.route", if i % 2 == 0 { "/geocode" } else { "/reverse" })],
+            })
+        })
+        .collect();
+    post(
+        &writer,
+        "/v1/metrics",
+        &json!({"resourceMetrics": [{
+            "resource": {"attributes": [kv("service.name", "geo")]},
+            "scopeMetrics": [{"metrics": [{
+                "name": "http.requests",
+                "sum": {"isMonotonic": true, "aggregationTemporality": 2, "dataPoints": points},
+            }]}],
+        }]}),
+    )
+    .await;
+
     // The second replica has what the first took once it has fetched the parts.
     let replica = telemetryd_store::clickhouse::Client::new(&configs[1]).unwrap();
     let _ = cluster;
@@ -167,6 +189,10 @@ async fn instances_on_different_replicas_answer_alike() {
         "otel_traces",
         "otel_traces_trace_id_ts",
         "otel_trace_streams",
+        "telemetryd_samples",
+        "telemetryd_series",
+        "telemetryd_sample_counts",
+        "telemetryd_folds",
     ] {
         replica
             .execute(&format!("SYSTEM SYNC REPLICA {table}"))
@@ -189,6 +215,15 @@ async fn instances_on_different_replicas_answer_alike() {
             encode("{ status = error }")
         ),
         format!("/api/traces/{:032x}", 6),
+        format!(
+            "/api/v1/query_range?query={}&start={start}&end={end}&step=30",
+            encode("sum by (http_route) (rate(http_requests_total[2m]))")
+        ),
+        format!(
+            "/api/v1/query?query={}&time={end}",
+            encode("increase(http_requests_total[10m])")
+        ),
+        format!("/api/v1/label/http_route/values?start={start}&end={end}"),
     ];
     for path in &paths {
         let want = ask(&writer, path).await;

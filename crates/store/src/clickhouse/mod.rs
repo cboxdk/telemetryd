@@ -13,6 +13,9 @@
 
 mod client;
 pub mod logs;
+pub mod metric_folds;
+pub mod metrics;
+pub mod metrics_schema;
 mod scan;
 pub mod schema;
 pub mod spans;
@@ -21,6 +24,7 @@ mod traceql;
 
 pub use client::{Client, Operation, Stats, StatsSnapshot};
 pub use logs::ClickHouseLogs;
+pub use metrics::ClickHouseMetrics;
 pub use spans::ClickHouseSpans;
 
 use telemetryd_core::Result;
@@ -31,6 +35,7 @@ use telemetryd_core::config::{ClickHouseConfig, RetentionConfig};
 pub struct ClickHouse {
     client: Client,
     pub logs: ClickHouseLogs,
+    pub metrics: ClickHouseMetrics,
     pub spans: ClickHouseSpans,
 }
 
@@ -47,6 +52,7 @@ impl ClickHouse {
         }
         Ok(Self {
             logs: ClickHouseLogs::new(client.clone()),
+            metrics: ClickHouseMetrics::new(client.clone()),
             spans: ClickHouseSpans::new(client.clone()),
             client,
         })
@@ -65,9 +71,15 @@ impl ClickHouse {
     pub fn app_usage(&self) -> Result<Vec<crate::AppUsage>> {
         use std::collections::BTreeMap;
         let mut apps: BTreeMap<String, crate::AppUsage> = BTreeMap::new();
-        for (table, summary) in [
-            (schema::LOGS, schema::LOG_STREAMS),
-            (schema::TRACES, schema::TRACE_STREAMS),
+        for (table, summary, hash, rows) in [
+            (schema::LOGS, schema::LOG_STREAMS, "StreamHash", "Rows"),
+            (schema::TRACES, schema::TRACE_STREAMS, "StreamHash", "Rows"),
+            (
+                metrics_schema::SAMPLES,
+                metrics_schema::SERIES,
+                "SeriesHash",
+                "Samples",
+            ),
         ] {
             let mut bytes = 0u64;
             self.client.query_lines(
@@ -88,7 +100,7 @@ impl ClickHouse {
             let mut rows_here: Vec<(String, u64, u64)> = Vec::new();
             self.client.query_lines(
                 &format!(
-                    "SELECT ServiceName AS app, uniqExact(StreamHash) AS series, sum(Rows) AS rows \
+                    "SELECT ServiceName AS app, uniqExact({hash}) AS series, sum({rows}) AS rows \
                      FROM {summary} GROUP BY app"
                 ),
                 |line| {
