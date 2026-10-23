@@ -26,8 +26,53 @@ pub struct BodyFilter {
     pub text: String,
 }
 
+/// Lines and bytes per stream group per time bucket: what `count_over_time`, `rate`,
+/// `bytes_over_time` and `bytes_rate` need, without reading the lines.
+///
+/// Buckets are `(anchor + k·width, anchor + (k+1)·width]`, the same half-open shape as
+/// a LogQL window, so a window whose bounds fall on bucket bounds holds exactly the
+/// lines of the buckets inside it.
+#[derive(Debug, Clone)]
+pub struct BucketRequest<'a> {
+    /// Lines after this, exclusive — also the grid's origin.
+    pub anchor_nanos: u64,
+    /// Lines up to this, inclusive.
+    pub until_nanos: u64,
+    pub width_nanos: u64,
+    pub matchers: &'a [LabelMatcher],
+    pub body_filters: &'a [BodyFilter],
+    /// Stream labels to group by; empty for one group of everything.
+    pub group_by: &'a [String],
+}
+
+/// One group's `(bucket, lines, bytes)`, in no particular order.
+pub type BucketCounts = Vec<(u64, u64, u64)>;
+
+/// What a store counted.
+#[derive(Debug, Default)]
+pub struct Buckets {
+    /// Per group, its `group_by` values and `(bucket, lines, bytes)`.
+    pub groups: Vec<(Vec<String>, BucketCounts)>,
+    /// Lines whose group the store could not tell from its stream labels alone — an
+    /// attribute that would stand in for a grouped label, or a row with no stream — to
+    /// be grouped by the caller, one by one, as if they had been scanned.
+    pub individual: Vec<LogRecord>,
+    /// Lines counted, for the response's statistics.
+    pub lines: u64,
+}
+
 /// Logs, as the Loki API and LogQL read them.
 pub trait LogStore: Send + Sync {
+    /// Count lines into buckets in the store, if it can; `None` when it cannot and the
+    /// caller should scan. The local store cannot: its segments are read either way.
+    ///
+    /// # Errors
+    /// When the store cannot be read.
+    fn buckets(&self, request: &BucketRequest<'_>) -> Result<Option<Buckets>> {
+        let _ = request;
+        Ok(None)
+    }
+
     /// Records in the scan's range whose stream matches, that `extra` accepts, in the
     /// scan's order and within its limit.
     ///

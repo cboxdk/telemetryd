@@ -38,7 +38,7 @@ use telemetryd_core::span::SpanRecord;
 use crate::schema::RecordSchema;
 use telemetryd_core::{Labels, LogRecord, Result, Signal};
 
-pub use backend::{BodyFilter, LogStore, RecordFilter};
+pub use backend::{BodyFilter, BucketRequest, Buckets, LogStore, RecordFilter};
 pub use cardinality::{Admission, Admitted, Cardinality};
 pub use datadir::{DataDir, DiskUsage};
 pub use logs::LogSchema;

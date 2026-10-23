@@ -36,7 +36,7 @@ use telemetryd_core::{
 use super::Client;
 use super::schema::{LOG_STREAMS, LOGS};
 use super::sql;
-use crate::backend::{LogStore, RecordFilter};
+use crate::backend::{BucketRequest, Buckets, LogStore, RecordFilter};
 use crate::records::Scan;
 use crate::topk::Order;
 
@@ -162,6 +162,86 @@ fn over_ceiling(request: &Scan<'_>, collected: usize) -> Result<()> {
 }
 
 impl LogStore for ClickHouseLogs {
+    fn buckets(&self, request: &BucketRequest<'_>) -> Result<Option<Buckets>> {
+        if request.width_nanos == 0 {
+            return Ok(None);
+        }
+        let anchor = i64::try_from(request.anchor_nanos).unwrap_or(i64::MAX);
+        let width = i64::try_from(request.width_nanos).unwrap_or(i64::MAX);
+        let scan = Scan::range(request.anchor_nanos, request.until_nanos)
+            .body_filters(request.body_filters);
+        let base = conditions(&scan, request.matchers);
+        // `conditions` reads `>=`; a window's floor is exclusive.
+        let base = format!(
+            "{base} AND Timestamp > {}",
+            sql::nanos(request.anchor_nanos)
+        );
+        let individual = individual_condition(request.group_by);
+
+        let groups: Vec<String> = request
+            .group_by
+            .iter()
+            .enumerate()
+            .map(|(i, name)| format!("{} AS g{i}", group_value(name)))
+            .collect();
+        let keys: Vec<String> = (0..request.group_by.len())
+            .map(|i| format!("g{i}"))
+            .collect();
+        let query = format!(
+            "SELECT intDiv(toUnixTimestamp64Nano(Timestamp) - {anchor} - 1, {width}) AS k, \
+             count() AS lines, sum(length(Body)) AS bytes{comma}{groups} \
+             FROM {LOGS} WHERE {base} AND NOT ({individual}) GROUP BY k{comma}{keys}",
+            comma = if groups.is_empty() { "" } else { ", " },
+            groups = groups.join(", "),
+            keys = keys.join(", "),
+        );
+        let mut out = Buckets::default();
+        let mut index: std::collections::HashMap<Vec<String>, usize> =
+            std::collections::HashMap::new();
+        self.client.query_lines(&query, |line| {
+            let row: serde_json::Value = serde_json::from_slice(line).map_err(|e| {
+                Error::Unavailable(format!("reading a bucket from ClickHouse: {e}"))
+            })?;
+            let values: Vec<String> = (0..request.group_by.len())
+                .map(|i| {
+                    row.get(format!("g{i}"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .collect();
+            let number = |name: &str| {
+                row.get(name)
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            };
+            let (k, lines, bytes) = (number("k"), number("lines"), number("bytes"));
+            out.lines += lines;
+            let next = out.groups.len();
+            let slot = *index.entry(values.clone()).or_insert(next);
+            if slot == next {
+                out.groups.push((values, Vec::new()));
+            }
+            out.groups[slot].1.push((k, lines, bytes));
+            Ok(ControlFlow::Continue(()))
+        })?;
+
+        self.read(
+            &format!("{base} AND ({individual})"),
+            Order::Ascending,
+            None,
+            |row| {
+                let record = row.into_record();
+                if matches_all(request.matchers, &record.stream) {
+                    out.lines += 1;
+                    out.individual.push(record);
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
+        Ok(Some(out))
+    }
+
     fn scan(
         &self,
         request: Scan<'_>,
@@ -314,6 +394,60 @@ impl LogStore for ClickHouseLogs {
         })?;
         Ok(seen.into_iter().collect())
     }
+}
+
+/// A grouped label's value as its stream gives it. `detected_level` is the one label a
+/// line carries that is not a stream label but follows from one: it is the record's
+/// level, unless the stream names one of its own.
+fn group_value(name: &str) -> String {
+    if name == "detected_level" {
+        "if(mapContains(Stream, 'detected_level'), Stream['detected_level'], Stream['level'])"
+            .to_owned()
+    } else {
+        format!("Stream[{}]", sql::quote(name))
+    }
+}
+
+/// Rows whose grouped labels cannot be read off `Stream` alone, and so are grouped by
+/// the caller, one record at a time.
+///
+/// A label a line is grouped by comes from its stream unless an attribute stands in for
+/// it: one of the record's own whose name sanitises to the label, or an unpromoted
+/// resource attribute that does where the stream has no such label (see
+/// `LogRecord::filter_labels`). Sanitising is matched loosely here, on letters alone —
+/// sanitising never changes an ASCII letter, so a key that sanitises to the label always
+/// has its letters — which can only ever send a row the slow way that did not need it.
+/// A row with no stream at all, written by something other than telemetryd, goes the
+/// same way, since its stream is reconstructed rather than stored.
+fn individual_condition(group_by: &[String]) -> String {
+    let letters = |text: &str| {
+        text.chars()
+            .filter(char::is_ascii_alphabetic)
+            .collect::<String>()
+    };
+    let mut parts = vec!["empty(Stream)".to_owned()];
+    if !group_by.is_empty() {
+        let names: Vec<String> = group_by.iter().map(|n| sql::quote(&letters(n))).collect();
+        parts.push(format!(
+            "arrayExists(k -> replaceRegexpAll(k, '[^a-zA-Z]', '') IN ({}), mapKeys(LogAttributes))",
+            names.join(", ")
+        ));
+        let resource: Vec<String> = group_by
+            .iter()
+            .map(|n| {
+                format!(
+                    "(replaceRegexpAll(k, '[^a-zA-Z]', '') = {} AND NOT mapContains(Stream, {}))",
+                    sql::quote(&letters(n)),
+                    sql::quote(n)
+                )
+            })
+            .collect();
+        parts.push(format!(
+            "arrayExists(k -> {}, mapKeys(ResourceAttributes))",
+            resource.join(" OR ")
+        ));
+    }
+    parts.join(" OR ")
 }
 
 /// The streams summary's rows that can hold data in the range. Each row records the
