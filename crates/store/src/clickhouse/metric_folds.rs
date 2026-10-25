@@ -174,7 +174,7 @@ impl<'a> Writer<'a> {
     }
 }
 
-fn read_meta(client: &Client, name: &str) -> Result<Option<String>> {
+pub(super) fn read_meta(client: &Client, name: &str) -> Result<Option<String>> {
     let mut value = None;
     client.query_lines(
         &format!(
@@ -200,7 +200,7 @@ fn read_meta(client: &Client, name: &str) -> Result<Option<String>> {
     Ok(value)
 }
 
-fn write_meta(client: &Client, name: &str, value: &str) -> Result<()> {
+pub(super) fn write_meta(client: &Client, name: &str, value: &str) -> Result<()> {
     client.execute(&format!(
         "INSERT INTO {META} SELECT {}, {}, now64(9)",
         sql::quote(name),
@@ -552,6 +552,27 @@ pub fn roll_up(client: &Client, now: u64, owner: &str) -> Result<RollUp> {
         done.folds_written += roll_days(client, day, day, now)?;
     }
     Ok(done)
+}
+
+/// Have the summaries made again from `hour` on, by whichever instance next holds the
+/// lease: for samples written into hours already summarised — an import of history,
+/// most often. A cursor already earlier is left where it is.
+///
+/// # Errors
+/// When ClickHouse cannot be read or written.
+pub fn refold_from(client: &Client, hour: u64) -> Result<()> {
+    if let Some(next) = read_meta(client, HOURS_CURSOR)?.and_then(|v| v.parse::<u64>().ok())
+        && next > hour
+    {
+        write_meta(client, HOURS_CURSOR, &hour.to_string())?;
+    }
+    let day = hour / 24;
+    if let Some(next) = read_meta(client, DAYS_CURSOR)?.and_then(|v| v.parse::<u64>().ok())
+        && next > day
+    {
+        write_meta(client, DAYS_CURSOR, &day.to_string())?;
+    }
+    Ok(())
 }
 
 fn oldest_hour(client: &Client) -> Result<Option<u64>> {
