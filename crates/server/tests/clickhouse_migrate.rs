@@ -404,7 +404,7 @@ fn rebuilds_keep_every_row_once(
 
 #[test]
 fn an_old_layout_is_rebuilt_with_every_row_once() {
-    let Some(config) = clickhouse_under_test("migrate_rebuild") else {
+    let Some(config) = clickhouse_under_test("migrate_rebuild").map(one_server) else {
         common::skip("TELEMETRYD_TEST_CLICKHOUSE_URL");
         return;
     };
@@ -438,8 +438,42 @@ fn an_old_layout_is_rebuilt_across_a_cluster() {
             }
         })
         .collect();
+    // A cluster of several shards has no older layout to bring up: only this version
+    // lays one out, and migrate says so rather than rebuilding it into one shard's.
+    let probe = Client::new(&configs[0]).unwrap();
+    if telemetryd_store::clickhouse::schema::sharded(&probe, &configs[0]).unwrap() {
+        let mut events = Vec::new();
+        migrate::run(
+            &probe,
+            &configs[0],
+            &long_retention(),
+            take_over(),
+            &mut |e| events.push(e.clone()),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::Found {
+                    what: "nothing",
+                    ..
+                }]
+            ),
+            "{events:?}"
+        );
+        return;
+    }
     // Shorter: every partition moved on a cluster is a replicated operation.
     rebuilds_keep_every_row_once(&configs[0], configs.get(1), 12);
+}
+
+/// The server alone, whatever cluster the suite runs on: an earlier version laid its
+/// tables out on one server or one shard, never over several.
+fn one_server(config: ClickHouseConfig) -> ClickHouseConfig {
+    ClickHouseConfig {
+        cluster: String::new(),
+        ..config
+    }
 }
 
 // ---------------------------------------------------------------------------------
@@ -575,7 +609,7 @@ const ROLLUPS: [(&str, &str, &str, &str, &str); 3] = [
 
 #[tokio::test]
 async fn a_rollup_younger_than_its_rows_is_filled_in_once() {
-    let Some(config) = clickhouse_under_test("migrate_backfill") else {
+    let Some(config) = clickhouse_under_test("migrate_backfill").map(one_server) else {
         common::skip("TELEMETRYD_TEST_CLICKHOUSE_URL");
         return;
     };
@@ -689,7 +723,7 @@ async fn a_rollup_younger_than_its_rows_is_filled_in_once() {
 
 #[tokio::test]
 async fn stale_objects_go_by_name_and_missing_indexes_are_built() {
-    let Some(config) = clickhouse_under_test("migrate_objects") else {
+    let Some(config) = clickhouse_under_test("migrate_objects").map(one_server) else {
         common::skip("TELEMETRYD_TEST_CLICKHOUSE_URL");
         return;
     };
