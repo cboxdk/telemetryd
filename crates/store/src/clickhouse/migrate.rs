@@ -9,14 +9,14 @@
 //!   name, swapped in by `EXCHANGE TABLES`, and the old rows copied into it a partition
 //!   at a time — through a staging table and `MOVE PARTITION`, so each partition
 //!   arrives exactly once and no materialized view sees it a second time. See
-//!   [`rebuild`].
+//!   `rebuild`.
 //! - **Objects earlier versions created and this one does not** are dropped — the ones
-//!   in [`STALE`], by name, and nothing else.
+//!   in `STALE`, by name, and nothing else.
 //! - **Indexes**: one this version declares and the table lacks is added; with
 //!   `materialize_indexes`, partitions written before it existed are indexed, a
 //!   partition at a time, and an index it replaces is dropped once they all are.
 //! - **Rollups** created after the rows they summarise (`--backfill`) are filled in
-//!   for those rows. See [`backfill`].
+//!   for those rows. See `backfill`.
 //!
 //! What is to be done is found by asking ClickHouse rather than by comparing text: a
 //! probe of each table, created from the statement an instance would run and dropped
