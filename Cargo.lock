@@ -2841,7 +2841,6 @@ dependencies = [
  "http-body-util",
  "percent-encoding",
  "pin-project-lite",
- "tokio",
  "tower-layer",
  "tower-service",
  "tracing",

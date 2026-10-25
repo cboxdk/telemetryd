@@ -37,7 +37,6 @@ use telemetryd_core::{Config, Result};
 use telemetryd_store::Store;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::limit::RequestBodyLimitLayer;
-use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 pub use state::AppState;
@@ -175,9 +174,9 @@ pub fn router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http())
         // 503, not 408: an OTLP exporter retries 429, 502, 503 and 504 and drops the
         // batch on anything else, so a timed-out ingest answered 408 was a batch lost.
-        .layer(TimeoutLayer::with_status_code(
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        .layer(axum::middleware::from_fn_with_state(
             request_timeout,
+            error::time_limit,
         ))
         // Outside the timeout, so a 408 on the Prometheus API gets the envelope too.
         .layer(axum::middleware::from_fn(error::prometheus_envelope))
