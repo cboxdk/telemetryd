@@ -121,35 +121,9 @@ pub async fn export(
 
     // Read on a blocking thread: scanning opens Parquet files, and doing that on a
     // runtime worker is what parked one in the Cbox ID path.
-    let scanned = tokio::task::spawn_blocking(move || -> Result<Scanned, Error> {
-        let scan = Scan {
-            abort_over: 0,
-            start_nanos: start,
-            end_nanos: end,
-            limit,
-            order: Order::Ascending,
-            exact_key: None,
-            required_text: None,
-            body_filters: &[],
-            // No narrowing: an export wants every column of every row, and a
-            // projection here would silently drop whatever it left out.
-            columns: None,
-        };
-
-        Ok(match signal {
-            telemetryd_core::Signal::Logs => {
-                Scanned::Logs(store.log_store().scan(scan, &[], &|_| true)?)
-            }
-            telemetryd_core::Signal::Traces => {
-                Scanned::Traces(store.span_store().scan(scan, &[], &|_| true)?)
-            }
-            telemetryd_core::Signal::Metrics => {
-                Scanned::Metrics(store.metric_store().scan(scan, &[], &|_| true)?)
-            }
-        })
-    })
-    .await
-    .map_err(|e| Error::Config(format!("export task panicked: {e}")))??;
+    let scanned = tokio::task::spawn_blocking(move || page(&store, signal, start, end, limit))
+        .await
+        .map_err(|e| Error::Config(format!("export task panicked: {e}")))??;
 
     // Encode and send batch by batch instead of building the whole document first.
     //
@@ -235,6 +209,96 @@ pub async fn export(
         .into_response())
 }
 
+/// One page of the export: at most `limit` records from `start`, oldest first.
+fn page(
+    store: &telemetryd_store::Store,
+    signal: telemetryd_core::Signal,
+    start: u64,
+    end: u64,
+    limit: usize,
+) -> Result<Scanned, Error> {
+    let scan = Scan {
+        abort_over: 0,
+        start_nanos: start,
+        end_nanos: end,
+        limit,
+        order: Order::Ascending,
+        exact_key: None,
+        required_text: None,
+        body_filters: &[],
+        // No narrowing: an export wants every column of every row, and a
+        // projection here would silently drop whatever it left out.
+        columns: None,
+    };
+
+    // The client's next page starts one nanosecond after the newest record of this
+    // one. A full page can stop partway through the records sharing that
+    // nanosecond — a scrape writes thousands of samples at one — and the next page
+    // would start past the rest. So a full page ends before its last timestamp,
+    // which the next page then starts at; and a full page that is one timestamp end
+    // to end is all of that timestamp, however many records it holds.
+    let at = |nanos: u64| Scan {
+        start_nanos: nanos,
+        end_nanos: nanos,
+        limit: 0,
+        ..scan
+    };
+    Ok(match signal {
+        telemetryd_core::Signal::Logs => {
+            let records = store.log_store().scan(scan, &[], &|_| true)?;
+            Scanned::Logs(whole_timestamps(
+                records,
+                limit,
+                |r| r.timestamp_nanos,
+                |t| store.log_store().scan(at(t), &[], &|_| true),
+            )?)
+        }
+        telemetryd_core::Signal::Traces => {
+            let records = store.span_store().scan(scan, &[], &|_| true)?;
+            Scanned::Traces(whole_timestamps(
+                records,
+                limit,
+                |r| r.start_nanos,
+                |t| store.span_store().scan(at(t), &[], &|_| true),
+            )?)
+        }
+        telemetryd_core::Signal::Metrics => {
+            let records = store.metric_store().scan(scan, &[], &|_| true)?;
+            Scanned::Metrics(whole_timestamps(
+                records,
+                limit,
+                |r| r.timestamp_nanos,
+                |t| store.metric_store().scan(at(t), &[], &|_| true),
+            )?)
+        }
+    })
+}
+
+/// A page that never ends partway through a timestamp: see the scan in [`export`].
+fn whole_timestamps<R>(
+    mut records: Vec<R>,
+    limit: usize,
+    timestamp: impl Fn(&R) -> u64,
+    all_at: impl FnOnce(u64) -> Result<Vec<R>, Error>,
+) -> Result<Vec<R>, Error> {
+    if limit == 0 || records.len() < limit {
+        return Ok(records);
+    }
+    let (Some(first), Some(last)) = (
+        records.first().map(&timestamp),
+        records.last().map(&timestamp),
+    ) else {
+        return Ok(records);
+    };
+    if first == last {
+        return all_at(last);
+    }
+    while records.last().is_some_and(|r| timestamp(r) == last) {
+        records.pop();
+    }
+    Ok(records)
+}
+
 /// How long an export waits for its client to take the next batch before giving up.
 const EXPORT_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -253,6 +317,26 @@ mod tests {
 
     /// An unknown signal must be refused, not answered with nothing — an empty
     /// export is indistinguishable from an empty range.
+    #[test]
+    fn a_full_page_never_ends_partway_through_a_timestamp() {
+        let all = |t: u64| Ok(vec![t; 7]);
+        // Room to spare: as it is.
+        assert_eq!(
+            whole_timestamps(vec![1, 2, 2], 5, |r| *r, all).unwrap(),
+            vec![1, 2, 2]
+        );
+        // Full: the last timestamp is left for the next page.
+        assert_eq!(
+            whole_timestamps(vec![1, 2, 3, 3], 4, |r| *r, all).unwrap(),
+            vec![1, 2]
+        );
+        // Full and one timestamp end to end: all of it.
+        assert_eq!(
+            whole_timestamps(vec![3, 3, 3], 3, |r| *r, all).unwrap(),
+            vec![3; 7]
+        );
+    }
+
     #[test]
     fn an_unknown_signal_is_refused_by_the_type() {
         assert!(serde_json::from_str::<Signal>("\"logs\"").is_ok());

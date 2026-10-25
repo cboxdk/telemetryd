@@ -126,40 +126,88 @@ schema` prints what to create.
 
 ### Upgrading a deployment
 
-At startup an instance creates what is missing — a new table, a new column — and skips
-what is there, so a restart of an unchanged fleet runs no DDL at all. It never alters an
-existing table's engine, sort key or partitioning: a table created by an older version
-keeps the layout it was created with. Two cases where that matters:
+At startup an instance creates what is missing — a new table, view, column or index —
+and skips what is there, so a restart of an unchanged fleet runs no DDL at all. It never
+alters an existing table's engine, sort key or partitioning: a table created by an older
+version keeps the layout it was created with, and a rollup created after the rows it
+summarises holds them only from then on. Answers are correct either way; some read more
+than they would. `telemetryd clickhouse migrate` brings the database up to this
+version's layout, while the fleet keeps writing:
 
-- `otel_traces_trace_id_ts` is an `AggregatingMergeTree` of each trace's earliest and
-  latest span on a new deployment, and stays the plain `MergeTree` of earlier versions
-  on an existing one. Both answer the same; the older one holds more rows.
-- `otel_trace_keys` starts empty, and telemetryd records in `telemetryd_meta` the moment
-  it was created. A TraceQL search over a range before then matches relaxed field names
-  the slower way, against every key of every span. To fill it in for older spans:
+```bash
+telemetryd clickhouse migrate --config /etc/telemetryd/telemetryd.toml --dry-run
+telemetryd clickhouse migrate --config /etc/telemetryd/telemetryd.toml
+telemetryd clickhouse migrate --config /etc/telemetryd/telemetryd.toml --backfill --materialize-indexes
+```
 
-  ```sql
-  INSERT INTO otel_trace_keys
-  SELECT toStartOfHour(Timestamp) AS Hour, ServiceName, key.1 AS Scope, key.2 AS Key,
-         count() AS Spans
-  FROM otel_traces
-  ARRAY JOIN arrayConcat(
-      arrayMap(k -> ('span', k), mapKeys(SpanAttributes)),
-      arrayMap(k -> ('resource', k), mapKeys(ResourceAttributes))) AS key
-  WHERE Timestamp < (SELECT fromUnixTimestamp64Nano(toInt64(argMax(Value, Updated)))
-                     FROM telemetryd_meta WHERE Name = 'trace_keys_since')
-  GROUP BY Hour, ServiceName, Scope, Key;
+`--dry-run` lists what it would do and changes nothing; it creates and drops a probe of
+each table to learn what this version's statements give on your server. Without
+`--dry-run`, it does what an instance's startup does, and then:
 
-  INSERT INTO telemetryd_meta VALUES ('trace_keys_since', '0', now64(9));
-  ```
+- **Rebuilds a table laid out differently.** It creates the new layout under a
+  temporary name and swaps it in with `EXCHANGE TABLES`: writes and materialized views
+  name the table, so from that moment they land in the new one. The old rows are then
+  copied in a partition at a time — into a staging table, checked against the old
+  partition (distinct keys, and the total of every summed column), and moved in with
+  `MOVE PARTITION`, which adds parts without an insert, so no view counts them again.
+  Each partition is recorded in `telemetryd_meta` as staged and then moved: a run that
+  is interrupted is run again and continues without copying any partition twice. A
+  table whose rows merge to one answer however often they arrive — the trace-id index,
+  the folds — is copied once before the swap as well, so nothing is missing from it
+  while the rest is copied. The old table is dropped at the end; `--keep-old` keeps it.
+  The database must be `Atomic`, ClickHouse's default.
+- **Drops what earlier versions created and this one does not**, by name — the
+  `otel_trace_attribute_keys` table and its view, the `idx_stream_value` index — and
+  nothing else.
+- **Adds an index a table lacks.** An index added to a table with rows covers only
+  parts written from then on; `--materialize-indexes` indexes the older partitions, one
+  `MATERIALIZE INDEX` per partition, and then drops an index it replaces.
+- **Fills in rollups** with `--backfill`: the log volume rollups and `otel_trace_keys`,
+  for rows older than the rollup. A day at a time, newest first, it adds per key what
+  the rows hold and the rollup does not — counted by the view's own query — so a day done
+  twice adds nothing, and rows with old timestamps the rollup already counted are not
+  counted again. The moment the rollup is complete from moves back a day at a time, so
+  queries use what is filled in as it is. It reads the rows once: on two billion lines,
+  budget minutes per day.
+
+One run at a time: a lease in `telemetryd_meta` refuses a second. One that died holds it
+for half an hour after its last step, or until a run with `--take-over`. `otel_logs` and
+`otel_traces` are the Collector's tables, which other writers may own: one laid out
+differently is reported, never rebuilt. A statement may take up to
+`--statement-timeout` (six hours); `--json` writes each step as an NDJSON event.
+
+Rebuilds it finds on databases created by pre-release builds of ClickHouse support:
+`otel_traces_trace_id_ts` from a plain `MergeTree` to the `AggregatingMergeTree` of each
+trace's first and last span, and `telemetryd_folds` and `telemetryd_sample_counts` from
+monthly to daily partitions. While the sample counts are copied, metric queries over
+the hours not yet copied read samples instead of summaries: slower, never wrong.
 
 ### Moving from one node
 
-`telemetryd export --url http://old:4319 --to http://new-balancer:4319 --signal logs`,
-and the same for `traces` and `metrics`, copies a single node's data into the
-ClickHouse fleet through the APIs both ends serve — see
-[Getting data out, and bringing it in](export-and-import.md). Run it once per range:
-the copy is not deduplicated.
+A single node's data directory moves into ClickHouse directly, offline:
+
+```bash
+systemctl stop telemetryd                      # the node: one user of a directory at a time
+telemetryd clickhouse import --config /etc/telemetryd/clickhouse.toml \
+    --from-data-dir /var/lib/telemetryd
+```
+
+It opens the directory as the store it was — sealed segments and the write-ahead log —
+and writes every record through the same path an instance in front of ClickHouse uses:
+the records themselves, not an OTLP rendering of them. Each signal is read oldest first
+in windows of time, never by count, so records sharing a timestamp — a scrape writes
+thousands of samples at one — are never split across a boundary. After each window,
+`telemetryd_meta` records how far it has come, and a run that is interrupted resumes
+there; at most the window in flight is written twice. Records older than the
+destination's retention are left out, since ClickHouse would drop them at once;
+`--since` narrows it further, `--signal` picks signals, `--restart` starts over.
+Samples written into hours the fleet has already summarised are summarised again by
+whichever instance holds the fold lease next.
+
+Between two running instances, `telemetryd export --url http://old:4319 --to
+http://new-balancer:4319 --signal logs` (and `traces`, `metrics`) copies through the
+APIs both ends serve — see [Getting data out, and bringing it in](export-and-import.md).
+It is not resumable: run it once per range.
 
 ### Backing up
 

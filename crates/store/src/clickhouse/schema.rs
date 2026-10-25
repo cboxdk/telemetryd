@@ -53,11 +53,11 @@ use super::sql::quote;
 
 pub const LOGS: &str = "otel_logs";
 pub const LOG_STREAMS: &str = "otel_log_streams";
-const LOG_STREAMS_VIEW: &str = "otel_log_streams_mv";
+pub(super) const LOG_STREAMS_VIEW: &str = "otel_log_streams_mv";
 pub const LOG_VOLUME: &str = "otel_log_volume";
-const LOG_VOLUME_VIEW: &str = "otel_log_volume_mv";
+pub(super) const LOG_VOLUME_VIEW: &str = "otel_log_volume_mv";
 pub const LOG_VOLUME_MINUTES: &str = "otel_log_volume_1m";
-const LOG_VOLUME_MINUTES_VIEW: &str = "otel_log_volume_1m_mv";
+pub(super) const LOG_VOLUME_MINUTES_VIEW: &str = "otel_log_volume_1m_mv";
 pub const META: &str = "telemetryd_meta";
 /// The key in [`META`] saying from when `otel_log_volume` counts every line.
 pub const LOG_VOLUME_SINCE: &str = "log_volume_since";
@@ -65,11 +65,11 @@ pub const LOG_VOLUME_SINCE: &str = "log_volume_since";
 pub const LOG_VOLUME_MINUTES_SINCE: &str = "log_volume_1m_since";
 pub const TRACES: &str = "otel_traces";
 pub const TRACE_IDS: &str = "otel_traces_trace_id_ts";
-const TRACE_IDS_VIEW: &str = "otel_traces_trace_id_ts_mv";
+pub(super) const TRACE_IDS_VIEW: &str = "otel_traces_trace_id_ts_mv";
 pub const TRACE_STREAMS: &str = "otel_trace_streams";
-const TRACE_STREAMS_VIEW: &str = "otel_trace_streams_mv";
+pub(super) const TRACE_STREAMS_VIEW: &str = "otel_trace_streams_mv";
 pub const TRACE_KEYS: &str = "otel_trace_keys";
-const TRACE_KEYS_VIEW: &str = "otel_trace_keys_mv";
+pub(super) const TRACE_KEYS_VIEW: &str = "otel_trace_keys_mv";
 /// The key in [`META`] saying from when `otel_trace_keys` holds every key.
 pub const TRACE_KEYS_SINCE: &str = "trace_keys_since";
 
@@ -555,22 +555,56 @@ GROUP BY Hour, ServiceName, Scope, Key"
     statements
 }
 
+/// How `table`'s rows age, if it ages at all.
+pub(super) fn aging_of(table: &str) -> Option<Aging> {
+    AGING.iter().find(|a| a.table == table).copied()
+}
+
+/// The statement that creates `name`, table or view, as [`statements`] has it.
+#[must_use]
+pub fn create_statement(
+    config: &ClickHouseConfig,
+    retention: &RetentionConfig,
+    name: &str,
+) -> Option<String> {
+    statements(config, retention)
+        .into_iter()
+        .find(|statement| created_name(statement).as_deref() == Some(name))
+}
+
+/// The `SELECT` of the materialized view `view`: what it inserts for each insert into
+/// its source.
+#[must_use]
+pub fn view_select(
+    config: &ClickHouseConfig,
+    retention: &RetentionConfig,
+    view: &str,
+) -> Option<String> {
+    let statement = create_statement(config, retention, view)?;
+    statement
+        .split_once(" AS\n")
+        .map(|(_, select)| select.to_owned())
+}
+
+/// The table or view a `CREATE … IF NOT EXISTS` statement creates.
+fn created_name(statement: &str) -> Option<String> {
+    let rest = statement
+        .strip_prefix("CREATE TABLE IF NOT EXISTS ")
+        .or_else(|| statement.strip_prefix("CREATE MATERIALIZED VIEW IF NOT EXISTS "))?;
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
 /// Every table and view the statements create, by name, in order: what a database whose
 /// schema someone else manages must hold.
 #[must_use]
 pub fn objects(config: &ClickHouseConfig, retention: &RetentionConfig) -> Vec<String> {
     statements(config, retention)
         .iter()
-        .filter_map(|statement| {
-            let rest = statement
-                .strip_prefix("CREATE TABLE IF NOT EXISTS ")
-                .or_else(|| statement.strip_prefix("CREATE MATERIALIZED VIEW IF NOT EXISTS "))?;
-            let name: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            (!name.is_empty()).then_some(name)
-        })
+        .filter_map(|statement| created_name(statement))
         .collect()
 }
 
@@ -660,6 +694,16 @@ pub fn ensure(
             continue;
         }
         client.execute(&statement)?;
+        // An index added to a table with rows covers only the parts written from now.
+        if let Some((table, index)) = added_index(&statement)
+            && existing.contains_key(&table)
+            && existing.contains_key(META)
+        {
+            client.execute(&format!(
+                "INSERT INTO {META} SELECT {}, toString(toUnixTimestamp(now())), now64(9)",
+                quote(&index_added_key(&table, &index))
+            ))?;
+        }
     }
     let ttl = ttl_statements(config, retention).join(";\n");
     let applied = setting(client, TTL_APPLIED)?;
@@ -876,7 +920,27 @@ pub fn rollup_start(client: &Client, name: &str) -> Result<Option<u64>> {
     Ok(since)
 }
 
+/// The key in [`META`] recording when an index was added to a table that already
+/// existed, in Unix seconds: the parts written before then lack it until they are
+/// rewritten, which `telemetryd clickhouse migrate --materialize-indexes` does.
+#[must_use]
+pub fn index_added_key(table: &str, index: &str) -> String {
+    format!("index_added:{table}:{index}")
+}
+
+/// The table and index an `ALTER TABLE … ADD INDEX IF NOT EXISTS` statement adds.
+fn added_index(statement: &str) -> Option<(String, String)> {
+    let rest = statement.strip_prefix("ALTER TABLE ")?;
+    let (table, after) = rest.split_once(' ')?;
+    let (_, index) = after.split_once("ADD INDEX IF NOT EXISTS ")?;
+    let index: String = index
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    (!index.is_empty()).then(|| (table.to_owned(), index))
+}
+
 /// A database name as an identifier, backquoted.
-fn identifier(name: &str) -> String {
+pub(super) fn identifier(name: &str) -> String {
     format!("`{}`", name.replace('\\', "\\\\").replace('`', "\\`"))
 }
