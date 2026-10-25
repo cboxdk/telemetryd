@@ -227,6 +227,13 @@ cores and disks, not with how many instances there are. Start ClickHouse with wh
 storage above needs on fast disks for the hot days, and add cores when the slow
 queries are the ones you run.
 
+Shard when one server is no longer enough: when the hot days no longer fit its disks,
+or when the scans — a line filter over hours, an error rate over a day — are slow on
+all its cores at once. A shard adds its disks and cores to every scan, since lines and
+spans spread over all of them. Until then, one shard of two or three replicas is
+simpler and loses nothing: at sixty billion lines a month, ninety days is 3.4 TB, which
+one server holds. See [Several shards](#several-shards).
+
 ## How queries stay fast
 
 A query is answered by ClickHouse doing the selecting and telemetryd doing the
@@ -316,6 +323,58 @@ different replica. The test suite runs two instances in front of two replicas an
 one's answers to the other's. Deduplication of identical inserted blocks is turned off
 for these tables: a rollup's blocks are computed, and two different batches can count
 one second of one stream to the same number.
+
+`ON CLUSTER` statements are answered once every server has run them, so the first
+start of a fleet on an empty database takes a while — half a minute on four servers in
+the test cluster — and later starts run none.
+
+## Several shards
+
+When one server's disks or cores are no longer enough, give the cluster more shards.
+telemetryd asks the server how many `clickhouse.cluster` has at startup, and on more
+than one lays every table out twice: `<name>_local` on each shard, holding that
+shard's rows, and `<name>` as a `Distributed` table over all of them. Every read and
+write names `<name>` as it always has, so nothing above the store changes; the
+materialized views are on the local tables, and each shard rolls up its own rows.
+
+Where a row goes is chosen so that what must meet does:
+
+| tables | spread by | why |
+|---|---|---|
+| `otel_logs`, the log summaries and volume rollups | at random | lines are only ever counted, summed and sorted across shards: every shard's disks share every scan |
+| `otel_traces`, `otel_traces_trace_id_ts` | trace id | a trace's spans and its row in the trace-id index are on one shard, and a lookup by trace id asks only that one |
+| `otel_trace_streams`, `otel_trace_keys` | at random | summed across shards |
+| `telemetryd_metrics_ingest` and every metric table | series | a series' samples, its series and count rows and its folds share a shard, so the reads that join them do so on each shard, and a fold's versions replace one another where they meet |
+| `telemetryd_meta` | — | one copy on every server, shards and all: the settings, markers and fold lease are the same wherever they are read |
+
+What a shard cluster needs, and telemetryd refuses to start without:
+
+- `{shard}` and `{replica}` macros on every server, as for one shard;
+- `<internal_replication>true</internal_replication>` on every shard with several
+  replicas — without it a `Distributed` table writes each row to every replica, and
+  replication copies it to each again;
+- a database laid out for this many shards. One created on a cluster of one shard
+  keeps its replicated tables when the cluster grows; their rows are not where the
+  sharded layout looks, and telemetryd says so rather than start. Start the larger
+  cluster on a new database, and copy the old one across with `telemetryd export --to`
+  while it is still served (see [Moving from one node](#moving-from-one-node));
+- as many shards as the database was laid out for, which it records. A row is on the
+  shard its key picks out of that many: with a shard more, new rows of a key go
+  elsewhere than its old ones, a metric fold made again no longer replaces the one
+  before it, and a read by trace id asks the wrong shard. A cluster that grows needs a
+  new database the same way.
+
+An insert is acknowledged once every shard it went to holds its rows
+(`distributed_foreground_insert`), so a `200` still means stored; a request that fails
+on one shard after another took its part is refused, and the sender's retry can store
+that part twice. Reads and writes across shards go to each shard's first replica that
+answers, in the order `remote_servers` lists them, and to the server's own for its own
+shard — so an instance reads what it just wrote. The other replicas take over when the
+first does not answer; to spread reads over them, list replicas in a different order
+on different servers.
+
+`telemetryd clickhouse schema` asks the server which layout to print;
+`--shards one` or `--shards many` prints one without connecting.
 
 ## What is per instance
 

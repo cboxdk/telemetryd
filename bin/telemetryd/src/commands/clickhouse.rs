@@ -12,13 +12,36 @@ use telemetryd_core::config::Overrides;
 #[derive(Debug, clap::Subcommand)]
 pub enum ClickHouseAction {
     /// Print the statements that create and age the tables, for a DBA to run.
-    Schema(crate::ConfigArgs),
+    Schema(SchemaArgs),
     /// Check that the configured account can do what an instance needs.
     Check(crate::ConfigArgs),
 }
 
+#[derive(Debug, clap::Args)]
+pub struct SchemaArgs {
+    #[command(flatten)]
+    config: crate::ConfigArgs,
+    /// Which layout to print. `auto` asks the server how many shards
+    /// `clickhouse.cluster` has, as an instance does at startup; the others print
+    /// without connecting.
+    #[arg(long, value_enum, default_value_t = Shards::Auto)]
+    shards: Shards,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum Shards {
+    Auto,
+    /// One server, or a cluster of one shard: replicated tables.
+    One,
+    /// A cluster of several shards: each shard's own tables, Distributed over them.
+    Many,
+}
+
 pub fn run(action: &ClickHouseAction) -> anyhow::Result<()> {
-    let (ClickHouseAction::Schema(args) | ClickHouseAction::Check(args)) = action;
+    let args = match action {
+        ClickHouseAction::Schema(schema) => &schema.config,
+        ClickHouseAction::Check(args) => args,
+    };
     let overrides = Overrides {
         data_dir: args.data_dir.clone(),
         ..Overrides::default()
@@ -32,15 +55,31 @@ pub fn run(action: &ClickHouseAction) -> anyhow::Result<()> {
         telemetryd_core::http::init_trust(ca_file).map_err(|e| anyhow::anyhow!(e))?;
     }
     match action {
-        ClickHouseAction::Schema(_) => {
-            print_schema(&config);
+        ClickHouseAction::Schema(schema) => {
+            let sharded = match schema.shards {
+                Shards::One => false,
+                Shards::Many => true,
+                Shards::Auto if config.clickhouse.cluster.trim().is_empty() => false,
+                Shards::Auto => {
+                    let client = telemetryd_store::clickhouse::Client::new(&config.clickhouse)?;
+                    telemetryd_store::clickhouse::schema::sharded(&client, &config.clickhouse)
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "{error}\n\nThe layout depends on how many shards the \
+                                 cluster has; pass --shards one or --shards many to print \
+                                 it without asking the server"
+                            )
+                        })?
+                }
+            };
+            print_schema(&config, sharded);
             Ok(())
         }
         ClickHouseAction::Check(_) => check(&config),
     }
 }
 
-fn print_schema(config: &Config) {
+fn print_schema(config: &Config, sharded: bool) {
     println!(
         "-- telemetryd {}: the schema for database {:?}{}.",
         env!("CARGO_PKG_VERSION"),
@@ -62,14 +101,17 @@ fn print_schema(config: &Config) {
             format!(" ON CLUSTER '{}'", cluster.replace('\'', "\\'"))
         }
     );
-    for statement in
-        telemetryd_store::clickhouse::schema::statements(&config.clickhouse, &config.retention)
-            .into_iter()
-            .chain(telemetryd_store::clickhouse::schema::ttl_statements(
-                &config.clickhouse,
-                &config.retention,
-            ))
-    {
+    for statement in telemetryd_store::clickhouse::schema::statements(
+        &config.clickhouse,
+        &config.retention,
+        sharded,
+    )
+    .into_iter()
+    .chain(telemetryd_store::clickhouse::schema::ttl_statements(
+        &config.clickhouse,
+        &config.retention,
+        sharded,
+    )) {
         println!("{statement};\n");
     }
 }

@@ -38,6 +38,9 @@ pub struct ClickHouse {
     pub logs: ClickHouseLogs,
     pub metrics: ClickHouseMetrics,
     pub spans: ClickHouseSpans,
+    /// The cluster, when the tables are laid out for its several shards: see
+    /// [`schema::sharded`].
+    sharded: Option<String>,
     /// The last [`ClickHouse::app_usage`] answer and when it was read.
     usage: std::sync::Mutex<Option<(std::time::Instant, Vec<crate::AppUsage>)>>,
 }
@@ -55,12 +58,13 @@ impl ClickHouse {
     /// error, not a first failed request.
     pub fn open(config: &ClickHouseConfig, retention: &RetentionConfig) -> Result<Self> {
         let client = Client::new(config)?;
+        let sharded = schema::sharded(&client, config)?;
         if config.create_schema {
-            schema::ensure(&client, config, retention)?;
+            schema::ensure(&client, config, retention, sharded)?;
         } else {
             // Someone else manages the schema: find out now that it is not all there,
             // rather than from the first write refused.
-            let missing = schema::missing(&client, config, retention)?;
+            let missing = schema::missing(&client, config, retention, sharded)?;
             if !missing.is_empty() {
                 return Err(telemetryd_core::Error::Config(format!(
                     "clickhouse.create_schema = false, and database {:?} lacks {}: create \
@@ -75,6 +79,7 @@ impl ClickHouse {
             logs: ClickHouseLogs::new(client.clone()),
             metrics: ClickHouseMetrics::new(client.clone()),
             spans: ClickHouseSpans::new(client.clone()),
+            sharded: sharded.then(|| config.cluster.trim().to_owned()),
             usage: std::sync::Mutex::new(None),
             client,
         })
@@ -129,11 +134,21 @@ impl ClickHouse {
             ),
         ] {
             let mut bytes = 0u64;
+            // On several shards, every shard's part of the table, from one replica of each.
+            let (parts, table) = if let Some(cluster) = &self.sharded {
+                (
+                    format!("cluster({}, system.parts)", sql::quote(cluster)),
+                    format!("{table}_local"),
+                )
+            } else {
+                ("system.parts".to_owned(), table.to_owned())
+            };
             self.client.query_lines(
                 &format!(
-                    "SELECT sum(data_compressed_bytes) AS bytes FROM system.parts \
-                     WHERE active AND database = currentDatabase() AND table = {}",
-                    sql::quote(table)
+                    "SELECT sum(data_compressed_bytes) AS bytes FROM {parts} \
+                     WHERE active AND database = {} AND table = {}",
+                    sql::quote(self.client.database()),
+                    sql::quote(&table)
                 ),
                 |line| {
                     let value: serde_json::Value = serde_json::from_slice(line).unwrap_or_default();
@@ -194,7 +209,7 @@ impl ClickHouse {
         retention: &RetentionConfig,
     ) -> Result<()> {
         if config.create_schema {
-            schema::apply_ttl(&self.client, config, retention)?;
+            schema::apply_ttl(&self.client, config, retention, self.sharded.is_some())?;
         } else {
             tracing::warn!(
                 "retention changed with clickhouse.create_schema = false: telemetryd does not \

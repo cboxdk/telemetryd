@@ -172,9 +172,61 @@ const AGING: &[Aging] = &[
 pub(super) struct Layout<'a> {
     pub(super) config: &'a ClickHouseConfig,
     pub(super) retention: &'a RetentionConfig,
+    /// Whether the cluster has more than one shard. See [`Layout::local`].
+    pub(super) sharded: bool,
 }
 
 impl Layout<'_> {
+    /// The table a table's rows are stored in.
+    ///
+    /// On one server, or a cluster of one shard, the table itself. On several shards
+    /// each shard stores its own rows in `<name>_local`, and `<name>` is a
+    /// `Distributed` table over all of them (see [`Layout::spread`]): every read and
+    /// write names the table as it always has, and ClickHouse sends it to the shards.
+    /// Materialized views are on the local tables, so each shard rolls up its own rows.
+    pub(super) fn local(&self, name: &str) -> String {
+        if self.sharded {
+            format!("{name}_local")
+        } else {
+            name.to_owned()
+        }
+    }
+
+    /// The `Distributed` table `name` over every shard's [`Layout::local`] table, an
+    /// insert into it sending each row to the shard `key` picks; nothing on one shard.
+    ///
+    /// The key decides what a shard can answer alone. Rows that must meet — the
+    /// versions of one fold, the samples and series of one series, the spans of one
+    /// trace — share a shard by sharing a key; rows that are only ever counted, summed or
+    /// sorted across shards are spread at random, so a scan has every shard's disks.
+    pub(super) fn spread(&self, name: &str, key: &str) -> Vec<String> {
+        if !self.sharded {
+            return Vec::new();
+        }
+        let on = self.on_cluster();
+        let local = self.local(name);
+        vec![format!(
+            "CREATE TABLE IF NOT EXISTS {name}{on} AS {local} \
+ENGINE = Distributed({}, {}, {local}, {key})",
+            quote(self.config.cluster.trim()),
+            quote(&self.config.database),
+        )]
+    }
+
+    /// `ALTER TABLE … ADD COLUMN IF NOT EXISTS`, for the table and, on several shards,
+    /// the local table under it.
+    pub(super) fn add_column(&self, name: &str, column: &str) -> Vec<String> {
+        let on = self.on_cluster();
+        let mut tables = vec![self.local(name)];
+        if self.sharded {
+            tables.push(name.to_owned());
+        }
+        tables
+            .into_iter()
+            .map(|table| format!("ALTER TABLE {table}{on} ADD COLUMN IF NOT EXISTS {column}"))
+            .collect()
+    }
+
     pub(super) fn on_cluster(&self) -> String {
         let cluster = self.config.cluster.trim();
         if cluster.is_empty() {
@@ -192,6 +244,18 @@ impl Layout<'_> {
             format!(
                 "Replicated{kind}('/clickhouse/tables/{{shard}}/{{database}}/{table}', '{{replica}}')"
             )
+        }
+    }
+
+    /// The engine of [`META`]: one copy on every server of the cluster, shards and all,
+    /// so the settings, markers and lease it holds are the same wherever they are read.
+    fn meta_engine(&self) -> String {
+        if self.sharded {
+            format!(
+                "ReplicatedReplacingMergeTree('/clickhouse/tables/all/{{database}}/{META}', '{{shard}}-{{replica}}')"
+            )
+        } else {
+            self.engine(META, "ReplacingMergeTree")
         }
     }
 
@@ -255,12 +319,23 @@ impl Layout<'_> {
 }
 
 /// Every statement, in the order they must run.
+///
+/// `sharded`: the cluster has more than one shard; see `Layout::local`.
 #[must_use]
-pub fn statements(config: &ClickHouseConfig, retention: &RetentionConfig) -> Vec<String> {
-    let layout = Layout { config, retention };
+pub fn statements(
+    config: &ClickHouseConfig,
+    retention: &RetentionConfig,
+    sharded: bool,
+) -> Vec<String> {
+    let layout = Layout {
+        config,
+        retention,
+        sharded,
+    };
     let on = layout.on_cluster();
+    let logs = layout.local(LOGS);
     let mut statements = vec![format!(
-        "CREATE TABLE IF NOT EXISTS {LOGS}{on} (
+        "CREATE TABLE IF NOT EXISTS {logs}{on} (
     Timestamp DateTime64(9, 'UTC') CODEC(Delta(8), ZSTD(1)),
     TraceId String CODEC(ZSTD(1)),
     SpanId String CODEC(ZSTD(1)),
@@ -282,19 +357,19 @@ PARTITION BY toDate(Timestamp)
 ORDER BY (ServiceName, toDateTime(Timestamp))
 {}
 {}",
-        layout.engine(LOGS, "MergeTree"),
+        layout.engine(&logs, "MergeTree"),
         layout.aging(LOGS),
         layout.settings(),
     )];
+    // Lines are only ever counted and sorted across shards: spread for the scans.
+    statements.extend(layout.spread(LOGS, "rand()"));
     // A table the store package created has none of them.
     for column in [
         "Stream Map(LowCardinality(String), String) CODEC(ZSTD(1))",
         "StreamHash UInt64 MATERIALIZED cityHash64(Stream) CODEC(ZSTD(1))",
         "AttributeLabels Array(LowCardinality(String)) CODEC(ZSTD(1))",
     ] {
-        statements.push(format!(
-            "ALTER TABLE {LOGS}{on} ADD COLUMN IF NOT EXISTS {column}"
-        ));
+        statements.extend(layout.add_column(LOGS, column));
     }
     statements.extend(streams_summary(
         &layout,
@@ -312,7 +387,7 @@ ORDER BY (ServiceName, toDateTime(Timestamp))
     Updated DateTime64(9, 'UTC')
 ) ENGINE = {}
 ORDER BY Name",
-        layout.engine(META, "ReplacingMergeTree")
+        layout.meta_engine()
     ));
     statements
 }
@@ -324,15 +399,23 @@ ORDER BY Name",
 /// a part's rows age by the new rule as ClickHouse next merges or drops it, and a day
 /// partition past the new retention is dropped whole.
 #[must_use]
-pub fn ttl_statements(config: &ClickHouseConfig, retention: &RetentionConfig) -> Vec<String> {
-    let layout = Layout { config, retention };
+pub fn ttl_statements(
+    config: &ClickHouseConfig,
+    retention: &RetentionConfig,
+    sharded: bool,
+) -> Vec<String> {
+    let layout = Layout {
+        config,
+        retention,
+        sharded,
+    };
     let on = layout.on_cluster();
     AGING
         .iter()
         .map(|aging| {
             format!(
                 "ALTER TABLE {}{on} MODIFY {}",
-                aging.table,
+                layout.local(aging.table),
                 layout.ttl(aging.time, aging.signal, aging.moves)
             )
         })
@@ -344,9 +427,10 @@ pub fn ttl_statements(config: &ClickHouseConfig, retention: &RetentionConfig) ->
 /// answer from.
 fn streams_summary(layout: &Layout<'_>, source: &str, summary: &str, view: &str) -> Vec<String> {
     let on = layout.on_cluster();
-    vec![
+    let (source, table) = (layout.local(source), layout.local(summary));
+    let mut statements = vec![
         format!(
-            "CREATE TABLE IF NOT EXISTS {summary}{on} (
+            "CREATE TABLE IF NOT EXISTS {table}{on} (
     Hour DateTime CODEC(Delta(4), ZSTD(1)),
     ServiceName LowCardinality(String),
     StreamHash UInt64,
@@ -359,12 +443,12 @@ PARTITION BY toDate(Hour)
 ORDER BY (Hour, ServiceName, StreamHash)
 {}
 {}",
-            layout.engine(summary, "AggregatingMergeTree"),
+            layout.engine(&table, "AggregatingMergeTree"),
             layout.aging(summary),
             layout.settings(),
         ),
         format!(
-            "CREATE MATERIALIZED VIEW IF NOT EXISTS {view}{on} TO {summary} AS
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS {view}{on} TO {table} AS
 SELECT
     toStartOfHour(Timestamp) AS Hour,
     ServiceName,
@@ -376,7 +460,11 @@ SELECT
 FROM (SELECT Timestamp, ServiceName, Stream AS S FROM {source})
 GROUP BY Hour, ServiceName, StreamHash"
         ),
-    ]
+    ];
+    // Read summed and grouped, never one row per stream: a stream's rows may be on
+    // every shard.
+    statements.extend(layout.spread(summary, "rand()"));
+    statements
 }
 
 /// Lines and bytes per stream per second, and per minute, for log volume without
@@ -392,8 +480,9 @@ GROUP BY Hour, ServiceName, StreamHash"
 /// a query reaching back before that counts from the lines.
 fn log_volume(layout: &Layout<'_>) -> Vec<String> {
     let on = layout.on_cluster();
+    let logs = layout.local(LOGS);
     let mut statements = Vec::new();
-    for (table, view, unit, nanos) in [
+    for (name, view, unit, nanos) in [
         (LOG_VOLUME, LOG_VOLUME_VIEW, "Second", 1_000_000_000_u64),
         (
             LOG_VOLUME_MINUTES,
@@ -402,6 +491,7 @@ fn log_volume(layout: &Layout<'_>) -> Vec<String> {
             60_000_000_000,
         ),
     ] {
+        let table = layout.local(name);
         statements.push(format!(
             "CREATE TABLE IF NOT EXISTS {table}{on} (
     ServiceName LowCardinality(String),
@@ -416,8 +506,8 @@ PARTITION BY toDate({partition})
 ORDER BY (ServiceName, {unit}, StreamHash, LabelsHash)
 {}
 {}",
-            layout.engine(table, "AggregatingMergeTree"),
-            layout.aging(table),
+            layout.engine(&table, "AggregatingMergeTree"),
+            layout.aging(name),
             layout.settings(),
             partition = if unit == "Second" {
                 "toDateTime(Second)"
@@ -435,9 +525,10 @@ SELECT
     any(A) AS AttributeLabels,
     count() AS Lines,
     sum(length(Body)) AS Bytes
-FROM (SELECT Timestamp, ServiceName, Stream AS S, arrayMap(x -> toString(x), AttributeLabels) AS A, Body FROM {LOGS})
+FROM (SELECT Timestamp, ServiceName, Stream AS S, arrayMap(x -> toString(x), AttributeLabels) AS A, Body FROM {logs})
 GROUP BY ServiceName, {unit}, StreamHash, LabelsHash"
         ));
+        statements.extend(layout.spread(name, "rand()"));
     }
     statements
 }
@@ -451,8 +542,9 @@ GROUP BY ServiceName, {unit}, StreamHash, LabelsHash"
 /// name's newest spans are in a different place.
 fn traces(layout: &Layout<'_>) -> Vec<String> {
     let on = layout.on_cluster();
+    let (traces, trace_ids) = (layout.local(TRACES), layout.local(TRACE_IDS));
     let mut statements = vec![format!(
-        "CREATE TABLE IF NOT EXISTS {TRACES}{on} (
+        "CREATE TABLE IF NOT EXISTS {traces}{on} (
     Timestamp DateTime64(9, 'UTC') CODEC(Delta(8), ZSTD(1)),
     TraceId String CODEC(ZSTD(1)),
     SpanId String CODEC(ZSTD(1)),
@@ -479,10 +571,13 @@ PARTITION BY toDate(Timestamp)
 ORDER BY (ServiceName, toDateTime(Timestamp))
 {}
 {}",
-        layout.engine(TRACES, "MergeTree"),
+        layout.engine(&traces, "MergeTree"),
         layout.aging(TRACES),
         layout.settings(),
     )];
+    // A trace's spans together, and its row in the trace-id index beside them, which a
+    // view on the shard writes: a lookup by trace id reads the one shard it is on.
+    statements.extend(layout.spread(TRACES, "cityHash64(TraceId)"));
     // A table the store package created has none of these.
     for column in [
         "TraceState String CODEC(ZSTD(1))",
@@ -490,15 +585,13 @@ ORDER BY (ServiceName, toDateTime(Timestamp))
         "Stream Map(LowCardinality(String), String) CODEC(ZSTD(1))",
         "StreamHash UInt64 MATERIALIZED cityHash64(Stream) CODEC(ZSTD(1))",
     ] {
-        statements.push(format!(
-            "ALTER TABLE {TRACES}{on} ADD COLUMN IF NOT EXISTS {column}"
-        ));
+        statements.extend(layout.add_column(TRACES, column));
     }
     statements.push(format!(
         // One row per trace once merged, not one per batch its spans came in: a trace's
         // first and last span are a min and a max, and reads take them as such, so a
         // part not merged yet answers the same.
-        "CREATE TABLE IF NOT EXISTS {TRACE_IDS}{on} (
+        "CREATE TABLE IF NOT EXISTS {trace_ids}{on} (
     TraceId String CODEC(ZSTD(1)),
     Start SimpleAggregateFunction(min, DateTime64(9, 'UTC')) CODEC(Delta(8), ZSTD(1)),
     End SimpleAggregateFunction(max, DateTime64(9, 'UTC')) CODEC(Delta(8), ZSTD(1))
@@ -507,27 +600,36 @@ PARTITION BY toDate(Start)
 ORDER BY TraceId
 {}
 {}",
-        layout.engine(TRACE_IDS, "AggregatingMergeTree"),
+        layout.engine(&trace_ids, "AggregatingMergeTree"),
         layout.aging(TRACE_IDS),
         layout.settings(),
     ));
     statements.push(format!(
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS {TRACE_IDS_VIEW}{on} TO {TRACE_IDS} AS
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS {TRACE_IDS_VIEW}{on} TO {trace_ids} AS
 SELECT TraceId, min(Timestamp) AS Start, max(Timestamp) AS End
-FROM {TRACES}
+FROM {traces}
 WHERE TraceId != ''
 GROUP BY TraceId"
     ));
+    statements.extend(layout.spread(TRACE_IDS, "cityHash64(TraceId)"));
     statements.extend(streams_summary(
         layout,
         TRACES,
         TRACE_STREAMS,
         TRACE_STREAMS_VIEW,
     ));
-    // Every attribute key per app per hour: what turns a relaxed attribute lookup into a
-    // list of the keys it could find, instead of a pattern run on every key of every span.
+    statements.extend(trace_keys(layout));
+    statements
+}
+
+/// Every attribute key per app per hour: what turns a relaxed attribute lookup into a
+/// list of the keys it could find, instead of a pattern run on every key of every span.
+fn trace_keys(layout: &Layout<'_>) -> Vec<String> {
+    let on = layout.on_cluster();
+    let (traces, trace_keys) = (layout.local(TRACES), layout.local(TRACE_KEYS));
+    let mut statements = Vec::new();
     statements.push(format!(
-        "CREATE TABLE IF NOT EXISTS {TRACE_KEYS}{on} (
+        "CREATE TABLE IF NOT EXISTS {trace_keys}{on} (
     Hour DateTime CODEC(Delta(4), ZSTD(1)),
     ServiceName LowCardinality(String),
     Scope LowCardinality(String),
@@ -538,28 +640,33 @@ PARTITION BY toDate(Hour)
 ORDER BY (ServiceName, Hour, Scope, Key)
 {}
 {}",
-        layout.engine(TRACE_KEYS, "AggregatingMergeTree"),
+        layout.engine(&trace_keys, "AggregatingMergeTree"),
         layout.aging(TRACE_KEYS),
         layout.settings(),
     ));
     statements.push(format!(
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS {TRACE_KEYS_VIEW}{on} TO {TRACE_KEYS} AS
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS {TRACE_KEYS_VIEW}{on} TO {trace_keys} AS
 SELECT toStartOfHour(Timestamp) AS Hour, ServiceName, key.1 AS Scope, key.2 AS Key, count() AS Spans
-FROM {TRACES}
+FROM {traces}
 ARRAY JOIN arrayConcat(
     arrayMap(k -> ('span', k), mapKeys(SpanAttributes)),
     arrayMap(k -> ('resource', k), mapKeys(ResourceAttributes))
 ) AS key
 GROUP BY Hour, ServiceName, Scope, Key"
     ));
+    statements.extend(layout.spread(TRACE_KEYS, "rand()"));
     statements
 }
 
 /// Every table and view the statements create, by name, in order: what a database whose
 /// schema someone else manages must hold.
 #[must_use]
-pub fn objects(config: &ClickHouseConfig, retention: &RetentionConfig) -> Vec<String> {
-    statements(config, retention)
+pub fn objects(
+    config: &ClickHouseConfig,
+    retention: &RetentionConfig,
+    sharded: bool,
+) -> Vec<String> {
+    statements(config, retention, sharded)
         .iter()
         .filter_map(|statement| {
             let rest = statement
@@ -582,6 +689,7 @@ pub fn missing(
     client: &Client,
     config: &ClickHouseConfig,
     retention: &RetentionConfig,
+    sharded: bool,
 ) -> Result<Vec<String>> {
     let mut present = std::collections::BTreeSet::new();
     client.query_lines(
@@ -594,7 +702,7 @@ pub fn missing(
             Ok(std::ops::ControlFlow::Continue(()))
         },
     )?;
-    Ok(objects(config, retention)
+    Ok(objects(config, retention, sharded)
         .into_iter()
         .filter(|name| !present.contains(name))
         .collect())
@@ -610,12 +718,17 @@ pub fn ensure(
     client: &Client,
     config: &ClickHouseConfig,
     retention: &RetentionConfig,
+    sharded: bool,
 ) -> Result<()> {
     // From the server's default database: the configured one may not exist yet, and a
     // request naming a database that does not exist is refused before it runs.
-    let on = Layout { config, retention }.on_cluster();
+    let on = Layout {
+        config,
+        retention,
+        sharded,
+    }
+    .on_cluster();
     let server = client.in_database("default");
-    one_shard(&server, config)?;
     let database_there = || -> Result<bool> {
         let mut there = false;
         server.query_lines(
@@ -655,59 +768,235 @@ pub fn ensure(
     // every replica through Keeper, and a fleet restarting one instance at a time would
     // queue the whole schema once per instance for nothing.
     let existing = existing_columns(client)?;
-    for statement in statements(config, retention) {
+    for statement in statements(config, retention, sharded) {
         if already_there(&statement, &existing) {
             continue;
         }
         client.execute(&statement)?;
     }
-    let ttl = ttl_statements(config, retention).join(";\n");
+    let ttl = ttl_statements(config, retention, sharded).join(";\n");
     let applied = setting(client, TTL_APPLIED)?;
     if applied.as_deref() != Some(ttl.as_str()) {
-        apply_ttl(client, config, retention)?;
+        apply_ttl(client, config, retention, sharded)?;
+    }
+    if sharded && setting(client, SHARDS)?.is_none() {
+        let mut shards = 0;
+        client.query_lines(
+            &format!(
+                "SELECT uniqExact(shard_num) AS n FROM system.clusters WHERE cluster = {}",
+                quote(config.cluster.trim())
+            ),
+            |line| {
+                let value: serde_json::Value = serde_json::from_slice(line).unwrap_or_default();
+                shards = value
+                    .get("n")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                Ok(std::ops::ControlFlow::Continue(()))
+            },
+        )?;
+        client.execute(&format!(
+            "INSERT INTO {META} SELECT {}, {}, now64(9)",
+            quote(SHARDS),
+            quote(&shards.to_string())
+        ))?;
     }
     record_rollup_start(client, LOG_VOLUME_SINCE, LOGS)?;
     record_rollup_start(client, LOG_VOLUME_MINUTES_SINCE, LOGS)?;
     record_rollup_start(client, TRACE_KEYS_SINCE, TRACES)
 }
 
+/// The key in [`META`] holding how many shards the tables were laid out for, so a
+/// cluster that has gained or lost one since is refused: see [`sharded`].
+const SHARDS: &str = "shards";
+
 /// The key in [`META`] holding the TTL statements last applied, so a start with the
 /// same retention runs none of them.
 const TTL_APPLIED: &str = "ttl_applied";
 
-/// Refuse a cluster of more than one shard, and one the server does not know.
+/// Whether the tables are laid out for several shards — see `Layout::local` — and
+/// so whether the cluster can hold them.
 ///
-/// The tables are replicated, not distributed: on a cluster of several shards each
-/// instance would read and write only its own replica's shard, and every answer would
-/// be part of one. Shards need `Distributed` tables, which telemetryd does not create.
-fn one_shard(server: &Client, config: &ClickHouseConfig) -> Result<()> {
+/// From `clickhouse.cluster` as the server defines it: more than one shard is the
+/// sharded layout. Refused, rather than created and wrong:
+///
+/// - a cluster the server's `remote_servers` does not define, or a server without the
+///   `{shard}` and `{replica}` macros the replicated tables are named by;
+/// - several shards, one of which has several replicas without `internal_replication`:
+///   a `Distributed` table would write a row to each replica, and replication copy it
+///   to each again;
+/// - tables already there laid out for the other: created on one shard and the cluster
+///   since grown, or the other way round. Their rows are not where the new layout
+///   would look, and moving them is a migration, not something to do at startup.
+///
+/// # Errors
+/// [`telemetryd_core::Error::Config`] naming what is wrong, or
+/// [`telemetryd_core::Error::Unavailable`] when ClickHouse cannot be read.
+pub fn sharded(client: &Client, config: &ClickHouseConfig) -> Result<bool> {
     let cluster = config.cluster.trim();
     if cluster.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
-    let mut shards = None;
+    let server = client.in_database("default");
+    let mut shards: Vec<(u64, u64, bool)> = Vec::new();
     server.query_lines(
         &format!(
-            "SELECT uniqExact(shard_num) AS shards FROM system.clusters WHERE cluster = {}",
+            "SELECT shard_num AS shard, count() AS replicas, min(internal_replication) AS internal \
+             FROM system.clusters WHERE cluster = {} GROUP BY shard_num ORDER BY shard_num",
             quote(cluster)
         ),
         |line| {
             let value: serde_json::Value = serde_json::from_slice(line).unwrap_or_default();
-            shards = value.get("shards").and_then(serde_json::Value::as_u64);
+            let number = |key: &str| {
+                value
+                    .get(key)
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            };
+            shards.push((number("shard"), number("replicas"), number("internal") == 1));
             Ok(std::ops::ControlFlow::Continue(()))
         },
     )?;
-    match shards.unwrap_or(0) {
-        0 => Err(telemetryd_core::Error::Config(format!(
+    if shards.is_empty() {
+        return Err(telemetryd_core::Error::Config(format!(
             "clickhouse.cluster is {cluster:?}, which the server's remote_servers does not define"
-        ))),
-        1 => Ok(()),
-        n => Err(telemetryd_core::Error::Config(format!(
-            "clickhouse.cluster {cluster:?} has {n} shards. telemetryd's tables are replicated, \
-             not distributed: on more than one shard each instance would see one shard's \
-             data. Use a cluster of one shard and as many replicas as you like"
-        ))),
+        )));
     }
+    let mut macros = std::collections::BTreeSet::new();
+    server.query_lines("SELECT macro FROM system.macros", |line| {
+        let value: serde_json::Value = serde_json::from_slice(line).unwrap_or_default();
+        if let Some(name) = value.get("macro").and_then(serde_json::Value::as_str) {
+            macros.insert(name.to_owned());
+        }
+        Ok(std::ops::ControlFlow::Continue(()))
+    })?;
+    let absent: Vec<&str> = ["shard", "replica"]
+        .into_iter()
+        .filter(|name| !macros.contains(*name))
+        .collect();
+    if !absent.is_empty() {
+        return Err(telemetryd_core::Error::Config(format!(
+            "clickhouse.cluster is {cluster:?}, but this server defines no {} macro; the \
+             replicated tables are named by {{shard}} and {{replica}} — set them in the \
+             server's <macros>",
+            absent.join(" or ")
+        )));
+    }
+    let sharded = shards.len() > 1;
+    if sharded
+        && let Some((shard, _, _)) = shards
+            .iter()
+            .find(|(_, replicas, internal)| *replicas > 1 && !internal)
+    {
+        return Err(telemetryd_core::Error::Config(format!(
+            "clickhouse.cluster {cluster:?} has {} shards, and shard {shard} has several \
+             replicas without <internal_replication>true</internal_replication>: every row \
+             would be written to each of them and then replicated to each again. Set it on \
+             every shard",
+            shards.len()
+        )));
+    }
+    laid_out_for(&server, client.database(), cluster, shards.len())?;
+    Ok(sharded)
+}
+
+/// Refuse tables already there laid out for another number of shards than `shards`.
+fn laid_out_for(server: &Client, database: &str, cluster: &str, shards: usize) -> Result<()> {
+    let sharded = shards > 1;
+    // Tables already there, laid out the other way.
+    let mut engines = Vec::new();
+    server.query_lines(
+        &format!(
+            "SELECT name, engine FROM system.tables WHERE database = {} AND name IN ({})",
+            quote(database),
+            [LOGS, TRACES, metrics_schema::SAMPLES]
+                .map(quote)
+                .join(", ")
+        ),
+        |line| {
+            let value: serde_json::Value = serde_json::from_slice(line).unwrap_or_default();
+            let text = |key: &str| {
+                value
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            engines.push((text("name"), text("engine")));
+            Ok(std::ops::ControlFlow::Continue(()))
+        },
+    )?;
+    if let Some((name, engine)) = engines
+        .iter()
+        .find(|(_, engine)| (engine == "Distributed") != sharded)
+    {
+        let (now, then) = if sharded {
+            (format!("{shards} shards"), "one shard")
+        } else {
+            ("one shard".to_owned(), "several shards")
+        };
+        return Err(telemetryd_core::Error::Config(format!(
+            "clickhouse.cluster {cluster:?} has {now}, but database {database:?} was laid \
+             out for {then}: {name} is a {engine} table. Its rows are not where telemetryd \
+             would look for them on {now}. Use a new database, or move the rows to one laid \
+             out for {now} (see the cookbook page \"Scale out on ClickHouse\")"
+        )));
+    }
+    // As many shards as when the tables were laid out. A row's shard is its key over
+    // the number of shards: with one more, a fold made again lands where its first
+    // version is not and both are kept, and a read by trace id asks the shard the
+    // trace would be on now rather than the one it is on.
+    let mut meta_there = false;
+    if sharded && !engines.is_empty() {
+        server.query_lines(
+            &format!(
+                "SELECT 1 AS one FROM system.tables WHERE database = {} AND name = {}",
+                quote(database),
+                quote(META)
+            ),
+            |_| {
+                meta_there = true;
+                Ok(std::ops::ControlFlow::Break(()))
+            },
+        )?;
+    }
+    if meta_there {
+        let mut recorded = None;
+        server.query_lines(
+            &format!(
+                "SELECT argMax(Value, Updated) AS value, count() AS n FROM {}.{META} \
+                 WHERE Name = {}",
+                identifier(database),
+                quote(SHARDS)
+            ),
+            |line| {
+                let row: serde_json::Value = serde_json::from_slice(line).unwrap_or_default();
+                if row
+                    .get("n")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+                    > 0
+                {
+                    recorded = row
+                        .get("value")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|v| v.parse::<usize>().ok());
+                }
+                Ok(std::ops::ControlFlow::Continue(()))
+            },
+        )?;
+        if let Some(then) = recorded.filter(|then| *then != shards) {
+            return Err(telemetryd_core::Error::Config(format!(
+                "clickhouse.cluster {cluster:?} has {shards} shards, but database \
+                 {database:?} was laid out for {then}. Each row is on the shard its key \
+                 picks out of {then}; with {shards}, new rows of the same key go elsewhere, \
+                 and a metric fold made again or a read by trace id no longer finds the rows \
+                 it must. Use a new database for the larger cluster (see the cookbook page \
+                 \"Scale out on ClickHouse\")"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Every table in the database, and its columns.
@@ -811,8 +1100,9 @@ pub fn apply_ttl(
     client: &Client,
     config: &ClickHouseConfig,
     retention: &RetentionConfig,
+    sharded: bool,
 ) -> Result<()> {
-    let statements = ttl_statements(config, retention);
+    let statements = ttl_statements(config, retention, sharded);
     for statement in &statements {
         client.execute_with(statement, &[("materialize_ttl_after_modify", "0")])?;
     }

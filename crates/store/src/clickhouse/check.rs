@@ -36,7 +36,8 @@ pub(super) fn run(config: &ClickHouseConfig, retention: &RetentionConfig) -> Che
     if unreachable {
         return checks;
     }
-    tables(&client, &server, config, retention, &mut checks);
+    let sharded = cluster(&client, config, &mut checks);
+    tables(&client, &server, config, retention, sharded, &mut checks);
     checks.push((
         "system.parts can be read, for what each app holds".to_owned(),
         server
@@ -44,7 +45,6 @@ pub(super) fn run(config: &ClickHouseConfig, retention: &RetentionConfig) -> Che
             .err()
             .map(|e| e.to_string()),
     ));
-    cluster(&server, config, &mut checks);
     policy(&server, config, &mut checks);
     checks
 }
@@ -64,6 +64,7 @@ fn tables(
     server: &Client,
     config: &ClickHouseConfig,
     retention: &RetentionConfig,
+    sharded: bool,
     checks: &mut Checks,
 ) {
     let database = format!("database {:?} exists", config.database);
@@ -83,7 +84,7 @@ fn tables(
     }
     checks.push((database, None));
     let what = "every table and view is there".to_owned();
-    match schema::missing(client, config, retention) {
+    match schema::missing(client, config, retention, sharded) {
         Ok(missing) if missing.is_empty() => checks.push((what, None)),
         Ok(missing) => checks.push((
             what,
@@ -106,22 +107,36 @@ fn tables(
     }
 }
 
-fn cluster(server: &Client, config: &ClickHouseConfig, checks: &mut Checks) {
+/// The cluster as [`schema::sharded`] judges it, and whether its tables are laid out for
+/// several shards.
+fn cluster(client: &Client, config: &ClickHouseConfig, checks: &mut Checks) -> bool {
     let cluster = config.cluster.trim();
     if cluster.is_empty() {
-        return;
+        return false;
     }
-    let known = any(
-        server,
-        &format!(
-            "SELECT 1 AS one FROM system.clusters WHERE cluster = {} LIMIT 1",
-            sql::quote(cluster)
-        ),
-    );
-    checks.push((
-        format!("cluster {cluster:?} is configured on the server"),
-        (!known).then(|| "system.clusters does not list it".to_owned()),
-    ));
+    match schema::sharded(client, config) {
+        Ok(sharded) => {
+            checks.push((
+                format!(
+                    "cluster {cluster:?} is configured on the server, as {}",
+                    if sharded {
+                        "several shards: Distributed tables over each shard's own"
+                    } else {
+                        "one shard: replicated tables"
+                    }
+                ),
+                None,
+            ));
+            sharded
+        }
+        Err(error) => {
+            checks.push((
+                format!("cluster {cluster:?} can hold the tables"),
+                Some(error.to_string()),
+            ));
+            false
+        }
+    }
 }
 
 fn policy(server: &Client, config: &ClickHouseConfig, checks: &mut Checks) {

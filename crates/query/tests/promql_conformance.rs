@@ -156,6 +156,8 @@ fn every_expression_answers_as_prometheus_does_on_clickhouse() {
         database: format!("td_test_metrics_promql_{unique}"),
         user: user.to_owned(),
         password: telemetryd_core::Secret::new(password),
+        // On a cluster of several shards when one is named, as the server tests do.
+        cluster: std::env::var("TELEMETRYD_TEST_CLICKHOUSE_URL_CLUSTER").unwrap_or_default(),
         ..telemetryd_core::config::ClickHouseConfig::default()
     };
     // The corpus is dated; a shorter retention would have ClickHouse drop it on insert.

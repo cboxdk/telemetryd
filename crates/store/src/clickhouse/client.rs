@@ -111,6 +111,18 @@ impl Stats {
     }
 }
 
+/// An insert into a table over several shards is acknowledged once every shard has its
+/// rows, not once they are queued to be sent: a `200` still means stored. Nothing on one
+/// shard, where there is nothing to send.
+const FOREGROUND: (&str, &str) = ("distributed_foreground_insert", "1");
+
+/// Which replica of each shard a read or write across shards goes to: the first that
+/// answers, in the order the server's `remote_servers` lists them, and this server's own
+/// for its own shard. The same replica for a write and the read after it, so an
+/// instance reads what it just wrote rather than a replica that has yet to fetch it —
+/// what a random choice, the default, would not promise. Nothing on one shard.
+const REPLICA: (&str, &str) = ("load_balancing", "in_order");
+
 /// How long a readiness answer is reused: a probe every second from every load
 /// balancer should not be a request to ClickHouse each.
 const PING_REUSE: Duration = Duration::from_secs(1);
@@ -295,11 +307,25 @@ impl Client {
     /// As [`Self::execute`].
     pub fn execute_with(&self, sql: &str, settings: &[(&str, &str)]) -> Result<()> {
         let started = Instant::now();
+        // An `INSERT … SELECT` into a table over several shards, done when it returns.
+        // And the answer only once the statement has finished: `ON CLUSTER` streams one
+        // row per server as each finishes, headers going out with the first — returned
+        // then, the next statement ran before this one had on every server, this one
+        // included, and a failure on the last server was a line in a body nobody read.
+        let settings = &[settings, &[FOREGROUND, REPLICA, ("wait_end_of_query", "1")]].concat();
         // An operator's statement, at startup or reload: what ClickHouse said is theirs
         // to read in full.
         let outcome = self
             .request(settings, sql.as_bytes(), sql, None)
-            .map(|_| ())
+            .and_then(|response| {
+                // Read to the end, so the connection is kept for the next statement.
+                std::io::copy(
+                    &mut response.into_body().into_reader(),
+                    &mut std::io::sink(),
+                )
+                .map(|_| ())
+                .map_err(|error| self.failed(sql, &error.to_string()))
+            })
             .map_err(Failure::detailed);
         self.stats.record(Operation::Schema, started, &outcome);
         outcome
@@ -336,6 +362,8 @@ impl Client {
                     ("async_insert_busy_timeout_min_ms", "200"),
                     ("async_insert_busy_timeout_max_ms", "500"),
                     ("input_format_skip_unknown_fields", "0"),
+                    FOREGROUND,
+                    REPLICA,
                 ],
                 &body,
                 &sql,
@@ -360,7 +388,12 @@ impl Client {
             .bytes_sent
             .fetch_add(body.bytes.len() as u64, Ordering::Relaxed);
         let outcome = self
-            .request_encoded(&[("query", sql.as_str())], &body, &sql, None)
+            .request_encoded(
+                &[("query", sql.as_str()), FOREGROUND, REPLICA],
+                &body,
+                &sql,
+                None,
+            )
             .map(|_| ())
             .map_err(Failure::brief);
         self.stats.record(Operation::Insert, started, &outcome);
@@ -480,8 +513,18 @@ impl Client {
     /// - `cancel_http_readonly_queries_on_client_close`: and stops a read whose caller
     ///   went away.
     /// - `max_query_size`: a query naming every series or trace it reads is long.
+    /// - On several shards (see `schema::Layout::local`), `distributed_product_mode =
+    ///   local`: a subquery over a table read across shards — the series a selector
+    ///   names, inside the read of their samples — runs on each shard over its own
+    ///   rows, which is every row it needs there, since a series' samples and series
+    ///   rows share a shard. And `optimize_skip_unused_shards`: a read of one trace id
+    ///   asks only the shard the trace is on. And [`REPLICA`]. None changes anything on
+    ///   one shard.
     fn read_settings(&self) -> Vec<(&'static str, String)> {
         vec![
+            ("distributed_product_mode", "local".to_owned()),
+            ("optimize_skip_unused_shards", "1".to_owned()),
+            (REPLICA.0, REPLICA.1.to_owned()),
             ("readonly", "2".to_owned()),
             (
                 "max_execution_time",
