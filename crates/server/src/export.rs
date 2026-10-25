@@ -300,8 +300,9 @@ fn whole_timestamps<R>(
             return Err(Error::LimitExceeded {
                 limit: "records at one timestamp",
                 detail: format!(
-                    "more than {AT_ONE_TIMESTAMP} records share the timestamp {last}, and a \
-                     page cannot end partway through one; narrow the export by selector"
+                    "more than {AT_ONE_TIMESTAMP} records share the timestamp {last}; a page \
+                     cannot end partway through one, so this range cannot be exported. \
+                     Export the ranges before and after it, from {last} + 1"
                 ),
             });
         }

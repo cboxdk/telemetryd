@@ -1004,6 +1004,12 @@ impl Snapshot {
         // sliced scan instead — which is the right way to read a window narrower than a
         // segment anyway.
         let whole_reads = 4usize.checked_div(points.len()).unwrap_or(0);
+        // The query's sample ceiling, shared by its selectors: each reads beside its
+        // summaries, and together they must hold no more than one read could.
+        let max_samples = match max_samples {
+            0 => 0,
+            n => (n / calls.len().max(1) as u64).max(1),
+        };
 
         let mut table = telemetryd_core::series::SeriesTable::new();
         let mut prepared = Vec::with_capacity(calls.len());

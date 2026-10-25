@@ -929,6 +929,26 @@ async fn a_single_node_imported_answers_as_it_did() {
     };
     let source = Store::open(&source_config).unwrap();
     let destination = ClickHouse::open(&config, &long_retention()).unwrap();
+    // The fleet has summarised up to now when the import starts: the hours it writes
+    // into are behind the fold cursor, and must be summarised again.
+    let cluster_dir = tempfile::tempdir().unwrap();
+    let remote = instance(cluster_dir.path(), config);
+    post(
+        &remote,
+        "/v1/metrics",
+        &json!({"resourceMetrics": [{
+            "resource": {"attributes": [kv("service.name", "fleet")]},
+            "scopeMetrics": [{"metrics": [{
+                "name": "fleet.up",
+                "gauge": {"dataPoints": [{
+                    "timeUnixNano": ((now() / HOUR - 3) * HOUR).to_string(),
+                    "asDouble": 1.0,
+                }]},
+            }]}],
+        }]}),
+    )
+    .await;
+    destination.metrics.roll_up(now(), "test").unwrap();
     let options = telemetryd_store::clickhouse::import::ImportOptions {
         signals: vec![
             telemetryd_core::Signal::Logs,
@@ -955,8 +975,12 @@ async fn a_single_node_imported_answers_as_it_did() {
     assert_eq!((again.logs, again.traces, again.metrics), (0, 0, 0));
     drop(source);
 
-    let cluster_dir = tempfile::tempdir().unwrap();
-    let remote = instance(cluster_dir.path(), config);
+    // The next pass goes back to the imported hours, six of them, then on to now.
+    let refolded = destination.metrics.roll_up(now(), "test").unwrap();
+    assert!(refolded.hours >= 6, "{refolded:?}");
+    let after = destination.metrics.roll_up(now(), "test").unwrap();
+    assert_eq!(after.hours, 0, "the request is taken once: {after:?}");
+
     for (path, want) in paths.iter().zip(&want) {
         assert_ne!(*want, Value::Null, "{path}");
         assert_eq!(&ask(&remote, path).await, want, "{path}");

@@ -69,6 +69,9 @@ const ROWS_PER_INSERT: usize = 100_000;
 const HOURS_CURSOR: &str = "metric_folds_next_hour";
 const DAYS_CURSOR: &str = "metric_folds_next_day";
 const LEASE: &str = "metric_folds_lease";
+/// A request to fold again from an hour, one row per request named
+/// `metric_folds_refold:{hour}:{nonce}`, `pending` until a pass has rewound to it.
+const REFOLD: &str = "metric_folds_refold:";
 
 /// A summary's numbers as the table stores them: bit patterns, so a NaN or an
 /// infinity in a sum or an increase survives as it is.
@@ -505,6 +508,8 @@ pub fn roll_up(client: &Client, now: u64, owner: &str) -> Result<RollUp> {
         return Ok(done);
     }
 
+    take_refolds(client)?;
+
     let Some(ready) = (now.saturating_sub(SETTLE_NANOS) / HOUR_NANOS).checked_sub(1) else {
         return Ok(done);
     };
@@ -522,12 +527,6 @@ pub fn roll_up(client: &Client, now: u64, owner: &str) -> Result<RollUp> {
         let last = ready.min((cursor / 24) * 24 + 23).min(budget_end - 1);
         done.folds_written += roll_hours(client, (cursor, last), None, now)?;
         done.hours += last - cursor + 1;
-        // An import may have rewound the cursor while these hours were made
-        // (`refold_from`): writing ours over it would lose the rewind, and the hours it
-        // asked for would never be made again. Stop instead; the next pass starts there.
-        if stored_cursor(client, HOURS_CURSOR)?.is_some_and(|stored| stored < cursor) {
-            return Ok(done);
-        }
         cursor = last + 1;
         write_meta(client, HOURS_CURSOR, &cursor.to_string())?;
         // Renewed as it goes: a pass over weeks of backlog outlasts one lease.
@@ -553,10 +552,6 @@ pub fn roll_up(client: &Client, now: u64, owner: &str) -> Result<RollUp> {
     if next_day < complete_until {
         done.folds_written += roll_days(client, next_day, complete_until - 1, now)?;
         done.days += complete_until - next_day;
-        // As for the hours: a rewind made meanwhile stands.
-        if stored_cursor(client, DAYS_CURSOR)?.is_some_and(|stored| stored < next_day) {
-            return Ok(done);
-        }
         write_meta(client, DAYS_CURSOR, &complete_until.to_string())?;
     }
     for day in repaired_days.into_iter().filter(|d| *d < complete_until) {
@@ -565,17 +560,53 @@ pub fn roll_up(client: &Client, now: u64, owner: &str) -> Result<RollUp> {
     Ok(done)
 }
 
-fn stored_cursor(client: &Client, key: &str) -> Result<Option<u64>> {
-    Ok(read_meta(client, key)?.and_then(|v| v.parse::<u64>().ok()))
-}
-
 /// Have the summaries made again from `hour` on, by whichever instance next holds the
 /// lease: for samples written into hours already summarised — an import of history,
-/// most often. A cursor already earlier is left where it is.
+/// most often.
+///
+/// A request of its own rather than a rewind of the cursors: only the lease holder
+/// moves those, so a pass in flight cannot write its progress over a rewind made
+/// meanwhile and lose it. [`roll_up`] takes every pending request first.
 ///
 /// # Errors
-/// When ClickHouse cannot be read or written.
+/// When ClickHouse cannot be written.
 pub fn refold_from(client: &Client, hour: u64) -> Result<()> {
+    write_meta(
+        client,
+        &format!(
+            "{REFOLD}{hour}:{}-{}",
+            crate::now_nanos(),
+            std::process::id()
+        ),
+        "pending",
+    )
+}
+
+/// Rewind the cursors to the earliest pending [`refold_from`] request, and mark every
+/// request taken. Called with the lease held, before the cursors are read.
+fn take_refolds(client: &Client) -> Result<()> {
+    let mut pending: Vec<(String, u64)> = Vec::new();
+    client.query_lines(
+        &format!(
+            "SELECT Name AS name FROM {META} WHERE startsWith(Name, {}) \
+             GROUP BY Name HAVING argMax(Value, Updated) = 'pending'",
+            sql::quote(REFOLD)
+        ),
+        |line| {
+            let name = super::scan::field(line, "name")?;
+            if let Some(hour) = name
+                .strip_prefix(REFOLD)
+                .and_then(|rest| rest.split(':').next())
+                .and_then(|hour| hour.parse::<u64>().ok())
+            {
+                pending.push((name, hour));
+            }
+            Ok(ControlFlow::Continue(()))
+        },
+    )?;
+    let Some(hour) = pending.iter().map(|(_, hour)| *hour).min() else {
+        return Ok(());
+    };
     if let Some(next) = read_meta(client, HOURS_CURSOR)?.and_then(|v| v.parse::<u64>().ok())
         && next > hour
     {
@@ -586,6 +617,11 @@ pub fn refold_from(client: &Client, hour: u64) -> Result<()> {
         && next > day
     {
         write_meta(client, DAYS_CURSOR, &day.to_string())?;
+    }
+    // Marked only once the rewind is written: a pass that fails before this leaves the
+    // requests pending, and the next takes them again.
+    for (name, _) in &pending {
+        write_meta(client, name, "taken")?;
     }
     Ok(())
 }
