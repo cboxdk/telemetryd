@@ -295,7 +295,11 @@ impl Table<'_> {
                 Order::Descending => edge.saturating_sub(width),
                 Order::Ascending => edge.saturating_add(width),
             };
-            width = width.saturating_mul(4);
+            let covered = match request.order {
+                Order::Descending => end - edge,
+                Order::Ascending => edge - start,
+            };
+            width = next_width(width, covered, out.len(), request.limit);
         }
     }
 
@@ -407,6 +411,28 @@ pub(super) fn stream_range(start_nanos: u64, end_nanos: u64) -> String {
     )
 }
 
+/// The next window's width, from how many of the rows the scan wants the range read
+/// so far held.
+///
+/// Four times the last at least, so a scan finds its page in a few windows however
+/// sparse the matches. More when the matches so far say so: a filter that kept 3 lines
+/// of the 100 asked for in the last hour wants some 50 hours more, and growing fourfold
+/// from a window sized for the unfiltered rate took a dozen windows to get there — each
+/// a request, and each reading its skip indexes again.
+pub(super) fn next_width(width: u64, covered: u64, found: usize, wanted: usize) -> u64 {
+    let at_least = width.saturating_mul(4);
+    let remaining = wanted.saturating_sub(found) as u128;
+    let estimate = if found == 0 {
+        // Nothing yet: as far as an order of magnitude more of the same would reach.
+        u128::from(covered).saturating_mul(16)
+    } else {
+        // Half again what the rate so far says the rest needs, so one window usually
+        // ends it.
+        u128::from(covered).saturating_mul(remaining) * 3 / (2 * found as u128)
+    };
+    u64::try_from(estimate).unwrap_or(u64::MAX).max(at_least)
+}
+
 /// The span a limited scan's first window covers, from how densely the selected streams
 /// wrote at the end it starts from: wide enough to hold the candidates `need` rows ask
 /// for, if the rate held, and never narrower than a second or wider than the range.
@@ -468,6 +494,18 @@ mod tests {
         );
         // From the other end the first hour is the one that counts.
         assert_eq!(first_window(&hours, Order::Ascending, 7, 2 * HOUR), HOUR);
+    }
+
+    #[test]
+    fn a_sparse_filter_widens_to_what_the_rate_so_far_says_the_rest_needs() {
+        const HOUR: u64 = 3_600_000_000_000;
+        // 3 of 100 in the hour read: some 48 hours more, and half again.
+        assert_eq!(next_width(HOUR, HOUR, 3, 100), HOUR * 97 * 3 / 6);
+        // None yet: sixteen times what was read.
+        assert_eq!(next_width(HOUR / 4, HOUR, 0, 100), 16 * HOUR);
+        // Never less than fourfold, however close the page is.
+        assert_eq!(next_width(HOUR, 10 * HOUR, 99, 100), 4 * HOUR);
+        assert_eq!(next_width(u64::MAX / 2, u64::MAX, 0, 100), u64::MAX);
     }
 
     #[test]
