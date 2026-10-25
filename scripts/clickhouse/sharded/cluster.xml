@@ -1,0 +1,31 @@
+<clickhouse>
+  <logger><level>warning</level><console>1</console></logger>
+  <listen_host>0.0.0.0</listen_host>
+  <zookeeper><node><host>keeper</host><port>9181</port></node></zookeeper>
+  <remote_servers>
+    <td_sharded>
+      <shard>
+        <internal_replication>true</internal_replication>
+        <replica><host>s1r1</host><port>9000</port><user>td</user><password>td</password></replica>
+        <replica><host>s1r2</host><port>9000</port><user>td</user><password>td</password></replica>
+      </shard>
+      <shard>
+        <internal_replication>true</internal_replication>
+        <replica><host>s2r1</host><port>9000</port><user>td</user><password>td</password></replica>
+        <replica><host>s2r2</host><port>9000</port><user>td</user><password>td</password></replica>
+      </shard>
+    </td_sharded>
+    <!-- The same servers without internal_replication: what telemetryd must refuse. -->
+    <td_sharded_unsafe>
+      <shard>
+        <replica><host>s1r1</host><port>9000</port><user>td</user><password>td</password></replica>
+        <replica><host>s1r2</host><port>9000</port><user>td</user><password>td</password></replica>
+      </shard>
+      <shard>
+        <replica><host>s2r1</host><port>9000</port><user>td</user><password>td</password></replica>
+        <replica><host>s2r2</host><port>9000</port><user>td</user><password>td</password></replica>
+      </shard>
+    </td_sharded_unsafe>
+  </remote_servers>
+  <distributed_ddl><path>/clickhouse/task_queue/ddl</path></distributed_ddl>
+</clickhouse>

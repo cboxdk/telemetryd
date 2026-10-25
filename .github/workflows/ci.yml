@@ -256,8 +256,9 @@ jobs:
         run: python3 scripts/promql-conformance.py --check
 
   # ClickHouse as the store: the Loki and Tempo corpora answered from it, its answers
-  # held to the local store's, a live tail across instances, and two instances in front
-  # of different replicas of one replicated cluster agreeing.
+  # held to the local store's, a live tail across instances, two instances in front
+  # of different replicas of one replicated cluster agreeing — and all of it again on a
+  # cluster of two shards of two replicas, with instances in front of different shards.
   clickhouse:
     name: ClickHouse as the store
     runs-on: ubuntu-latest
@@ -267,18 +268,36 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - name: a replicated ClickHouse cluster
-        run: docker compose -f scripts/clickhouse/compose.yml up -d --wait
+      - name: a replicated ClickHouse cluster, and one of two shards
+        run: |
+          docker compose -f scripts/clickhouse/compose.yml up -d --wait
+          docker compose -f scripts/clickhouse/sharded/compose.yml up -d --wait
       - name: every test that runs against ClickHouse
         env:
           TELEMETRYD_TEST_CLICKHOUSE_URL: http://td:td@127.0.0.1:18124
           TELEMETRYD_TEST_CLICKHOUSE_CLUSTER: td
           TELEMETRYD_TEST_CLICKHOUSE_REPLICAS: http://td:td@127.0.0.1:18124,http://td:td@127.0.0.1:18125
+          TELEMETRYD_TEST_CLICKHOUSE_SHARDED_CLUSTER: td_sharded
+          TELEMETRYD_TEST_CLICKHOUSE_SHARDED_UNSAFE_CLUSTER: td_sharded_unsafe
+          TELEMETRYD_TEST_CLICKHOUSE_SHARDED_URLS: http://td:td@127.0.0.1:18134,http://td:td@127.0.0.1:18136
+          TELEMETRYD_TEST_CLICKHOUSE_REQUIRED: "1"
+        run: cargo test --locked -p telemetryd-server -p telemetryd-query
+      - name: every test again, on two shards
+        env:
+          TELEMETRYD_TEST_CLICKHOUSE_URL: http://td:td@127.0.0.1:18134
+          TELEMETRYD_TEST_CLICKHOUSE_URL_CLUSTER: td_sharded
+          TELEMETRYD_TEST_CLICKHOUSE_CLUSTER: td_sharded
+          TELEMETRYD_TEST_CLICKHOUSE_REPLICAS: http://td:td@127.0.0.1:18134,http://td:td@127.0.0.1:18137
+          TELEMETRYD_TEST_CLICKHOUSE_SHARDED_CLUSTER: td_sharded
+          TELEMETRYD_TEST_CLICKHOUSE_SHARDED_UNSAFE_CLUSTER: td_sharded_unsafe
+          TELEMETRYD_TEST_CLICKHOUSE_SHARDED_URLS: http://td:td@127.0.0.1:18134,http://td:td@127.0.0.1:18136
           TELEMETRYD_TEST_CLICKHOUSE_REQUIRED: "1"
         run: cargo test --locked -p telemetryd-server -p telemetryd-query
       - name: what ClickHouse said, if it refused
         if: failure()
-        run: docker compose -f scripts/clickhouse/compose.yml logs --tail 200
+        run: |
+          docker compose -f scripts/clickhouse/compose.yml logs --tail 200
+          docker compose -f scripts/clickhouse/sharded/compose.yml logs --tail 200
 
   # The same for LogQL: `crates/server/tests/logql_conformance.rs` holds telemetryd to
   # Loki's answers in `check`; this asks Loki again.

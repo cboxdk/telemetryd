@@ -171,7 +171,8 @@ max_request_bytes     = "4MiB"       # segments are split into requests this siz
 database        = "default"
 user            = "default"
 # password      = "file:/run/secrets/clickhouse"
-cluster         = ""         # ON CLUSTER this, with Replicated engines; empty = one server
+cluster         = ""         # ON CLUSTER this, with Replicated engines; on several shards also
+                             # Distributed tables over each shard's own; empty = one server
 create_schema   = true       # create what is missing and bring TTLs to retention.* at startup
 storage_policy  = ""         # set on tables telemetryd creates; needed by cold_after
 cold_after      = "0s"       # move logs, spans and metric samples this old to cold_volume; 0 = never

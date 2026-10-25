@@ -55,8 +55,9 @@ pub struct ClickHouseConfig {
     pub database: String,
     pub user: String,
     pub password: Secret,
-    /// Create the tables on `ON CLUSTER` this cluster, with `ReplicatedMergeTree`.
-    /// Empty = one server, plain `MergeTree`.
+    /// Create the tables on `ON CLUSTER` this cluster, with `ReplicatedMergeTree`; on a
+    /// cluster of several shards, each shard's own tables with a `Distributed` table
+    /// over them. Empty = one server, plain `MergeTree`.
     pub cluster: String,
     /// Create the tables and columns that are missing at startup, and bring their TTLs
     /// to `retention.*`. Off for a database whose schema someone else manages.

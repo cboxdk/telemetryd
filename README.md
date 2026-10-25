@@ -276,6 +276,14 @@ TELEMETRYD_TEST_CLICKHOUSE_REQUIRED=1 \
   cargo test -p telemetryd-server -p telemetryd-query
 ```
 
+The same suite on a cluster of two shards of two replicas, as CI runs it too, with
+`scripts/clickhouse/sharded/compose.yml` up: `TELEMETRYD_TEST_CLICKHOUSE_URL=http://td:td@127.0.0.1:18134`
+and `TELEMETRYD_TEST_CLICKHOUSE_URL_CLUSTER=td_sharded`, plus
+`TELEMETRYD_TEST_CLICKHOUSE_SHARDED_CLUSTER=td_sharded`,
+`TELEMETRYD_TEST_CLICKHOUSE_SHARDED_UNSAFE_CLUSTER=td_sharded_unsafe` and
+`TELEMETRYD_TEST_CLICKHOUSE_SHARDED_URLS=http://td:td@127.0.0.1:18134,http://td:td@127.0.0.1:18136`
+for `tests/clickhouse_shards.rs`.
+
 `TELEMETRYD_TEST_CLICKHOUSE_REQUIRED=1` turns a skip into a failure. Each test writes
 to a database of its own, `td_test_*`, and leaves it behind for inspection;
 `docker compose … down -v` removes them all.

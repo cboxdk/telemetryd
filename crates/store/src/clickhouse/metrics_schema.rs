@@ -77,9 +77,18 @@ pub(super) fn statements(layout: &Layout<'_>) -> Vec<String> {
     let (samples_ttl, series_ttl) = (layout.aging(SAMPLES), layout.aging(SERIES));
     let (counts_ttl, folds_ttl) = (layout.aging(COUNTS), layout.aging(FOLDS));
     let settings = layout.settings();
-    vec![
-        format!(
-            "CREATE TABLE IF NOT EXISTS {INGEST}{on} (
+    let (ingest, samples, series) = (
+        layout.local(INGEST),
+        layout.local(SAMPLES),
+        layout.local(SERIES),
+    );
+    // A series' samples, its rows in the series and counts tables and its folds share a
+    // shard: the views write them where its samples land, and a fold is inserted by the
+    // same hash. A read joining them, or a fold's versions replacing one another, then
+    // meets on one shard.
+    let by_series = "cityHash64(Series)";
+    vec![format!(
+        "CREATE TABLE IF NOT EXISTS {ingest}{on} (
     Timestamp DateTime64(9, 'UTC'),
     MetricName LowCardinality(String),
     ServiceName LowCardinality(String),
@@ -88,9 +97,12 @@ pub(super) fn statements(layout: &Layout<'_>) -> Vec<String> {
     Value Float64,
     Special UInt8
 ) ENGINE = Null"
-        ),
+    )]
+    .into_iter()
+    .chain(layout.spread(INGEST, by_series))
+    .chain([
         format!(
-            "CREATE TABLE IF NOT EXISTS {SAMPLES}{on} (
+            "CREATE TABLE IF NOT EXISTS {samples}{on} (
     MetricName LowCardinality(String),
     SeriesHash UInt64,
     Timestamp DateTime64(9, 'UTC') CODEC(DoubleDelta, ZSTD(1)),
@@ -102,15 +114,15 @@ PARTITION BY toDate(Timestamp)
 ORDER BY (MetricName, SeriesHash, Timestamp)
 {samples_ttl}
 {settings}",
-            engine.engine(SAMPLES, "MergeTree")
+            engine.engine(&samples, "MergeTree")
         ),
         format!(
-            "CREATE MATERIALIZED VIEW IF NOT EXISTS {SAMPLES_VIEW}{on} TO {SAMPLES} AS
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS {SAMPLES_VIEW}{on} TO {samples} AS
 SELECT MetricName, cityHash64(Series) AS SeriesHash, Timestamp, Value, Special, Kind
-FROM {INGEST}"
+FROM {ingest}"
         ),
         format!(
-            "CREATE TABLE IF NOT EXISTS {SERIES}{on} (
+            "CREATE TABLE IF NOT EXISTS {series}{on} (
     Day Date,
     MetricName LowCardinality(String),
     ServiceName LowCardinality(String),
@@ -124,10 +136,10 @@ PARTITION BY Day
 ORDER BY (MetricName, Day, SeriesHash)
 {series_ttl}
 {settings}",
-            engine.engine(SERIES, "AggregatingMergeTree")
+            engine.engine(&series, "AggregatingMergeTree")
         ),
         format!(
-            "CREATE MATERIALIZED VIEW IF NOT EXISTS {SERIES_VIEW}{on} TO {SERIES} AS
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS {SERIES_VIEW}{on} TO {series} AS
 SELECT
     toDate(Timestamp) AS Day,
     MetricName,
@@ -137,11 +149,12 @@ SELECT
     count() AS Samples,
     min(Timestamp) AS MinTimestamp,
     max(Timestamp) AS MaxTimestamp
-FROM (SELECT Timestamp, MetricName, ServiceName, Series AS S FROM {INGEST})
+FROM (SELECT Timestamp, MetricName, ServiceName, Series AS S FROM {ingest})
 GROUP BY Day, MetricName, ServiceName, SeriesHash"
         ),
-    ]
-    .into_iter()
+    ])
+    .chain(layout.spread(SAMPLES, "SeriesHash"))
+    .chain(layout.spread(SERIES, "SeriesHash"))
     .chain(summaries(engine, &counts_ttl, &folds_ttl))
     .collect()
 }
@@ -150,9 +163,14 @@ GROUP BY Day, MetricName, ServiceName, SeriesHash"
 fn summaries(engine: &Layout<'_>, counts_ttl: &str, folds_ttl: &str) -> Vec<String> {
     let on = engine.on_cluster();
     let settings = engine.settings();
-    vec![
+    let (ingest, counts, folds) = (
+        engine.local(INGEST),
+        engine.local(COUNTS),
+        engine.local(FOLDS),
+    );
+    let mut statements = vec![
         format!(
-            "CREATE TABLE IF NOT EXISTS {COUNTS}{on} (
+            "CREATE TABLE IF NOT EXISTS {counts}{on} (
     MetricName LowCardinality(String),
     Hour UInt32,
     SeriesHash UInt64,
@@ -162,20 +180,20 @@ PARTITION BY intDiv(Hour, 24)
 ORDER BY (MetricName, Hour, SeriesHash)
 {counts_ttl}
 {settings}",
-            engine.engine(COUNTS, "AggregatingMergeTree")
+            engine.engine(&counts, "AggregatingMergeTree")
         ),
         format!(
-            "CREATE MATERIALIZED VIEW IF NOT EXISTS {COUNTS_VIEW}{on} TO {COUNTS} AS
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS {COUNTS_VIEW}{on} TO {counts} AS
 SELECT
     MetricName,
     toUInt32(intDiv(toUnixTimestamp64Nano(Timestamp) - 1, {HOUR_NANOS})) AS Hour,
     cityHash64(S) AS SeriesHash,
     countIf(Special != {STALE}) AS Samples
-FROM (SELECT Timestamp, MetricName, Series AS S, Special FROM {INGEST})
+FROM (SELECT Timestamp, MetricName, Series AS S, Special FROM {ingest})
 GROUP BY MetricName, Hour, SeriesHash"
         ),
         format!(
-            "CREATE TABLE IF NOT EXISTS {FOLDS}{on} (
+            "CREATE TABLE IF NOT EXISTS {folds}{on} (
     MetricName LowCardinality(String),
     Tier UInt8,
     Bucket UInt32,
@@ -197,9 +215,14 @@ PARTITION BY (Tier, toDate(Starts))
 ORDER BY (MetricName, Tier, Bucket, SeriesHash)
 {folds_ttl}
 {settings}",
-            versioned(&engine.engine(FOLDS, "ReplacingMergeTree"))
+            versioned(&engine.engine(&folds, "ReplacingMergeTree"))
         ),
-    ]
+    ];
+    statements.extend(engine.spread(COUNTS, "SeriesHash"));
+    // A fold's versions replace one another only where they meet: by series, on the
+    // shard its samples are on, which a read with `FINAL` reads alone.
+    statements.extend(engine.spread(FOLDS, "SeriesHash"));
+    statements
 }
 
 /// A `ReplacingMergeTree` engine clause that keeps the highest `Version`: the engine

@@ -195,9 +195,16 @@ async fn instances_on_different_replicas_answer_alike() {
         "telemetryd_sample_counts",
         "telemetryd_folds",
     ] {
-        replica
-            .execute(&format!("SYSTEM SYNC REPLICA {table}"))
-            .unwrap();
+        // On several shards the replicated table is the shard's own, under the
+        // Distributed one.
+        if replica
+            .execute(&format!("SYSTEM SYNC REPLICA {table}_local"))
+            .is_err()
+        {
+            replica
+                .execute(&format!("SYSTEM SYNC REPLICA {table}"))
+                .unwrap();
+        }
     }
 
     let (start, end) = (BASE / SECOND, BASE / SECOND + 600);

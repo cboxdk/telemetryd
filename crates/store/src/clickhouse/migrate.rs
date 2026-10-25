@@ -135,10 +135,25 @@ pub fn run(
     options: Options,
     report: &mut dyn FnMut(&Event),
 ) -> Result<()> {
+    // A layout over several shards is this version's own: no earlier one created it,
+    // so there is nothing older to bring up — only what startup creates.
+    if schema::sharded(client, config)? {
+        if !options.dry_run && config.create_schema {
+            schema::ensure(client, config, retention, true)?;
+        }
+        report(&Event::Found {
+            what: "nothing",
+            object: config.database.clone(),
+            detail: "laid out over several shards, which only this version creates: \
+                     nothing older to migrate"
+                .to_owned(),
+        });
+        return Ok(());
+    }
     // What an instance's startup creates — missing tables, views, columns — first, as
     // it would, and as safely run beside one: the rest is what startup leaves alone.
     if options.dry_run {
-        for missing in schema::missing(client, config, retention)? {
+        for missing in schema::missing(client, config, retention, false)? {
             report(&Event::Found {
                 what: "create",
                 object: missing,
@@ -146,8 +161,8 @@ pub fn run(
             });
         }
     } else if config.create_schema {
-        schema::ensure(client, config, retention)?;
-    } else if let Some(missing) = schema::missing(client, config, retention)?.first() {
+        schema::ensure(client, config, retention, false)?;
+    } else if let Some(missing) = schema::missing(client, config, retention, false)?.first() {
         return Err(Error::Config(format!(
             "clickhouse.create_schema = false, and the database lacks {missing}: create \
              what `telemetryd clickhouse schema` prints first"
@@ -164,7 +179,11 @@ pub fn run(
         // Stale objects first: a stale view would otherwise keep feeding a stale table.
         tally.add(drop_stale(
             client,
-            &Layout { config, retention },
+            &Layout {
+                config,
+                retention,
+                sharded: false,
+            },
             &existing,
             options,
             report,
@@ -176,7 +195,11 @@ pub fn run(
         let existing = tables(client)?;
         tally.add(indexes(
             client,
-            &Layout { config, retention },
+            &Layout {
+                config,
+                retention,
+                sharded: false,
+            },
             &existing,
             &expected,
             options,
@@ -502,7 +525,7 @@ fn probe(
         ..config.clone()
     };
     let mut expected = BTreeMap::new();
-    for name in schema::objects(&local, retention) {
+    for name in schema::objects(&local, retention, false) {
         let Some(statement) = schema::create_statement(&local, retention, &name) else {
             continue;
         };
@@ -656,7 +679,11 @@ fn rebuild(
     report: &mut dyn FnMut(&Event),
 ) -> Result<usize> {
     atomic_database(client)?;
-    let layout = Layout { config, retention };
+    let layout = Layout {
+        config,
+        retention,
+        sharded: false,
+    };
     let on = layout.on_cluster();
     let statement = schema::create_statement(config, retention, table)
         .ok_or_else(|| Error::Config(format!("telemetryd has no statement creating {table}")))?;
@@ -850,7 +877,11 @@ fn copy_back(
     owner: &str,
     report: &mut dyn FnMut(&Event),
 ) -> Result<usize> {
-    let layout = Layout { config, retention };
+    let layout = Layout {
+        config,
+        retention,
+        sharded: false,
+    };
     let on = layout.on_cluster();
     let Some(source) = tables_named(client, Some(&[old]))?.remove(old) else {
         // Dropped by an earlier run that stopped before saying it was done.

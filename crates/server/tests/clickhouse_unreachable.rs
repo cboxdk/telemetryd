@@ -125,7 +125,7 @@ async fn a_clickhouse_that_goes_away_is_refused_loudly_not_accepted_quietly() {
     let config = config(tmp.path(), port);
     config.validate().unwrap();
     let tables =
-        telemetryd_store::clickhouse::schema::objects(&config.clickhouse, &config.retention);
+        telemetryd_store::clickhouse::schema::objects(&config.clickhouse, &config.retention, false);
     let server = tokio::spawn(stand_in(listener, tables));
 
     let store = Arc::new(
