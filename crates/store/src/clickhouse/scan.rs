@@ -45,8 +45,20 @@ const WINDOW_ROWS_PER_RESULT: u64 = 4;
 /// cheaper in round trips and dearer in the case that matters: ClickHouse stops reading
 /// once it has a page, and a filter that matches a few hundred lines a day made it read
 /// the whole day looking for a page twice the limit.
-fn page_size(wanted: usize) -> usize {
-    wanted.clamp(100, 10_000)
+///
+/// So the page is what is still needed, scaled by how many of the rows read so far the
+/// predicate kept: a `| logfmt | status >= 500` keeping one line in a hundred asked
+/// for pages of a hundred and made a hundred round trips for its page, where the
+/// rate says to ask for ten thousand.
+fn page_size(wanted: usize, read: usize, kept: usize) -> usize {
+    let scaled = match (read, kept) {
+        (0, _) => wanted,
+        // Nothing kept yet: four times what was read, so a run of rejections is crossed
+        // in a few pages rather than one page at a time.
+        (_, 0) => read.saturating_mul(4),
+        _ => wanted.saturating_mul(read).saturating_mul(3) / kept.saturating_mul(2),
+    };
+    scaled.clamp(100, 10_000)
 }
 
 /// A row with a timestamp, as every signal's rows have: `t`, in nanoseconds.
@@ -320,8 +332,9 @@ impl Table<'_> {
         out: &mut Vec<T>,
     ) -> Result<bool> {
         let mut bound: Option<String> = None;
+        let (mut read, mut kept) = (0, 0);
         loop {
-            let page = page_size(request.limit.saturating_sub(out.len()));
+            let page = page_size(request.limit.saturating_sub(out.len()), read, kept);
             let conditions = match &bound {
                 Some(bound) => format!("{window} AND {bound}"),
                 None => window.to_owned(),
@@ -353,9 +366,11 @@ impl Table<'_> {
                     ));
                 }
             }
+            read += rows.len();
             for row in rows {
                 let record = convert(row);
                 if accepts(&record) {
+                    kept += 1;
                     out.push(record);
                     over_ceiling(request, out.len())?;
                     if out.len() >= request.limit {
@@ -494,6 +509,19 @@ mod tests {
         );
         // From the other end the first hour is the one that counts.
         assert_eq!(first_window(&hours, Order::Ascending, 7, 2 * HOUR), HOUR);
+    }
+
+    #[test]
+    fn a_page_is_what_is_still_needed_scaled_by_what_the_predicate_keeps() {
+        // Nothing read yet: what is needed.
+        assert_eq!(page_size(250, 0, 0), 250);
+        // One in a hundred kept: a hundred times more, and half again, within the cap.
+        assert_eq!(page_size(50, 200, 2), 7_500);
+        assert_eq!(page_size(99, 100, 1), 10_000);
+        // Nothing kept: four times what was read.
+        assert_eq!(page_size(100, 300, 0), 1_200);
+        // Everything kept: barely more than needed, and never under a hundred.
+        assert_eq!(page_size(10, 100, 100), 100);
     }
 
     #[test]
