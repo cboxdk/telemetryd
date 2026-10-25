@@ -220,16 +220,19 @@ impl AppState {
     /// its own: an entry exists only while that client has a request in flight, and
     /// there can never be more of those than there are permits.
     pub fn ingest_slot_for(&self, identity: Option<&str>) -> Option<IngestSlot> {
-        let permit = Arc::clone(&self.ingest_permits).try_acquire_owned().ok()?;
-
         let Some(app) = identity.filter(|_| self.config.relay.is_enabled()) else {
+            let permit = Arc::clone(&self.ingest_permits).try_acquire_owned().ok()?;
             return Some(IngestSlot {
-                _permit: permit,
+                permit: Some(permit),
                 app: None,
                 in_flight: Arc::clone(&self.in_flight),
             });
         };
 
+        // The share before the permit. Taken the other way round, a client over its
+        // share still held a permit for the moment it took to be refused, and a dozen
+        // of its requests refused at once filled the queue the share reserves for
+        // everyone else.
         let ceiling = self.config.relay.per_client_slots(self.queue_depth);
         {
             let mut in_flight = self
@@ -249,12 +252,15 @@ impl AppState {
             }
             *held += 1;
         }
-
-        Some(IngestSlot {
-            _permit: permit,
+        // From here the slot owns the share it took: dropped without a permit, it gives
+        // the share back.
+        let mut slot = IngestSlot {
+            permit: None,
             app: Some(app.to_owned()),
             in_flight: Arc::clone(&self.in_flight),
-        })
+        };
+        slot.permit = Some(Arc::clone(&self.ingest_permits).try_acquire_owned().ok()?);
+        Some(slot)
     }
 
     pub fn new(config: Arc<Config>, store: Arc<Store>) -> Result<Self> {
@@ -483,7 +489,8 @@ impl AppState {
 /// that only ever goes up and a client locked out of its own quota forever.
 #[derive(Debug)]
 pub struct IngestSlot {
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    /// `None` only while the slot is being claimed.
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
     app: Option<String>,
     in_flight: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
 }
