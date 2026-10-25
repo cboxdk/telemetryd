@@ -213,7 +213,8 @@ It is not resumable: run it once per range.
 
 The telemetry is ClickHouse's to back up, with its own `BACKUP DATABASE telemetry TO
 Disk('backups', 'telemetry.zip')` or `TO S3(…)`, and `RESTORE` the same way. The
-instances hold nothing a backup needs.
+instances hold nothing a backup needs. On a cluster, and for restoring into a fresh one,
+see [Operate telemetryd on ClickHouse](operate-clickhouse.md#back-up-and-restore).
 
 ## Ninety days, and more
 
@@ -296,7 +297,8 @@ ClickHouse hands back, which is what keeps the answers the same.
   day reads the last few seconds of that day, sized from how densely the stream writes,
   widening only if they do not hold enough.
 - **Line filters, TraceQL conditions in SQL.** `|= "timeout"` becomes a `LIKE` the body's
-  token index can skip granules by; `{ span.http.route = "/geocode" && duration > 1s }`
+  n-gram index can skip granules by — an id or a rare word reads a few granules of
+  thousands; `{ span.http.route = "/geocode" && duration > 1s }`
   becomes conditions on the maps and the duration column. Each is a condition every
   match meets, never sufficient on its own: the query's own evaluation still decides.
 - **Log volume from rollups.** A count with no line filter is answered from the per-minute

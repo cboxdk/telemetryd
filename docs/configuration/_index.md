@@ -11,6 +11,7 @@ environment and no flags is a complete, supported setup — the empty configurat
 valid configuration, and everything else is an override on top of it.
 
 - [Reference](reference.md) — every option, with defaults
+- [Command line](cli.md) — every command and flag
 
 **Precedence**, lowest to highest: built-in defaults → `telemetryd.toml` → environment →
 CLI flags. Each layer is partial, so any subset of the upper ones suffices.

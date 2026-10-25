@@ -85,7 +85,7 @@ enum Command {
     /// Check a configuration and show where every value came from.
     Validate(ConfigArgs),
 
-    /// With ClickHouse as the store: print its schema, or check the account can use it.
+    /// With ClickHouse as the store: print its schema, check the account, migrate or import.
     #[command(name = "clickhouse")]
     ClickHouse {
         #[command(subcommand)]

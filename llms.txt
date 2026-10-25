@@ -129,9 +129,10 @@ configured. That is deliberate and should not be worked around with `--insecure`
 - [Sending data](https://cbox.dk/packages/telemetryd/docs/getting-started/sending-data): endpoints, labels, and what a 200 does not mean
 - [Docker](https://cbox.dk/packages/telemetryd/docs/getting-started/docker): the container, and the tokens it generates on first start
 - [Configuration reference](https://cbox.dk/packages/telemetryd/docs/configuration/reference): every option with its default
+- [Command-line reference](https://cbox.dk/packages/telemetryd/docs/configuration/cli): every command and flag
 - [COMPATIBILITY.md](https://github.com/cboxdk/telemetryd/blob/main/COMPATIBILITY.md): the authoritative API subset, endpoint by endpoint
 - [BUILD-STATUS.md](https://github.com/cboxdk/telemetryd/blob/main/BUILD-STATUS.md): what is built, what is not, and what is deliberately absent
-- [Cookbook](https://cbox.dk/packages/telemetryd/docs/cookbook/_index): task-shaped recipes — relay mode, single sign-on, export and import, exposing it safely
+- [Cookbook](https://cbox.dk/packages/telemetryd/docs/cookbook/_index): task-shaped recipes — relay mode, single sign-on, export and import, exposing it safely, scaling out on ClickHouse and operating it
 
 ## Do not
 

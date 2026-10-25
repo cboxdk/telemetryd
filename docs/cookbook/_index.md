@@ -18,4 +18,5 @@ description: "Task-shaped recipes for running telemetryd in anger."
 - [Single sign-on with Cbox ID](single-sign-on.md)
 - [A safe front door for mobile clients](relay-mode.md)
 - [Scale out on ClickHouse](scale-out-on-clickhouse.md)
+- [Operate telemetryd on ClickHouse](operate-clickhouse.md)
 - [Getting data out, and bringing it in](export-and-import.md)
