@@ -1,0 +1,50 @@
+# A ClickHouse cluster of two shards of two replicas each, for the tests that run
+# telemetryd on more than one shard: a Keeper and four servers, cluster `td_sharded`,
+# user and password `td`. Apart from `../compose.yml` (one shard) so either can run
+# alone.
+#
+#   docker compose -f scripts/clickhouse/sharded/compose.yml up -d --wait
+#   TELEMETRYD_TEST_CLICKHOUSE_SHARDED_CLUSTER=td_sharded \
+#   TELEMETRYD_TEST_CLICKHOUSE_SHARDED_URLS=http://td:td@127.0.0.1:18134,http://td:td@127.0.0.1:18136 \
+#     cargo test -p telemetryd-server --test clickhouse_shards
+#
+# 18134 and 18135 are the replicas of shard 1, 18136 and 18137 of shard 2.
+# Pinned by digest, as the actions are: 25.8, the LTS line telemetryd is tested on.
+name: telemetryd-clickhouse-sharded
+services:
+  keeper:
+    image: clickhouse/clickhouse-keeper:25.8@sha256:86ef98ab9c41998c562806a062ef1079af07755f6bcec0a46e9caa9b7a4b4253
+    volumes: ["../keeper.xml:/etc/clickhouse-keeper/keeper_config.xml:ro"]
+  s1r1: &server
+    image: clickhouse/clickhouse-server:25.8@sha256:0152dd511befe6a2c2ef53e930726179669b08116da78500b37c51c96ff5ee77
+    environment:
+      CLICKHOUSE_USER: td
+      CLICKHOUSE_PASSWORD: td
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - "./cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro"
+      - "./s1r1.xml:/etc/clickhouse-server/config.d/macros.xml:ro"
+    ports: ["18134:8123"]
+    depends_on: [keeper]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8123/ping"]
+      interval: 2s
+      retries: 30
+  s1r2:
+    <<: *server
+    volumes:
+      - "./cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro"
+      - "./s1r2.xml:/etc/clickhouse-server/config.d/macros.xml:ro"
+    ports: ["18135:8123"]
+  s2r1:
+    <<: *server
+    volumes:
+      - "./cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro"
+      - "./s2r1.xml:/etc/clickhouse-server/config.d/macros.xml:ro"
+    ports: ["18136:8123"]
+  s2r2:
+    <<: *server
+    volumes:
+      - "./cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro"
+      - "./s2r2.xml:/etc/clickhouse-server/config.d/macros.xml:ro"
+    ports: ["18137:8123"]

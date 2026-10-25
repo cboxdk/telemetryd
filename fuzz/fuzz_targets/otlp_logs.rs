@@ -14,6 +14,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = telemetryd_ingest::logs::decode(
         data,
         DecodeContext {
+            keep_resource: false,
             pool: None,
             limits: &limits,
             ingest: &ingest,

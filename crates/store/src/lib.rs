@@ -5,13 +5,16 @@
 //! store in M3. Both register in one retention pass, so the disk budget means the same
 //! thing everywhere.
 
+pub mod backend;
 pub mod bloom;
 pub mod cardinality;
+pub mod clickhouse;
 pub mod datadir;
 mod dictionary;
 pub mod folds;
 pub mod intern;
 pub mod logs;
+pub mod metric_backend;
 pub mod metrics;
 pub mod records;
 pub mod retention;
@@ -36,9 +39,15 @@ use telemetryd_core::span::SpanRecord;
 use crate::schema::RecordSchema;
 use telemetryd_core::{Labels, LogRecord, Result, Signal};
 
+pub use backend::{
+    BodyFilter, BucketRequest, Buckets, LogStore, RecordFilter, SpanAggregateRequest,
+    SpanAggregateRow, SpanAggregates, SpanAggregation, SpanCondition, SpanField, SpanOp, SpanStore,
+    SpanValue,
+};
 pub use cardinality::{Admission, Admitted, Cardinality};
 pub use datadir::{DataDir, DiskUsage};
 pub use logs::LogSchema;
+pub use metric_backend::MetricStore;
 pub use metrics::MetricSchema;
 pub use records::{RecordStore, RecordStoreStatus, Scan, StoreSettings};
 pub use retention::{Candidate, Plan, ReaperReport};
@@ -76,6 +85,9 @@ pub struct Store {
     /// has not forwarded yet, with `relay.when_full = "reject"`; cleared by the next pass
     /// that finds room. While set, every append is refused.
     refusing: std::sync::atomic::AtomicBool,
+    /// The database, instead of the files in `data_dir`, when `[clickhouse]` is
+    /// configured.
+    clickhouse: Option<clickhouse::ClickHouse>,
 }
 
 /// What one app holds in the store.
@@ -110,6 +122,17 @@ impl Store {
         let root = config.storage.resolve_data_dir();
         let data_dir = DataDir::open(&root)?;
         data_dir.clean_tmp()?;
+
+        // Before anything is opened: a ClickHouse that cannot be reached or refuses the
+        // schema is a startup error, not a first failed request.
+        let clickhouse = if config.clickhouse.is_enabled() {
+            Some(clickhouse::ClickHouse::open(
+                &config.clickhouse,
+                &config.retention,
+            )?)
+        } else {
+            None
+        };
 
         let settings = StoreSettings::from(&config.storage);
         let logs = RecordStore::<LogSchema>::open(
@@ -163,7 +186,35 @@ impl Store {
             reaper: Mutex::new(ReaperReport::default()),
             wal_truncations: RwLock::new(truncations),
             refusing: std::sync::atomic::AtomicBool::new(false),
+            clickhouse,
         })
+    }
+
+    /// Logs, wherever they are kept: what the query engines read.
+    pub fn log_store(&self) -> &dyn LogStore {
+        match &self.clickhouse {
+            Some(clickhouse) => &clickhouse.logs,
+            None => &self.logs,
+        }
+    }
+
+    /// Summarise settled metric hours in ClickHouse; `None` without ClickHouse.
+    ///
+    /// # Errors
+    /// When ClickHouse cannot be read or written.
+    pub fn roll_up_metrics(&self, now: u64) -> Result<Option<clickhouse::metric_folds::RollUp>> {
+        static OWNER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let owner = OWNER.get_or_init(|| format!("{}-{}", std::process::id(), now_nanos()));
+        self.clickhouse
+            .as_ref()
+            .map(|c| c.metrics.roll_up(now, owner))
+            .transpose()
+    }
+
+    /// Whether logs, traces and metrics are kept in ClickHouse rather than on this
+    /// machine.
+    pub fn in_clickhouse(&self) -> bool {
+        self.clickhouse.is_some()
     }
 
     pub fn logs(&self) -> &RecordStore<LogSchema> {
@@ -174,10 +225,21 @@ impl Store {
         &self.traces
     }
 
+    /// Spans, wherever they are kept: what the query engines read.
+    pub fn span_store(&self) -> &dyn SpanStore {
+        match &self.clickhouse {
+            Some(clickhouse) => &clickhouse.spans,
+            None => &self.traces,
+        }
+    }
+
     /// Append trace spans. Durable before this returns.
     pub fn append_spans(&self, records: &[SpanRecord]) -> Result<Admitted> {
         self.append_within_limits(records, SpanSchema::index_labels, |kept| {
-            self.traces.append(kept)
+            match &self.clickhouse {
+                Some(clickhouse) => clickhouse.spans.append(kept),
+                None => self.traces.append(kept),
+            }
         })
     }
 
@@ -185,10 +247,21 @@ impl Store {
         &self.metrics
     }
 
+    /// Metrics, wherever they are kept: what the PromQL engine reads.
+    pub fn metric_store(&self) -> &dyn MetricStore {
+        match &self.clickhouse {
+            Some(clickhouse) => &clickhouse.metrics,
+            None => &self.metrics,
+        }
+    }
+
     /// Append metric samples. Durable before this returns.
     pub fn append_samples(&self, records: &[MetricSample]) -> Result<Admitted> {
         self.append_within_limits(records, MetricSchema::index_labels, |kept| {
-            self.metrics.append(kept)
+            match &self.clickhouse {
+                Some(clickhouse) => clickhouse.metrics.append(kept),
+                None => self.metrics.append(kept),
+            }
         })
     }
 
@@ -199,7 +272,10 @@ impl Store {
     /// Append log records. Durable before this returns.
     pub fn append_logs(&self, records: &[LogRecord]) -> Result<Admitted> {
         self.append_within_limits(records, LogSchema::index_labels, |kept| {
-            self.logs.append(kept)
+            match &self.clickhouse {
+                Some(clickhouse) => clickhouse.logs.append(kept),
+                None => self.logs.append(kept),
+            }
         })
     }
 
@@ -559,6 +635,18 @@ impl Store {
                 ));
             }
         }
+        // The tables age by the same retention, so they change with it — and a
+        // retention a ClickHouse refuses is reported, not taken as applied.
+        if let Some(clickhouse) = &self.clickhouse
+            && changes.iter().any(|c| c.starts_with("retention."))
+            && let Err(error) = clickhouse.apply_retention(&config.clickhouse, &config.retention)
+        {
+            tracing::error!(
+                %error,
+                "retention changed, but ClickHouse refused the new TTLs; its tables keep the old ones"
+            );
+            changes.push(format!("ClickHouse TTLs NOT changed: {error}"));
+        }
         policy.retention = config.retention.clone();
 
         changes
@@ -578,6 +666,12 @@ impl Store {
     /// to fix that short of one segment per app.
     #[must_use]
     pub fn app_usage(&self) -> Vec<AppUsage> {
+        if let Some(clickhouse) = &self.clickhouse {
+            return clickhouse.app_usage().unwrap_or_else(|error| {
+                tracing::warn!(%error, "could not read what each app holds from ClickHouse");
+                Vec::new()
+            });
+        }
         let mut apps: BTreeMap<String, AppUsage> = BTreeMap::new();
 
         for (signal, segments) in [
@@ -661,6 +755,12 @@ impl Store {
     /// Why writes are being refused right now, if they are — what `/ready` answers with.
     #[must_use]
     pub fn not_accepting(&self) -> Option<String> {
+        // Every write goes to ClickHouse, so one that does not answer is one this
+        // instance cannot store anything in — and a load balancer should know before a
+        // sender finds out.
+        if let Some(Err(error)) = self.clickhouse.as_ref().map(|c| c.client().ping()) {
+            return Some(error.to_string());
+        }
         if self.refusing.load(std::sync::atomic::Ordering::Relaxed) {
             return Some(
                 "the disk budget is full of telemetry not yet forwarded upstream".to_owned(),
@@ -742,6 +842,7 @@ impl Store {
             series_evicted: self.cardinality.evicted_series(),
             series_rejected: self.cardinality.rejected_records(),
             wal_truncations: lock_read(&self.wal_truncations).clone(),
+            clickhouse: self.clickhouse.as_ref().map(|c| c.client().snapshot()),
         })
     }
 }
@@ -783,6 +884,9 @@ pub struct StoreStatus {
     pub series_by_app: std::collections::BTreeMap<String, u64>,
     /// Non-empty when a crash cost us records. "Degrade loudly."
     pub wal_truncations: Vec<Truncation>,
+    /// Requests to ClickHouse, when it is the store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clickhouse: Option<clickhouse::StatsSnapshot>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -832,6 +936,7 @@ mod tests {
             attributes: Labels::new(),
             trace_id: None,
             span_id: None,
+            resource: telemetryd_core::Labels::default(),
         }
     }
 

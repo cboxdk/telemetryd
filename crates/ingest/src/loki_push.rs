@@ -383,6 +383,7 @@ fn record(
         attributes,
         trace_id,
         span_id,
+        resource: telemetryd_core::Labels::default(),
     })
 }
 
@@ -472,6 +473,7 @@ mod tests {
 
     fn context<'a>(limits: &'a LimitsConfig, ingest: &'a IngestConfig) -> DecodeContext<'a> {
         DecodeContext {
+            keep_resource: false,
             limits,
             ingest,
             now_nanos: 1_750_000_000_000_000_000,

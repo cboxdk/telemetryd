@@ -15,8 +15,7 @@ use std::sync::{Mutex, PoisonError};
 
 use telemetryd_core::{Error, LabelMatcher, Labels, LogRecord, MatchOp, MetricKind, Result};
 use telemetryd_core::{MetricSample, metric::STALE_MARKER_BITS};
-use telemetryd_store::RecordStore;
-use telemetryd_store::logs::LogSchema;
+use telemetryd_store::LogStore;
 
 use crate::lexer::{Token, tokenize};
 use crate::logql::{LabelPredicate, LogQuery, Parser, Stage};
@@ -592,7 +591,7 @@ fn too_many_series() -> Error {
 /// # Errors
 /// A `400` for a pipeline error in a series, or a query over the series or sample limits.
 pub fn evaluate(
-    store: &RecordStore<LogSchema>,
+    store: &dyn LogStore,
     query: &MetricQuery,
     steps: &[u64],
     deadline: Deadline,
@@ -600,6 +599,10 @@ pub fn evaluate(
     let mut samples = Vec::new();
     let mut lines = 0;
     for (index, range) in query.ranges.iter().enumerate() {
+        if let Some(read) = range.counted_in_store(index, store, steps, &mut samples)? {
+            lines += read;
+            continue;
+        }
         let (series, read) = range.extract(store, steps, deadline)?;
         lines += read;
         pipeline_error(&series)?;
@@ -658,7 +661,211 @@ fn pipeline_error(series: &Extracted) -> Result<()> {
     )))
 }
 
+/// Labels a line carries that are not stream labels and do not follow from one, so a
+/// store counting by stream cannot group by them.
+const RECORD_FIELDS: &[&str] = &["trace_id", "span_id", "severity_text"];
+
+/// Buckets one aggregation may ask a store for. A day at a second's step is 86,400.
+const MAX_BUCKETS: u64 = 1_000_000;
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
 impl RangeAggregation {
+    /// The labels to group by when the store can count this aggregation itself.
+    ///
+    /// Only where counting is the whole of it: `count_over_time`, `rate`,
+    /// `bytes_over_time` and `bytes_rate`, over a pipeline of nothing but `|=` and `!=`
+    /// line filters, grouped by stream labels — `sum by (level) (count_over_time(…))`,
+    /// the query behind every log volume chart. Anything that reads the line — a
+    /// parser, a regex, a label filter, `unwrap` — is evaluated line by line as before.
+    fn store_grouping(&self) -> Option<Vec<String>> {
+        if self.unwrap.is_some()
+            || !matches!(
+                self.function,
+                RangeFunction::CountOverTime
+                    | RangeFunction::Rate
+                    | RangeFunction::BytesOverTime
+                    | RangeFunction::BytesRate
+            )
+        {
+            return None;
+        }
+        let plain = self.query.stages.iter().all(|stage| {
+            matches!(stage, Stage::Line(filter)
+                if matches!(filter.op, crate::logql::LineOp::Contains | crate::logql::LineOp::NotContains))
+        });
+        if !plain {
+            return None;
+        }
+        match &self.grouping {
+            Some(Grouping::All) => Some(Vec::new()),
+            Some(Grouping::By(names))
+                if names
+                    .iter()
+                    .all(|n| is_label_name(n) && !RECORD_FIELDS.contains(&n.as_str())) =>
+            {
+                Some(names.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// The aggregation counted by the store, into placeholder samples, when the store
+    /// can count it; `None` to scan instead. Returns the lines counted.
+    ///
+    /// The store counts lines and bytes per group into buckets as wide as the greatest
+    /// common divisor of the step and the range, laid on the windows' own bounds, so
+    /// every window is a whole number of buckets and its count is theirs summed. The
+    /// answer is the one `emit` gives from the lines themselves: same windows, same
+    /// values, same staleness markers.
+    fn counted_in_store(
+        &self,
+        index: usize,
+        store: &dyn LogStore,
+        steps: &[u64],
+        out: &mut Vec<MetricSample>,
+    ) -> Result<Option<u64>> {
+        let Some(group_by) = self.store_grouping() else {
+            return Ok(None);
+        };
+        let (Some(&first), Some(&last)) = (steps.first(), steps.last()) else {
+            return Ok(None);
+        };
+        let step = steps
+            .get(1)
+            .map_or(self.range_nanos, |second| second - first);
+        if steps.windows(2).any(|pair| pair[1] - pair[0] != step) {
+            return Ok(None);
+        }
+        let width = gcd(step, self.range_nanos);
+        // A window clipped at zero is not on the grid.
+        if width == 0 || first.saturating_sub(self.offset_nanos) < self.range_nanos {
+            return Ok(None);
+        }
+        let (anchor, _) = self.window(first);
+        let (_, until) = self.window(last);
+        if (until - anchor) / width > MAX_BUCKETS {
+            return Ok(None);
+        }
+        let body = crate::loki::body_filters(&self.query);
+        let request = telemetryd_store::BucketRequest {
+            anchor_nanos: anchor,
+            until_nanos: until,
+            width_nanos: width,
+            matchers: &self.query.matchers,
+            body_filters: &body,
+            group_by: &group_by,
+            bytes: matches!(
+                self.function,
+                RangeFunction::BytesOverTime | RangeFunction::BytesRate
+            ),
+        };
+        let Some(counted) = store.buckets(&request)? else {
+            return Ok(None);
+        };
+
+        let mut series: HashMap<Labels, std::collections::BTreeMap<u64, (u64, u64)>> =
+            HashMap::new();
+        let mut add = |labels: Labels, bucket: u64, lines: u64, bytes: u64| -> Result<()> {
+            if !series.contains_key(&labels) && series.len() >= MAX_SERIES {
+                return Err(too_many_series());
+            }
+            let slot = series.entry(labels).or_default().entry(bucket).or_default();
+            slot.0 += lines;
+            slot.1 += bytes;
+            Ok(())
+        };
+        for (values, buckets) in counted.groups {
+            let labels: Labels = group_by
+                .iter()
+                .zip(values)
+                .filter(|(_, value)| !value.is_empty())
+                .map(|(name, value)| (name.clone(), value))
+                .collect();
+            for (bucket, lines, bytes) in buckets {
+                add(labels.clone(), bucket, lines, bytes)?;
+            }
+        }
+        for record in &counted.individual {
+            if let Some((labels, _)) = self.sample(record) {
+                let bucket = (record.timestamp_nanos - anchor - 1) / width;
+                add(labels, bucket, 1, record.body.len() as u64)?;
+            }
+        }
+
+        self.emit_counted(index, series, (anchor, width), steps, out)?;
+        Ok(Some(counted.lines))
+    }
+
+    /// Each counted series' value at each step, as [`Self::emit`] gives it from lines.
+    fn emit_counted(
+        &self,
+        index: usize,
+        series: HashMap<Labels, std::collections::BTreeMap<u64, (u64, u64)>>,
+        (anchor, width): (u64, u64),
+        steps: &[u64],
+        out: &mut Vec<MetricSample>,
+    ) -> Result<()> {
+        #[allow(clippy::cast_precision_loss)]
+        let seconds = self.range_nanos as f64 / 1e9;
+        let name = format!("{PLACEHOLDER}{index}");
+        for (mut labels, buckets) in series {
+            labels.insert("__name__", name.clone());
+            let keys: Vec<u64> = buckets.keys().copied().collect();
+            let mut lines_before = vec![0u64];
+            let mut bytes_before = vec![0u64];
+            for (lines, bytes) in buckets.values() {
+                lines_before.push(lines_before.last().copied().unwrap_or(0) + lines);
+                bytes_before.push(bytes_before.last().copied().unwrap_or(0) + bytes);
+            }
+            let mut present = false;
+            for &at in steps {
+                let (floor, top) = self.window(at);
+                // The buckets whose upper bound lies in (floor, top].
+                let low = keys.partition_point(|&k| k < (floor - anchor) / width);
+                let high = keys.partition_point(|&k| k < (top - anchor) / width);
+                let lines = lines_before[high] - lines_before[low];
+                let bytes = bytes_before[high] - bytes_before[low];
+                #[allow(clippy::cast_precision_loss)]
+                let value = (lines > 0).then(|| match self.function {
+                    RangeFunction::CountOverTime => lines as f64,
+                    RangeFunction::Rate => lines as f64 / seconds,
+                    RangeFunction::BytesOverTime => bytes as f64,
+                    _ => bytes as f64 / seconds,
+                });
+                let sample = |value: f64| MetricSample {
+                    timestamp_nanos: at,
+                    series: labels.clone(),
+                    value,
+                    kind: MetricKind::Gauge,
+                };
+                match value {
+                    Some(value) => {
+                        out.push(sample(value));
+                        present = true;
+                    }
+                    None if present => {
+                        out.push(sample(f64::from_bits(STALE_MARKER_BITS)));
+                        present = false;
+                    }
+                    None => {}
+                }
+            }
+            if out.len() > MAX_SAMPLES {
+                return Err(Error::BadRequest(format!(
+                    "this query would hold more than {MAX_SAMPLES} points; widen `step`, \
+                     narrow the range, or aggregate with sum by (…)"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// The window a step reads: `(floor, top]`, offset applied.
     fn window(&self, at: u64) -> (u64, u64) {
         let top = at.saturating_sub(self.offset_nanos);
@@ -668,7 +875,7 @@ impl RangeAggregation {
     /// Read every line any step's window covers, once, into series.
     fn extract(
         &self,
-        store: &RecordStore<LogSchema>,
+        store: &dyn LogStore,
         steps: &[u64],
         deadline: Deadline,
     ) -> Result<(Extracted, u64)> {
@@ -699,7 +906,9 @@ impl RangeAggregation {
             false
         };
         let prefilter = crate::loki::build_line_prefilter(&self.query);
-        let mut scan = telemetryd_store::Scan::range(floor.saturating_add(1), top);
+        let body = crate::loki::body_filters(&self.query);
+        let mut scan =
+            telemetryd_store::Scan::range(floor.saturating_add(1), top).body_filters(&body);
         if let Some(prefilter) = prefilter.as_ref() {
             scan = scan.columns(prefilter);
         }
@@ -1011,7 +1220,7 @@ fn is_label_name(name: &str) -> bool {
 /// # Errors
 /// As [`evaluate`], and for an answer over [`MAX_SERIES`].
 pub fn answer_range(
-    store: &RecordStore<LogSchema>,
+    store: &dyn LogStore,
     query: &MetricQuery,
     steps: &[u64],
     deadline: Deadline,
@@ -1056,7 +1265,7 @@ pub fn answer_range(
 /// # Errors
 /// As [`evaluate`].
 pub fn answer_instant(
-    store: &RecordStore<LogSchema>,
+    store: &dyn LogStore,
     query: &MetricQuery,
     at: u64,
     deadline: Deadline,

@@ -18,8 +18,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use telemetryd_core::{Error, LabelMatcher, Labels, MetricSample, Result};
-use telemetryd_store::RecordStore;
-use telemetryd_store::metrics::MetricSchema;
+use telemetryd_store::MetricStore;
 
 use crate::promql::{
     AggregateOp, BinaryModifier, BinaryOp, Expr, Function, Group, Grouping, Matching, Offset,
@@ -917,7 +916,7 @@ impl Snapshot {
     /// `Ok(None)` when the store cannot read this way — a segment from before stream
     /// dictionaries — and the caller reads the span whole instead.
     fn load_windows(
-        store: &RecordStore<MetricSchema>,
+        store: &dyn MetricStore,
         pushdown: &[LabelMatcher],
         windows: &[(u64, u64)],
         max_samples: u64,
@@ -993,10 +992,11 @@ impl Snapshot {
     /// that reading them would cost more than the ordinary scan. The caller then takes
     /// that scan, untouched, so this can only ever add speed.
     fn fold_from_summaries(
-        store: &RecordStore<MetricSchema>,
+        store: &dyn MetricStore,
         expr: &Expr,
         calls: &[(&Selector, Duration, Function)],
         points: &[u64],
+        max_samples: u64,
     ) -> Result<Option<Self>> {
         // What the shortcut may spend on segments the window does not contain whole. One
         // point can afford a handful; a chart asking for two hundred and fifty pays for
@@ -1004,6 +1004,12 @@ impl Snapshot {
         // sliced scan instead — which is the right way to read a window narrower than a
         // segment anyway.
         let whole_reads = 4usize.checked_div(points.len()).unwrap_or(0);
+        // The query's sample ceiling, shared by its selectors: each reads beside its
+        // summaries, and together they must hold no more than one read could.
+        let max_samples = match max_samples {
+            0 => 0,
+            n => (n / calls.len().max(1) as u64).max(1),
+        };
 
         let mut table = telemetryd_core::series::SeriesTable::new();
         let mut prepared = Vec::with_capacity(calls.len());
@@ -1013,20 +1019,29 @@ impl Snapshot {
             let range_nanos = duration_nanos(*range);
             let gauges = summarises_gauge(*function);
             let mut by_step: Vec<Vec<(usize, f64)>> = vec![Vec::new(); points.len()];
+            let windows: Vec<(u64, u64)> = points
+                .iter()
+                .map(|at_nanos| {
+                    let at = offset.apply(*at_nanos);
+                    (at.saturating_sub(range_nanos), at)
+                })
+                .collect();
+            // The selector's own matchers, not the pushdown shared by every selector: the
+            // pushdown is only what all of them have in common, so `x{code="500"}` divided
+            // by `x` would otherwise fold every code into both sides and read as exactly 1.
+            // The selector's matchers include the pushdown, so this only ever prunes more.
+            let Some(folded_windows) = store.fold_windows(
+                &windows,
+                &selector.matchers,
+                whole_reads,
+                max_samples,
+                gauges,
+            )?
+            else {
+                return Ok(None);
+            };
 
-            for (point, at_nanos) in points.iter().enumerate() {
-                let at = offset.apply(*at_nanos);
-                let floor = at.saturating_sub(range_nanos);
-                // The selector's own matchers, not the pushdown shared by every selector:
-                // the pushdown is only what all of them have in common, so `x{code="500"}`
-                // divided by `x` would otherwise fold every code into both sides and read
-                // as exactly 1. The selector's matchers include the pushdown, so this only
-                // ever prunes more.
-                let Some(folded) =
-                    store.fold_window(floor, at, &selector.matchers, whole_reads, gauges)?
-                else {
-                    return Ok(None);
-                };
+            for ((point, at_nanos), folded) in points.iter().enumerate().zip(folded_windows) {
                 for (series, summary) in folded {
                     let value = if gauges {
                         // Every series here has samples in the window, so each of these
@@ -1194,7 +1209,7 @@ impl Snapshot {
     /// overlap — late data — so when a series steps back the read is abandoned and the
     /// span is read again in slices, where every sample is sorted before it is folded.
     fn accumulate_folds(
-        store: &RecordStore<MetricSchema>,
+        store: &dyn MetricStore,
         calls: &[(&Selector, Duration, bool)],
         points: &[u64],
         pushdown: &[telemetryd_core::LabelMatcher],
@@ -1214,7 +1229,7 @@ impl Snapshot {
     /// Fold straight from the store, a series at a time. `Ok(false)` when one series'
     /// runs came out of time order, and `state` is then to be discarded.
     fn fold_columns(
-        store: &RecordStore<MetricSchema>,
+        store: &dyn MetricStore,
         state: &mut FoldState<'_>,
         pushdown: &[telemetryd_core::LabelMatcher],
         windows: &[(u64, u64)],
@@ -1268,7 +1283,7 @@ impl Snapshot {
     /// Fold the windows a slice at a time, each slice sorted by the store before it is
     /// folded.
     fn fold_slices(
-        store: &RecordStore<MetricSchema>,
+        store: &dyn MetricStore,
         state: &mut FoldState<'_>,
         pushdown: &[telemetryd_core::LabelMatcher],
         windows: &[(u64, u64)],
@@ -1369,7 +1384,7 @@ impl Snapshot {
     /// Memory becomes O(series), not O(window): twelve thousand series is under a
     /// megabyte whether the window is an hour or a year.
     fn load_folded(
-        store: &RecordStore<MetricSchema>,
+        store: &dyn MetricStore,
         expr: &Expr,
         points: &[u64],
         pushdown: &[telemetryd_core::LabelMatcher],
@@ -1386,7 +1401,7 @@ impl Snapshot {
         // days of retention is eighty-three days of empty slices, and an empty slice
         // still pays a full scan: the segments are pruned on their time range before one
         // row is read, so the cost is the same whether it finds anything or not.
-        let from = match store.status().oldest_record_nanos {
+        let from = match store.oldest_sample_nanos()? {
             Some(oldest) => asked_from.max(oldest),
             None => asked_from,
         };
@@ -1400,7 +1415,9 @@ impl Snapshot {
             .iter()
             .map(|(selector, range, per_second)| (*selector, *range, rate_function(*per_second)))
             .collect();
-        if let Some(snapshot) = Self::fold_from_summaries(store, expr, &summarised, points)? {
+        if let Some(snapshot) =
+            Self::fold_from_summaries(store, expr, &summarised, points, max_samples)?
+        {
             return Ok(snapshot);
         }
 
@@ -1467,7 +1484,7 @@ impl Snapshot {
     }
 
     pub fn load(
-        store: &RecordStore<MetricSchema>,
+        store: &dyn MetricStore,
         expr: &Expr,
         start_nanos: u64,
         end_nanos: u64,
@@ -1484,7 +1501,7 @@ impl Snapshot {
     /// folded load built for two points and a step loop asking for twelve is how an index
     /// went out of bounds and took the server down with it.
     pub fn load_at(
-        store: &RecordStore<MetricSchema>,
+        store: &dyn MetricStore,
         expr: &Expr,
         points: &[u64],
         max_samples: u64,
@@ -1547,7 +1564,9 @@ impl Snapshot {
         // data, a sum that is not finite — it is read the ordinary way below.
         if Self::should_summarise(expr) {
             let calls = summary_calls(expr);
-            if let Some(snapshot) = Self::fold_from_summaries(store, expr, &calls, points)? {
+            if let Some(snapshot) =
+                Self::fold_from_summaries(store, expr, &calls, points, max_samples)?
+            {
                 return Ok(snapshot.bounded(points));
             }
         }

@@ -276,6 +276,68 @@ enum SeriesLoss {
     Evicted(u64),
 }
 
+/// What each write-ahead log holds.
+fn report_wal(status: &Value) {
+    if let Some(wal) = status
+        .pointer("/wal")
+        .or_else(|| status.pointer("/storage/wal"))
+        .and_then(Value::as_object)
+    {
+        crate::out::outln!("  wal");
+        for (signal, stats) in wal {
+            crate::out::outln!(
+                "    {signal:<8}   {} records, {} segments",
+                stats
+                    .get("appended_records")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                stats.get("segments").and_then(Value::as_u64).unwrap_or(0),
+            );
+        }
+    }
+}
+
+/// The ClickHouse lines, and an alert when a request to it failed recently.
+fn report_clickhouse(clickhouse: &Value) -> Option<String> {
+    let field = |key: &str| clickhouse.get(key).and_then(Value::as_str).unwrap_or("?");
+    crate::out::outln!(
+        "  store        ClickHouse {}, database {}",
+        field("url"),
+        field("database")
+    );
+    for request in clickhouse
+        .get("requests")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let count = |key: &str| request.get(key).and_then(Value::as_u64).unwrap_or(0);
+        crate::out::outln!(
+            "    {:<8}   {} ok, {} failed",
+            request
+                .get("operation")
+                .and_then(Value::as_str)
+                .unwrap_or("?"),
+            count("succeeded"),
+            count("failed"),
+        );
+    }
+    // Kept after recovery, so said only while recent: a failure from yesterday is not
+    // something to act on now.
+    let error = clickhouse.get("last_error").filter(|e| !e.is_null())?;
+    let ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |now| now.as_secs())
+        .saturating_sub(error.get("at").and_then(Value::as_u64).unwrap_or(0));
+    (ago < 3_600).then(|| {
+        format!(
+            "the last ClickHouse request to fail, {} ago: {}",
+            humantime::format_duration(std::time::Duration::from_secs(ago)),
+            error.get("message").and_then(Value::as_str).unwrap_or("?")
+        )
+    })
+}
+
 // Every value here comes from a JSON number and is rendered for a human: byte
 // counts and an uptime in seconds, all far below any lossy boundary.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -310,43 +372,38 @@ fn print_summary(status: &Value) {
     );
     crate::out::outln!("  data dir     {}", text("/storage/data_dir"));
 
-    let used = number("/storage/disk_used_bytes") as u64;
-    let budget = number("/storage/disk_budget_bytes") as u64;
-    let ratio = number("/storage/disk_used_ratio") * 100.0;
-    crate::out::outln!(
-        "  disk         {} of {} ({ratio:.1}%)",
-        bytesize::ByteSize::b(used),
-        bytesize::ByteSize::b(budget),
-    );
+    let clickhouse_alert = if let Some(clickhouse) = status
+        .pointer("/storage/clickhouse")
+        .filter(|c| !c.is_null())
+    {
+        report_clickhouse(clickhouse)
+    } else {
+        // The local disk is the store only without ClickHouse; with it, the budget
+        // guards nothing an operator would ask about.
+        let used = number("/storage/disk_used_bytes") as u64;
+        let budget = number("/storage/disk_budget_bytes") as u64;
+        let ratio = number("/storage/disk_used_ratio") * 100.0;
+        crate::out::outln!(
+            "  disk         {} of {} ({ratio:.1}%)",
+            bytesize::ByteSize::b(used),
+            bytesize::ByteSize::b(budget),
+        );
+        None
+    };
 
     let series_alert = report_series(status);
 
-    if let Some(wal) = status
-        .pointer("/wal")
-        .or_else(|| status.pointer("/storage/wal"))
-        .and_then(Value::as_object)
-    {
-        crate::out::outln!("  wal");
-        for (signal, stats) in wal {
-            crate::out::outln!(
-                "    {signal:<8}   {} records, {} segments",
-                stats
-                    .get("appended_records")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                stats.get("segments").and_then(Value::as_u64).unwrap_or(0),
-            );
-        }
-    }
+    report_wal(status);
 
     // Anything that needs attention goes last, where it is read.
     let mut alerts = Vec::new();
+    alerts.extend(clickhouse_alert);
     if flag("/storage/over_budget") {
         alerts.push(format!(
             "disk usage ({}) is over the configured budget ({}); the reaper is \
              dropping the oldest data",
-            bytesize::ByteSize::b(used),
-            bytesize::ByteSize::b(budget)
+            bytesize::ByteSize::b(number("/storage/disk_used_bytes") as u64),
+            bytesize::ByteSize::b(number("/storage/disk_budget_bytes") as u64)
         ));
     }
     alerts.extend(series_alert);

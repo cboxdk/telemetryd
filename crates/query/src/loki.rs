@@ -10,8 +10,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use telemetryd_core::{Error, Labels, LogRecord, Result};
-use telemetryd_store::RecordStore;
-use telemetryd_store::logs::LogSchema;
+use telemetryd_store::LogStore;
 
 use arrow::array::Array as _;
 
@@ -476,7 +475,7 @@ pub struct StatsSummary {
 
 /// Run a `query_range` against the log store.
 pub fn query_range(
-    store: &RecordStore<LogSchema>,
+    store: &dyn LogStore,
     request: &QueryRangeRequest,
 ) -> Result<LokiResponse<StreamsData>> {
     let started = std::time::Instant::now();
@@ -499,7 +498,9 @@ pub fn query_range(
     // `|= "text"` that rejects 99% of rows now costs a substring scan over a
     // contiguous buffer instead of ~500ns of allocation per row.
     let prefilter = build_line_prefilter(&request.query);
+    let body = body_filters(&request.query);
     let mut scan = telemetryd_store::Scan::range(request.start_nanos, request.end_nanos)
+        .body_filters(&body)
         .limit(request.limit)
         .order(match request.direction {
             Direction::Backward => telemetryd_store::Order::Descending,
@@ -547,6 +548,26 @@ pub fn query_range(
 /// contract, so anything not handled here simply falls through.
 pub(crate) type Prefilter =
     Box<dyn Fn(&arrow::record_batch::RecordBatch, &mut Vec<u32>) -> Result<()> + Send + Sync>;
+
+/// The query's line filters on the stored body, for a store that selects with them
+/// itself — what `build_line_prefilter` is for the local one.
+pub fn body_filters(query: &LogQuery) -> Vec<telemetryd_store::BodyFilter> {
+    query
+        .raw_line_filters()
+        .filter_map(|filter| {
+            match filter.op {
+                logql::LineOp::Contains => Some(true),
+                logql::LineOp::NotContains => Some(false),
+                _ => None,
+            }
+            .map(|contains| telemetryd_store::BodyFilter {
+                contains,
+                text: filter.pattern.clone(),
+            })
+        })
+        .filter(|filter| !filter.text.is_empty())
+        .collect()
+}
 
 pub(crate) fn build_line_prefilter(query: &LogQuery) -> Option<Prefilter> {
     // Only the filters that see the stored line: after `line_format` or `decolorize`
@@ -698,14 +719,14 @@ fn group_into_streams(
 /// With `query`, only labels of streams that selector matches, as Loki does. It was
 /// ignored, so Grafana's label browser offered values that returned nothing when picked.
 pub fn label_names(
-    store: &RecordStore<LogSchema>,
+    store: &dyn LogStore,
     selectors: &[String],
     start_nanos: u64,
     end_nanos: u64,
 ) -> Result<LokiResponse<Vec<String>>> {
     if selectors.is_empty() {
         return Ok(LokiResponse::success(
-            store.label_names(start_nanos, end_nanos),
+            store.label_names(start_nanos, end_nanos)?,
         ));
     }
     let streams = matching_streams(store, selectors, start_nanos, end_nanos)?;
@@ -714,7 +735,7 @@ pub fn label_names(
 
 /// `/loki/api/v1/label/{name}/values`, scoped by `query` like the names.
 pub fn label_values(
-    store: &RecordStore<LogSchema>,
+    store: &dyn LogStore,
     name: &str,
     selectors: &[String],
     start_nanos: u64,
@@ -734,7 +755,7 @@ pub fn label_values(
 }
 
 fn matching_streams(
-    store: &RecordStore<LogSchema>,
+    store: &dyn LogStore,
     selectors: &[String],
     start_nanos: u64,
     end_nanos: u64,
@@ -749,7 +770,7 @@ fn matching_streams(
 
 /// `/loki/api/v1/series`
 pub fn series(
-    store: &RecordStore<LogSchema>,
+    store: &dyn LogStore,
     selectors: &[String],
     start_nanos: u64,
     end_nanos: u64,

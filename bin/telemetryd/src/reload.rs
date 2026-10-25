@@ -96,12 +96,74 @@ fn immutable_differences(old: &Config, new: &Config) -> Vec<String> {
         format!("{:?}", old.server.tls),
         format!("{:?}", new.server.tls),
     );
-    // Named without its values: an upstream URL can carry credentials in its userinfo.
+    // Named without their values: an upstream URL can carry credentials in its userinfo.
     if old.relay.upstream != new.relay.upstream {
         differences.push("relay.upstream (changed)".to_owned());
     }
+    clickhouse_differences(old, new, &mut differences);
 
     differences
+}
+
+/// `[clickhouse]`, none of which a reload can change.
+fn clickhouse_differences(old: &Config, new: &Config, differences: &mut Vec<String>) {
+    let mut note = |name: &str, old: String, new: String| {
+        if old != new {
+            differences.push(format!("{name} ({old} -> {new})"));
+        }
+    };
+    // The ClickHouse connection is made once, and the schema, its tiers and its storage
+    // policy with it. The URL and the password are named without their values.
+    let (was, is) = (&old.clickhouse, &new.clickhouse);
+    note(
+        "clickhouse.database",
+        was.database.clone(),
+        is.database.clone(),
+    );
+    note("clickhouse.user", was.user.clone(), is.user.clone());
+    note(
+        "clickhouse.cluster",
+        was.cluster.clone(),
+        is.cluster.clone(),
+    );
+    note(
+        "clickhouse.create_schema",
+        was.create_schema.to_string(),
+        is.create_schema.to_string(),
+    );
+    note(
+        "clickhouse.storage_policy",
+        was.storage_policy.clone(),
+        is.storage_policy.clone(),
+    );
+    note(
+        "clickhouse.cold_after",
+        humantime::format_duration(was.cold_after).to_string(),
+        humantime::format_duration(is.cold_after).to_string(),
+    );
+    note(
+        "clickhouse.cold_volume",
+        was.cold_volume.clone(),
+        is.cold_volume.clone(),
+    );
+    note(
+        "clickhouse.allow_plaintext",
+        was.allow_plaintext.to_string(),
+        is.allow_plaintext.to_string(),
+    );
+    note(
+        "clickhouse.timeout",
+        humantime::format_duration(was.timeout).to_string(),
+        humantime::format_duration(is.timeout).to_string(),
+    );
+    // Named without their values: the URL may name a host worth not logging, and the
+    // password is a secret.
+    if was.url != is.url {
+        differences.push("clickhouse.url (changed)".to_owned());
+    }
+    if was.password != is.password {
+        differences.push("clickhouse.password (changed)".to_owned());
+    }
 }
 
 /// Re-read configuration and apply the parts that can change.

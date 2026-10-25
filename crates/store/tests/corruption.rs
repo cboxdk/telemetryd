@@ -67,6 +67,7 @@ fn record(i: u64) -> LogRecord {
         attributes: Labels::new(),
         trace_id: None,
         span_id: None,
+        resource: telemetryd_core::Labels::default(),
     }
 }
 
@@ -80,6 +81,7 @@ fn everything() -> Scan<'static> {
         exact_key: None,
         columns: None,
         required_text: None,
+        body_filters: &[],
     }
 }
 
@@ -256,6 +258,7 @@ fn a_segment_from_before_these_fields_existed_still_reads() {
                 exact_key: None,
                 columns: None,
                 required_text: Some("line 7"),
+                body_filters: &[],
             },
             &matchers,
             &|record: &LogRecord| record.body.contains("line 7"),

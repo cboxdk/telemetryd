@@ -1,0 +1,1 @@
+<clickhouse><macros><shard>01</shard><replica>s1r2</replica></macros></clickhouse>

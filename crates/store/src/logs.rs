@@ -150,6 +150,7 @@ impl RecordSchema for LogSchema {
                 attributes: labels_from_json(attributes.value(row)),
                 trace_id: optional_string(trace_ids, row),
                 span_id: optional_string(span_ids, row),
+                resource: telemetryd_core::Labels::default(),
             });
         }
         Ok(out)
@@ -241,6 +242,7 @@ mod tests {
             attributes,
             trace_id: Some("4bf92f3577b34da6a3ce929d0e0e4736".to_owned()),
             span_id: None,
+            resource: telemetryd_core::Labels::default(),
         }
     }
 

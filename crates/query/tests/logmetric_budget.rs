@@ -27,6 +27,7 @@ fn a_query_past_its_deadline_is_stopped() {
             attributes: Labels::new(),
             trace_id: None,
             span_id: None,
+            resource: telemetryd_core::Labels::default(),
         })
         .collect();
     store.logs().append(&records).unwrap();

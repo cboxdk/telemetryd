@@ -118,6 +118,28 @@ fn reference() -> String {
     format!("{:08x}", clock.rotate_left(13) ^ sequence)
 }
 
+/// `server.request_timeout`, answered as every other refusal to wait is: `503` with
+/// `Retry-After` and a reason.
+///
+/// `tower_http`'s timeout answered a bare `503`, with no body and no `Retry-After`. With
+/// ClickHouse as the store an insert waits up to `clickhouse.timeout`, 30 seconds by
+/// default like this one, so a ClickHouse that had stopped completing inserts — Keeper
+/// down, say — reached every sender as a `503` that did not say when to come back.
+pub async fn time_limit(
+    axum::extract::State(limit): axum::extract::State<std::time::Duration>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    match tokio::time::timeout(limit, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => ApiError(Error::Unavailable(format!(
+            "the request took longer than server.request_timeout ({}); retry shortly",
+            humantime::format_duration(limit)
+        )))
+        .into_response(),
+    }
+}
+
 /// The Prometheus API's own error envelope, on the Prometheus API.
 ///
 /// Prometheus answers `{"status":"error","errorType":"bad_data","error":"…"}`, and
@@ -228,6 +250,38 @@ mod tests {
         let response = ApiError(error).into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(response.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    /// A request past `server.request_timeout` says when to come back, as an insert that
+    /// ClickHouse is too slow to complete must for the sender to retry it.
+    #[tokio::test]
+    async fn a_timed_out_request_asks_the_client_to_retry() {
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .route(
+                "/v1/logs",
+                axum::routing::post(|| async {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    "stored"
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                std::time::Duration::from_millis(20),
+                time_limit,
+            ));
+        let request = axum::http::Request::post("/v1/logs")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("server.request_timeout"),
+            "{body:?}"
+        );
     }
 
     /// A 5xx tells the caller what to do and where the detail is, not the detail: an I/O

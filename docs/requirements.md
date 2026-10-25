@@ -51,8 +51,10 @@ table to stay true.
 
 Stated because these are the dependencies comparable systems do need:
 
-- **No database.** Storage is files in one directory.
-- **No object storage.**
+- **No database.** Storage is files in one directory — unless you choose ClickHouse, to
+  run several instances or keep months; see
+  [Scale out on ClickHouse](cookbook/scale-out-on-clickhouse.md).
+- **No object storage.** ClickHouse can tier older days onto it, if you want that.
 - **No collector or agent.** Applications send OTLP straight to telemetryd.
 - **No protobuf or C extension on the client.** OTLP/HTTP JSON is first-class, which is
   what makes this work under PHP-FPM.

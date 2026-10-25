@@ -69,6 +69,7 @@ fn record(i: u64) -> LogRecord {
         attributes,
         trace_id: None,
         span_id: None,
+        resource: telemetryd_core::Labels::default(),
     }
 }
 
@@ -82,6 +83,7 @@ fn newest_hundred() -> Scan<'static> {
         exact_key: None,
         columns: None,
         required_text: None,
+        body_filters: &[],
     }
 }
 
@@ -211,6 +213,7 @@ fn a_query_sees_records_appended_a_moment_ago() {
                     exact_key: None,
                     columns: None,
                     required_text: None,
+                    body_filters: &[],
                 },
                 &matchers,
                 &|_| true,

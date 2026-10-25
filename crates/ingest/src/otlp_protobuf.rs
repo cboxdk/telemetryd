@@ -935,6 +935,7 @@ mod equivalence {
 
         let (limits, ingest) = context();
         let ctx = DecodeContext {
+            keep_resource: false,
             pool: None,
             limits: &limits,
             ingest: &ingest,
@@ -1031,6 +1032,7 @@ mod equivalence {
         let decoded = crate::logs::convert_data(
             &logs(&wire).unwrap(),
             DecodeContext {
+                keep_resource: false,
                 pool: None,
                 limits: &limits,
                 ingest: &ingest,
