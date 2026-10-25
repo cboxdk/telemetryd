@@ -45,6 +45,10 @@ const BATCH: usize = 2_000;
 /// Records one request will return. The client walks the range in these.
 const DEFAULT_LIMIT: usize = 50_000;
 const MAX_LIMIT: usize = 200_000;
+/// Records one timestamp may hold for a page to be all of it. A page that is one
+/// nanosecond end to end is read whole rather than split, so this, not `limit`, is
+/// what bounds its memory; past it the request is refused rather than truncated.
+const AT_ONE_TIMESTAMP: usize = 10 * MAX_LIMIT;
 
 #[derive(Debug, Deserialize)]
 pub struct ExportParams {
@@ -236,11 +240,11 @@ fn page(
     // nanosecond — a scrape writes thousands of samples at one — and the next page
     // would start past the rest. So a full page ends before its last timestamp,
     // which the next page then starts at; and a full page that is one timestamp end
-    // to end is all of that timestamp, however many records it holds.
+    // to end is all of that timestamp, up to `AT_ONE_TIMESTAMP` records.
     let at = |nanos: u64| Scan {
         start_nanos: nanos,
         end_nanos: nanos,
-        limit: 0,
+        limit: AT_ONE_TIMESTAMP + 1,
         ..scan
     };
     Ok(match signal {
@@ -291,7 +295,17 @@ fn whole_timestamps<R>(
         return Ok(records);
     };
     if first == last {
-        return all_at(last);
+        let all = all_at(last)?;
+        if all.len() > AT_ONE_TIMESTAMP {
+            return Err(Error::LimitExceeded {
+                limit: "records at one timestamp",
+                detail: format!(
+                    "more than {AT_ONE_TIMESTAMP} records share the timestamp {last}, and a \
+                     page cannot end partway through one; narrow the export by selector"
+                ),
+            });
+        }
+        return Ok(all);
     }
     while records.last().is_some_and(|r| timestamp(r) == last) {
         records.pop();
@@ -335,6 +349,12 @@ mod tests {
             whole_timestamps(vec![3, 3, 3], 3, |r| *r, all).unwrap(),
             vec![3; 7]
         );
+        // More at that timestamp than a page may hold: refused, not cut short.
+        let too_many = |t: u64| Ok(vec![t; AT_ONE_TIMESTAMP + 1]);
+        assert!(matches!(
+            whole_timestamps(vec![3, 3, 3], 3, |r| *r, too_many),
+            Err(Error::LimitExceeded { .. })
+        ));
     }
 
     #[test]

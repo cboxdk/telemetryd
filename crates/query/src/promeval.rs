@@ -996,6 +996,7 @@ impl Snapshot {
         expr: &Expr,
         calls: &[(&Selector, Duration, Function)],
         points: &[u64],
+        max_samples: u64,
     ) -> Result<Option<Self>> {
         // What the shortcut may spend on segments the window does not contain whole. One
         // point can afford a handful; a chart asking for two hundred and fifty pays for
@@ -1023,8 +1024,13 @@ impl Snapshot {
             // pushdown is only what all of them have in common, so `x{code="500"}` divided
             // by `x` would otherwise fold every code into both sides and read as exactly 1.
             // The selector's matchers include the pushdown, so this only ever prunes more.
-            let Some(folded_windows) =
-                store.fold_windows(&windows, &selector.matchers, whole_reads, gauges)?
+            let Some(folded_windows) = store.fold_windows(
+                &windows,
+                &selector.matchers,
+                whole_reads,
+                max_samples,
+                gauges,
+            )?
             else {
                 return Ok(None);
             };
@@ -1403,7 +1409,9 @@ impl Snapshot {
             .iter()
             .map(|(selector, range, per_second)| (*selector, *range, rate_function(*per_second)))
             .collect();
-        if let Some(snapshot) = Self::fold_from_summaries(store, expr, &summarised, points)? {
+        if let Some(snapshot) =
+            Self::fold_from_summaries(store, expr, &summarised, points, max_samples)?
+        {
             return Ok(snapshot);
         }
 
@@ -1550,7 +1558,9 @@ impl Snapshot {
         // data, a sum that is not finite — it is read the ordinary way below.
         if Self::should_summarise(expr) {
             let calls = summary_calls(expr);
-            if let Some(snapshot) = Self::fold_from_summaries(store, expr, &calls, points)? {
+            if let Some(snapshot) =
+                Self::fold_from_summaries(store, expr, &calls, points, max_samples)?
+            {
                 return Ok(snapshot.bounded(points));
             }
         }

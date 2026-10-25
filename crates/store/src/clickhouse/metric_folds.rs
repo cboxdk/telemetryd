@@ -59,7 +59,8 @@ const HOURS_PER_PASS: u64 = 24 * 7;
 /// How long a lease to summarise is held.
 const LEASE_NANOS: u64 = 10 * 60 * 1_000_000_000;
 
-/// Samples one [`fold_windows`] reads beside the summaries before it declines.
+/// Samples one [`fold_windows`] reads beside the summaries before it declines, when the
+/// query's own ceiling is higher or none.
 const MAX_RAW_SAMPLES: usize = 20_000_000;
 
 /// Rows sent per insert while summarising.
@@ -521,6 +522,12 @@ pub fn roll_up(client: &Client, now: u64, owner: &str) -> Result<RollUp> {
         let last = ready.min((cursor / 24) * 24 + 23).min(budget_end - 1);
         done.folds_written += roll_hours(client, (cursor, last), None, now)?;
         done.hours += last - cursor + 1;
+        // An import may have rewound the cursor while these hours were made
+        // (`refold_from`): writing ours over it would lose the rewind, and the hours it
+        // asked for would never be made again. Stop instead; the next pass starts there.
+        if stored_cursor(client, HOURS_CURSOR)?.is_some_and(|stored| stored < cursor) {
+            return Ok(done);
+        }
         cursor = last + 1;
         write_meta(client, HOURS_CURSOR, &cursor.to_string())?;
         // Renewed as it goes: a pass over weeks of backlog outlasts one lease.
@@ -546,12 +553,20 @@ pub fn roll_up(client: &Client, now: u64, owner: &str) -> Result<RollUp> {
     if next_day < complete_until {
         done.folds_written += roll_days(client, next_day, complete_until - 1, now)?;
         done.days += complete_until - next_day;
+        // As for the hours: a rewind made meanwhile stands.
+        if stored_cursor(client, DAYS_CURSOR)?.is_some_and(|stored| stored < next_day) {
+            return Ok(done);
+        }
         write_meta(client, DAYS_CURSOR, &complete_until.to_string())?;
     }
     for day in repaired_days.into_iter().filter(|d| *d < complete_until) {
         done.folds_written += roll_days(client, day, day, now)?;
     }
     Ok(done)
+}
+
+fn stored_cursor(client: &Client, key: &str) -> Result<Option<u64>> {
+    Ok(read_meta(client, key)?.and_then(|v| v.parse::<u64>().ok()))
 }
 
 /// Have the summaries made again from `hour` on, by whichever instance next holds the
@@ -753,8 +768,13 @@ pub(super) fn fold_windows(
     client: &Client,
     reading: &Reading<'_>,
     windows: &[(u64, u64)],
+    max_samples: usize,
     gauges: bool,
 ) -> Result<Option<Vec<Folded>>> {
+    let ceiling = match max_samples {
+        0 => MAX_RAW_SAMPLES,
+        n => n.min(MAX_RAW_SAMPLES),
+    };
     let mut out: Vec<Folded> = vec![Vec::new(); windows.len()];
     if windows.is_empty() || reading.series.is_empty() {
         return Ok(Some(out));
@@ -874,7 +894,7 @@ pub(super) fn fold_windows(
             let value = super::metrics::joined_value(f64::from_bits(read(16)), row[24]);
             samples.entry(read(0)).or_default().push((read(8), value));
             held += 1;
-            if held > MAX_RAW_SAMPLES {
+            if held > ceiling {
                 too_many = true;
                 return Ok(ControlFlow::Break(()));
             }

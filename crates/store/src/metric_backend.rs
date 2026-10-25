@@ -50,6 +50,10 @@ pub trait MetricStore: Send + Sync {
     /// any one is declined. A store that can answer them together — one read for the
     /// summaries every window draws on — does; the default asks one at a time.
     ///
+    /// `max_samples` is the query's sample ceiling (`0`: none). A store that reads
+    /// samples beside its summaries declines rather than hold more than that, so the
+    /// caller's own read, which refuses past it, decides.
+    ///
     /// # Errors
     /// When the store cannot be read.
     fn fold_windows(
@@ -57,6 +61,7 @@ pub trait MetricStore: Send + Sync {
         windows: &[(u64, u64)],
         matchers: &[LabelMatcher],
         whole_reads_allowed: usize,
+        _max_samples: u64,
         gauges: bool,
     ) -> Result<Option<Vec<Folded>>> {
         let mut out = Vec::with_capacity(windows.len());

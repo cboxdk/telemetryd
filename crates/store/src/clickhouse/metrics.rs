@@ -415,6 +415,7 @@ impl MetricStore for ClickHouseMetrics {
                 &[(start_nanos, end_nanos)],
                 matchers,
                 whole_reads_allowed,
+                0,
                 gauges,
             )?
             .and_then(|mut windows| windows.pop()))
@@ -424,7 +425,10 @@ impl MetricStore for ClickHouseMetrics {
         &self,
         windows: &[(u64, u64)],
         matchers: &[LabelMatcher],
+        // Segments read whole, a local-store notion: here the hours not summarised are
+        // read by time range, and `max_samples` bounds what that holds.
         _whole_reads_allowed: usize,
+        max_samples: u64,
         gauges: bool,
     ) -> Result<Option<Vec<crate::metric_backend::Folded>>> {
         let (Some(start), Some(end)) = (
@@ -444,6 +448,7 @@ impl MetricStore for ClickHouseMetrics {
                 condition: selected.condition(),
             },
             windows,
+            usize::try_from(max_samples).unwrap_or(usize::MAX),
             gauges,
         )
     }
