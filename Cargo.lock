@@ -2466,7 +2466,7 @@ dependencies = [
 
 [[package]]
 name = "telemetryd"
-version = "0.72.2"
+version = "0.73.0"
 dependencies = [
  "anyhow",
  "bytesize",
@@ -2491,7 +2491,7 @@ dependencies = [
 
 [[package]]
 name = "telemetryd-core"
-version = "0.72.2"
+version = "0.73.0"
 dependencies = [
  "bytesize",
  "directories",
@@ -2512,7 +2512,7 @@ dependencies = [
 
 [[package]]
 name = "telemetryd-ingest"
-version = "0.72.2"
+version = "0.73.0"
 dependencies = [
  "bytesize",
  "flate2",
@@ -2528,7 +2528,7 @@ dependencies = [
 
 [[package]]
 name = "telemetryd-query"
-version = "0.72.2"
+version = "0.73.0"
 dependencies = [
  "arrow",
  "proptest",
@@ -2543,7 +2543,7 @@ dependencies = [
 
 [[package]]
 name = "telemetryd-server"
-version = "0.72.2"
+version = "0.73.0"
 dependencies = [
  "axum",
  "bytesize",
@@ -2578,7 +2578,7 @@ dependencies = [
 
 [[package]]
 name = "telemetryd-store"
-version = "0.72.2"
+version = "0.73.0"
 dependencies = [
  "arrow",
  "bytesize",
