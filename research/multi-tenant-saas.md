@@ -218,9 +218,41 @@ en tilstand:
   ubegrænset overforbrug.
 - `reject`: hard limit nået, eller projektet er suspenderet
 
-Med flere instanser tæller hver for sig. `accept_until(n)` kan derfor overskrides med op
-til (instanser × det, der kom ind før næste sync). Det er acceptabelt for et *soft*
-limit. Skal det være skarpt, så route pr. projekt på load balanceren.
+Uden delt tæller tæller hver instans for sig, og `accept_until(n)` kan overskrides med
+op til (instanser × det, der kom ind før næste sync). Det løses af den hurtige tæller
+nedenfor, så load balanceren ikke behøver at route pr. projekt.
+
+**Hurtig tæller mellem den timelige bogføring (Valkey).** Ingest kan ikke spørge
+ClickHouse ved hver request, og instanserne skal se det samme tal. Derfor tre lag:
+
+1. **I processen**: en atomisk tæller pr. (projekt, signal) i hver instans. Ingest rører
+   kun den, aldrig netværket. Afgørelsen (accept/afvis) tages ud fra det sidst kendte
+   totaltal plus det lokale delta.
+2. **Valkey, hvert ~1-2 sekund**: hver instans sender sine deltaer i én pipeline
+   (`INCRBY usage:{nøgle}:{periode}:{signal}`), får totalerne tilbage og lægger
+   projektet i et dirty-set (`SADD usage:dirty`). Overskridelsen af et soft limit er så
+   højst (instanser × 1-2 sekunders trafik), og det er skarpt nok.
+3. **Flush hvert 5-10 minut**: et job læser og tømmer dirty-settet, så kun projekter
+   med forbrug bliver rørt. Det skriver forbruget til control plane, som opdaterer
+   forbrugssiden, sender 80/100 %-advarsler og genberegner policyen.
+
+Delte kvoter falder naturligt ud af det: policyen siger, hvilke tællere et projekt
+tæller op (sin egen og fx organisationens pulje), så pooling er bare én `INCRBY` mere.
+Tællerne nulstilles ikke. Nøglen indeholder perioden (fra kontrakten), så en ny måned
+er en ny nøgle, og den gamle får en TTL.
+
+Valkey er til håndhævelse og live-visning, *ikke* til fakturering. Det er ikke en
+holdbar kilde, og et tab af Valkey må ikke koste penge eller data:
+
+- Falder Valkey ud, fortsætter instanserne på lokal tælling (som uden Valkey), dvs.
+  fail open. Ingest må aldrig afvise data, fordi tælleren er nede.
+- Fakturering bygger stadig på `usage_hourly` i ClickHouse, som tæller det, der faktisk
+  blev gemt. Ved månedsafslutning afstemmes Valkey mod den, og ClickHouse vinder.
+- Genstartes Valkey midt i en måned, kan tællerne genopbygges fra `usage_hourly`.
+
+Bemærk: `usage_hourly` er en materialized view og opdateres allerede ved insert, ikke
+én gang i timen. Til forbrugssiden alene kunne control plane læse den hvert 5. minut.
+Det, Valkey giver, er et fælles tal i hot path, som alle instanser kan håndhæve imod.
 
 Uden fast loft er overforbrug fakturering og ikke håndhævelse: control plane læser
 `usage_hourly`, trækker kvoten fra og sender resten til Cbox Billing som forbrug.
@@ -286,7 +318,8 @@ skal tjekkes, men det skal kunne:
    stempling, skema med `TenantId`, scoping-wrapper og isolationstests. Kun med
    ClickHouse. *Størst og vigtigst.*
 2. **Nøglebutik og sync** fra en minimal control plane (bare tenants og nøgler).
-3. **Måling og entitlements**: `usage_hourly`, policy-sync pr. projekt (accept, soft limit, reject), ikke-retrybart afslag.
+3. **Måling og entitlements**: `usage_hourly`, Valkey-tæller med flush hvert 5-10 min,
+   policy-sync pr. projekt (accept, soft limit, reject), ikke-retrybart afslag.
 4. **Per-tenant limits** (køandel, query-slots, serier) og **custom retention**.
 5. **Control plane til produkt**: Billing, forbrugsside, offentligt API, onboarding.
 6. **telemetry-ui i tenant-mode**.
@@ -387,4 +420,7 @@ når kunden selv slår det til. SaaS'en er et andet produkt, hvor data ligger ho
 1. **Hvilken export-vej først**: laravel-telemetry med to destinationer, eller
    telemetryd relay mod cloud'en? SDK-vejen er mindst arbejde. Relay-vejen dækker også
    ikke-Laravel-kilder.
-2. **Dubletter ved export**: tæller de med i kvoten, eller dedupes de i cloud'en?
+2. **Hvem kører flush-jobbet**: den lukkede telemetryd (én instans tager en lock i
+   Valkey), eller control plane som en Laravel-scheduled job, der læser Valkey direkte?
+   Control plane er enklest, fordi det alligevel er den, der skal bruge tallene.
+3. **Dubletter ved export**: tæller de med i kvoten, eller dedupes de i cloud'en?
