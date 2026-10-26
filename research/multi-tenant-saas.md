@@ -348,8 +348,9 @@ begge findes:
   overlever offline-perioder. Peg `upstream` på cloud'en og `token` på projektets
   ingest-nøgle. Cloud'en stempler tenant ud fra nøglen, så den lokale instans ikke kan
   skrive til et andet projekt. Relay mode gemmer lokalt og kan stadig forespørges
-  ("The relay is still queryable" i `docs/cookbook/relay-mode.md`), så "gem lokalt og
-  send en kopi til cloud" findes i praksis allerede. Men relay mode afviser i dag en
+  ("The relay is still queryable" i `docs/cookbook/relay-mode.md`), men docs'ene taler om
+  "the last few hours", altså en buffer og ikke et fuldt lokalt lager. Det skal tjekkes,
+  om normal retention gælder i relay mode. Men relay mode afviser i dag en
   almindelig `auth.ingest_token`, medmindre `trust_client_identity = true`, og den
   kræver Parquet (ikke `[clickhouse]`). En self-hosted installation, der bare vil
   sende en kopi, har derfor brug for en lettere variant, fx `[export.cloud]` uden
