@@ -19,7 +19,7 @@ Det der skal til, groft sagt:
    fra payload, og påtvunget på *alle* læsninger. Det er det største og vigtigste stykke.
 2. **Kun ClickHouse-backend til SaaS.** Tenant-kolonne først i alle sorteringsnøgler.
    Parquet-backenden forbliver single-tenant.
-3. **Kvoter og målinger pr. tenant**: tæller i ClickHouse, kvotestatus i telemetryd og
+3. **Entitlements pr. projekt**: målinger i ClickHouse, en policy pr. projekt fra control plane, og
    per-tenant limits, så én kunde ikke kan sulte de andre.
 4. **Et separat control plane** (Laravel-app) til konti, API-nøgler, planer, Cbox
    Billing, forbrug og det offentlige API. telemetryd skal ikke kende til priser.
@@ -45,6 +45,11 @@ med README'ens "local and production are the same program".
 ## Hvad der skal laves i telemetryd
 
 ### 1. Identitet: hvem er tenant?
+
+*Besluttet:* en tenant i telemetryd er et **projekt**. En organisation kan have mange
+projekter, men det begreb lever kun i control plane. telemetryd kender kun projekter.
+`app` (laravel-telemetrys `service.name`) bliver ved med at være et namespace inden i
+projektet.
 
 I dag er credentials statiske fra config og byttes på `SIGHUP`
 (`crates/server/src/state.rs:36`). Der findes tre token-sæt (ingest, query, admin),
@@ -134,37 +139,97 @@ Det skal til:
   (consistent hashing), så tællingen er præcis, eller accepter "op til N gange" og
   størrelsesjuster.
 
-### 6. Retention pr. plan
+### 6. Retention: mindst 90 dage, custom pr. kunde/projekt/plan
 
-TTL er i dag pr. tabel og sat fra config (`schema.rs:270`). Kunder på forskellige planer
-skal have forskellig retention. Forslag: et lille antal retention-trin (fx 7/14/30/90
-dage), en `RetentionDays`-kolonne sat ved ingest ud fra planen, og
-`PARTITION BY (RetentionDays, toDate(Timestamp))`. Så er udløb stadig at droppe hele
-partitioner, som er billigt, i stedet for row-level TTL-merges, som er dyrt.
+*Besluttet:* mindst 90 dage og frit sat pr. plan, kunde eller projekt. Det gælder alle
+signaler. Metrics har i dag 30 dage som default.
 
-Desuden: sletning af en hel tenant ved opsigelse eller GDPR
-(`ALTER TABLE … DELETE WHERE TenantId = …` på alle tabeller), som et admin-kommando.
+TTL er i dag pr. tabel og sat fra config (`schema.rs:270`). En hel tabel deler altså én
+retention, og det holder ikke længere. Forslag:
 
-### 7. Måling og kvoter ("X spans")
+- En `RetentionDays`-kolonne på hver række, sat ved ingest ud fra projektets aktuelle
+  retention (fra control plane, se punkt 7).
+- `PARTITION BY (RetentionDays, toMonday(Timestamp))`, og en baggrundsopgave i
+  telemetryd dropper partitioner, hvor `uge + RetentionDays` er passeret. Udløb forbliver
+  dermed at droppe hele partitioner, som er billigt. Row-level TTL på blandede
+  partitioner betyder merges og omskrivning, som er dyrt i den skala.
+- Ugepartitioner i stedet for dagpartitioner, fordi custom retention ganger antallet
+  af partitioner op: 20 forskellige værdier × 400 dage i dagpartitioner er 8.000
+  partitioner pr. tabel, og det kan ClickHouse ikke lide. Med uger er det ca. 1.100.
+  Prisen er, at data lever op til 7 dage ekstra. Det er fint, når løftet er
+  "mindst N dage".
+- Control plane bør runde custom-værdier til hele uger eller måneder. Det holder antallet
+  af værdier nede og ændrer ikke noget for kunden.
 
-**Måling.** Kilden til sandheden bør være ClickHouse: en materialized view
-`usage_hourly` (`SummingMergeTree`, nøgle `TenantId, Hour, Signal`) med rækker og
-bytes. Det virker på tværs af alle instanser, overlever genstarter og kan læses direkte
-af control plane til faktura og forbrugsgraf. `telemetryd_ingest_accepted_total` har i
-dag kun en `signal`-label, og tenant må ikke blive en Prometheus-label (kardinalitet).
+**Når retention ændres** (en kunde opgraderer fra 90 til 365 dage): nye data får den nye
+værdi med det samme. Eksisterende data beholder den gamle, medmindre vi kører en
+`ALTER TABLE … UPDATE RetentionDays` for projektet. Det er en mutation, så den er dyr,
+men den er sjælden og kan køres som et job. Ved nedgradering er det rimeligt kun at lade
+den gælde nye data.
 
-**Håndhævelse.** telemetryd henter kvotestatus pr. tenant fra control plane (eller fra
-en lille tabel i ClickHouse som control plane skriver), cachet og eventual consistent.
-Det gør ikke noget, at en kunde ryger lidt over i et minut.
+Desuden: sletning af et helt projekt ved opsigelse eller GDPR
+(`ALTER TABLE … DELETE WHERE TenantId = …` på alle tabeller), som en admin-kommando.
 
-**Svaret til senderen, når kvoten er brugt**: *ikke* `429`/`503`. OTLP-exportere prøver
-dem igen, og så får vi en retry-storm fra alle kundens servere. Brug et ikke-retrybart
-svar (`200` med `partialSuccess`, eller `400` med en klar besked) og tæl det. Planen kan
-have en "soft overage"-margin, og der skal være advarsler ved 80/100 %.
+### 7. Entitlements, måling og håndhævelse
 
-**Hvad sælger vi?** Det skal besluttes (se åbne spørgsmål): spans alene, "events"
-(spans + loglinjer) som Nightwatch, eller GB. Metrics passer dårligt til "antal", og
-prissættes bedre pr. aktiv serie.
+*Besluttet:* alt med en grænse er et entitlement. Overforbrug kan tillades og faktureres,
+eller der er et soft limit på X % over kvoten, eller nye data afvises. Det afhænger af
+entitlementet.
+
+**Rollefordeling.** telemetryd skal hverken kende planer, priser eller organisationer.
+Den måler, rapporterer og håndhæver en *policy pr. projekt*, som control plane har
+regnet ud. Control plane ejer entitlements, pooling på tværs af en organisations
+projekter og fakturering. Så kan en kvote, der deles af en organisations ti projekter,
+ændre sig uden kodeændringer i telemetryd.
+
+**Hvad telemetryd måler** (pr. projekt, pr. time, pr. signal), i en materialized view
+`usage_hourly` (`SummingMergeTree`, nøgle `TenantId, Hour, Signal`):
+
+| Måler | Kilde |
+|---|---|
+| spans, loglinjer, metric-samples | rækker ved insert |
+| bytes ingested | rå størrelse ved insert |
+| aktive metric-serier | den eksisterende serietælling, pr. projekt |
+| lagret volumen | `system.parts` pr. projekt og partition (bruges allerede til `telemetryd_app_bytes_estimate`) |
+| forespørgsler / læste rækker | tælles i query-laget, flushes til ClickHouse |
+
+Det virker på tværs af alle instanser, overlever genstarter og kan læses direkte af
+control plane. `telemetryd_ingest_accepted_total` har i dag kun en `signal`-label, og
+tenant må ikke blive en Prometheus-label (kardinalitet).
+
+Entitlements, der ikke er volumen, håndhæves de steder, de hører til:
+
+| Entitlement | Håndhæves af |
+|---|---|
+| spans/logs/samples pr. periode | telemetryd ved ingest, efter policy |
+| aktive serier | telemetryd, som `max_series_per_app` i dag |
+| retention | telemetryd via `RetentionDays` |
+| query-concurrency, rate | telemetryd |
+| projekter pr. organisation, brugere, API-nøgler | control plane |
+| features (live tail, export, alerts …) | telemetryd pr. route, ud fra en feature-liste i policyen |
+
+**Policyen pr. projekt.** Det er det, telemetryd henter fra control plane: cachet,
+pull hvert ~30 sekund plus push ved ændringer, og eventual consistent. Pr. måler står der
+en tilstand:
+
+- `accept`: under kvoten, eller overforbrug faktureres uden loft
+- `accept_until(n)`: soft limit, så modtag op til `n` mere i perioden og afvis derefter.
+  telemetryd tæller lokalt fra det tal, så et minuts forsinkelse ikke bliver til
+  ubegrænset overforbrug.
+- `reject`: hard limit nået, eller projektet er suspenderet
+
+Med flere instanser tæller hver for sig. `accept_until(n)` kan derfor overskrides med op
+til (instanser × det, der kom ind før næste sync). Det er acceptabelt for et *soft*
+limit. Skal det være skarpt, så route pr. projekt på load balanceren.
+
+Uden fast loft er overforbrug fakturering og ikke håndhævelse: control plane læser
+`usage_hourly`, trækker kvoten fra og sender resten til Cbox Billing som forbrug.
+
+**Svaret til senderen, når der afvises**: *ikke* `429`/`503`. OTLP-exportere prøver dem
+igen, og så får vi en retry-storm fra alle kundens servere. Brug et ikke-retrybart svar
+(`200` med `partialSuccess` og en besked, der siger "quota exceeded for project X"),
+og tæl det, så kunden kan se på forbrugssiden, hvad der er droppet. Advarsler ved 80 og
+100 % og ved start på overforbrug kommer fra control plane.
 
 ### 8. Sampling (nice to have, men vigtig for "X spans")
 
@@ -178,10 +243,15 @@ brænder kvoten af på healthchecks. Det hører i SDK'et og ikke i telemetryd.
 
 Det er her "SaaS'en" bor, og det er sandsynligvis mere arbejde end telemetryd-delen:
 
-- Organisationer, projekter (= tenants eller apps), brugere og roller via Cbox ID
-- API-nøgler: oprette, rotere, tilbagekalde, synket til telemetryd
-- Planer, kvoter, retention-trin, Cbox Billing-abonnementer, overforbrug
-- Forbrugsside (læser `usage_hourly`) og mails ved 80/100 %
+- Organisationer → projekter. Et projekt er en tenant i telemetryd. Brugere og roller
+  via Cbox ID, på organisations- og projektniveau.
+- API-nøgler pr. projekt: oprette, rotere, tilbagekalde, synket til telemetryd
+- Entitlement-model: planer giver entitlements, og de kan overstyres pr. organisation
+  eller projekt. Pr. entitlement: kvote, pulje (organisation eller projekt) og
+  overforbrugsregel (faktureret, soft limit på X %, hard). Ud af den regnes policyen
+  pr. projekt, som sendes til telemetryd.
+- Cbox Billing: abonnement pr. organisation, forbrug (overforbrug) afregnet månedligt
+- Forbrugsside pr. organisation og projekt (læser `usage_hourly`) og mails ved 80/100 %
 - **Det offentlige API**: nøgler, forbrug og projekter, og evt. en proxy til
   query-API'erne med kundens token
 - Onboarding: "composer require laravel-telemetry, sæt nøglen i `.env`, færdig"
@@ -216,8 +286,8 @@ skal tjekkes, men det skal kunne:
    wrapper, signaturændringer på `trace`/`label_*`, isolationstests. Det hele bag
    `[tenancy]` og kun med ClickHouse. *Størst og vigtigst.*
 2. **Nøglebutik og sync** fra en minimal control plane (bare tenants og nøgler).
-3. **Måling og kvoter**: `usage_hourly`, kvotestatus, ikke-retrybart afslag.
-4. **Per-tenant limits** (køandel, query-slots, serier) og **retention-trin**.
+3. **Måling og entitlements**: `usage_hourly`, policy-sync pr. projekt (accept, soft limit, reject), ikke-retrybart afslag.
+4. **Per-tenant limits** (køandel, query-slots, serier) og **custom retention**.
 5. **Control plane til produkt**: Billing, forbrugsside, offentligt API, onboarding.
 6. **telemetry-ui i tenant-mode**.
 7. Sikkerhedsdocs, pentest, lancering. Dedicated-instanser (model A) kan sælges fra dag
@@ -227,18 +297,24 @@ Punkt 1 til 4 er Rust-arbejde i det her repo. Punkt 5 og 6 er Laravel. Første
 milepæl, der er værd at sigte efter, er punkt 1 og 2 med to testkunder på et
 ClickHouse-cluster.
 
-## Åbne spørgsmål til dig
+## Besluttet
 
-1. **Enhed**: sælger vi spans, events (spans + logs) eller GB? Og hvordan prissættes
-   metrics?
-2. **Tenant = organisation eller projekt?** Nightwatch har én app pr. abonnement. Hvis en
-   kunde har flere apps, er tenant så kunden, med `app` indenfor, eller hver app for sig?
-   Jeg ville vælge organisation = tenant og `app` som i dag.
-3. **Over kvoten**: smid væk, sample ned, eller fortsæt og fakturer overforbrug?
-4. **Retention-trin**: hvilke, og hænger de på planen?
-5. **Skal tenancy ind i det åbne telemetryd (MIT)**, eller i en lukket fork eller et
+1. **Entitlements**: alt med en grænse er et entitlement, ikke kun spans.
+2. **Tenant = projekt**. En organisation har mange projekter, og det håndteres i control
+   plane.
+3. **Overforbrug** afhænger af entitlementet: faktureres, soft limit på X %, eller
+   afvisning af nye data.
+4. **Retention** er mindst 90 dage, custom pr. kunde, projekt eller plan.
+
+## Stadig åbne
+
+1. **Pulje eller pr. projekt?** Deler en organisations projekter én kvote, eller har
+   hvert projekt sin egen? Modellen ovenfor kan begge dele, men planerne skal vælge.
+2. **Skal tenancy ind i det åbne telemetryd (MIT)**, eller i en lukket fork eller et
    plugin? Det er MIT i dag, så alle kan bygge det samme. Det taler for at holde control
    plane lukket og telemetryd åben.
-6. **Self-hosted vs. SaaS i markedsføringen**: README'en sælger "your telemetry never
+3. **Self-hosted vs. SaaS i markedsføringen**: README'en sælger "your telemetry never
    leaves your infrastructure". SaaS'en er et andet tilbud ved siden af, og det skal
    formuleres, så de ikke modsiger hinanden.
+4. **Afregningsperiode** for kvoter: kalendermåned pr. organisation, eller løbende fra
+   abonnementets start? Det afgør, hvornår tællerne nulstilles.
