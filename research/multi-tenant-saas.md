@@ -26,10 +26,10 @@ Det der skal til, groft sagt:
 5. **telemetry-ui i tenant-mode**, med læsetoken pr. tenant i stedet for at stole på
    en `X-Scope-OrgID`-header.
 
-Min anbefaling er at bygge tenancy ind i telemetryd som en opt-in mode
-(`[tenancy] enabled = true`, kræver ClickHouse). Default, altså én node uden noget,
-skal forblive som i dag. Så sælger self-hosted og SaaS det samme program, og det passer
-med README'ens "local and production are the same program".
+*Besluttet:* tenancy er **lukket**. SaaS'en er et nyt, lukket produkt, hvor data gemmes
+i vores cloud. Det åbne telemetryd (MIT) forbliver single-tenant og self-hosted, og kan
+som tilvalg sende data videre til cloud'en (se "Lukket kode oven på det åbne
+telemetryd" og "Export fra self-hosted til cloud" nedenfor).
 
 ## De tre måder at gøre det på
 
@@ -282,9 +282,9 @@ skal tjekkes, men det skal kunne:
 
 ## Rækkefølge
 
-1. **Tenancy-kerne i telemetryd**: identitet, stempling, skema med `TenantId`, scoping
-   wrapper, signaturændringer på `trace`/`label_*`, isolationstests. Det hele bag
-   `[tenancy]` og kun med ClickHouse. *Størst og vigtigst.*
+1. **Tenancy-kerne**: seams i det åbne telemetryd, og i den lukkede binary identitet,
+   stempling, skema med `TenantId`, scoping-wrapper og isolationstests. Kun med
+   ClickHouse. *Størst og vigtigst.*
 2. **Nøglebutik og sync** fra en minimal control plane (bare tenants og nøgler).
 3. **Måling og entitlements**: `usage_hourly`, policy-sync pr. projekt (accept, soft limit, reject), ikke-retrybart afslag.
 4. **Per-tenant limits** (køandel, query-slots, serier) og **custom retention**.
@@ -293,9 +293,76 @@ skal tjekkes, men det skal kunne:
 7. Sikkerhedsdocs, pentest, lancering. Dedicated-instanser (model A) kan sælges fra dag
    ét parallelt med det her.
 
-Punkt 1 til 4 er Rust-arbejde i det her repo. Punkt 5 og 6 er Laravel. Første
-milepæl, der er værd at sigte efter, er punkt 1 og 2 med to testkunder på et
-ClickHouse-cluster.
+Punkt 1 til 4 er Rust-arbejde, mest i den lukkede repo, med små generiske seams i det
+åbne telemetryd (se nedenfor). Punkt 5 og 6 er Laravel. Første milepæl, der er værd at
+sigte efter, er punkt 1 og 2 med to testkunder på et ClickHouse-cluster.
+
+## Lukket kode oven på det åbne telemetryd
+
+telemetryd er bygget som en binary, men workspace'et er allerede delt i publicerbare
+crates (`telemetryd-core`, `-store`, `-ingest`, `-query`, `-server`). Tre måder at holde
+tenancy lukket:
+
+| | Hvordan | Problem |
+|---|---|---|
+| Lukket fork | Kopi af repo'et med tenancy flettet ind | Hver upstream-release skal merges ind, for altid. Det bliver dyrere for hver release |
+| **Lukket binary oven på de åbne crates** | En privat repo med sin egen `main`, der bruger de åbne crates som biblioteker og lægger tenancy ovenpå | Det åbne telemetryd skal have nogle få generiske seams |
+| Plugin | Dynamisk loading | Strider mod "no plugins, a single static binary" i `docs/extension-points` |
+
+**Anbefaling: lukket binary oven på de åbne crates.** De seams, det åbne telemetryd skal
+have, er generiske og afslører intet om SaaS'en:
+
+- **Identitet som trait**: en `CredentialResolver`, der går fra request til
+  `ClientIdentity`. Den åbne implementation er config og OIDC som i dag, og den lukkede
+  slår nøgler op i nøglebutikken og giver en tenant med.
+- **Store-wrapper**: de tre store-traits skal kunne wrappes udefra, og
+  `trace`/`label_*` skal tage et scope-argument (punkt 4). Signaturændringen er også en
+  forbedring for det åbne produkt, fordi `app`-scoping så kan håndhæves samme sted.
+- **Skema-udvidelse**: ClickHouse-skemaet skal kunne få ekstra kolonner og en anden
+  `ORDER BY`/`PARTITION BY`, eller også ejer den lukkede repo sit eget skema og sin egen
+  migrering. Det sidste er nok enklest, fordi `TenantId` og `RetentionDays` alligevel
+  ændrer hele nøglen.
+- **Ingest-hook** før insert: stempling, entitlement-tjek og tælling (punkt 2 og 7).
+- **Router, der kan udvides**: den lukkede binary monterer sine egne admin- og
+  policy-routes.
+
+Seams lander i det åbne repo som almindelige PR'er, testet med de åbne
+implementationer. Isolationstests, nøglebutik, entitlements, retention pr. række og
+`usage_hourly` ligger i den lukkede repo. Den lukkede binary pinner en telemetryd-version
+og følger med, som en almindelig afhængighed.
+
+Licensen skal stå ærligt: den lukkede binary er proprietær og bundter MIT-crates, så
+deres licens- og copyright-tekst skal med (SBOM). Det åbne telemetryd ændrer ikke
+licens.
+
+## Export fra self-hosted til cloud
+
+*Besluttet:* et tilvalg til at sende data videre til cloud'en. Der er to veje, og de kan
+begge findes:
+
+- **Fra laravel-telemetry**: exporteren får en ekstra, valgfri OTLP-destination, så
+  appen sender til både den lokale telemetryd og cloud'en med projektets ingest-nøgle.
+  Det er ren config i SDK'et og kræver intet i telemetryd.
+- **Fra telemetryd**: relay mode (`crates/server/src/relay.rs`) forwarder allerede
+  forseglede segmenter til en `upstream` med at-least-once-levering og en cursor, der
+  overlever offline-perioder. Peg `upstream` på cloud'en og `token` på projektets
+  ingest-nøgle. Cloud'en stempler tenant ud fra nøglen, så den lokale instans ikke kan
+  skrive til et andet projekt. Relay mode gemmer lokalt og kan stadig forespørges
+  ("The relay is still queryable" i `docs/cookbook/relay-mode.md`), så "gem lokalt og
+  send en kopi til cloud" findes i praksis allerede. Men relay mode afviser i dag en
+  almindelig `auth.ingest_token`, medmindre `trust_client_identity = true`, og den
+  kræver Parquet (ikke `[clickhouse]`). En self-hosted installation, der bare vil
+  sende en kopi, har derfor brug for en lettere variant, fx `[export.cloud]` uden
+  relay-reglerne om identitet. Det er et lille, generisk tilvalg i det åbne
+  telemetryd.
+
+Begge veje bruger kundens kvote i cloud'en, og at-least-once betyder, at dubletter
+tæller med. Det skal stå på forbrugssiden og i vilkårene, eller også skal cloud'en
+dedupe på segment-id.
+
+Markedsføringen løser sig med det: self-hosted telemetryd lover stadig "your telemetry
+never leaves your infrastructure", fordi export er slået fra som default og kun sender,
+når kunden selv slår det til. SaaS'en er et andet produkt, hvor data ligger hos os (EU).
 
 ## Besluttet
 
@@ -306,15 +373,17 @@ ClickHouse-cluster.
    afvisning af nye data.
 4. **Retention** er mindst 90 dage, custom pr. kunde, projekt eller plan.
 
+5. **Kvoter** kan både deles af en organisations projekter og være pr. projekt. Det
+   vælges pr. entitlement i planen eller kontrakten.
+6. **Afregningsperiode** er kalendermåned som standard. Enterprise kan få tilpassede
+   kontrakter (anden periode, årlig kvote osv.). Periode og nulstilling er derfor et
+   felt på kontrakten i control plane, og telemetryd kender kun til policyen.
+7. **Tenancy er lukket**. Det åbne telemetryd forbliver MIT og single-tenant.
+8. **SaaS'en gemmer i cloud'en**. Self-hosted kan som tilvalg exportere dertil.
+
 ## Stadig åbne
 
-1. **Pulje eller pr. projekt?** Deler en organisations projekter én kvote, eller har
-   hvert projekt sin egen? Modellen ovenfor kan begge dele, men planerne skal vælge.
-2. **Skal tenancy ind i det åbne telemetryd (MIT)**, eller i en lukket fork eller et
-   plugin? Det er MIT i dag, så alle kan bygge det samme. Det taler for at holde control
-   plane lukket og telemetryd åben.
-3. **Self-hosted vs. SaaS i markedsføringen**: README'en sælger "your telemetry never
-   leaves your infrastructure". SaaS'en er et andet tilbud ved siden af, og det skal
-   formuleres, så de ikke modsiger hinanden.
-4. **Afregningsperiode** for kvoter: kalendermåned pr. organisation, eller løbende fra
-   abonnementets start? Det afgør, hvornår tællerne nulstilles.
+1. **Hvilken export-vej først**: laravel-telemetry med to destinationer, eller
+   telemetryd relay mod cloud'en? SDK-vejen er mindst arbejde. Relay-vejen dækker også
+   ikke-Laravel-kilder.
+2. **Dubletter ved export**: tæller de med i kvoten, eller dedupes de i cloud'en?
