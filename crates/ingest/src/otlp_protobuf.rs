@@ -635,6 +635,10 @@ fn number_point(reader: &mut Reader<'_>) -> Result<NumberPoint> {
                 out.as_int = crate::otlp::FlexI64::Number(reader.fixed64()? as i64);
             }
             (7, WireType::LengthDelimited) => push_attribute(reader, &mut out.attributes)?,
+            (8, WireType::Varint) => {
+                out.flags = u32::try_from(reader.varint()?)
+                    .map_err(|_| Error::BadRequest("metric flags exceed uint32".to_owned()))?;
+            }
             _ => reader.skip(wire)?,
         }
     }
@@ -700,6 +704,10 @@ fn histogram_point(reader: &mut Reader<'_>) -> Result<HistogramPoint> {
                 }
             }
             (9, WireType::LengthDelimited) => push_attribute(reader, &mut out.attributes)?,
+            (10, WireType::Varint) => {
+                out.flags = u32::try_from(reader.varint()?)
+                    .map_err(|_| Error::BadRequest("metric flags exceed uint32".to_owned()))?;
+            }
             _ => reader.skip(wire)?,
         }
     }
@@ -710,6 +718,25 @@ fn histogram_point(reader: &mut Reader<'_>) -> Result<HistogramPoint> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn no_recorded_value_flags_survive_json_and_protobuf() {
+        let point = number_point(&mut Reader::new(&[8 << 3, 1])).unwrap();
+        assert_eq!(point.flags, 1);
+        let point = histogram_point(&mut Reader::new(&[10 << 3, 1])).unwrap();
+        assert_eq!(point.flags, 1);
+        assert_eq!(
+            serde_json::from_str::<NumberPoint>(r#"{"flags":1}"#)
+                .unwrap()
+                .flags,
+            1
+        );
+        assert_eq!(
+            serde_json::from_str::<HistogramPoint>(r#"{"flags":1}"#)
+                .unwrap()
+                .flags,
+            1
+        );
+    }
 
     /// The protobuf fuzz target starts from these, so they had better be what they claim
     /// to be: a logs, a traces and a metrics request an SDK could have sent. A seed that

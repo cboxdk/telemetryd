@@ -1,7 +1,7 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
-  "serialNumber": "urn:uuid:c835b354-6ff7-5918-aacf-5d53f9e9fbcd",
+  "serialNumber": "urn:uuid:1a2f76f4-bb07-5a41-a514-90dced3762ed",
   "version": 1,
   "metadata": {
     "component": {
@@ -2122,10 +2122,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/futures-macro@0.3.31",
+      "bom-ref": "pkg:cargo/futures-macro@0.3.33",
       "name": "futures-macro",
-      "version": "0.3.31",
-      "purl": "pkg:cargo/futures-macro@0.3.31",
+      "version": "0.3.33",
+      "purl": "pkg:cargo/futures-macro@0.3.33",
       "description": "The futures-rs procedural macro implementations.",
       "licenses": [
         {
@@ -2200,10 +2200,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/futures-util@0.3.31",
+      "bom-ref": "pkg:cargo/futures-util@0.3.33",
       "name": "futures-util",
-      "version": "0.3.31",
-      "purl": "pkg:cargo/futures-util@0.3.31",
+      "version": "0.3.33",
+      "purl": "pkg:cargo/futures-util@0.3.33",
       "description": "Common utilities and extension traits for the futures-rs library.",
       "licenses": [
         {
@@ -3987,32 +3987,6 @@
         {
           "type": "vcs",
           "url": "https://github.com/taiki-e/pin-project-lite"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "pkg:cargo/pin-utils@0.1.0",
-      "name": "pin-utils",
-      "version": "0.1.0",
-      "purl": "pkg:cargo/pin-utils@0.1.0",
-      "description": "Utilities for pinning",
-      "licenses": [
-        {
-          "license": {
-            "id": "Apache-2.0"
-          }
-        },
-        {
-          "license": {
-            "id": "MIT"
-          }
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/rust-lang-nursery/pin-utils"
         }
       ]
     },
@@ -7199,15 +7173,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/zstd@0.13.3",
+      "bom-ref": "pkg:cargo/zstd@0.13.4",
       "name": "zstd",
-      "version": "0.13.3",
-      "purl": "pkg:cargo/zstd@0.13.3",
+      "version": "0.13.4",
+      "purl": "pkg:cargo/zstd@0.13.4",
       "description": "Binding for the zstd compression library.",
       "licenses": [
         {
           "license": {
-            "id": "MIT"
+            "id": "BSD-3-Clause"
           }
         }
       ],
@@ -7220,20 +7194,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/zstd-safe@7.2.4",
+      "bom-ref": "pkg:cargo/zstd-safe@7.4.0",
       "name": "zstd-safe",
-      "version": "7.2.4",
-      "purl": "pkg:cargo/zstd-safe@7.2.4",
+      "version": "7.4.0",
+      "purl": "pkg:cargo/zstd-safe@7.4.0",
       "description": "Safe low-level bindings for the zstd compression library.",
       "licenses": [
         {
           "license": {
-            "id": "Apache-2.0"
-          }
-        },
-        {
-          "license": {
-            "id": "MIT"
+            "id": "BSD-3-Clause"
           }
         }
       ],
@@ -7246,20 +7215,15 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/zstd-sys@2.0.16+zstd.1.5.7",
+      "bom-ref": "pkg:cargo/zstd-sys@2.1.2+zstd.1.5.7",
       "name": "zstd-sys",
-      "version": "2.0.16+zstd.1.5.7",
-      "purl": "pkg:cargo/zstd-sys@2.0.16+zstd.1.5.7",
+      "version": "2.1.2+zstd.1.5.7",
+      "purl": "pkg:cargo/zstd-sys@2.1.2+zstd.1.5.7",
       "description": "Low-level bindings for the zstd compression library.",
       "licenses": [
         {
           "license": {
-            "id": "Apache-2.0"
-          }
-        },
-        {
-          "license": {
-            "id": "MIT"
+            "id": "BSD-3-Clause"
           }
         }
       ],
