@@ -103,6 +103,7 @@ pub struct SumData {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct NumberPoint {
+    pub flags: u32,
     #[serde(alias = "time_unix_nano")]
     pub time_unix_nano: FlexU64,
     pub attributes: Vec<KeyValue>,
@@ -116,6 +117,9 @@ pub struct NumberPoint {
 impl NumberPoint {
     #[allow(clippy::cast_precision_loss)]
     fn value(&self) -> f64 {
+        if self.flags & 1 != 0 {
+            return f64::from_bits(telemetryd_core::metric::STALE_MARKER_BITS);
+        }
         self.as_double
             .or_else(|| self.as_int.get().map(|v| v as f64))
             .unwrap_or(0.0)
@@ -134,6 +138,7 @@ pub struct HistogramData {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct HistogramPoint {
+    pub flags: u32,
     #[serde(alias = "time_unix_nano")]
     pub time_unix_nano: FlexU64,
     pub attributes: Vec<KeyValue>,
@@ -485,6 +490,15 @@ fn push_histogram(
     derived: &mut HistogramSeries,
     decoded: &mut Decoded<MetricSample>,
 ) {
+    if point.flags & 1 != 0 {
+        // This stateless projection cannot identify all older bucket layouts.
+        // Retain the marker in native consumers; never manufacture zero counts.
+        decoded.refuse(Rejection::new(
+            RejectReason::UnsupportedMetricType,
+            "histogram no-recorded-value marker requires a native metric consumer".to_owned(),
+        ));
+        return;
+    }
     let timestamp_nanos = resolve_time(point.time_unix_nano, ctx, decoded);
 
     let mut base = base_series(name, resource, app, ctx);
@@ -1068,5 +1082,19 @@ mod tests {
         assert_eq!(values.len(), 4, "{:?}", decoded.rejections);
         assert!(values[0].is_nan());
         assert_eq!(&values[1..], &[f64::INFINITY, f64::NEG_INFINITY, 2.5]);
+    }
+    #[test]
+    fn absent_number_is_a_staleness_marker_and_absent_histogram_is_not_zero() {
+        let decoded = decode_str(
+            r#"{"resourceMetrics":[{"scopeMetrics":[{"metrics":[
+            {"name":"g","gauge":{"dataPoints":[{"timeUnixNano":"1750000000000000000","flags":1,"asDouble":99}]}},
+            {"name":"h","histogram":{"aggregationTemporality":2,"dataPoints":[{"timeUnixNano":"1750000000000000000","flags":1,"count":"0","sum":0}]}}
+        ]}]}]}"#,
+        );
+        assert_eq!(decoded.records.len(), 1);
+        assert!(telemetryd_core::metric::is_stale_marker(
+            decoded.records[0].value
+        ));
+        assert_eq!(decoded.rejections.len(), 1);
     }
 }
