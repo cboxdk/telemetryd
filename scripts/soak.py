@@ -809,7 +809,8 @@ def tls_material() -> dict:
     run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
         "-keyout", ca_key, "-out", ca_pem, "-subj", "/CN=telemetryd soak CA",
         "-addext", "basicConstraints=critical,CA:TRUE",
-        "-addext", "keyUsage=critical,keyCertSign,cRLSign")
+        "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+        "-addext", "subjectKeyIdentifier=hash")
     run("openssl", "req", "-newkey", "rsa:2048", "-nodes",
         "-keyout", key, "-out", csr, "-subj", "/CN=localhost")
     # A SAN is not optional: rustls rejects a certificate matched only on common name.
@@ -818,6 +819,8 @@ def tls_material() -> dict:
         handle.write("basicConstraints=critical,CA:FALSE\n")
         handle.write("keyUsage=critical,digitalSignature,keyEncipherment\n")
         handle.write("extendedKeyUsage=serverAuth\n")
+        handle.write("subjectKeyIdentifier=hash\n")
+        handle.write("authorityKeyIdentifier=keyid:always,issuer\n")
     run("openssl", "x509", "-req", "-in", csr, "-CA", ca_pem, "-CAkey", ca_key,
         "-CAcreateserial", "-out", cert, "-days", "1", "-extfile", ext)
 
