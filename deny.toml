@@ -9,7 +9,18 @@ targets = [
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # Unmaintained, not a vulnerability: chrono's maintainers stepped back
+    # (chronotope/chrono#1768) and no release fixes "unmaintained". We do not use it;
+    # it arrives only through arrow-arith/arrow-array/arrow-cast and parquet, so it
+    # leaves when arrow moves off it. Revisit on every arrow upgrade.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained chrono, transitive via arrow/parquet only; no fixed version exists" },
+    # Unmaintained, not a vulnerability. The advisory says humantime wraps chrono;
+    # humantime 2.4.0 has no dependencies at all. We use it to parse and print config
+    # durations (`7d`, `100ms`); swapping the parser changes which strings existing
+    # config files may hold, so that is a reviewed change of its own, not a CI fix.
+    { id = "RUSTSEC-2026-0542", reason = "unmaintained humantime (dependency-free); replacing it changes the config duration format" },
+]
 
 [licenses]
 version = 2
