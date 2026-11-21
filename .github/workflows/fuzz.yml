@@ -88,3 +88,4 @@ jobs:
           name: crash-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}/
           if-no-files-found: ignore
+          retention-days: 7

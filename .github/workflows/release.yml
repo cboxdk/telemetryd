@@ -242,6 +242,7 @@ jobs:
             dist/*.deb
             dist/*.sha256
           if-no-files-found: error
+          retention-days: 7
 
   release:
     name: publish
