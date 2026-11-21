@@ -1,7 +1,7 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
-  "serialNumber": "urn:uuid:1a2f76f4-bb07-5a41-a514-90dced3762ed",
+  "serialNumber": "urn:uuid:92fce83d-fc2c-5235-951b-4c9740d5ff6c",
   "version": 1,
   "metadata": {
     "component": {
@@ -4538,10 +4538,10 @@
     },
     {
       "type": "library",
-      "bom-ref": "pkg:cargo/rustix@1.1.4",
+      "bom-ref": "pkg:cargo/rustix@1.1.6",
       "name": "rustix",
-      "version": "1.1.4",
-      "purl": "pkg:cargo/rustix@1.1.4",
+      "version": "1.1.6",
+      "purl": "pkg:cargo/rustix@1.1.6",
       "description": "Safe Rust bindings to POSIX/Unix/Linux/Winsock-like syscalls",
       "licenses": [
         {
